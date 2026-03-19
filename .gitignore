@@ -1,0 +1,35 @@
+# 環境設定・秘密情報
+.env
+.streamlit/secrets.toml
+
+# 大容量DBファイル（除外）
+cogni_code_master.db
+partslink_items.db
+*.db
+
+# Pythonキャッシュ
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 開発用一時ファイル
+tmp_*.py
+tmp_*.txt
+*.log
+dump*.py
+dump*.txt
+check_*.py
+debug_*.txt
+test_*.py
+step*.py
+fix_*.py
+search_*.py
+find_*.py
+extract_*.py
+analyze_*.py
+cogni_*.py
+full_analysis_*.py
+deploy_hf.py
+keys.txt
+result.json
+match_output*.txt
