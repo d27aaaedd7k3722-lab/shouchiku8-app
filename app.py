@@ -3635,7 +3635,8 @@ def extract_honda_cars_subtotals(file_bytes):
 
 
 def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
-                     use_fax_filter=False, use_rasterize=False, use_enhance=True):
+                     use_fax_filter=False, use_rasterize=False, use_enhance=True,
+                     enable_self_correction=True):
     """
     見積書をAI-OCRで解析するメイン関数。
     新機能:
@@ -3647,7 +3648,7 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
 
     # ── ファイルハッシュキャッシュ: 同一ファイルの再解析を防ぐ ──────────────
     _cache_key = (hashlib.md5(file_bytes).hexdigest()
-                  + f"_{used_model}_{use_rasterize}_{use_fax_filter}")
+                  + f"_{used_model}_{use_rasterize}_{use_fax_filter}_{use_enhance}_{enable_self_correction}")
     if _cache_key in _analyze_result_cache:
         print("[INFO] キャッシュヒット: 再解析をスキップします", file=sys.stderr)
         return _analyze_result_cache[_cache_key]
@@ -3695,9 +3696,9 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
         last_page_idx = max(0, num_pages - 1)
         # 最終ページと1ページ目を並列ラスタライズ（直列から並列化 → ~2s節約）
         def _raster_last(_):
-            return rasterize_pdf_page(file_bytes, last_page_idx, dpi=250, enhance=use_enhance)
+            return rasterize_pdf_page(file_bytes, last_page_idx, dpi=300, enhance=use_enhance)
         def _raster_first(_):
-            return rasterize_pdf_page(file_bytes, 0, dpi=250, enhance=use_enhance)
+            return rasterize_pdf_page(file_bytes, 0, dpi=300, enhance=use_enhance)
         with ThreadPoolExecutor(max_workers=2) as _ex:
             _fut_last  = _ex.submit(_raster_last, None)
             _fut_first = _ex.submit(_raster_first, None)
@@ -3781,7 +3782,7 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
         if use_rasterize:
             def _rasterize_one_page(args):
                 idx, pb = args
-                img = rasterize_pdf_page(pb, 0, dpi=250, enhance=use_enhance)
+                img = rasterize_pdf_page(pb, 0, dpi=300, enhance=use_enhance)
                 if img:
                     return (idx, img, 'image/jpeg')
                 return (idx, pb, 'application/pdf')
@@ -3923,7 +3924,8 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
             result['pdf_wage_total']  = _cv_calc_w + _cv_sp
 
     # ⑦ 自己修復ループ（合計値が取得できた場合のみ、最大2回）
-    if (result['pdf_parts_total'] > 0 or result['pdf_wage_total'] > 0):
+    # enable_self_correction=False（ベタ打ちモード等）の場合はスキップして高速化
+    if enable_self_correction and (result['pdf_parts_total'] > 0 or result['pdf_wage_total'] > 0):
         _correction_rounds = 0
         for _sc_round in range(2):
             _cur_items = result['items']
@@ -4475,6 +4477,9 @@ def main():
         _use_raster    = st.session_state.get('use_rasterize', True)   # デフォルトTrue（UIと一致）
         _use_enhance   = st.session_state.get('use_enhance', True)
         _model         = st.session_state.get('selected_model', GEMINI_MODEL)
+        # ベタ打ちモードでは自己修復ループを無効化（DB照合不要のため高速化）
+        _is_beta_s2    = st.session_state.get('selected_mode', 'db') == 'beta'
+        _enable_sc     = not _is_beta_s2
 
         if vehicle_bytes is None:
             st.error("車検証データが見つかりません。ステップ①に戻ってください。")
@@ -4497,7 +4502,7 @@ def main():
                     )
                     fut_estimate = executor.submit(
                         analyze_estimate, api_key, estimate_bytes, estimate_mime, _model,
-                        _use_fax, _use_raster, _use_enhance
+                        _use_fax, _use_raster, _use_enhance, _enable_sc
                     )
                     vehicle_data  = fut_vehicle.result()
                     progress.progress(50, text="✅ 車検証の解析完了、見積書を処理中...")
