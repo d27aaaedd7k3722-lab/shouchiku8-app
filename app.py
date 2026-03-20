@@ -3146,6 +3146,67 @@ def _self_correction_retry(api_key, file_bytes, mime_type, model_name,
         return None
 
 
+def extract_honda_cars_subtotals(file_bytes):
+    """
+    Honda Cars形式PDFから pypdf テキスト解析で部品/工賃合計を確実に抽出する。
+    Geminiが誤読するケースを防ぐため、pypdfのテキスト抽出結果を使用する。
+
+    pypdf特有のパターン:
+      - 「小      計 195,398 482,976」行 → 最終的な部品/工賃合計
+      - 「ページ小計 140,547 175,246」行 → ページ別小計（全ページを加算）
+
+    戻り値: (parts_total, wages_total) または None（Honda Cars形式でない場合）
+    """
+    import re
+    try:
+        from pypdf import PdfReader
+        import io as _io
+        reader = PdfReader(_io.BytesIO(file_bytes))
+    except Exception:
+        return None
+
+    all_text = ''
+    for page in reader.pages:
+        try:
+            t = page.extract_text() or ''
+            all_text += t + '\n'
+        except Exception:
+            pass
+
+    if not all_text.strip():
+        return None
+
+    # Honda Cars形式を識別: 「部品価格(税込)」列ヘッダが存在する
+    if '部品価格(税込)' not in all_text and '部品価格（税込）' not in all_text:
+        return None
+
+    # パターン1: 「小      計 195,398 482,976」（最終合計行・スペース多め）
+    m = re.search(r'小\s{2,}計\s+([\d,]+)\s+([\d,]+)', all_text)
+    if m:
+        parts = int(m.group(1).replace(',', ''))
+        wages = int(m.group(2).replace(',', ''))
+        if parts > 0 or wages > 0:
+            return (parts, wages)
+
+    # パターン2: 「小計 NNN NNN」（スペース少ない場合）
+    m = re.search(r'小\s*計\s+([\d,]+)\s+([\d,]+)', all_text)
+    if m:
+        parts = int(m.group(1).replace(',', ''))
+        wages = int(m.group(2).replace(',', ''))
+        if parts > 0 or wages > 0:
+            return (parts, wages)
+
+    # パターン3: ページ小計を全ページ合算
+    page_totals = re.findall(r'ページ小計\s+([\d,]+)\s+([\d,]+)', all_text)
+    if page_totals:
+        total_parts = sum(int(p.replace(',', '')) for p, w in page_totals)
+        total_wages = sum(int(w.replace(',', '')) for p, w in page_totals)
+        if total_parts > 0 or total_wages > 0:
+            return (total_parts, total_wages)
+
+    return None
+
+
 def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
                      use_fax_filter=False, use_rasterize=False, use_enhance=True):
     """
@@ -3238,6 +3299,21 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     target_wage  = safe_int(totals_data.get('pdf_wage_total', 0))
     pdf_grand    = safe_int(totals_data.get('pdf_grand_total', 0))
     discount     = safe_int(totals_data.get('discount_amount', 0))
+
+    # ④-a Honda Cars形式: pypdfで正確な合計値を取得（Gemini誤読を防ぐ）
+    # Geminiは「小計 195,398 482,976」の数値を誤認することがある。
+    # pypdf解析は列レイアウトに依存しないため確実。
+    if mime_type == 'application/pdf':
+        _pypdf_totals = extract_honda_cars_subtotals(file_bytes)
+        if _pypdf_totals:
+            _pypdf_parts, _pypdf_wages = _pypdf_totals
+            import sys
+            print(f"[INFO] Honda Cars pypdf合計: 部品={_pypdf_parts:,}, 工賃={_pypdf_wages:,} "
+                  f"(Gemini推測: 部品={target_parts:,}, 工賃={target_wage:,})", file=sys.stderr)
+            target_parts = _pypdf_parts
+            target_wage  = _pypdf_wages
+            totals_data['pdf_parts_total'] = _pypdf_parts
+            totals_data['pdf_wage_total']  = _pypdf_wages
 
     # ⑤ 2パス目: 明細抽出
     if pages and len(pages) > 1:
@@ -4378,11 +4454,13 @@ def main():
 
             # 金額差額の計算
             parts_diff = calc_parts - pdf_parts if pdf_parts > 0 else 0
-            # SP込みでも一致チェック
+            # SP込みでも一致チェック（部品）
             parts_match_sp = (calc_parts + sp == pdf_parts) if pdf_parts > 0 else False
             parts_match = (calc_parts == pdf_parts) or parts_match_sp
             wage_diff = calc_wages - pdf_wages if pdf_wages > 0 else 0
-            wage_match = (calc_wages == pdf_wages)
+            # SP込みでも一致チェック（工賃）: Honda Cars等でSPが工賃列に含まれる場合
+            wage_match_sp = (calc_wages + sp == pdf_wages) if pdf_wages > 0 else False
+            wage_match = (calc_wages == pdf_wages) or wage_match_sp
             has_discrepancy = False
 
             with scol1:
@@ -4734,7 +4812,9 @@ def main():
             if _step4_beta and _discrepancies_step4:
                 st.markdown('<div class="section-title">📋 ベタ打ちモード — 差異特定レポート</div>', unsafe_allow_html=True)
                 st.markdown('金額の不一致箇所を特定するための詳細レポートをPDF形式でダウンロードできます。')
-                beta_pdf_bytes = generate_beta_discrepancy_report_pdf(estimate_data, calc_parts, calc_wages, pdf_parts or 0, pdf_wages or 0, updated_vehicle)
+                # ショートパーツはHonda Cars等で工賃列に含まれるため、差異レポートの計算値に加算
+                _calc_wages_report = calc_wages + sp if wage_match_sp else calc_wages
+                beta_pdf_bytes = generate_beta_discrepancy_report_pdf(estimate_data, calc_parts, _calc_wages_report, pdf_parts or 0, pdf_wages or 0, updated_vehicle)
                 st.download_button(
                     label="📄 差異レポートをダウンロード(PDF)",
                     data=beta_pdf_bytes,
