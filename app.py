@@ -89,6 +89,10 @@ _quota_exhausted_models: set = set()
 
 _model_availability_cache: dict = {}  # key: api_key_hash, value: list of model IDs
 
+# 解析結果キャッシュ: 同一ファイル（md5）の再解析を防ぐ（セッション中に有効）
+# key: md5_hex + "_" + model_name + "_" + str(use_rasterize) → value: 解析結果dict
+_analyze_result_cache: dict = {}
+
 def get_available_gemini_models(api_key: str) -> list:
     """APIキーで利用可能なGeminiモデルを確認して返す（優先順位付き）。
     モジュールレベルキャッシュで結果を保持（サーバー再起動まで有効）。"""
@@ -525,7 +529,7 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
         
         # 未マッチ（またはそれに準ずる低マッチレベル）部品には先頭に「※」を付与
         # ベタ打ちモードではDB照合を行わないため※を付けない
-        if not is_beta_mode and (m_level >= 4 or m_level == 0):
+        if not is_beta_mode and m_level >= 4:
             if not name.startswith('※'):
                 name = '※' + name
         
@@ -1898,7 +1902,7 @@ def match_parts_with_addata(items, addata_folder):
         'フェンダ': 'フエンダ', 'フェンダー': 'フエンダ',
         'バンパー': 'バンパ', 'バンパカバー': 'バンパカバ',
         'ボンネット': 'ボンネツト',
-        'ラジエーター': 'ラジエータ', 'ラジエーター': 'ラジエータ',
+        'ラジエーター': 'ラジエータ',
         'ワイパー': 'ワイパ', 'ミラー': 'ミラ',
         'スタビライザー': 'スタビライザ', 'スポイラー': 'スポイラ',
         'アブソーバー': 'アブソーバ', 'コンデンサー': 'コンデンサ',
@@ -1912,6 +1916,15 @@ def match_parts_with_addata(items, addata_folder):
         from Levenshtein import distance
     except ImportError:
         def distance(a, b): return len(a) + len(b) # dummy
+
+    # 部品名を事前正規化してキャッシュ（fuzzy_match_part内ループの高速化）
+    _KANA_SMALL_TO_LARGE_PRE = str.maketrans('ｧｨｩｪｫｯｬｭｮ', 'ｱｲｳｴｵﾂﾔﾕﾖ')
+    for _mp in master_parts:
+        if '_norm_name' not in _mp:
+            _mn = jaconv.z2h(_mp['name'], ascii=True, digit=True, kana=True).replace(' ', '')
+            _mn = _mn.translate(_KANA_SMALL_TO_LARGE_PRE)
+            _mp['_norm_name'] = _mn
+            _mp['_norm_name_clean'] = _mn.replace('L', '').replace('R', '').replace('ﾊﾟﾈﾙ', '').replace('ｱｯｼ', '').replace('ｱｳﾀ', '').replace('ｲﾝﾅ', '').replace('ｶﾞｰﾄﾞ', '').strip()
 
     def fuzzy_match_part(target_name, target_price, target_part_no=''):
         # 0. 品番 (part_no) による完全・前方マッチング（最も確実）
@@ -1960,18 +1973,15 @@ def match_parts_with_addata(items, addata_folder):
         norm_target = norm_target.replace(' ', '')
 
         # 小書き文字を大文字に変換するマップ（Addataは全て大文字カナが多い）
-        KANA_SMALL_TO_LARGE = str.maketrans('ｧｨｩｪｫｯｬｭｮ', 'ｱｲｳｴｵﾂﾔﾕﾖ')
-        norm_target = norm_target.translate(KANA_SMALL_TO_LARGE)
+        norm_target = norm_target.translate(_KANA_SMALL_TO_LARGE_PRE)
 
         # clean版: L/R位置フラグ・パネル・アッシ・ガードを除去した芯の文字列
         norm_target_clean = norm_target.replace('L', '').replace('R', '').replace('ﾊﾟﾈﾙ', '').replace('ｱｯｼ', '').replace('ｶﾞｰﾄﾞ', '').strip()
 
         candidates = []
         for mp in master_parts:
-            m_name = jaconv.z2h(mp['name'], ascii=True, digit=True, kana=True).replace(' ', '')
-            m_name = m_name.translate(KANA_SMALL_TO_LARGE)
-            
-            m_name_clean = m_name.replace('L','').replace('R','').replace('ﾊﾟﾈﾙ', '').replace('ｱｯｼ', '').replace('ｱｳﾀ', '').replace('ｲﾝﾅ', '').replace('ｶﾞｰﾄﾞ', '').strip()
+            m_name = mp['_norm_name']          # 事前正規化済み
+            m_name_clean = mp['_norm_name_clean']  # 事前計算済み
             
             d = distance(m_name, norm_target)
             d_clean = distance(m_name_clean, norm_target_clean)
@@ -2335,7 +2345,7 @@ def generate_beta_discrepancy_report_pdf(estimate_data, calc_parts, calc_wages, 
         try:
             p_amt = int(float(it.get('parts_amount', 0)))
         except:
-            p_amt = getattr(it, '_original_parts_amount', 0)
+            p_amt = it.get('_original_parts_amount', 0)
             
         try:
             w_amt = int(float(it.get('wage', 0)))
@@ -2565,49 +2575,164 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
 
 【フォーマットA: コグニセブン系（部品価格列と工賃列が分離）】
 特徴: 「コード | 修理項目/部品名称 | 修理方法/部品番号 | 部品価格(円) | 工賃(円)」
-- 部品価格と工賃が別々の列に記載される
+列の位置（左→右）: コード → 品名 → 修理方法/部品番号 → 【部品価格列】 → 【工賃列】
+- 【部品価格列（右から2列目）】の値 → parts_amount に入れる
+- 【工賃列（最右列）】の値 → wage に入れる
 - 塗装明細が別セクション「【塗装明細】」にある場合がある
 - 費用セクション「【費用】」にショートパーツ・内張り費用等がある
 - 小計行に「部品計」「工賃計」「課税額計」「消費税」「合計」がある
 → 部品価格列の値をparts_amountに、工賃列の値をwageに入れる
 
+★★★ フォーマットA 列ズレ防止ルール ★★★
+- 部品価格列と工賃列の見出しが必ず表頭にある。読み取り前に列見出し行で位置を確認すること。
+- 「部品価格」列が空欄 → parts_amount=0（工賃列の値を借用しない）
+- 「工賃」列が空欄 → wage=0（部品価格列の値を借用しない）
+- 1行に両方値がある場合（取替行等）→ 両方のフィールドに設定する
+- 「ショートパーツ」「雑品代」「小物部品代」はitemsに含めずshort_parts_wageに合算
+
+NG例（絶対にしてはいけない）:
+  見積書の実際のレイアウト（「部品価格|工賃」の列）:
+  ├─ Fバンパー    取替  【21,300】 【 7,700】  ← 両方あり
+  ├─ Fバンパー脱着 脱着  【      】 【 3,080】  ← 工賃のみ
+  × 誤: Fバンパー脱着: parts=3,080, wage=0   ← 工賃列の値を部品に誤配置
+  ○ 正: Fバンパー脱着: parts=0, wage=3,080   ← 工賃列が正しい
+
 【フォーマットB: 修理工場系（種別列で作業/部品を区分）】
 特徴: 「作業内容/使用部品名 | 作業部位 | 種別 | 数量 | 単価 | 技術料/部品金額」
-- 「種別」列に「作業」「部品」と明記されている
-- 種別が「作業」→ 金額をwageに入れる（parts_amount=0）
-- 種別が「部品」→ 金額をparts_amountに入れる（wage=0）
+列の位置（左→右）: 品名 → 作業部位 → 【種別列】 → 数量 → 単価 → 【金額列】
+- 【種別列】が「作業」→ 金額列の値をwageに入れる（parts_amount=0）
+- 【種別列】が「部品」→ 金額列の値をparts_amountに入れる（wage=0）
 - 最下部に「技術料計」「部品計」「整備合計」がある
+
+★★★ フォーマットB 列ズレ防止ルール ★★★
+- 種別列の「作業」「部品」が判別の唯一の根拠。金額列は1つだが種別で振り分ける。
+- 種別が読み取れない場合はname/methodから判定: 脱着・修理・板金系→wage、部品名系→parts
+- 金額列が空欄の場合はparts_amount=0, wage=0 の両方ゼロにする
+
+NG例（絶対にしてはいけない）:
+  ├─ Rドア  板金  【作業】 1  8,000  ← 種別=作業 → wage=8,000
+  ├─ ドアHINGE  部品  【部品】 2  2,200  ← 種別=部品 → parts=4,400
+  × 誤: ドアHINGE: wage=4,400   ← 種別「部品」なのに工賃に誤配置
+  ○ 正: ドアHINGE: parts=4,400, wage=0
 
 【フォーマットC: メルセデスベンツ系ディーラー（作業コード＋金額の1列）】
 特徴: 「作業コード/部品番号 | 作業内容/部品名 | 時間/数量 | 金額」
-- 作業と部品が混在し、金額が1列のみ
-- 作業コードがBPで始まる → 作業行（wage=金額, parts_amount=0）
-- 作業コードがMAまたはMNで始まる → 部品行（parts_amount=金額, wage=0）
-- 作業名に「ペイント」「塗装」を含む → 作業行
-- 作業名に「脱着」「交換」「修理」「板金」を含む → 作業行
+列の位置（左→右）: 【コード列】 → 品名 → 時間/数量 → 【金額列（1列）】
+- 金額列は1つだが、コードのプレフィックスで部品/工賃を判別する
+- コードがBPで始まる → wage=金額, parts_amount=0（作業行）
+- コードがMAまたはMNで始まる → parts_amount=金額, wage=0（部品行）
+- コードが読み取れない場合は品名で判断:
+  「脱着」「修理」「板金」「塗装」「ペイント」「交換」→ 作業行（wage=金額）
+  「部品番号付き品名」「ASSY」「パネル」等の部品名 → 部品行（parts_amount=金額）
 - 最下部に「技術料」「部品代」「整備代合計」「消費税」「合計金額」がある
+
+★★★ フォーマットC 列ズレ防止ルール ★★★
+- コードプレフィックスが最優先。「BP-xxx」→必ずwage、「MA-xxx」→必ずparts
+- コードが不明瞭な場合は品名を次の判断材料にする
+- 金額列が1つしかないため、parts_amountかwageのどちらか一方のみに値を入れる（両方ゼロか一方のみ）
+- 同一行にBPコード＋MAコードが混在することはない
+
+NG例（絶対にしてはいけない）:
+  ├─ BP-00001  ボンネット板金    2.0h  18,000  ← BP→wage
+  ├─ MA-85400  ボンネット パネル  1個   52,000  ← MA→parts
+  × 誤: ボンネットパネル: wage=52,000  ← MAコードなのに工賃に誤配置
+  ○ 正: ボンネットパネル: parts=52,000, wage=0
 
 【フォーマットD: BMW系ディーラー（概算見積書・セクション分け＋作業CD）】
 特徴: 「項目 | 作業CD/部品No. | 作業項目/部品名 | 工数/数量 | 単価 | 金額」
+列の位置（左→右）: 項目 → 【作業CD列】 → 品名 → 工数/数量 → 単価 → 【金額列（1列）】
 - セクション分け（A: 事故修理、B: 搬送費用 等）がある
-- 作業CDが「MM99」で始まる行 → 工賃行（wage=金額, parts_amount=0）
-- 作業CDが「UU99」で始まる行 → その他費用行（wage=金額, parts_amount=0）
-- 作業CDが数字のみ（例: 0711 9904 207）→ 部品行（parts_amount=金額, wage=0）
+- 作業CDが「MM99」で始まる → wage=金額, parts_amount=0（工賃行）
+- 作業CDが「UU99」で始まる → wage=金額, parts_amount=0（その他費用行）
+- 作業CDが数字のみ（例: 0711 9904 207）→ parts_amount=金額, wage=0（部品行）
 - 工賃行のquantityは1にする（工数は時間なので数量ではない）
 - 最下部に「工賃合計額」「部品合計額」「税込合計金額」がある
 
+★★★ フォーマットD 列ズレ防止ルール ★★★
+- 作業CDの先頭2文字が判断の核心。「MM」→wage、「UU」→wage、数字のみ→parts
+- CDが読み取れない場合: 「RH」「LH」「F」「R」等の部位略号付き品名→parts、動詞系作業名→wage
+- セクションヘッダ行（A:〜 / B:〜）はitemsに含めない
+- 金額列は1列のみ。部品行か作業行かでparts/wageどちらか一方だけに入れる
+
+NG例（絶対にしてはいけない）:
+  ├─ MM99-0012  フロントドア板金   2.0  9,800  12,000  ← MM99→wage
+  ├─ 4151-7143  ドアインナーパネル  1    24,500  24,500  ← 数字CD→parts
+  × 誤: ドアインナーパネル: wage=24,500  ← 数字CDなのに工賃に誤配置
+  ○ 正: ドアインナーパネル: parts=24,500, wage=0
+
 【フォーマットE: 町工場系（品名＋数量＋単価＋金額＋工賃の5列構成）】
 特徴: 「品名 | 数量 | 単価 | 金額 | 工賃」の列構成
-- 作業行: 「○○脱着組替」等、右端の「工賃」列に金額がある → wage=工賃列の値
-- 部品行: 部品名＋数量＋単価＋金額 → parts_amount=金額列の値
+列の位置（左→右）: 品名 → 数量 → 単価 → 【金額列（部品代）】 → 【工賃列】
+- 【金額列（右から2列目）】 → parts_amount に入れる（部品代）
+- 【工賃列（最右列）】 → wage に入れる
+- 作業行: 「○○脱着組替」等 → 工賃列のみに金額、金額列は空 → parts=0, wage=工賃値
+- 部品行: 部品名＋数量＋単価＋金額 → 金額列に値、工賃列は空 → parts=金額値, wage=0
 - 最下部に「部品代」「工賃」「値引き」「小計」「消費税」「合計」がある
+
+★★★ フォーマットE 列ズレ防止ルール ★★★
+【最重要】「金額」列と「工賃」列は異なる列。絶対に混同しない。
+  - 「金額」列（左）= 部品代 → parts_amount
+  - 「工賃」列（右）= 作業代 → wage
+- 同一行に両方ある場合（取替行等）→ parts_amountとwageの両方に設定
+- 金額列が空欄 → parts_amount=0（工賃列の値を借用しない）
+- 工賃列が空欄 → wage=0（金額列の値を借用しない）
+
+NG例（絶対にしてはいけない）:
+  見積書の実際のレイアウト（「金額|工賃」の列）:
+  ├─ Lフロントフェンダ 取替  1  18,000  18,000  6,600  ← 金額=18,000, 工賃=6,600
+  ├─ Lフロントフェンダ 板金  1       -       -  8,800  ← 金額=なし, 工賃=8,800
+  ├─ ボルト類        取替  5     200   1,000      -  ← 金額=1,000, 工賃=なし
+  × 誤: Lフロントフェンダ板金: parts=8,800, wage=0  ← 工賃を部品に誤配置
+  ○ 正: Lフロントフェンダ板金: parts=0, wage=8,800
+  × 誤: ボルト類: parts=200 (単価を使用)  ← 金額列(1,000)ではなく単価を使用
+  ○ 正: ボルト類: parts=1,000 (金額列の値)
 
 【フォーマットF: トヨタディーラー系（概算見積書・作業内容＋使用部品＋技術料）】
 特徴: 「作業内容 | 使用部品 | 個数 | 部品・油脂 | 技術料 | 計」の列構成
-- 作業行は「○○脱着」「○○修理」等 → 技術料列に金額がある（wage=技術料）
-- 部品行は使用部品名＋個数＋部品金額 → parts_amount=部品・油脂列の値
-- 「ショートパーツ」→ short_parts_wageに合算
+列の位置（左→右）: 作業内容/部品名 → 個数 → 【部品・油脂列（左金額）】 → 【技術料列（右金額）】 → 計
+- 【部品・油脂列（左側金額列）】 に金額がある → parts_amount に入れる
+- 【技術料列（右側金額列）】 に金額がある → wage に入れる
+- 作業行（脱着・修理等）は技術料列のみ金額あり → parts_amount=0, wage=技術料値
+- 部品行（部品名・材料等）は部品・油脂列のみ金額あり → parts_amount=部品値, wage=0
+- 「ショートパーツ」→ short_parts_wageに合算（itemsに含めない）
 - 最下部に「整備代金合計」が部品・技術料の内訳付きで記載される
+
+★★★ フォーマットF 絶対に守るべき列ズレ防止ルール ★★★
+【フォーマットFで最頻出するエラーパターン（必ず回避せよ）】
+トヨタ系見積書では、「作業+部品」「脱着のみ」「材料のみ」「両方ある行」が混在する。
+同一品目でも「部品欄に材料費」「技術料欄に作業費」のどちらか一方しか入らないことが多い。
+
+NG例（絶対にしてはいけない）:
+  見積書の実際のレイアウト（「個数|部品・油脂|技術料」の列）:
+  ├─ 左サイドFWD(コテイ)脱着   1  【     】 【24,816】  ← 技術料のみ
+  ├─ 化粧シーリング作業        1  【 8,800】 【10,340】  ← 両方あり
+  ├─ 発砲ウレタン除去・充填    2  【30,360】 【     】   ← 部品・油脂のみ（材料費）
+
+  誤った読み取り（NG）:
+  × 左サイドFWD脱着: parts=24,816, wage=0  ← 技術料を部品に誤配置
+  × 発砲ウレタン: parts=0, wage=30,360     ← 部品・油脂を技術料に誤配置
+
+  正しい読み取り（OK）:
+  ○ 左サイドFWD(コテイ)脱着: parts=0, wage=24,816   ← 技術料列の値→wage
+  ○ 化粧シーリング作業: parts=8,800, wage=10,340     ← 両列の値→それぞれに
+  ○ 発砲ウレタン除去・充填: parts=30,360, wage=0     ← 部品・油脂列の値→parts
+
+【フォーマットF 部品/技術料の判定基準（重要）】
+  - 「脱着」「取外」「取付」「組付」を含む行名 → 技術料列の値→wage（部品列が空なのでparts=0）
+  - 「ウレタン」「シーリング」「アンダーコート」「防錆」「塗料」「材料」「充填」等の材料名 → 部品・油脂列→parts_amount
+  - 「作業」「施工」「修理」「研磨」等の作業名のみ → 技術料列の値→wage
+  - 部品番号（英数字コード）が記載されている行 → 部品・油脂列の値→parts_amount
+  - 列が空欄の場合は必ず0にする。前後の行から値を借用しない。
+  - 同じ品目（例: 発砲ウレタン）でも、見積書によって部品列 or 技術料列どちらに記載されているかが異なる。
+    必ず【その見積書の実際の列配置】で判断すること（他の見積書の慣例を適用しない）。
+
+【フォーマットF 参照点を使った列位置の校正（最初に実施せよ）】
+  - 読み取り開始前に、テーブル最初の行で列位置を確認すること
+  - 例: 「左FrアウタミラーL取替 1 4,213 1,039」なら 4,213=部品・油脂, 1,039=技術料
+  - 一度列位置を確定したら、全行に同じ列構造を適用すること
+  - 「部品・油脂」列の見出しが表頭にある列 = parts_amount に入れる列
+  - 「技術料」列の見出しが表頭にある列 = wage に入れる列
+  - ページをまたいでも列構造は変わらない
 
 【フォーマットL: Honda Cars / ホンダディーラー系（概算お見積書・2列金額）】
 特徴: 「No | 整備内容（部品又は作業名） | 作業 | 数量 | 部品・油脂代 | 技術料」
@@ -2656,46 +2781,133 @@ NG例（絶対にしてはいけない）:
 
 【フォーマットG: 整備工場系（整備内容＋技術料＋部品単価＋部品小計の4列）】
 特徴: 「整備内容 | 技術料(円) | 数量 | 部品単価(円) | 部品小計(円)」
-- 1行に技術料と部品小計の両方が存在する場合がある
+列の位置（左→右）: 品名 → 【技術料列】 → 数量 → 部品単価 → 【部品小計列】
+- 【技術料列（左金額列）】の値 → wage に入れる
+- 【部品小計列（最右列）】の値 → parts_amount に入れる（数量×単価の小計）
+- 1行に技術料と部品小計の両方が存在する場合がある（取替行等）
 - 数量に単位が付く場合（「1個」「10個」「2本」）→ 数値部分のみ抽出
 - 最下部に「A 技術料」「B 部品代」の合計が記載される
 
+★★★ フォーマットG 列ズレ防止ルール ★★★
+- 技術料列と部品小計列は異なる列。左が技術料、右が部品小計（単価ではない）。
+- 技術料列が空欄 → wage=0（部品小計の値を借用しない）
+- 部品小計列が空欄 → parts_amount=0（技術料の値を借用しない）
+- 「部品単価」列（部品小計の左隣）は参考情報。parts_amountには「部品小計」を使う。
+
+NG例（絶対にしてはいけない）:
+  見積書の実際のレイアウト（「技術料|数量|単価|部品小計」の列）:
+  ├─ Fガラス取替   【5,500】  1  32,000  【32,000】  ← 技術料=5,500, 部品=32,000
+  ├─ Fガラス脱着   【3,000】  -       -  【      】  ← 技術料=3,000, 部品=なし
+  × 誤: Fガラス脱着: parts=3,000  ← 技術料列の値を部品に誤配置
+  ○ 正: Fガラス脱着: parts=0, wage=3,000
+  × 誤: Fガラス取替: parts=32,000 (部品単価を使用)  ← 単価ではなく小計を使う
+  ○ 正: Fガラス取替: parts=32,000 (部品小計列), wage=5,500
+
 【フォーマットH: ヤナセ系（左右2カラム構成・作業と部品が左右に分離）】
 特徴: 左側に「作業内容 | 金額」、右側に「使用部品 | 数量 | 金額」が並ぶ
-- 左カラム: 作業内容と作業金額 → wageに入れる
-- 右カラム: 使用部品名＋数量＋部品金額 → parts_amountに入れる
+列の構造: 【左カラム: 作業名＋作業金額】 ｜ 【右カラム: 部品名＋数量＋部品金額】
+- 左カラムの金額 → wage に入れる
+- 右カラムの金額 → parts_amount に入れる
 - 最下部に「定価合計:（作業）金額（部品）金額（全体）金額」がある
+- 同じ行に作業と部品が並ぶ場合、左カラム=wage、右カラム=parts の両方に設定
+
+★★★ フォーマットH 列ズレ防止ルール ★★★
+【左右レイアウトの最重要ルール】
+- ページを左半分と右半分に分けて読み取ること
+- 左カラムの金額と右カラムの金額を絶対に混同しない
+- 右カラムが空欄の行（作業のみ）→ parts_amount=0
+- 左カラムが空欄の行（部品のみ）→ wage=0
+- 左右同じ行に両方ある場合 → 両方のフィールドに設定
+
+NG例（絶対にしてはいけない）:
+  左カラム                右カラム
+  ├─ フロントガラス脱着 12,000 ｜ ─
+  ├─ ─                       ｜ フロントガラス ASSY 1  45,000
+  × 誤: フロントガラス脱着: parts=12,000  ← 左カラム作業金額を部品に誤配置
+  ○ 正: フロントガラス脱着: parts=0, wage=12,000
+  ○ 正: フロントガラス ASSY: parts=45,000, wage=0
 
 【フォーマットI: トラック整備系（部品列と工賃列が分離した一般的な4列）】
 特徴: 「作業内容及び部品明細 | 数量 | 単価 | 部品 | 工賃」の5列
-- 工賃列に値がある行 → wage=工賃列の値
-- 部品列に値がある行 → parts_amount=部品列の値
+列の位置（左→右）: 品名 → 数量 → 単価 → 【部品列】 → 【工賃列】
+- 【部品列（右から2列目）】の値 → parts_amount に入れる
+- 【工賃列（最右列）】の値 → wage に入れる
 - 「ショートパーツ」「材料費」は部品扱い（parts_amountに入れる）
+- 同一行に両方ある場合（取替行等）→ 両方のフィールドに設定
+
+★★★ フォーマットI 列ズレ防止ルール ★★★
+- 「部品」列と「工賃」列は隣接しているが異なる列。絶対に混同しない。
+- 部品列が空欄 → parts_amount=0（工賃列の値を借用しない）
+- 工賃列が空欄 → wage=0（部品列の値を借用しない）
+- 「単価」列の値はparts_amountに使わない（「部品」列の値を使う）
+
+NG例（絶対にしてはいけない）:
+  見積書の実際のレイアウト（「数量|単価|部品|工賃」の列）:
+  ├─ タイヤ交換  4  15,000  60,000  【 8,000】  ← 部品=60,000, 工賃=8,000
+  ├─ バランス調整 4       -       -  【 2,000】  ← 部品=なし,  工賃=2,000
+  × 誤: タイヤ交換: parts=15,000 (単価列を使用)
+  ○ 正: タイヤ交換: parts=60,000 (部品列), wage=8,000 (工賃列)
+  × 誤: バランス調整: parts=2,000 (工賃列の値を部品に)
+  ○ 正: バランス調整: parts=0, wage=2,000
 
 【フォーマットJ: UDトラックス系（区コードで作業/部品を判別）】
 特徴: 「区 | 作業コード(部品番号) | 作業内容(部品名称) | 数量 | 定価/単価 | 金額」
+列の位置（左→右）: 【区コード列】 → 作業コード/部品番号 → 品名 → 数量 → 単価 → 【金額列（1列）】
 - 区=11 → 作業行（wage=金額, parts_amount=0, quantity=1）
 - 区=1  → 部品行（parts_amount=金額, wage=0）
 - 区=5  → セクションヘッダ → itemsに含めない
-- 区=7  → その他費用行（wage=金額）
+- 区=7  → その他費用行（wage=金額, parts_amount=0）
+- 金額列は1列のみ。区コードで振り分ける。
+
+★★★ フォーマットJ 列ズレ防止ルール ★★★
+- 区コード「11」と「1」の読み誤りに注意（11=作業、1=部品）
+- 区コードが読み取れない場合: 品名から判断（脱着/修理/板金系→wage、部品名系→parts）
+- 「定価」列はparts_amountに使わない。「金額」列（最終列）を使う。
+- セクションヘッダ（区=5）は金額ゼロであっても絶対にitemsに含めない
+
+NG例（絶対にしてはいけない）:
+  区   コード       品名              数量  単価    金額
+  ├─ 11  B120001  フロントドア板金    1     -     15,000  ← 区=11→wage
+  ├─  1  A450271  フロントドアパネル  1  38,000   38,000  ← 区=1→parts
+  × 誤: フロントドア板金: parts=15,000  ← 区=11なのに部品に誤配置
+  ○ 正: フロントドア板金: parts=0, wage=15,000
+  × 誤: フロントドアパネル: wage=38,000  ← 区=1なのに工賃に誤配置
+  ○ 正: フロントドアパネル: parts=38,000, wage=0
 
 【フォーマットK: スズキ/ダイハツディーラー系（工数×単価方式）】
 特徴: 「作業項目 | 修理方法 | 工数 | 工賃単価 | 数量 | 部品価格 | 部品番号」の7列構成
-- 「工数」列（例: 0.70, 1.50, 2.30）と「工賃単価」列（例: 7,700, 25,300）が分離している
-- 工賃 = 工賃単価列の値（工数は参考情報）→ wage=工賃単価列の値
-- 部品価格 = 数量列の右隣の金額列 → parts_amount=部品価格列の値
-- 同一行に工賃(wage)と部品価格(parts_amount)の両方が存在することがある
+列の位置（左→右）: 品名 → 修理方法 → 工数 → 【工賃単価列】 → 数量 → 【部品価格列】 → 部品番号
+- 【工賃単価列（左金額列）】の値 → wage に入れる（工数は参考情報に過ぎない）
+- 【部品価格列（右金額列）】の値 → parts_amount に入れる
+- 「工数」列（例: 0.70, 1.50）は参考値。wageには「工賃単価」の値を使う（工数×単価ではない）
+- 同一行に工賃と部品価格の両方が存在することがある（取替行等）
   例: 「LH フロントフェンダ パネル | 取替 | 0.70 | 7,700 | 1.00 | 21,300 | 57711-59S00」
-      → name=LH フロントフェンダ パネル, method=取替, wage=7700, quantity=1, parts_amount=21300, part_no=57711-59S00
-- 工数のみで部品価格列が空の行 → 作業行（wage=工賃単価, parts_amount=0）
+      → wage=7700, parts_amount=21300, part_no=57711-59S00
+- 工数あり・部品価格列が空の行 → 作業行（wage=工賃単価, parts_amount=0）
   例: 「左 フロントフェンダー エプロン | 鈑金 | 0.80 | 8,800」→ wage=8800, parts_amount=0
-- 部品価格のみで工賃列が空の行 → 部品行（parts_amount=部品価格, wage=0）
+- 部品価格あり・工賃単価列が空の行 → 部品行（parts_amount=部品価格, wage=0）
 - 塗装セクション（2ページ目等）: 「作業項目 | 工数 | 工賃単価 | 係数 | 塗装工賃」の5列
-  塗装工賃 = 工賃単価×係数（または直接記載値）→ wage=塗装工賃列の値
+  塗装工賃（最右列の直接記載値）→ wage=塗装工賃列の値
   例: 「左フロントフェンダパネル取替 | 1.50 | 16,500 | 0.45 | 7,425」→ wage=7425
 - 「OBD点検」等の点検行: 「OBD点検 | 点検 | 1.00 | 11,000」→ wage=11000, parts_amount=0
 - 最下部に「部品計」「工賃計」「塗装工賃計」「消費税」「合計」がある
 → 各列の値を正確に読み取り、工賃列と部品価格列を絶対に取り違えないこと
+
+★★★ フォーマットK 列ズレ防止ルール ★★★
+【最重要】「工賃単価」と「部品価格」は独立した2列。絶対に混同しない。
+- 工賃単価列（左側）→ wage。部品価格列（右側）→ parts_amount。
+- 「工数（小数値）」はwageではない。工賃単価列の値（整数）をwageに使う。
+- 塗装セクションでは列構成が変わる（5列）。最右列の「塗装工賃」→wage。
+- 部品番号列（最右列）は金額ではない。parts_amountには「部品価格」列の値を使う。
+
+NG例（絶対にしてはいけない）:
+  品名               修理方法  工数  工賃単価  数量  部品価格   部品番号
+  ├─ RHフロントフェンダ  取替   0.70  【7,700】  1  【21,300】  57711-AAA
+  ├─ フロントエプロン   板金   0.80  【8,800】  -  【      】  -
+  × 誤: RHフロントフェンダ: parts=0.70 (工数を使用)
+  ○ 正: RHフロントフェンダ: wage=7700 (工賃単価), parts=21300 (部品価格)
+  × 誤: フロントエプロン: parts=8,800 (工賃単価を部品に誤配置)
+  ○ 正: フロントエプロン: wage=8,800, parts=0
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 ■ 返すべきJSON形式
@@ -2734,24 +2946,32 @@ NG例（絶対にしてはいけない）:
 }
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
-■ 【最最最重要】行と金額の一対一対応原則
+■ 【最最最重要】行と金額の一対一対応原則（全フォーマット共通）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 これは全てのフォーマットに共通する絶対原則です。
 
 ★ 各金額は必ずその行の品目にのみ属します ★
 ★ 隣接する行の金額を別の行に割り当てることは絶対に禁止です ★
+★ 見積書の列見出し（部品/技術料）を確認してから全行に適用すること ★
 
-【原則の適用方法】
-1. テーブルの各行を上から順に1行ずつ処理する
-2. その行の「部品列」に値がある → parts_amountに設定（wage=0）
-3. その行の「技術料/工賃列」に値がある → wageに設定（parts_amount=0）
-4. その行の両方の列に値がある → 両方に設定
-5. その行の両方の列が空 → その行はitemsに含めない
+【処理手順（全フォーマット共通）】
+STEP-0: 表の見出し行を確認し、「部品/部品価格/部品・油脂」列と「工賃/技術料」列の位置を確定する
+STEP-1: テーブルの各行を上から順に1行ずつ処理する
+STEP-2: その行の「部品列」に値がある → parts_amountに設定
+STEP-3: その行の「技術料/工賃列」に値がある → wageに設定
+STEP-4: その行の両方の列に値がある → 両方に設定
+STEP-5: その行の両方の列が空 → その行はitemsに含めない
 
 【特に重要】列が空欄のときの扱い:
 - 部品列が空欄 → parts_amount = 0（前後の行の値を借用しない）
 - 技術料列が空欄 → wage = 0（前後の行の値を借用しない）
 - 「空欄 = その行にその種別の金額なし = 0」これが絶対ルール
+
+【列ズレが発生しやすい典型パターンと対策】
+パターン1: 金額列が1つ（CDE JK等）→ コード/種別で振り分け、絶対に前後借用しない
+パターン2: 材料名なのに技術料列に記載される → 見積書の実際の列配置を優先（推測不可）
+パターン3: 脱着行の直後の行の部品金額が視覚的に重なる → 脱着行のparts=0を徹底
+パターン4: ページ境界で行の対応がずれる → ページをまたいでも列構造は変わらない
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 ■ 「取替（交換）」同一行パターンの部品代/工賃分離
@@ -2817,6 +3037,18 @@ NG例（絶対にしてはいけない）:
       行E: LNG ASSY*NH900L*  8311132R003ZA  1,342  ← 赤線あり → 除外
     → 採用するのは行B(1,342)と行D(44,000)のみ。行A・C・Eは全て除外。
     - 取消線の色（赤・黒）にかかわらず、線が引かれている行は必ず除外すること
+23. 【重要: 脱着行の部品価格ゼロ強制】
+    ★ 作業内容（method）が「脱着」「取外」「取付」「脱外」等の脱着系の場合、
+      同じ行の部品列に金額が見えていても parts_amount = 0 とすること ★
+    - 「脱着」行には部品代が発生しない。列のアライメントずれで隣接行の金額が
+      視覚的に重なって見えることがあるが、その値は別の行（直後の取替行）のものである。
+    - 部品代を計上できる（parts_amount > 0 が正当）な作業区分は「取替」「交換」のみ。
+    - 「脱着組替」「取外組付」は部品代なしで工賃のみ（wage > 0, parts_amount = 0）。
+    例:
+      「左RrバンパアツパカバーR 脱着 [3,080に見える欄] **」
+       → method=脱着, parts_amount=0（3,080は直後の取替行の値）, wage=適切な値
+      「右RrバンパアツパカバーR 取替 3,080 **」
+       → method=取替, parts_amount=3080, wage=適切な値
 
 【STEP 2: DBマッチング用データ正規化】
 20. 【部品番号の正規化】part_no フィールドの値:
@@ -2900,34 +3132,152 @@ NG例（絶対にしてはいけない）:
 def validate_and_correct_items(items):
     """
     辞書ベースバリデーション: AIの誤分類を後処理で修正する。
-    - 「脱着」「交換」等の作業系methodなのにparts_amountだけ入っている → wageへ移動
-    - ただし「取替」「交換」で parts_amount と wage の両方が入っている行は正常（部品＋工賃同一行）
+
+    【部品価格計上の必須ルール】
+    基本ルール: 部品価格を計上するのは、作業内容（method）が「取替」の場合のみ。
+    例外ルール: 作業内容が空白でも、部品価格欄に金額がある場合は「取替」とみなし計上。
+    それ以外（脱着・修理・板金等）の場合、parts_amount は強制的に 0 とする。
+    これにより「脱着」行の空欄によって次行の金額がズレて取り込まれる連鎖エラーを防ぐ。
+
+    【作業区分ごとの挙動】
+    - 取替/交換系:    parts_amount 有効（工賃も同行にある場合はそのまま）
+    - 脱着/取外系:    parts_amount = 0 強制（部品代なし）。工賃はそのまま保持。
+    - 修理/板金等:    parts_amount = 0 強制。wage==0 のとき parts_amt を wage へ移動
+                      （AIが工賃を parts 列に誤分類したケースを救済）
+    - 空白method:     parts_amount > 0 ならそのまま（取替とみなす）
     """
-    WAGE_METHODS  = {'脱着', '取外', '取付', '修理', '調整', '板金', '塗装',
-                     'ペイント', '研磨', '清掃', '点検', '作業', '交換', '脱外組付',
-                     '修正', '組付', '施工', '補修'}
-    # 取替/交換は部品代＋工賃の両方が同一行に存在するパターンが多い
-    BOTH_OK_METHODS = {'取替', '交換', '脱着組替', '取外組付'}
+    # 部品代計上が有効な作業区分
+    PARTS_OK_METHODS = {'取替', '交換', '脱着組替', '取外組付'}
+
+    # 脱着系: parts_amount を 0 に強制。工賃は保持。wage への移動も行わない。
+    REMOVAL_METHODS  = {'脱着', '取外', '取付', '組付', '脱外'}
+
+    # 修理・塗装系: parts_amount = 0 強制。wage==0 なら parts_amt を wage へ移動
+    REPAIR_METHODS   = {'修理', '調整', '板金', '塗装', 'ペイント', '研磨',
+                        '清掃', '点検', '作業', '修正', '施工', '補修'}
+
     corrected = []
     for item in items:
-        item = dict(item)
-        method    = str(item.get('method', ''))
+        item      = dict(item)
+        method    = str(item.get('method', '')).strip()
         name      = str(item.get('name', ''))
         parts_amt = safe_int(item.get('parts_amount', 0))
         wage      = safe_int(item.get('wage', 0))
-        # 取替/交換で部品金額と工賃の両方がある → 正常（分離済み）→ そのまま
-        is_both_ok = any(kw in method for kw in BOTH_OK_METHODS) and parts_amt > 0 and wage > 0
-        if is_both_ok:
+
+        # ケース1: 取替/交換系 → 部品代・工賃ともに有効（変更なし）
+        if any(kw in method for kw in PARTS_OK_METHODS):
             corrected.append(item)
             continue
-        # 作業系キーワードがあるのに部品金額のみ → wageへ
-        is_wage_method = any(kw in method for kw in WAGE_METHODS)
-        is_wage_name   = any(kw in name   for kw in {'脱着', '板金', '塗装', 'ペイント', '修理', '研磨'})
-        if (is_wage_method or is_wage_name) and parts_amt > 0 and wage == 0:
-            item['wage']         = parts_amt
+
+        # ケース2: 作業内容空白 + 部品価格あり → 「取替」とみなしそのまま計上
+        if not method and parts_amt > 0:
+            corrected.append(item)
+            continue
+
+        # ケース3: 脱着/取外系 → parts_amount を強制ゼロ（wage は触らない）
+        is_removal = any(kw in method for kw in REMOVAL_METHODS)
+        is_removal_name = any(kw in name for kw in {'脱着', '取外', '取付', '組付'})
+        if is_removal or is_removal_name:
             item['parts_amount'] = 0
+            corrected.append(item)
+            continue
+
+        # ケース4: 修理・塗装等 → parts_amount = 0 強制。wage==0 なら wage へ救済移動
+        is_repair = any(kw in method for kw in REPAIR_METHODS)
+        is_repair_name = any(kw in name for kw in {'板金', '塗装', 'ペイント', '修理', '研磨'})
+        if (is_repair or is_repair_name) and parts_amt > 0:
+            if wage == 0:
+                # AIが工賃を parts 列に誤分類したとみなして wage へ移動
+                item['wage']  = parts_amt
+            item['parts_amount'] = 0
+
         corrected.append(item)
     return corrected
+
+
+def check_parts_labor_classification(items):
+    """
+    部品/工賃区分の疑わしい行を検出する。
+    AI抽出結果の parts_amount / wage の割り当てが不自然な行をフラグ付きで返す。
+
+    検出パターン:
+    1. 「脱着」「取外」系の行に parts_amount > 0 がある（脱着に部品代は不要）
+    2. 「材料」「ウレタン」「シーリング」等の材料系名称なのに wage > 0, parts_amount = 0
+       （材料費は部品・油脂列に入るべき）
+    3. 両方ゼロの行（金額未読み取りの可能性）
+    4. 「修理」「板金」「塗装」等の作業系なのに parts_amount > 0, wage = 0
+       （作業費は技術料列に入るべき）
+
+    Returns: list of dicts {
+        'row_no': int,      # 1始まりの行番号
+        'name': str,        # 品名
+        'parts_amount': int,
+        'wage': int,
+        'flag': str,        # 'parts_in_labor' / 'labor_in_parts' / 'both_zero' / 'ambiguous'
+        'message': str,     # 日本語の警告メッセージ
+        'severity': str,    # 'error' / 'warning'
+    }
+    """
+    # 脱着系キーワード（部品代なし）
+    REMOVAL_KW = {'脱着', '取外', '取付', '組付', '脱外'}
+    # 材料系キーワード（部品・油脂列に入るべき）
+    MATERIAL_KW = {'ウレタン', 'シーリング', 'アンダーコート', '防錆', '塗料', '材料',
+                   '充填', '発泡', '発砲', 'パネルボンド', '接着', '油脂', 'オイル'}
+    # 作業・修理系キーワード（技術料列に入るべき）
+    WORK_KW = {'修理', '板金', 'ペイント', '研磨', '塗装', '清掃', '点検', '作業', '施工', '補修'}
+
+    alerts = []
+    for i, item in enumerate(items):
+        name      = str(item.get('name', '')).strip()
+        method    = str(item.get('method', '')).strip()
+        parts_amt = safe_int(item.get('parts_amount', 0))
+        wage      = safe_int(item.get('wage', 0))
+        row_no    = i + 1
+
+        base = {'row_no': row_no, 'name': name, 'parts_amount': parts_amt, 'wage': wage}
+
+        # パターン1: 脱着系で parts_amount > 0
+        if any(kw in name or kw in method for kw in REMOVAL_KW) and parts_amt > 0:
+            alerts.append({**base,
+                'flag': 'parts_in_labor',
+                'message': f'行{row_no}「{name}」: 脱着系作業なのに部品金額 ¥{parts_amt:,} が計上されています。'
+                           '技術料欄の値が誤って部品欄に入った可能性があります。',
+                'severity': 'error'
+            })
+            continue
+
+        # パターン2: 材料系名称で wage > 0 かつ parts_amount = 0
+        if any(kw in name for kw in MATERIAL_KW) and wage > 0 and parts_amt == 0:
+            alerts.append({**base,
+                'flag': 'labor_in_parts',
+                'message': f'行{row_no}「{name}」: 材料系品名なのに工賃 ¥{wage:,} のみ計上されています。'
+                           '部品・油脂列の値が誤って技術料欄に入った可能性があります。',
+                'severity': 'error'
+            })
+            continue
+
+        # パターン3: 作業系名称で parts_amount > 0 かつ wage = 0 （取替除く）
+        if any(kw in name or kw in method for kw in WORK_KW):
+            if parts_amt > 0 and wage == 0 and '取替' not in method and '交換' not in method:
+                alerts.append({**base,
+                    'flag': 'parts_in_labor',
+                    'message': f'行{row_no}「{name}」: 作業系名称なのに部品金額 ¥{parts_amt:,} のみ計上されています。'
+                               '技術料列の値が誤って部品欄に入った可能性があります。',
+                    'severity': 'warning'
+                })
+                continue
+
+        # パターン4: 両方ゼロ（品名があるのに金額なし）
+        if parts_amt == 0 and wage == 0 and name:
+            zero_ok = {'脱着', '取外', '取付', '組付', '点検', '調整', '清掃'}
+            if not any(kw in name or kw in method for kw in zero_ok):
+                alerts.append({**base,
+                    'flag': 'both_zero',
+                    'message': f'行{row_no}「{name}」: 部品金額・工賃ともに0円です。金額の読み取り漏れがないか確認してください。',
+                    'severity': 'warning'
+                })
+
+    return alerts
 
 
 def extract_special_items(items, existing_sp=0, existing_exempt=0):
@@ -3291,14 +3641,22 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
       use_fax_filter: FAXページを自動除外する（追加APIコール1回）
       use_rasterize: PDF→JPEG変換してから送信（行ズレ防止）
     """
+    import hashlib, sys
     used_model = model_name or GEMINI_MODEL
+
+    # ── ファイルハッシュキャッシュ: 同一ファイルの再解析を防ぐ ──────────────
+    _cache_key = (hashlib.md5(file_bytes).hexdigest()
+                  + f"_{used_model}_{use_rasterize}_{use_fax_filter}")
+    if _cache_key in _analyze_result_cache:
+        print("[INFO] キャッシュヒット: 再解析をスキップします", file=sys.stderr)
+        return _analyze_result_cache[_cache_key]
+    # ──────────────────────────────────────────────────────────────────────────
 
     # クォータ超過モデルを除外して使用モデルを決定
     if used_model in _quota_exhausted_models:
         # 代替モデルを選択
         for alt_model in _PREFERRED_MODELS:
             if alt_model not in _quota_exhausted_models:
-                import sys
                 print(f"[INFO] モデル '{used_model}' はクォータ超過のため '{alt_model}' に切り替えます", file=sys.stderr)
                 used_model = alt_model
                 break
@@ -3321,39 +3679,51 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     if pages and len(pages) > 1:
         pages = detect_and_reorder_pages(pages)
 
-    # ③-b ラスタライズ: PDF→JPEG変換（行ズレ防止）
-    # 1パス目用: 合計欄が最終ページにある場合を考慮し、最終ページをラスタライズ
-    raster_bytes = file_bytes
-    raster_mime  = mime_type
+    # ③-b&c ラスタライズ: PDF→JPEG変換（行ズレ防止）
+    # 最終ページ（合計欄）と1ページ目（車両情報）を並列でラスタライズ
+    raster_bytes       = file_bytes
+    raster_mime        = mime_type
+    first_raster_bytes = file_bytes
+    first_raster_mime  = mime_type
     if use_rasterize and mime_type == 'application/pdf':
         try:
             from pypdf import PdfReader
             num_pages = len(PdfReader(io.BytesIO(file_bytes)).pages)
         except Exception:
             num_pages = 1
-        # 最終ページをラスタライズ（合計欄は通常最終ページにある）
         last_page_idx = max(0, num_pages - 1)
-        img = rasterize_pdf_page(file_bytes, last_page_idx, dpi=250, enhance=use_enhance)
+        # 最終ページと1ページ目を並列ラスタライズ（直列から並列化 → ~2s節約）
+        def _raster_last(_):
+            return rasterize_pdf_page(file_bytes, last_page_idx, dpi=250, enhance=use_enhance)
+        def _raster_first(_):
+            return rasterize_pdf_page(file_bytes, 0, dpi=250, enhance=use_enhance)
+        with ThreadPoolExecutor(max_workers=2) as _ex:
+            _fut_last  = _ex.submit(_raster_last, None)
+            _fut_first = _ex.submit(_raster_first, None)
+            img  = _fut_last.result()
+            img1 = _fut_first.result()
         if img:
             raster_bytes = img
             raster_mime  = 'image/jpeg'
-
-    # ③-c 1ページ目もラスタライズ（車両情報ヘッダ読み取り用）
-    first_raster_bytes = file_bytes
-    first_raster_mime  = mime_type
-    if use_rasterize and mime_type == 'application/pdf':
-        img1 = rasterize_pdf_page(file_bytes, 0, dpi=250, enhance=use_enhance)
         if img1:
             first_raster_bytes = img1
             first_raster_mime  = 'image/jpeg'
 
     # ④ 1パス目: 合計値＋車両情報抽出
     # 合計欄は最終ページ、車両情報は1ページ目にあることが多い
-    # 単一ページ or 1ページ目=最終ページ の場合はそのまま
-    totals_data = analyze_estimate_totals(api_key, raster_bytes, raster_mime, used_model) or {}
-    # 複数ページで1ページ目≠最終ページの場合、1ページ目から車両情報を別途取得
-    if pages and len(pages) > 1 and first_raster_bytes != raster_bytes:
-        first_page_data = analyze_estimate_totals(api_key, first_raster_bytes, first_raster_mime, used_model) or {}
+    # 複数ページの場合は最終ページと1ページ目を並列でAPI呼び出し（直列から並列化 → ~10s節約）
+    _need_first_page = bool(pages and len(pages) > 1 and first_raster_bytes != raster_bytes)
+    if _need_first_page:
+        with ThreadPoolExecutor(max_workers=2) as _ex:
+            _fut_totals = _ex.submit(
+                analyze_estimate_totals, api_key, raster_bytes, raster_mime, used_model)
+            _fut_first  = _ex.submit(
+                analyze_estimate_totals, api_key, first_raster_bytes, first_raster_mime, used_model)
+            totals_data     = _fut_totals.result() or {}
+            first_page_data = _fut_first.result() or {}
+    else:
+        totals_data = analyze_estimate_totals(api_key, raster_bytes, raster_mime, used_model) or {}
+    if _need_first_page:
         # 車両情報は1ページ目の結果を優先
         vinfo_first = first_page_data.get('vehicle_info', {})
         vinfo_last  = totals_data.get('vehicle_info', {})
@@ -3406,17 +3776,19 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
         all_items   = []
         total_sp    = 0
         confidences = []
-        # 各ページのラスタライズ前処理
-        page_data = []
-        for idx, page_bytes in enumerate(pages):
-            send_bytes = page_bytes
-            send_mime  = 'application/pdf'
-            if use_rasterize:
-                img = rasterize_pdf_page(page_bytes, 0, dpi=250, enhance=use_enhance)
+        # 各ページのラスタライズ前処理（並列化 → 直列ループから変換 ~5-8s節約）
+        if use_rasterize:
+            def _rasterize_one_page(args):
+                idx, pb = args
+                img = rasterize_pdf_page(pb, 0, dpi=250, enhance=use_enhance)
                 if img:
-                    send_bytes = img
-                    send_mime  = 'image/jpeg'
-            page_data.append((idx, send_bytes, send_mime))
+                    return (idx, img, 'image/jpeg')
+                return (idx, pb, 'application/pdf')
+            with ThreadPoolExecutor(max_workers=min(4, len(pages))) as _rex:
+                page_data = list(_rex.map(_rasterize_one_page, enumerate(pages)))
+            page_data.sort(key=lambda x: x[0])
+        else:
+            page_data = [(idx, pb, 'application/pdf') for idx, pb in enumerate(pages)]
         # 全ページを並列でAPI呼び出し（高速化）
         def _analyze_page(args):
             idx, sb, sm = args
@@ -3619,6 +3991,14 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
             'validation_error':       None if is_match else f'部品差額{p_diff:+,}円・工賃差額{w_diff:+,}円',
         }
 
+    # ── キャッシュ保存 ──────────────────────────────────────────────────────────
+    _analyze_result_cache[_cache_key] = result
+    # キャッシュが大きくなりすぎないよう古いエントリを削除（最大20件）
+    while len(_analyze_result_cache) > 20:
+        oldest_key = next(iter(_analyze_result_cache))
+        del _analyze_result_cache[oldest_key]
+    # ──────────────────────────────────────────────────────────────────────────
+
     return result
 
 
@@ -3810,8 +4190,12 @@ def main():
             )
         # 利用可能なモデルをAPIで動的取得（APIキーがある場合のみ）
         if api_key:
-            with st.spinner("利用可能なモデルを確認中..."):
-                _avail_models = get_available_gemini_models(api_key)
+            _ck = api_key[-8:] if len(api_key) >= 8 else api_key
+            if _ck in _model_availability_cache:
+                _avail_models = _model_availability_cache[_ck]
+            else:
+                with st.spinner("利用可能なモデルを確認中..."):
+                    _avail_models = get_available_gemini_models(api_key)
         else:
             _avail_models = [_FALLBACK_MODEL]
         selected_model = st.selectbox(
@@ -4299,10 +4683,10 @@ def main():
             err_str = str(e)
             # クォータ超過エラーの場合、分かりやすいメッセージとリトライを促す
             if '429' in err_str or 'RESOURCE_EXHAUSTED' in err_str or 'クォータが上限' in err_str:
-                _cur_model = st.session_state.get('selected_model', used_ai_model or 'gemini-3.1-pro-preview')
+                _cur_model = st.session_state.get('selected_model', _model or 'gemini-2.5-flash')
                 _quota_exhausted_models.add(_cur_model)
                 # キャッシュクリア
-                _api_key_for_err = st.session_state.get('api_key_input', '')
+                _api_key_for_err = api_key
                 if _api_key_for_err:
                     _ck = _api_key_for_err[-8:]
                     if _ck in _model_availability_cache:
@@ -4760,6 +5144,7 @@ def main():
                     verify_html += f'<tr style="border-bottom:1px solid #e2e8f0"><td style="padding:6px 10px">{v_label}</td><td style="padding:6px 10px;text-align:right">¥{v_pdf:,}</td><td style="padding:6px 10px;text-align:right">¥{v_calc:,}{v_diff_text}</td><td style="padding:6px 10px;text-align:center;color:{v_color};font-weight:600">{v_icon}</td></tr>'
 
                 # ④ 逆算チェック: 合計から逆算して個別金額との不整合チェック
+                reverse_ok = False  # ブロック外からの参照に備えて初期化
                 if pdf_grand > 0 and (pdf_parts > 0 or pdf_wages > 0):
                     reverse_sub = calc_parts + calc_wages + sp
                     reverse_tax = round(reverse_sub * TAX_RATE)
@@ -4785,6 +5170,80 @@ def main():
                     st.markdown(f'<div class="success-box" style="padding:10px 16px;margin:8px 0">✅ <b>ベタ打ち検証: 全項目一致（一致率 {match_rate:.0f}%）</b> — PDF原本とNEO転記内容が完全一致しています。</div>', unsafe_allow_html=True)
                 else:
                     st.markdown(f'<div class="error-box" style="padding:10px 16px;margin:8px 0">⚠️ <b>ベタ打ち検証: 不一致あり（一致率 {match_rate:.0f}%）</b> — PDF原本との差異を確認してください。基準: 99%以上</div>', unsafe_allow_html=True)
+
+            # ── ベタ打ちモード専用: 部品・工賃区分確認パネル ──────────────────────────
+            _classification_alerts = []
+            _classification_confirmed = True
+            if _step3_mode == 'beta':
+                _classification_alerts = check_parts_labor_classification(edited_items)
+                _error_alerts   = [a for a in _classification_alerts if a['severity'] == 'error']
+                _warning_alerts = [a for a in _classification_alerts if a['severity'] == 'warning']
+
+                if _classification_alerts:
+                    st.markdown(
+                        '<div class="section-title">🔍 部品・工賃区分確認（NEO転記前の必須チェック）</div>',
+                        unsafe_allow_html=True
+                    )
+                    # エラー（要確認）
+                    if _error_alerts:
+                        st.markdown(
+                            f'<div class="error-box" style="padding:10px 16px;margin:6px 0">'
+                            f'🚨 <b>要確認: 部品/工賃の区分に疑わしい行が {len(_error_alerts)} 件あります</b><br>'
+                            f'以下の行を確認し、正しい列に金額が入っているかを確認してください。'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                        for a in _error_alerts:
+                            st.markdown(
+                                f'<div style="background:#fef2f2;border-left:4px solid #dc2626;padding:8px 12px;margin:4px 0;font-size:13px">'
+                                f'🔴 <b>行{a["row_no"]}「{a["name"]}」</b>: '
+                                f'部品¥{a["parts_amount"]:,} / 工賃¥{a["wage"]:,}<br>'
+                                f'⚠️ {a["message"]}'
+                                f'</div>',
+                                unsafe_allow_html=True
+                            )
+                    # 警告（参考情報）
+                    if _warning_alerts:
+                        with st.expander(f"⚠️ 参考警告 ({len(_warning_alerts)} 件) — 要確認の可能性あり", expanded=False):
+                            for a in _warning_alerts:
+                                st.markdown(
+                                    f'<div style="background:#fffbeb;border-left:4px solid #d97706;padding:8px 12px;margin:4px 0;font-size:13px">'
+                                    f'🟡 <b>行{a["row_no"]}「{a["name"]}」</b>: '
+                                    f'部品¥{a["parts_amount"]:,} / 工賃¥{a["wage"]:,}<br>'
+                                    f'{a["message"]}'
+                                    f'</div>',
+                                    unsafe_allow_html=True
+                                )
+
+                    # 確認チェックボックス（エラーがある場合のみ）
+                    if _error_alerts:
+                        _classification_confirmed = st.checkbox(
+                            "⬆️ 上記の部品/工賃区分を確認しました。この内容でNEOファイルに転記します。",
+                            value=False,
+                            key='classification_confirmed'
+                        )
+                        if not _classification_confirmed:
+                            st.info(
+                                "💡 明細を修正するには、上の「✏️ 明細行を修正」エリアで各行の部品金額・工賃を直接編集できます。"
+                                "区分が正しければチェックを入れてNEO生成に進んでください。"
+                            )
+                    else:
+                        _classification_confirmed = True
+                        st.markdown(
+                            '<div class="success-box" style="padding:10px 16px;margin:8px 0">'
+                            '✅ <b>部品・工賃区分チェック: 参考警告のみ</b> — 重大な区分エラーは検出されませんでした。</div>',
+                            unsafe_allow_html=True
+                        )
+                else:
+                    st.markdown(
+                        '<div class="success-box" style="padding:10px 16px;margin:8px 0">'
+                        '✅ <b>部品・工賃区分チェック: 問題なし</b> — 全明細行の区分が正常です。</div>',
+                        unsafe_allow_html=True
+                    )
+
+            # セッションに保存（STEP4で参照）
+            st.session_state['classification_alerts'] = _classification_alerts
+            st.session_state['classification_confirmed'] = _classification_confirmed
 
             # マスタ連携の差額計算とレポート表示（DBモード時のみ）
             discrepancies = []
@@ -4886,11 +5345,33 @@ def main():
             amount_confirmed = True
             st.info("💡 見積書なし — 車両情報のみのNEOファイルを作成します")
 
-        if 'amount_confirmed' not in dir():
+        if 'amount_confirmed' not in locals():
             amount_confirmed = True
+
+        # ── 部品/工賃区分確認チェックの取得（ベタ打ちモード）──────────────────
+        _cls_confirmed   = st.session_state.get('classification_confirmed', True)
+        _cls_alerts      = st.session_state.get('classification_alerts', [])
+        _cls_errors      = [a for a in _cls_alerts if a['severity'] == 'error']
+        # ベタ打ちモード以外は常にOK
+        if _step3_mode != 'beta':
+            _cls_confirmed = True
 
         # NEO生成ボタン
         st.markdown("---")
+
+        # 区分エラーがあって未確認の場合、警告を再表示
+        if _cls_errors and not _cls_confirmed and _step3_mode == 'beta':
+            st.markdown(
+                '<div class="mismatch-banner">'
+                '<div class="mismatch-title">🚫 部品・工賃区分の確認が必要です</div>'
+                '<div class="mismatch-body">'
+                f'{len(_cls_errors)}件の区分エラーが未確認です。<br>'
+                '上の「🔍 部品・工賃区分確認」パネルで内容を確認し、チェックボックスにチェックを入れてください。'
+                '</div>'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
         bcol1, bcol2 = st.columns(2)
         with bcol1:
             if st.button("← ステップ①に戻る", use_container_width=True):
@@ -4899,7 +5380,7 @@ def main():
                 st.session_state['estimate_data'] = None
                 st.rerun()
         with bcol2:
-            gen_disabled = not amount_confirmed
+            gen_disabled = not amount_confirmed or not _cls_confirmed
             if st.button("📦 NEOファイルを生成する →", type="primary", use_container_width=True, disabled=gen_disabled):
                 st.session_state['updated_vehicle'] = updated_vehicle
                 st.session_state['calc_parts']      = calc_parts
@@ -4910,8 +5391,10 @@ def main():
                 st.session_state['total_diff']      = total_diff
                 st.session_state['step'] = 4
                 st.rerun()
-            if gen_disabled:
+            if not amount_confirmed:
                 st.caption("⬆️ 金額差異を確認してチェックを入れてください")
+            elif not _cls_confirmed:
+                st.caption("⬆️ 部品・工賃区分エラーを確認してチェックを入れてください")
 
     # =========================================
     # STEP 4: NEO生成・ダウンロード
@@ -5002,6 +5485,32 @@ def main():
                 with st.expander("📄 不一致レポートを確認", expanded=False):
                     for d_item in _discrepancies_step4:
                         st.warning(d_item)
+
+            # ── ベタ打ちモード: 部品・工賃区分確認済みサマリー表示 ──
+            if _step4_beta:
+                _cls_alerts_s4 = st.session_state.get('classification_alerts', [])
+                _cls_errors_s4 = [a for a in _cls_alerts_s4 if a['severity'] == 'error']
+                _cls_warnings_s4 = [a for a in _cls_alerts_s4 if a['severity'] == 'warning']
+                if _cls_errors_s4:
+                    st.markdown(
+                        f'<div style="background:#fef9c3;border:1px solid #ca8a04;border-radius:6px;padding:10px 14px;margin:8px 0;font-size:13px">'
+                        f'✅ <b>部品・工賃区分確認済み</b> — {len(_cls_errors_s4)} 件の要確認項目が確認・承認された上でNEOを生成しました。<br>'
+                        + ''.join(f'<div style="margin-top:4px">⚠️ 行{a["row_no"]}「{a["name"]}」: 部品¥{a["parts_amount"]:,} / 工賃¥{a["wage"]:,}</div>' for a in _cls_errors_s4)
+                        + '</div>',
+                        unsafe_allow_html=True
+                    )
+                elif _cls_warnings_s4:
+                    st.markdown(
+                        f'<div style="background:#f0fdf4;border:1px solid #16a34a;border-radius:6px;padding:10px 14px;margin:8px 0;font-size:13px">'
+                        f'✅ <b>部品・工賃区分チェック: 問題なし</b> — 参考警告 {len(_cls_warnings_s4)} 件のみ（重大エラーなし）</div>',
+                        unsafe_allow_html=True
+                    )
+                else:
+                    st.markdown(
+                        '<div style="background:#f0fdf4;border:1px solid #16a34a;border-radius:6px;padding:10px 14px;margin:8px 0;font-size:13px">'
+                        '✅ <b>部品・工賃区分チェック: 問題なし</b></div>',
+                        unsafe_allow_html=True
+                    )
 
             # ── ベタ打ちモード: PDF原本との差異特定レポート ──
             if _step4_beta and _discrepancies_step4:
