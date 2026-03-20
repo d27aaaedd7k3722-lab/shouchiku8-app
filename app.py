@@ -4531,6 +4531,8 @@ def main():
             is_tax_inclusive = estimate_data.get('_is_tax_inclusive', False) if estimate_data else False
             _step4_beta = st.session_state.get('selected_mode', 'db') == 'beta'
             # カスタムテンプレートNEOが指定されている場合はそちらを使用
+            # Step4はStep1とは別のelifブランチのため、session_stateから取得する
+            custom_neo_file = st.session_state.get('custom_neo_upload')
             _use_custom_neo = custom_neo_file is not None
             _active_template = custom_neo_file.read() if _use_custom_neo else template_data
             if _use_custom_neo:
