@@ -757,8 +757,7 @@ def update_em_db(db_bytes, cust, insurance_info, estimated_date, is_tax_inclusiv
         _cust_values  = []
         _field_map = [
             ('Name1', customer_name), ('UserName', customer_name), ('OwnerName', owner_name),
-            ('PostalNo', postal_no), ('Prefecture', prefecture),
-            ('Municipality', municipality), ('AddressOther1', address_other),
+            # 住所欄はNEOに記載不要のため除外（PostalNo/Prefecture/Municipality/AddressOther1は書き込まない）
             ('CarRegNoDepartment', car_dept), ('CarRegNoDivision', car_div),
             ('CarRegNoBusiness', car_biz), ('CarRegNoSerial', car_serial),
             ('CarSerialNo', car_serial_no), ('CarMouldNo', model_desig), ('CarKindNo', category_num),
@@ -780,10 +779,9 @@ def update_em_db(db_bytes, cust, insurance_info, estimated_date, is_tax_inclusiv
         if _cust_updates:
             cur.execute(f"UPDATE Customer SET {', '.join(_cust_updates)}", _cust_values)
     else:
-        # 通常モード: 全フィールドを上書き
+        # 通常モード: 全フィールドを上書き（住所欄はNEO不要のため除外）
         cur.execute('''UPDATE Customer SET
             Name1=?, UserName=?, OwnerName=?,
-            PostalNo=?, Prefecture=?, Municipality=?, AddressOther1=?,
             CarRegNoDepartment=?, CarRegNoDivision=?,
             CarRegNoBusiness=?, CarRegNoSerial=?,
             CarSerialNo=?, CarMouldNo=?, CarKindNo=?,
@@ -792,7 +790,6 @@ def update_em_db(db_bytes, cust, insurance_info, estimated_date, is_tax_inclusiv
             Kilometer=?
         ''', (
             customer_name, customer_name, owner_name,
-            postal_no, prefecture, municipality, address_other,
             car_dept, car_div, car_biz, car_serial,
             car_serial_no, model_desig, category_num,
             term_date, term_era, term_era_year,
@@ -4379,10 +4376,12 @@ def main():
         }
 
         # 見積明細
-        calc_parts = 0
-        calc_wages = 0
-        pdf_parts  = 0
-        pdf_wages  = 0
+        calc_parts    = 0
+        calc_wages    = 0
+        pdf_parts     = 0
+        pdf_wages     = 0
+        sp            = 0
+        wage_match_sp = False  # Step4でも参照するため初期化
 
         with tab_estimate:
           if estimate_data and estimate_data.get('items'):
