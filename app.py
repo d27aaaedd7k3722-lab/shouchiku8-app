@@ -2564,6 +2564,7 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
 * 入力資料に記載されている文字を一言一句そのまま転記すること。
 * 勝手な項目の統合、省略、金額の再計算は絶対にしないこと。
 * 読み取り不能な箇所は必ず「不明」と記載すること（空欄で省略しない）。
+* **nameフィールドを空文字列 `""` で返すことは絶対に禁止。** 見積書に品名が記載されていれば正確に転記し、読み取れない場合は必ず「不明」と記載すること。work_codeに入れた値の品名が読み取れない場合も「不明」ではなく品名欄から読み取った文字列を入れること。
 * アジャスターとしての査定・減額調整はこの段階では行わないこと。
 * 部品番号（part_no）・作業コード（work_code）が記載されている場合は絶対に省略せず転記すること。
 
@@ -2918,7 +2919,7 @@ NG例（絶対にしてはいけない）:
   "tax_reason": "「税込」または「税抜」と判定した根拠を簡潔に（例: 合計欄に消費税が別記されているため税抜と判定）",
   "items": [
     {
-      "name": "部品名または作業名（見積書に記載のまま正確に転記）",
+      "name": "部品名または作業名（見積書に記載のまま正確に転記。空文字列 \"\" は絶対禁止→読み取れなければ「不明」）",
       "method": "区分（取替/脱着/修理/塗装/交換/調整/板金/部品 等）",
       "quantity": 数量（整数に丸める。1.00→1）,
       "parts_amount": その行の部品金額合計（整数。作業行は0。カンマ・¥記号を除去した純粋な整数）,
@@ -3810,12 +3811,20 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
         results.sort(key=lambda x: x[0])
         page_amount_bases = []  # 各ページのGemini税区分判定を収集
         page_boundary_indices = []  # ページ境界インデックスを追跡
+        _prev_page_sp = None  # ページ境界でのshort_parts_wage二重計上防止用
         for idx, res in results:
             page_items = res.get('items', [])
             if all_items:
                 page_boundary_indices.append(len(all_items))  # このページの先頭インデックス
             all_items.extend(page_items)
-            total_sp += safe_int(res.get('short_parts_wage', 0))
+            page_sp = safe_int(res.get('short_parts_wage', 0))
+            # ページ境界でショートパーツ行が両ページに出現する場合の二重計上防止:
+            # 直前ページと同じ非ゼロ値 → 同一行のページ境界重複とみなしスキップ
+            if page_sp > 0 and page_sp == _prev_page_sp:
+                pass  # 重複 → スキップ
+            else:
+                total_sp += page_sp
+            _prev_page_sp = page_sp  # ゼロでも更新（非隣接の同値を重複とみなさないため）
             confidences.append(safe_float(res.get('confidence', 0.0)))
             ab = res.get('amount_basis', '')
             if ab in ('tax_inclusive', 'tax_exclusive'):
@@ -3867,6 +3876,13 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
 
     # ⑥ 辞書ベースバリデーション
     result['items'] = validate_and_correct_items(result['items'])
+
+    # ⑥-a 品名空白フォールバック（AIが名称を読み取れなかった行を保護）
+    # work_code が非空なら品名の代替として使用し、それもなければ「不明」を設定
+    for _it in result['items']:
+        if not str(_it.get('name', '')).strip():
+            _wc = str(_it.get('work_code', '')).strip()
+            _it['name'] = _wc if _wc else '不明'
 
     # ⑥-b 明細行ごとの整合性チェック
     result['items'], row_warnings = validate_row_consistency(result['items'])
