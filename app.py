@@ -4329,45 +4329,10 @@ def main():
     # STEP 1: アップロード
     # =========================================
     if current_step == 1:
-        # ── モード選択（st.radio で実装） ──
-        st.markdown("""
-        <style>
-        div[data-testid="stRadio"] > label { display: none; }
-        div[data-testid="stRadio"] > div { display: flex; gap: 12px; }
-        div[data-testid="stRadio"] > div > label {
-            flex: 1; border: 2px solid #e2e8f0; border-radius: 8px;
-            padding: 14px 16px; background: #fff; cursor: pointer;
-            display: flex; flex-direction: column; align-items: center; text-align: center;
-        }
-        div[data-testid="stRadio"] > div > label:has(input:checked) {
-            border-color: #1d4ed8; background: #eff6ff;
-        }
-        /* DBマッチングモードをグレーアウト（現在エラーにより使用停止中） */
-        div[data-testid="stRadio"] > div > label:first-child {
-            opacity: 0.35;
-            pointer-events: none;
-            cursor: not-allowed !important;
-            background: #f8fafc !important;
-            border-color: #cbd5e1 !important;
-            color: #94a3b8 !important;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-        mode = st.radio(
-            "動作モード",
-            options=["🤖 DBマッチングモード（コグニセブンDBと照合して部品コード・作業コードを確定）",
-                     "✏️ ベタ打ちモード（見積内容をそのままNEOファイルに転記）"],
-            index=1,
-            horizontal=True,
-            label_visibility="collapsed",
-            key="mode_radio"
-        )
-        # DBマッチングモードは現在停止中 → 常にベタ打ちモードを使用
+        # ベタ打ちモード固定
         st.session_state['selected_mode'] = 'beta'
-        mode_val = 'beta'
 
-        # モード状態バッジ
-        st.markdown('<div style="background:#f1f5f9;border:1px solid #e2e8f0;border-radius:8px;padding:10px 14px;font-size:13px;margin-bottom:12px">✏️ <b>ベタ打ちモード選択中</b> — 見積内容をそのままNEOファイルに転記します</div>', unsafe_allow_html=True)
+        st.markdown('<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;font-size:13px;margin-bottom:12px">✏️ <b>ベタ打ちモード</b> — 見積内容をそのままNEOファイルに転記します</div>', unsafe_allow_html=True)
 
         # ── アップロードカード ──
         col1, col2 = st.columns(2)
