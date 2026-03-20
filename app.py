@@ -5006,19 +5006,30 @@ def main():
             scol1, scol2, scol3 = st.columns(3)
             rev_match = estimate_data.get('_reverse_match', False)
 
+            # 税込/税抜モード判定
+            is_tax_incl_s3 = estimate_data.get('_is_tax_inclusive', False)
+            tax_label_sfx  = "税込" if is_tax_incl_s3 else "税抜"
+
             # 金額差額の計算
             parts_diff = calc_parts - pdf_parts if pdf_parts > 0 else 0
             # SP込みでも一致チェック（部品）
             parts_match_sp = (calc_parts + sp == pdf_parts) if pdf_parts > 0 else False
-            parts_match = (calc_parts == pdf_parts) or parts_match_sp
+            # 税込モードでは明細合算とPDF記載値の小差（明細行数×1円以内）も一致とみなす
+            _parts_tol = len(edited_items) if is_tax_incl_s3 else 0
+            parts_match_tol = (abs(calc_parts - pdf_parts) <= _parts_tol) if pdf_parts > 0 else False
+            parts_match_tol_sp = (abs(calc_parts + sp - pdf_parts) <= _parts_tol) if pdf_parts > 0 else False
+            parts_match = (calc_parts == pdf_parts) or parts_match_sp or parts_match_tol or parts_match_tol_sp
             wage_diff = calc_wages - pdf_wages if pdf_wages > 0 else 0
             # SP込みでも一致チェック（工賃）: Honda Cars等でSPが工賃列に含まれる場合
             wage_match_sp = (calc_wages + sp == pdf_wages) if pdf_wages > 0 else False
-            wage_match = (calc_wages == pdf_wages) or wage_match_sp
+            _wages_tol = len(edited_items) if is_tax_incl_s3 else 0
+            wage_match_tol = (abs(calc_wages - pdf_wages) <= _wages_tol) if pdf_wages > 0 else False
+            wage_match_tol_sp = (abs(calc_wages + sp - pdf_wages) <= _wages_tol) if pdf_wages > 0 else False
+            wage_match = (calc_wages == pdf_wages) or wage_match_sp or wage_match_tol or wage_match_tol_sp
             has_discrepancy = False
 
             with scol1:
-                st.metric("部品合計（税抜）", f"¥{calc_parts:,}")
+                st.metric(f"部品合計（{tax_label_sfx}）", f"¥{calc_parts:,}")
                 if pdf_parts > 0 and not parts_match and not rev_match:
                     has_discrepancy = True
                     st.markdown(
@@ -5028,7 +5039,7 @@ def main():
                 elif pdf_parts > 0:
                     st.markdown('<div class="success-box">✅ PDF金額と一致</div>', unsafe_allow_html=True)
             with scol2:
-                st.metric("工賃合計（税抜）", f"¥{calc_wages:,}")
+                st.metric(f"工賃合計（{tax_label_sfx}）", f"¥{calc_wages:,}")
                 if pdf_wages > 0 and not wage_match and not rev_match:
                     has_discrepancy = True
                     st.markdown(
@@ -5041,9 +5052,13 @@ def main():
                 exp_tow = st.session_state.get('exp_towing', 0)
                 exp_ren = st.session_state.get('exp_rental', 0)
                 exp_exm = st.session_state.get('exp_exempt', 0)
-                sub   = calc_parts + calc_wages + sp + exp_tow + exp_ren
-                tax   = round(sub * TAX_RATE)
-                total = sub + tax + exp_exm
+                sub = calc_parts + calc_wages + sp + exp_tow + exp_ren
+                if is_tax_incl_s3:
+                    # 税込モード: 明細金額は既に税込 → 消費税を加算しない
+                    total = sub + exp_exm
+                else:
+                    tax   = round(sub * TAX_RATE)
+                    total = sub + tax + exp_exm
                 st.metric("合計（税込）", f"¥{total:,}")
                 if rev_match:
                     st.markdown('<div class="success-box">✅ 逆算一致</div>', unsafe_allow_html=True)
@@ -5128,8 +5143,12 @@ def main():
                 reverse_ok = False  # ブロック外からの参照に備えて初期化
                 if pdf_grand > 0 and (pdf_parts > 0 or pdf_wages > 0):
                     reverse_sub = calc_parts + calc_wages + sp
-                    reverse_tax = round(reverse_sub * TAX_RATE)
-                    reverse_grand = reverse_sub + reverse_tax + st.session_state.get('exp_exempt', 0)
+                    if is_tax_incl_s3:
+                        # 税込モード: 金額は既に税込 → 消費税を加算しない
+                        reverse_grand = reverse_sub + st.session_state.get('exp_exempt', 0)
+                    else:
+                        reverse_tax = round(reverse_sub * TAX_RATE)
+                        reverse_grand = reverse_sub + reverse_tax + st.session_state.get('exp_exempt', 0)
                     _rev_tolerance = min(_n_items + 10, 50)
                     reverse_ok = abs(reverse_grand - pdf_grand) <= _rev_tolerance
                     reverse_icon = '✅' if reverse_ok else '⚠️'
