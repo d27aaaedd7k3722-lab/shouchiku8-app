@@ -3455,6 +3455,30 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     result['short_parts_wage'] = sp_total
     result['tax_exempt_amount'] = exempt_total
 
+    # ⑥-d スキャンPDF等でpypdf取得失敗時のクロスバリデーション
+    # Geminiが誤った小計値を返した場合（スキャンPDF等）、明細合算＋grand_totalで検証して上書き
+    _cv_items_nd = [it for it in result['items'] if it.get('name') != '値引き']
+    _cv_calc_p   = sum(safe_int(it.get('parts_amount', 0)) for it in _cv_items_nd)
+    _cv_calc_w   = sum(safe_int(it.get('wage', 0))         for it in _cv_items_nd)
+    _cv_sp       = safe_int(result.get('short_parts_wage', 0))
+    _cv_grand    = safe_int(result.get('pdf_grand_total', 0))
+    _cv_p_stated = safe_int(result.get('pdf_parts_total', 0))
+    _cv_w_stated = safe_int(result.get('pdf_wage_total', 0))
+    if _cv_p_stated > 0 and _cv_w_stated > 0 and _cv_grand > 0 and _cv_calc_p > 0:
+        _cv_item_total = _cv_calc_p + _cv_calc_w + _cv_sp
+        # 明細合算＋sp が grand_total に近い（2%以内）か確認
+        _cv_match_grand = abs(_cv_item_total - _cv_grand) / _cv_grand < 0.02
+        # Geminiのstated totalsが明細合算と大きくずれているか（10%超）
+        _cv_p_wrong = abs(_cv_calc_p - _cv_p_stated) / max(_cv_calc_p, 1) > 0.10
+        _cv_w_wrong = abs(_cv_calc_w + _cv_sp - _cv_w_stated) / max(_cv_calc_w + _cv_sp, 1) > 0.10
+        if _cv_match_grand and (_cv_p_wrong or _cv_w_wrong):
+            import sys as _sys_cv
+            print(f"[INFO] cross-validation: Gemini stated totals誤り検出 → 明細合算値で上書き", file=_sys_cv.stderr)
+            print(f"  Gemini: 部品={_cv_p_stated:,}, 工賃={_cv_w_stated:,}", file=_sys_cv.stderr)
+            print(f"  明細合算: 部品={_cv_calc_p:,}, 工賃={_cv_calc_w+_cv_sp:,} (sp={_cv_sp:,}), 合計={_cv_item_total:,}≈{_cv_grand:,}", file=_sys_cv.stderr)
+            result['pdf_parts_total'] = _cv_calc_p
+            result['pdf_wage_total']  = _cv_calc_w + _cv_sp
+
     # ⑦ 自己修復ループ（合計値が取得できた場合のみ、最大2回）
     if (result['pdf_parts_total'] > 0 or result['pdf_wage_total'] > 0):
         _correction_rounds = 0
@@ -3462,8 +3486,10 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
             _cur_items = result['items']
             _cur_parts = sum(safe_int(it.get('parts_amount', 0)) for it in _cur_items)
             _cur_wage  = sum(safe_int(it.get('wage', 0))         for it in _cur_items)
+            _sc_sp     = safe_int(result.get('short_parts_wage', 0))
             _p_diff = abs(_cur_parts - result['pdf_parts_total'])
-            _w_diff = abs(_cur_wage  - result['pdf_wage_total'])
+            # 工賃比較はショートパーツを加味（Honda Cars等でspが工賃列に含まれるため）
+            _w_diff = abs((_cur_wage + _sc_sp) - result['pdf_wage_total'])
             if _p_diff == 0 and _w_diff == 0:
                 break  # 完全一致 → 修正不要
             retry = _self_correction_retry(
