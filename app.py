@@ -3954,6 +3954,22 @@ def main():
                 st.caption("🔍 OCR対象: 部品名・部品番号・単価・工賃・塗装・その他費用 全明細")
             else:
                 st.info("💡 見積書なしの場合、車両情報のみのNEOを作成します")
+            # ── 税区分 手動指定（任意）──
+            st.markdown('<div style="margin-top:8px;font-size:12px;color:#555;font-weight:600">💴 見積書の税区分（自動判定が外れる場合に手動指定）</div>', unsafe_allow_html=True)
+            _tax_options = ['自動判定（推奨）', '税込み（内税）', '税抜き（外税）']
+            _saved_tax_override = st.session_state.get('tax_override', '自動判定（推奨）')
+            _tax_sel = st.radio(
+                "税区分",
+                options=_tax_options,
+                index=_tax_options.index(_saved_tax_override) if _saved_tax_override in _tax_options else 0,
+                horizontal=True,
+                key='tax_override_radio',
+                label_visibility='collapsed',
+                help="工場見積の価格が税込みか税抜きかを手動指定できます。不明な場合は「自動判定」のままにしてください。"
+            )
+            st.session_state['tax_override'] = _tax_sel
+            if _tax_sel != '自動判定（推奨）':
+                st.caption(f"⚙️ 手動設定: {_tax_sel} — AI自動判定より優先されます")
 
         # ── テンプレートNEOアップロード（任意） ──
         with st.expander("📁 テンプレートNEOファイル（任意）", expanded=False):
@@ -3972,8 +3988,24 @@ def main():
                 help="コグニセブンで作成した.neoファイル。証券番号・工場名・車両情報等が入力済みのものを使用してください。"
             )
             if custom_neo_file:
-                st.success(f"✅ {custom_neo_file.name} ({custom_neo_file.size:,} bytes)")
+                # Streamlitのfile_uploaderはステップ遷移でウィジェットが非表示になると
+                # session_stateのキーがクリアされる。そのため、バイト列を別キーに保存して永続化する
+                _neo_bytes_read = custom_neo_file.read()
+                st.session_state['custom_neo_bytes'] = _neo_bytes_read
+                st.session_state['custom_neo_name']  = custom_neo_file.name
+                custom_neo_file.seek(0)
+                st.success(f"✅ {custom_neo_file.name} ({len(_neo_bytes_read):,} bytes)")
                 st.caption("📋 車検証OCRで誤記入を訂正し、テンプレートの工場名・証券番号等はそのまま引き継ぎます")
+            elif st.session_state.get('custom_neo_bytes'):
+                # 前回アップロード済みのファイルがある場合、その情報を表示
+                _saved_name = st.session_state.get('custom_neo_name', 'テンプレートNEO')
+                _saved_size = len(st.session_state['custom_neo_bytes'])
+                st.success(f"✅ {_saved_name} ({_saved_size:,} bytes) — 前回アップロード済み")
+                st.caption("📋 車検証OCRで誤記入を訂正し、テンプレートの工場名・証券番号等はそのまま引き継ぎます")
+                if st.button("🗑️ テンプレートNEOをリセット", key='clear_custom_neo'):
+                    st.session_state.pop('custom_neo_bytes', None)
+                    st.session_state.pop('custom_neo_name', None)
+                    st.rerun()
             else:
                 st.info(f"未選択の場合はデフォルトテンプレート（{TEMPLATE_FILENAME}）を使用します")
 
@@ -4119,6 +4151,18 @@ def main():
                     estimate_data['_veh_match_result'] = {'match_layer': 3, 'is_supported': False, 'reason': 'ベタ打ちモード（DB照合スキップ）'}
                     progress.progress(92, text="✏️ ベタ打ちモード — PDF見積をそのまま転記...")
                 
+                # --- 税区分 手動オーバーライドの適用 ---
+                _tax_override = st.session_state.get('tax_override', '自動判定（推奨）')
+                if _tax_override == '税込み（内税）':
+                    estimate_data['_is_tax_inclusive'] = True
+                    estimate_data['_tax_basis']        = 'tax_inclusive'
+                    estimate_data['_tax_manual']       = True
+                elif _tax_override == '税抜き（外税）':
+                    estimate_data['_is_tax_inclusive'] = False
+                    estimate_data['_tax_basis']        = 'tax_exclusive'
+                    estimate_data['_tax_manual']       = True
+                    estimate_data.pop('_tax_converted', None)
+
                 # --- セッションステートへの保存 ---
                 st.session_state['estimate_data'] = estimate_data
 
@@ -4849,13 +4893,19 @@ def main():
             is_tax_inclusive = estimate_data.get('_is_tax_inclusive', False) if estimate_data else False
             _step4_beta = st.session_state.get('selected_mode', 'db') == 'beta'
             # カスタムテンプレートNEOが指定されている場合はそちらを使用
-            # Step4はStep1とは別のelifブランチのため、session_stateから取得する
-            custom_neo_file = st.session_state.get('custom_neo_upload')
-            _use_custom_neo = custom_neo_file is not None
-            _active_template = custom_neo_file.read() if _use_custom_neo else template_data
+            # session_stateに永続化したバイト列を優先使用（file_uploaderはステップ遷移でクリアされるため）
+            _custom_neo_bytes = st.session_state.get('custom_neo_bytes')
+            if not _custom_neo_bytes:
+                # フォールバック: file_uploaderが同一セッション内でまだ生きている場合
+                _fallback_neo = st.session_state.get('custom_neo_upload')
+                if _fallback_neo:
+                    _custom_neo_bytes = _fallback_neo.read()
+                    _fallback_neo.seek(0)
+            _use_custom_neo   = _custom_neo_bytes is not None
+            _active_template  = _custom_neo_bytes if _use_custom_neo else template_data
             if _use_custom_neo:
-                custom_neo_file.seek(0)  # 再読込に備えてシーク位置リセット
-                progress.progress(40, text="📁 カスタムテンプレートNEOを読み込み中...")
+                _custom_name = st.session_state.get('custom_neo_name', 'カスタムNEO')
+                progress.progress(40, text=f"📁 テンプレートNEO ({_custom_name}) を読み込み中...")
             neo_data, total_parts, total_wages, grand_total = generate_neo_file(
                 _active_template, updated_vehicle, items, short_parts_wage, insurance_info,
                 expenses=expense_info, is_tax_inclusive=is_tax_inclusive, is_beta_mode=_step4_beta,
@@ -4974,6 +5024,8 @@ def main():
                     'pdf_parts', 'pdf_wages',
                     'policy_no', 'contractor_name',
                     'exp_towing', 'exp_rental', 'exp_exempt',
+                    'custom_neo_bytes', 'custom_neo_name',  # テンプレートNEOのバイト列もリセット
+                    'tax_override',  # 税込/税抜き手動設定もリセット
                 ]:
                     if key in st.session_state:
                         del st.session_state[key]
