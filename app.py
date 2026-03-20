@@ -4876,8 +4876,12 @@ def main():
             if _step4_beta and _discrepancies_step4:
                 st.markdown('<div class="section-title">📋 ベタ打ちモード — 差異特定レポート</div>', unsafe_allow_html=True)
                 st.markdown('金額の不一致箇所を特定するための詳細レポートをPDF形式でダウンロードできます。')
+                # Step4はStep3とは別ブランチのため、wage_match_sp/spをStep4内で再計算する
+                _sp_s4 = safe_int(short_parts_wage)
+                _pdf_wages_s4 = safe_int(pdf_wages or 0)
+                _wage_match_sp_s4 = (_pdf_wages_s4 > 0 and calc_wages + _sp_s4 == _pdf_wages_s4)
                 # ショートパーツはHonda Cars等で工賃列に含まれるため、差異レポートの計算値に加算
-                _calc_wages_report = calc_wages + sp if wage_match_sp else calc_wages
+                _calc_wages_report = calc_wages + _sp_s4 if _wage_match_sp_s4 else calc_wages
                 beta_pdf_bytes = generate_beta_discrepancy_report_pdf(estimate_data, calc_parts, _calc_wages_report, pdf_parts or 0, pdf_wages or 0, updated_vehicle)
                 st.download_button(
                     label="📄 差異レポートをダウンロード(PDF)",
