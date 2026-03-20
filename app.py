@@ -2442,89 +2442,70 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type):
 
 
 def analyze_estimate_totals(api_key, file_bytes, mime_type, model_name):
-    """1パス目: 合計値・税込/税抜の判定 + 見積書ヘッダの車両情報読み取り"""
-    prompt = """あなたは自動車修理見積書のデータ化を行う専門アシスタントです。
-提供された見積書から以下の情報を一言一句そのまま抽出してください。
-
-【重要な制約事項】
-* 入力資料に記載されている文字を一言一句そのまま抽出すること。勝手な統合・省略・再計算は絶対にしないこと。
-* 読み取り不能な箇所は空文字列""または0にすること（推測で補完しない）。
-* アジャスターとしての査定や減額調整はこの段階では行わないこと。
-
-**必ず有効なJSONのみを返してください。**
-
-{
-  "_thought_process": "判断の根拠を50字以内で",
-  "repair_shop_name": "修理工場名・会社名（見積書の発行元。ヘッダや印鑑欄に記載。不明なら空文字）",
-  "amount_basis": "明細・合計が税込か税抜かを自動判定: tax_inclusive(税込)/tax_exclusive(税抜)/unknown",
-  "tax_reason": "「税込」または「税抜」と判定した根拠（例: 合計欄に消費税が別記されているため税抜）",
-  "pdf_parts_total": 見積書に印刷されている部品合計/部品代/部品計の値（整数）,
-  "pdf_wage_total": 見積書に印刷されている工賃合計/技術料/工賃計の値（整数）,
-  "pdf_grand_total": 見積書に印刷されている最終合計金額（税込・整数）,
-  "discount_amount": 値引き額（税込なら税込額、税抜なら税抜額、なければ0・整数）,
-  "confidence": 読み取り信頼度 0.0〜1.0,
-
-  "vehicle_info": {
-    "car_name": "車名・車種名（記載があれば。なければ空文字）",
-    "car_model": "型式（記載があれば。なければ空文字）",
-    "engine_model": "エンジン型式（記載があれば。なければ空文字）",
-    "color_code": "カラーコード（記載があれば。なければ空文字）",
-    "color_name": "色名（記載があれば。なければ空文字）",
-    "trim_code": "トリムコード/内装コード（記載があれば。なければ空文字）",
-    "grade": "グレード名（記載があれば。なければ空文字）",
-    "model_year": "年式（記載があれば。なければ空文字）",
-    "chassis_no": "車台番号（記載があれば。なければ空文字）",
-    "mileage": 走行距離（km、整数。記載があれば。なければ0）
-  }
-}
-
-金額の注意:
-- 一般的に左列が部品合計、右列が工賃合計
-- 「部品計」「部品代」「部品合計額」「部品・油脂」等を探す
-- 「工賃計」「技術料」「工賃合計額」等を探す
-- 「合計」「税込合計」「総合計」が最終合計
-- 金額はカンマを除去して整数で返す
-- 読み取れない場合は0（nullではなく）
-- 【重要】合計行がページ1ヘッダ上部のサマリーボックスに記載されている場合がある
-  （例: Honda Cars系の見積書はページ1上部に合計値、最終ページに合計行なし）
-  → 最終ページだけでなく、ページ1のヘッダ部分からも合計値を探すこと
-- 【Honda Cars特有】「整備代①」欄の金額 = 部品+工賃の合計（税抜）。
-  「整備代①」が合計欄の場合、その値をpdf_grand_totalとして採用する。
-  ただし「内消費税10%」が別記されていれば tax_inclusive と判定する。
-  「ページ小計」「整備代 小計」はページ内集計であり最終合計ではない。
-- 「見積金額」「請求金額」「お見積り金額」等もpdf_grand_totalの候補
-- amount_basis の判定ルール（重要）:
-  * 「内消費税 ○○円」「うち消費税 ○○円」→ 合計に税が含まれている = tax_inclusive
-  * 「(税込)」「税込合計」「税込金額」などの表記 → tax_inclusive
-  * 「小計 ○○円 / 消費税 ○○円 / 合計 ○○円」と3行に分かれている → tax_exclusive
-  * 合計の上に税抜小計と消費税の行が別々にある → tax_exclusive
-  * 合計欄に「税込」の表記があれば → tax_inclusive
-  * 判定できない場合のみ → unknown
-
-修理工場名の探し方:
-- 見積書の上部・ヘッダ・右上・左上に会社名・店舗名が記載されていることが多い
-- 「○○自動車」「○○モータース」「○○板金」等の名称を探す
-- FAX送信元の会社名もここに含まれる場合がある
-
-車両情報の注意:
-- 見積書のヘッダ部分（上部）に車名・型式・カラーコード等が記載されていることが多い
-- 記載がない項目は空文字列""にする（推測しない）
-- 「車名」「車種」「Car」等のラベルの横に書かれた値を読む
-- 「E/G型式」「エンジン」「原動機」等のラベルの横がエンジン型式
-- 「C/C」「カラー」「塗色」等のラベルの横がカラーコード
-- 「T/C」「トリム」「内装」等のラベルの横がトリムコード
-"""
+    """1パス目: 合計値 + 見積書ヘッダの修理工場名・車両情報読み取り"""
+    system_prompt = (
+        "あなたは、自動車修理見積書をNEOファイルへ転記するための明細抽出アシスタントです。\n"
+        "ルール:\n"
+        "- PDF記載内容を正確に抽出する\n"
+        "- 推測補完・勝手な再計算をしない\n"
+        "- 文字列で読めない値は「不明」\n"
+        "- 数値で読めない値は 0\n"
+        "- 税区分は判定しない\n"
+        "- 出力は JSON のみ"
+    )
+    user_prompt = (
+        "以下の見積書ページから合計値・修理工場名・車両情報を抽出し、NEO転記用JSONを返してください。\n"
+        "説明文は不要です。数値はカンマを除去した整数で返してください。\n"
+        "tax区分は判定しないでください。\n\n"
+        "金額の探し方:\n"
+        "- 「部品計」「部品代」「部品合計」「部品・油脂」等 → pdf_parts_total\n"
+        "- 「工賃計」「技術料」「工賃合計」等 → pdf_wage_total\n"
+        "- 「合計」「総合計」「見積金額」「請求金額」等 → pdf_grand_total\n"
+        "- Honda Cars系: ページ1上部サマリーボックスの合計値も確認する\n"
+        "- 「ページ小計」はpdf_grand_totalに使わない\n"
+        "- 値引き額は discount_amount\n\n"
+        "修理工場名: 見積書ヘッダ・右上・左上の会社名・店舗名。\n"
+        "車両情報: ヘッダ部の車名・型式・カラーコード等。記載なければ空文字。"
+    )
+    # response schema: totals + vehicle_info のみ
+    _schema_totals = {
+        "type": "object",
+        "properties": {
+            "repair_shop_name": {"type": "string"},
+            "pdf_parts_total":  {"type": "integer"},
+            "pdf_wage_total":   {"type": "integer"},
+            "pdf_grand_total":  {"type": "integer"},
+            "discount_amount":  {"type": "integer"},
+            "confidence":       {"type": "number"},
+            "vehicle_info": {
+                "type": "object",
+                "properties": {
+                    "car_name":    {"type": "string"},
+                    "car_model":   {"type": "string"},
+                    "engine_model":{"type": "string"},
+                    "color_code":  {"type": "string"},
+                    "color_name":  {"type": "string"},
+                    "trim_code":   {"type": "string"},
+                    "grade":       {"type": "string"},
+                    "model_year":  {"type": "string"},
+                    "chassis_no":  {"type": "string"},
+                    "mileage":     {"type": "string"},
+                },
+            },
+        },
+    }
     try:
         from google.genai import types
         client = _get_genai_client(api_key)
         file_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
         response = client.models.generate_content(
             model=model_name,
-            contents=[prompt, file_part],
+            contents=[system_prompt, user_prompt, file_part],
             config={
                 "temperature": 0.0,
                 "max_output_tokens": 4096,
                 "response_mime_type": "application/json",
+                "response_schema": _schema_totals,
             },
         )
         if response.text:
@@ -2534,7 +2515,6 @@ def analyze_estimate_totals(api_key, file_bytes, mime_type, model_name):
                 return extract_json_from_response(response.text)
     except Exception as e:
         err_msg = str(e)
-        # モデル廃止エラーを呼び出し元に伝えるため例外を再送出
         if 'no longer available' in err_msg or '404' in err_msg or 'NOT_FOUND' in err_msg:
             raise RuntimeError(f"モデル '{model_name}' は利用できません。サイドバーで別のモデルを選択してください。\n詳細: {err_msg}") from e
     return None
@@ -2545,538 +2525,113 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
     page_instruction = ''
     if total_pages > 1:
         page_instruction = (
-            f'\n\n★★★ これは全{total_pages}ページ中の{page_num}ページ目です。\n'
-            'このページに記載されている明細行を全て読み取ってください。\n'
-            '特に重要: ページの先頭行・末尾行を見落とさないでください。\n'
-            'ページ上部や下部にある行も必ず含めてください。\n'
-            '合計行・小計行・ページ小計行・整備代小計行はitemsに含めないでください。\n'
-            '【列ズレ防止】各金額は必ずその行の品目にのみ属します。'
-            '隣接行の金額を別の行に割り当てることは絶対に禁止です。'
-            '列が空欄の場合はその種別の金額=0として扱ってください。\n'
-            '【取消線除外】赤線・黒線の取消線が引かれた行は全て除外してください。 ★★★\n'
+            f'これは全{total_pages}ページ中の{page_num}ページ目です。'
+            'このページに記載されている明細行をすべて読み取ってください。'
+            'ページ先頭行・末尾行を見落とさないでください。'
+            '合計行・小計行・ページ小計行はitemsに含めないでください。'
+            '列が空欄の場合はその種別の金額=0として扱ってください。'
+            '取消線のある行は除外してください。\n'
         )
-    prompt = """あなたは自動車修理見積書のデータ化を行う専門アシスタントです。
-提供された見積書の画像またはPDFから、すべての明細行を1行も漏らさず正確に読み取ってください。
-**必ず有効なJSONのみを返してください。それ以外のテキストは一切不要です。**
-**JSONは完結させてください。途中で切れないようにしてください。**
+    system_prompt = (
+        "あなたは、自動車修理見積書をNEOファイルへ転記するための明細抽出アシスタントです。\n"
+        "入力された見積書ページを読み取り、NEO転記用の構造化データを返してください。\n"
+        "ルール:\n"
+        "- PDF記載内容をできる限り正確に抽出する\n"
+        "- 勝手な統合、省略、並べ替え、再計算、推測補完をしない\n"
+        "- 文字列で読めない値は「不明」\n"
+        "- 数値で読めない値は 0\n"
+        "- name は空文字禁止。読めない場合は「不明」\n"
+        "- 合計行、小計行、ページ小計行、総合計行は items に含めない\n"
+        "- 値引き行は items に含めず discount_amount に入れる\n"
+        "- 取消線のある行は除外する\n"
+        "- 金額は必ずその行の列位置を優先し、前後の行から借用しない\n"
+        "- 抽出した文字列中のカタカナはNEO転記用として半角へ正規化する\n"
+        "- 意味を変える要約や補完はしない\n"
+        "- 税区分は判定しない\n"
+        "- 出力は JSON のみ\n"
+        "\n"
+        "明細ルール:\n"
+        "- 各明細行を1行ずつ処理する\n"
+        "- name は品名・作業名として必ず抽出する（空文字厳禁・読めなければ「不明」）\n"
+        "- parts_amount は部品列の値\n"
+        "- wage は工賃列の値\n"
+        "- 部品列が空欄なら parts_amount = 0\n"
+        "- 工賃列が空欄なら wage = 0\n"
+        "- 両方空欄の行は items に含めない\n"
+        "- コード列があれば work_code に入れる\n"
+        "- 部品番号があれば part_no に入れる（半角英数字に正規化）\n"
+        "- 塗装明細や脱着明細も通常明細として含める\n"
+        "\n"
+        "特記事項:\n"
+        "- ショートパーツ、雑品代、小物部品は items に含めず short_parts_wage に合算\n"
+        "- 預託金、廃棄処分費用は items に含めず tax_exempt_amount に加算\n"
+        "- 油脂代は parts_amount\n"
+        "- 診断料、点検料、写真代、内張り費用は通常明細として扱う\n"
+        "- 工賃欄が ** や *** など数値不明なら wage = 0\n"
+        "- 数量が「(14」「（14」形式で記載されている場合、数値部分のみを quantity に入れる\n"
+        "\n"
+        "フォーマット注意:\n"
+        "- コグニセブン系: 右から2列目=部品、最右列=工賃\n"
+        "- トヨタ系: 「部品・油脂」=parts_amount、「技術料」=wage\n"
+        "- Honda Cars系: ページ1上部サマリーボックスの合計値も確認する\n"
+        "- メルセデスベンツ系: BPコード→wage、MAコード→parts_amount\n"
+        "- BMW系: MM99/UU99→wage、数字CDのみ→parts_amount\n"
+        "- スズキ/ダイハツ系: 工賃単価列=wage、部品価格列=parts_amount（工数は使わない）\n"
+        "- UDトラックス系: 区=11→wage、区=1→parts_amount\n"
+        "- ヤナセ系: 左カラム=wage、右カラム=parts_amount\n"
+    )
+    user_prompt = (
+        f"{page_instruction}"
+        "以下の見積書を解析し、NEO転記用JSONを返してください。\n"
+        "説明文は不要です。\n"
+        "文字列で読めない値は「不明」、数値で読めない値は 0 にしてください。\n"
+        "抽出文字列中のカタカナは半角に正規化してください。\n"
+        "税区分は判定しないでください。\n"
+        "部品名称(name)は必ず返してください。読めない場合でも空文字ではなく「不明」を返してください。\n"
+        "合計行・小計行はitemsに含めないでください。"
+    )
+    prompt = system_prompt + "\n---\n" + user_prompt
 
-【最重要制約】
-* 入力資料に記載されている文字を一言一句そのまま転記すること。
-* 勝手な項目の統合、省略、金額の再計算は絶対にしないこと。
-* 読み取り不能な箇所は必ず「不明」と記載すること（空欄で省略しない）。
-* **nameフィールドを空文字列 `""` で返すことは絶対に禁止。** 見積書に品名が記載されていれば正確に転記し、読み取れない場合は必ず「不明」と記載すること。work_codeに入れた値の品名が読み取れない場合も「不明」ではなく品名欄から読み取った文字列を入れること。
-* アジャスターとしての査定・減額調整はこの段階では行わないこと。
-* 部品番号（part_no）・作業コード（work_code）が記載されている場合は絶対に省略せず転記すること。
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-■ 見積書フォーマット自動判定ガイド
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-見積書には主に10種類のフォーマットがあります。まず全体を見てフォーマットを判定してください。
-
-【フォーマットA: コグニセブン系（部品価格列と工賃列が分離）】
-特徴: 「コード | 修理項目/部品名称 | 修理方法/部品番号 | 部品価格(円) | 工賃(円)」
-列の位置（左→右）: コード → 品名 → 修理方法/部品番号 → 【部品価格列】 → 【工賃列】
-- 【部品価格列（右から2列目）】の値 → parts_amount に入れる
-- 【工賃列（最右列）】の値 → wage に入れる
-- 塗装明細が別セクション「【塗装明細】」にある場合がある
-- 費用セクション「【費用】」にショートパーツ・内張り費用等がある
-- 小計行に「部品計」「工賃計」「課税額計」「消費税」「合計」がある
-→ 部品価格列の値をparts_amountに、工賃列の値をwageに入れる
-
-★★★ フォーマットA 列ズレ防止ルール ★★★
-- 部品価格列と工賃列の見出しが必ず表頭にある。読み取り前に列見出し行で位置を確認すること。
-- 「部品価格」列が空欄 → parts_amount=0（工賃列の値を借用しない）
-- 「工賃」列が空欄 → wage=0（部品価格列の値を借用しない）
-- 1行に両方値がある場合（取替行等）→ 両方のフィールドに設定する
-- 「ショートパーツ」「雑品代」「小物部品代」はitemsに含めずshort_parts_wageに合算
-
-NG例（絶対にしてはいけない）:
-  見積書の実際のレイアウト（「部品価格|工賃」の列）:
-  ├─ Fバンパー    取替  【21,300】 【 7,700】  ← 両方あり
-  ├─ Fバンパー脱着 脱着  【      】 【 3,080】  ← 工賃のみ
-  × 誤: Fバンパー脱着: parts=3,080, wage=0   ← 工賃列の値を部品に誤配置
-  ○ 正: Fバンパー脱着: parts=0, wage=3,080   ← 工賃列が正しい
-
-【フォーマットB: 修理工場系（種別列で作業/部品を区分）】
-特徴: 「作業内容/使用部品名 | 作業部位 | 種別 | 数量 | 単価 | 技術料/部品金額」
-列の位置（左→右）: 品名 → 作業部位 → 【種別列】 → 数量 → 単価 → 【金額列】
-- 【種別列】が「作業」→ 金額列の値をwageに入れる（parts_amount=0）
-- 【種別列】が「部品」→ 金額列の値をparts_amountに入れる（wage=0）
-- 最下部に「技術料計」「部品計」「整備合計」がある
-
-★★★ フォーマットB 列ズレ防止ルール ★★★
-- 種別列の「作業」「部品」が判別の唯一の根拠。金額列は1つだが種別で振り分ける。
-- 種別が読み取れない場合はname/methodから判定: 脱着・修理・板金系→wage、部品名系→parts
-- 金額列が空欄の場合はparts_amount=0, wage=0 の両方ゼロにする
-
-NG例（絶対にしてはいけない）:
-  ├─ Rドア  板金  【作業】 1  8,000  ← 種別=作業 → wage=8,000
-  ├─ ドアHINGE  部品  【部品】 2  2,200  ← 種別=部品 → parts=4,400
-  × 誤: ドアHINGE: wage=4,400   ← 種別「部品」なのに工賃に誤配置
-  ○ 正: ドアHINGE: parts=4,400, wage=0
-
-【フォーマットC: メルセデスベンツ系ディーラー（作業コード＋金額の1列）】
-特徴: 「作業コード/部品番号 | 作業内容/部品名 | 時間/数量 | 金額」
-列の位置（左→右）: 【コード列】 → 品名 → 時間/数量 → 【金額列（1列）】
-- 金額列は1つだが、コードのプレフィックスで部品/工賃を判別する
-- コードがBPで始まる → wage=金額, parts_amount=0（作業行）
-- コードがMAまたはMNで始まる → parts_amount=金額, wage=0（部品行）
-- コードが読み取れない場合は品名で判断:
-  「脱着」「修理」「板金」「塗装」「ペイント」「交換」→ 作業行（wage=金額）
-  「部品番号付き品名」「ASSY」「パネル」等の部品名 → 部品行（parts_amount=金額）
-- 最下部に「技術料」「部品代」「整備代合計」「消費税」「合計金額」がある
-
-★★★ フォーマットC 列ズレ防止ルール ★★★
-- コードプレフィックスが最優先。「BP-xxx」→必ずwage、「MA-xxx」→必ずparts
-- コードが不明瞭な場合は品名を次の判断材料にする
-- 金額列が1つしかないため、parts_amountかwageのどちらか一方のみに値を入れる（両方ゼロか一方のみ）
-- 同一行にBPコード＋MAコードが混在することはない
-
-NG例（絶対にしてはいけない）:
-  ├─ BP-00001  ボンネット板金    2.0h  18,000  ← BP→wage
-  ├─ MA-85400  ボンネット パネル  1個   52,000  ← MA→parts
-  × 誤: ボンネットパネル: wage=52,000  ← MAコードなのに工賃に誤配置
-  ○ 正: ボンネットパネル: parts=52,000, wage=0
-
-【フォーマットD: BMW系ディーラー（概算見積書・セクション分け＋作業CD）】
-特徴: 「項目 | 作業CD/部品No. | 作業項目/部品名 | 工数/数量 | 単価 | 金額」
-列の位置（左→右）: 項目 → 【作業CD列】 → 品名 → 工数/数量 → 単価 → 【金額列（1列）】
-- セクション分け（A: 事故修理、B: 搬送費用 等）がある
-- 作業CDが「MM99」で始まる → wage=金額, parts_amount=0（工賃行）
-- 作業CDが「UU99」で始まる → wage=金額, parts_amount=0（その他費用行）
-- 作業CDが数字のみ（例: 0711 9904 207）→ parts_amount=金額, wage=0（部品行）
-- 工賃行のquantityは1にする（工数は時間なので数量ではない）
-- 最下部に「工賃合計額」「部品合計額」「税込合計金額」がある
-
-★★★ フォーマットD 列ズレ防止ルール ★★★
-- 作業CDの先頭2文字が判断の核心。「MM」→wage、「UU」→wage、数字のみ→parts
-- CDが読み取れない場合: 「RH」「LH」「F」「R」等の部位略号付き品名→parts、動詞系作業名→wage
-- セクションヘッダ行（A:〜 / B:〜）はitemsに含めない
-- 金額列は1列のみ。部品行か作業行かでparts/wageどちらか一方だけに入れる
-
-NG例（絶対にしてはいけない）:
-  ├─ MM99-0012  フロントドア板金   2.0  9,800  12,000  ← MM99→wage
-  ├─ 4151-7143  ドアインナーパネル  1    24,500  24,500  ← 数字CD→parts
-  × 誤: ドアインナーパネル: wage=24,500  ← 数字CDなのに工賃に誤配置
-  ○ 正: ドアインナーパネル: parts=24,500, wage=0
-
-【フォーマットE: 町工場系（品名＋数量＋単価＋金額＋工賃の5列構成）】
-特徴: 「品名 | 数量 | 単価 | 金額 | 工賃」の列構成
-列の位置（左→右）: 品名 → 数量 → 単価 → 【金額列（部品代）】 → 【工賃列】
-- 【金額列（右から2列目）】 → parts_amount に入れる（部品代）
-- 【工賃列（最右列）】 → wage に入れる
-- 作業行: 「○○脱着組替」等 → 工賃列のみに金額、金額列は空 → parts=0, wage=工賃値
-- 部品行: 部品名＋数量＋単価＋金額 → 金額列に値、工賃列は空 → parts=金額値, wage=0
-- 最下部に「部品代」「工賃」「値引き」「小計」「消費税」「合計」がある
-
-★★★ フォーマットE 列ズレ防止ルール ★★★
-【最重要】「金額」列と「工賃」列は異なる列。絶対に混同しない。
-  - 「金額」列（左）= 部品代 → parts_amount
-  - 「工賃」列（右）= 作業代 → wage
-- 同一行に両方ある場合（取替行等）→ parts_amountとwageの両方に設定
-- 金額列が空欄 → parts_amount=0（工賃列の値を借用しない）
-- 工賃列が空欄 → wage=0（金額列の値を借用しない）
-
-NG例（絶対にしてはいけない）:
-  見積書の実際のレイアウト（「金額|工賃」の列）:
-  ├─ Lフロントフェンダ 取替  1  18,000  18,000  6,600  ← 金額=18,000, 工賃=6,600
-  ├─ Lフロントフェンダ 板金  1       -       -  8,800  ← 金額=なし, 工賃=8,800
-  ├─ ボルト類        取替  5     200   1,000      -  ← 金額=1,000, 工賃=なし
-  × 誤: Lフロントフェンダ板金: parts=8,800, wage=0  ← 工賃を部品に誤配置
-  ○ 正: Lフロントフェンダ板金: parts=0, wage=8,800
-  × 誤: ボルト類: parts=200 (単価を使用)  ← 金額列(1,000)ではなく単価を使用
-  ○ 正: ボルト類: parts=1,000 (金額列の値)
-
-【フォーマットF: トヨタディーラー系（概算見積書・作業内容＋使用部品＋技術料）】
-特徴: 「作業内容 | 使用部品 | 個数 | 部品・油脂 | 技術料 | 計」の列構成
-列の位置（左→右）: 作業内容/部品名 → 個数 → 【部品・油脂列（左金額）】 → 【技術料列（右金額）】 → 計
-- 【部品・油脂列（左側金額列）】 に金額がある → parts_amount に入れる
-- 【技術料列（右側金額列）】 に金額がある → wage に入れる
-- 作業行（脱着・修理等）は技術料列のみ金額あり → parts_amount=0, wage=技術料値
-- 部品行（部品名・材料等）は部品・油脂列のみ金額あり → parts_amount=部品値, wage=0
-- 「ショートパーツ」→ short_parts_wageに合算（itemsに含めない）
-- 最下部に「整備代金合計」が部品・技術料の内訳付きで記載される
-
-★★★ フォーマットF 絶対に守るべき列ズレ防止ルール ★★★
-【フォーマットFで最頻出するエラーパターン（必ず回避せよ）】
-トヨタ系見積書では、「作業+部品」「脱着のみ」「材料のみ」「両方ある行」が混在する。
-同一品目でも「部品欄に材料費」「技術料欄に作業費」のどちらか一方しか入らないことが多い。
-
-NG例（絶対にしてはいけない）:
-  見積書の実際のレイアウト（「個数|部品・油脂|技術料」の列）:
-  ├─ 左サイドFWD(コテイ)脱着   1  【     】 【24,816】  ← 技術料のみ
-  ├─ 化粧シーリング作業        1  【 8,800】 【10,340】  ← 両方あり
-  ├─ 発砲ウレタン除去・充填    2  【30,360】 【     】   ← 部品・油脂のみ（材料費）
-
-  誤った読み取り（NG）:
-  × 左サイドFWD脱着: parts=24,816, wage=0  ← 技術料を部品に誤配置
-  × 発砲ウレタン: parts=0, wage=30,360     ← 部品・油脂を技術料に誤配置
-
-  正しい読み取り（OK）:
-  ○ 左サイドFWD(コテイ)脱着: parts=0, wage=24,816   ← 技術料列の値→wage
-  ○ 化粧シーリング作業: parts=8,800, wage=10,340     ← 両列の値→それぞれに
-  ○ 発砲ウレタン除去・充填: parts=30,360, wage=0     ← 部品・油脂列の値→parts
-
-【フォーマットF 部品/技術料の判定基準（重要）】
-  - 「脱着」「取外」「取付」「組付」を含む行名 → 技術料列の値→wage（部品列が空なのでparts=0）
-  - 「ウレタン」「シーリング」「アンダーコート」「防錆」「塗料」「材料」「充填」等の材料名 → 部品・油脂列→parts_amount
-  - 「作業」「施工」「修理」「研磨」等の作業名のみ → 技術料列の値→wage
-  - 部品番号（英数字コード）が記載されている行 → 部品・油脂列の値→parts_amount
-  - 列が空欄の場合は必ず0にする。前後の行から値を借用しない。
-  - 同じ品目（例: 発砲ウレタン）でも、見積書によって部品列 or 技術料列どちらに記載されているかが異なる。
-    必ず【その見積書の実際の列配置】で判断すること（他の見積書の慣例を適用しない）。
-
-【フォーマットF 参照点を使った列位置の校正（最初に実施せよ）】
-  - 読み取り開始前に、テーブル最初の行で列位置を確認すること
-  - 例: 「左FrアウタミラーL取替 1 4,213 1,039」なら 4,213=部品・油脂, 1,039=技術料
-  - 一度列位置を確定したら、全行に同じ列構造を適用すること
-  - 「部品・油脂」列の見出しが表頭にある列 = parts_amount に入れる列
-  - 「技術料」列の見出しが表頭にある列 = wage に入れる列
-  - ページをまたいでも列構造は変わらない
-
-【フォーマットL: Honda Cars / ホンダディーラー系（概算お見積書・2列金額）】
-特徴: 「No | 整備内容（部品又は作業名） | 作業 | 数量 | 部品・油脂代 | 技術料」
-識別方法: Honda Carsロゴ、「概算お見積書」「板金塗装」ヘッダ、"Honda Cars"または"ホンダカーズ"の記載
-列の位置（左→右）: 品名列 → 作業列 → 数量列 → 【部品・油脂代列】 → 【技術料列】
-- 【部品・油脂代列】（左側の金額列）の値 → parts_amount に入れる
-- 【技術料列】（右側の金額列）の値 → wage に入れる
-- 同一行に両列に値がある場合 → parts_amountとwageの両方に入れる
-- セクション番号付き（例: "1 板金塗装修理"  "2 内装部品交換"）
-
-★★★ Honda Cars形式で絶対に守るべき列ズレ防止ルール ★★★
-【最頻出エラーパターン（必ず回避せよ）】
-Honda Cars見積書では「部品のみの行」と「技術料のみの行」が交互に出現する。
-このとき、ある行の技術料を次の行の技術料と誤って合算・置換することが頻発する。
-
-NG例（絶対にしてはいけない）:
-  見積書の実際のレイアウト:
-  ├─ ガーニッシュASSY Rスライドドア  交換  1.0  【4,917】  【    】
-  ├─ コーティング再施工             [作業] 1.0  【    】  【26,400】
-  ├─ 諸費用                        [費用] 1.0  【4,675】  【    】
-  └─ 材料費                        [費用] 1.0  【26,675】 【    】
-
-  誤った読み取り（NG）:
-  × ガーニッシュASSY: parts=4,917, wage=26,400  ← 下の行の技術料を取り込んでいる
-  × コーティング再施工: parts=4,675, wage=0     ← さらに下の行の部品代を取り込んでいる
-  × 諸費用: parts=26,675, wage=0                ← さらに下の行の値を取り込んでいる
-
-  正しい読み取り（OK）:
-  ○ ガーニッシュASSY: parts=4,917, wage=0       ← 技術料列が空なのでwage=0
-  ○ コーティング再施工: parts=0, wage=26,400    ← 部品列が空なのでparts=0
-  ○ 諸費用: parts=4,675, wage=0                 ← 技術料列が空なのでwage=0
-  ○ 材料費: parts=26,675, wage=0                ← 技術料列が空なのでwage=0
-
-【Honda Cars部品/技術料の判定基準】
-  - 部品番号（英数字コード）が記載されている行: 部品代列(左)の値→parts_amount
-  - 「清掃」「エーミング」「コーティング」「塗装費用」「洗車」等の作業名: 技術料列(右)の値→wage
-  - 「諸費用」「材料費」「ショートパーツ」: 部品代列(左)の値→parts_amount
-  - GARN ASSY R.FR ST 等の部品名で部品番号付き: 部品代列(左)の値→parts_amount（技術料列は空でwage=0）
-  - 整備代 小計行・ページ小計行 → itemsに含めない（合計行のため）
-
-【Honda Cars取消線（抹消行）の厳格処理】
-  - 見積書上で赤線・黒線の取消線が引かれた行（例: GARN ASSY*NH900L* に2本の横線）
-  - このような取消行は完全に除外すること
-  - 同一部品番号が複数行に記載され、一方に取消線がある場合 → 取消線のない行のみ採用
-  - 具体例: 「8412132R003ZA 3,850」が赤線付きで出現 → この行を除外、他の行のみ採用
-
-【フォーマットG: 整備工場系（整備内容＋技術料＋部品単価＋部品小計の4列）】
-特徴: 「整備内容 | 技術料(円) | 数量 | 部品単価(円) | 部品小計(円)」
-列の位置（左→右）: 品名 → 【技術料列】 → 数量 → 部品単価 → 【部品小計列】
-- 【技術料列（左金額列）】の値 → wage に入れる
-- 【部品小計列（最右列）】の値 → parts_amount に入れる（数量×単価の小計）
-- 1行に技術料と部品小計の両方が存在する場合がある（取替行等）
-- 数量に単位が付く場合（「1個」「10個」「2本」）→ 数値部分のみ抽出
-- 最下部に「A 技術料」「B 部品代」の合計が記載される
-
-★★★ フォーマットG 列ズレ防止ルール ★★★
-- 技術料列と部品小計列は異なる列。左が技術料、右が部品小計（単価ではない）。
-- 技術料列が空欄 → wage=0（部品小計の値を借用しない）
-- 部品小計列が空欄 → parts_amount=0（技術料の値を借用しない）
-- 「部品単価」列（部品小計の左隣）は参考情報。parts_amountには「部品小計」を使う。
-
-NG例（絶対にしてはいけない）:
-  見積書の実際のレイアウト（「技術料|数量|単価|部品小計」の列）:
-  ├─ Fガラス取替   【5,500】  1  32,000  【32,000】  ← 技術料=5,500, 部品=32,000
-  ├─ Fガラス脱着   【3,000】  -       -  【      】  ← 技術料=3,000, 部品=なし
-  × 誤: Fガラス脱着: parts=3,000  ← 技術料列の値を部品に誤配置
-  ○ 正: Fガラス脱着: parts=0, wage=3,000
-  × 誤: Fガラス取替: parts=32,000 (部品単価を使用)  ← 単価ではなく小計を使う
-  ○ 正: Fガラス取替: parts=32,000 (部品小計列), wage=5,500
-
-【フォーマットH: ヤナセ系（左右2カラム構成・作業と部品が左右に分離）】
-特徴: 左側に「作業内容 | 金額」、右側に「使用部品 | 数量 | 金額」が並ぶ
-列の構造: 【左カラム: 作業名＋作業金額】 ｜ 【右カラム: 部品名＋数量＋部品金額】
-- 左カラムの金額 → wage に入れる
-- 右カラムの金額 → parts_amount に入れる
-- 最下部に「定価合計:（作業）金額（部品）金額（全体）金額」がある
-- 同じ行に作業と部品が並ぶ場合、左カラム=wage、右カラム=parts の両方に設定
-
-★★★ フォーマットH 列ズレ防止ルール ★★★
-【左右レイアウトの最重要ルール】
-- ページを左半分と右半分に分けて読み取ること
-- 左カラムの金額と右カラムの金額を絶対に混同しない
-- 右カラムが空欄の行（作業のみ）→ parts_amount=0
-- 左カラムが空欄の行（部品のみ）→ wage=0
-- 左右同じ行に両方ある場合 → 両方のフィールドに設定
-
-NG例（絶対にしてはいけない）:
-  左カラム                右カラム
-  ├─ フロントガラス脱着 12,000 ｜ ─
-  ├─ ─                       ｜ フロントガラス ASSY 1  45,000
-  × 誤: フロントガラス脱着: parts=12,000  ← 左カラム作業金額を部品に誤配置
-  ○ 正: フロントガラス脱着: parts=0, wage=12,000
-  ○ 正: フロントガラス ASSY: parts=45,000, wage=0
-
-【フォーマットI: トラック整備系（部品列と工賃列が分離した一般的な4列）】
-特徴: 「作業内容及び部品明細 | 数量 | 単価 | 部品 | 工賃」の5列
-列の位置（左→右）: 品名 → 数量 → 単価 → 【部品列】 → 【工賃列】
-- 【部品列（右から2列目）】の値 → parts_amount に入れる
-- 【工賃列（最右列）】の値 → wage に入れる
-- 「ショートパーツ」「材料費」は部品扱い（parts_amountに入れる）
-- 同一行に両方ある場合（取替行等）→ 両方のフィールドに設定
-
-★★★ フォーマットI 列ズレ防止ルール ★★★
-- 「部品」列と「工賃」列は隣接しているが異なる列。絶対に混同しない。
-- 部品列が空欄 → parts_amount=0（工賃列の値を借用しない）
-- 工賃列が空欄 → wage=0（部品列の値を借用しない）
-- 「単価」列の値はparts_amountに使わない（「部品」列の値を使う）
-
-NG例（絶対にしてはいけない）:
-  見積書の実際のレイアウト（「数量|単価|部品|工賃」の列）:
-  ├─ タイヤ交換  4  15,000  60,000  【 8,000】  ← 部品=60,000, 工賃=8,000
-  ├─ バランス調整 4       -       -  【 2,000】  ← 部品=なし,  工賃=2,000
-  × 誤: タイヤ交換: parts=15,000 (単価列を使用)
-  ○ 正: タイヤ交換: parts=60,000 (部品列), wage=8,000 (工賃列)
-  × 誤: バランス調整: parts=2,000 (工賃列の値を部品に)
-  ○ 正: バランス調整: parts=0, wage=2,000
-
-【フォーマットJ: UDトラックス系（区コードで作業/部品を判別）】
-特徴: 「区 | 作業コード(部品番号) | 作業内容(部品名称) | 数量 | 定価/単価 | 金額」
-列の位置（左→右）: 【区コード列】 → 作業コード/部品番号 → 品名 → 数量 → 単価 → 【金額列（1列）】
-- 区=11 → 作業行（wage=金額, parts_amount=0, quantity=1）
-- 区=1  → 部品行（parts_amount=金額, wage=0）
-- 区=5  → セクションヘッダ → itemsに含めない
-- 区=7  → その他費用行（wage=金額, parts_amount=0）
-- 金額列は1列のみ。区コードで振り分ける。
-
-★★★ フォーマットJ 列ズレ防止ルール ★★★
-- 区コード「11」と「1」の読み誤りに注意（11=作業、1=部品）
-- 区コードが読み取れない場合: 品名から判断（脱着/修理/板金系→wage、部品名系→parts）
-- 「定価」列はparts_amountに使わない。「金額」列（最終列）を使う。
-- セクションヘッダ（区=5）は金額ゼロであっても絶対にitemsに含めない
-
-NG例（絶対にしてはいけない）:
-  区   コード       品名              数量  単価    金額
-  ├─ 11  B120001  フロントドア板金    1     -     15,000  ← 区=11→wage
-  ├─  1  A450271  フロントドアパネル  1  38,000   38,000  ← 区=1→parts
-  × 誤: フロントドア板金: parts=15,000  ← 区=11なのに部品に誤配置
-  ○ 正: フロントドア板金: parts=0, wage=15,000
-  × 誤: フロントドアパネル: wage=38,000  ← 区=1なのに工賃に誤配置
-  ○ 正: フロントドアパネル: parts=38,000, wage=0
-
-【フォーマットK: スズキ/ダイハツディーラー系（工数×単価方式）】
-特徴: 「作業項目 | 修理方法 | 工数 | 工賃単価 | 数量 | 部品価格 | 部品番号」の7列構成
-列の位置（左→右）: 品名 → 修理方法 → 工数 → 【工賃単価列】 → 数量 → 【部品価格列】 → 部品番号
-- 【工賃単価列（左金額列）】の値 → wage に入れる（工数は参考情報に過ぎない）
-- 【部品価格列（右金額列）】の値 → parts_amount に入れる
-- 「工数」列（例: 0.70, 1.50）は参考値。wageには「工賃単価」の値を使う（工数×単価ではない）
-- 同一行に工賃と部品価格の両方が存在することがある（取替行等）
-  例: 「LH フロントフェンダ パネル | 取替 | 0.70 | 7,700 | 1.00 | 21,300 | 57711-59S00」
-      → wage=7700, parts_amount=21300, part_no=57711-59S00
-- 工数あり・部品価格列が空の行 → 作業行（wage=工賃単価, parts_amount=0）
-  例: 「左 フロントフェンダー エプロン | 鈑金 | 0.80 | 8,800」→ wage=8800, parts_amount=0
-- 部品価格あり・工賃単価列が空の行 → 部品行（parts_amount=部品価格, wage=0）
-- 塗装セクション（2ページ目等）: 「作業項目 | 工数 | 工賃単価 | 係数 | 塗装工賃」の5列
-  塗装工賃（最右列の直接記載値）→ wage=塗装工賃列の値
-  例: 「左フロントフェンダパネル取替 | 1.50 | 16,500 | 0.45 | 7,425」→ wage=7425
-- 「OBD点検」等の点検行: 「OBD点検 | 点検 | 1.00 | 11,000」→ wage=11000, parts_amount=0
-- 最下部に「部品計」「工賃計」「塗装工賃計」「消費税」「合計」がある
-→ 各列の値を正確に読み取り、工賃列と部品価格列を絶対に取り違えないこと
-
-★★★ フォーマットK 列ズレ防止ルール ★★★
-【最重要】「工賃単価」と「部品価格」は独立した2列。絶対に混同しない。
-- 工賃単価列（左側）→ wage。部品価格列（右側）→ parts_amount。
-- 「工数（小数値）」はwageではない。工賃単価列の値（整数）をwageに使う。
-- 塗装セクションでは列構成が変わる（5列）。最右列の「塗装工賃」→wage。
-- 部品番号列（最右列）は金額ではない。parts_amountには「部品価格」列の値を使う。
-
-NG例（絶対にしてはいけない）:
-  品名               修理方法  工数  工賃単価  数量  部品価格   部品番号
-  ├─ RHフロントフェンダ  取替   0.70  【7,700】  1  【21,300】  57711-AAA
-  ├─ フロントエプロン   板金   0.80  【8,800】  -  【      】  -
-  × 誤: RHフロントフェンダ: parts=0.70 (工数を使用)
-  ○ 正: RHフロントフェンダ: wage=7700 (工賃単価), parts=21300 (部品価格)
-  × 誤: フロントエプロン: parts=8,800 (工賃単価を部品に誤配置)
-  ○ 正: フロントエプロン: wage=8,800, parts=0
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-■ 返すべきJSON形式
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-{
-  "_thought_process": "フォーマット判定の根拠と税込/税抜の判断理由を100字以内で",
-  "amount_basis": "tax_inclusive(明細が税込) / tax_exclusive(明細が税抜) / unknown",
-  "tax_reason": "「税込」または「税抜」と判定した根拠を簡潔に（例: 合計欄に消費税が別記されているため税抜と判定）",
-  "items": [
-    {
-      "name": "部品名または作業名（見積書に記載のまま正確に転記。空文字列 \"\" は絶対禁止→読み取れなければ「不明」）",
-      "method": "区分（取替/脱着/修理/塗装/交換/調整/板金/部品 等）",
-      "quantity": 数量（整数に丸める。1.00→1）,
-      "parts_amount": その行の部品金額合計（整数。作業行は0。カンマ・¥記号を除去した純粋な整数）,
-      "wage": その行の工賃/技術料（整数。部品行は0。カンマ・¥記号を除去した純粋な整数）,
-      "part_no": "部品番号/品番【STEP2正規化】全角→半角英数字に変換・不要な空白削除・ハイフンは除去。なければ空文字列",
-      "work_code": "作業コード/部品コード（見積書の『コード』列に記載された値をそのまま転記。なければ空文字列）"
+    # response schema for items extraction
+    _schema_single = {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name":         {"type": "string"},
+                        "method":       {"type": "string"},
+                        "quantity":     {"type": "integer"},
+                        "parts_amount": {"type": "integer"},
+                        "wage":         {"type": "integer"},
+                        "part_no":      {"type": "string"},
+                        "work_code":    {"type": "string"},
+                    },
+                },
+            },
+            "short_parts_wage":  {"type": "integer"},
+            "tax_exempt_amount": {"type": "integer"},
+            "discount_amount":   {"type": "integer"},
+            "pdf_parts_total":   {"type": "integer"},
+            "pdf_wage_total":    {"type": "integer"},
+            "confidence":        {"type": "number"},
+            "totals_verification": {
+                "type": "object",
+                "properties": {
+                    "calculated_parts_total": {"type": "integer"},
+                    "calculated_labor_total": {"type": "integer"},
+                    "document_parts_total":   {"type": "integer"},
+                    "document_labor_total":   {"type": "integer"},
+                    "parts_diff":             {"type": "integer"},
+                    "labor_diff":             {"type": "integer"},
+                    "is_match":               {"type": "boolean"},
+                    "validation_error":       {"type": "string"},
+                },
+            },
+        },
     }
-  ],
-  "short_parts_wage": ショートパーツ・雑品代・小物部品代の合計（整数。なければ0。itemsには含めない）,
-  "tax_exempt_amount": 預託金・廃棄処分費用等の非課税費用合計（整数。なければ0。itemsには含めない）,
-  "discount_amount": 値引き額（整数。なければ0。items には含めない）,
-  "pdf_parts_total": 見積書記載の「部品計」「部品代」の値（整数）,
-  "pdf_wage_total": 見積書記載の「工賃計」「技術料」の値（整数）,
-  "confidence": 読み取り信頼度 0.0〜1.0,
-  "totals_verification": {
-    "calculated_parts_total": itemsのparts_amount合計（整数）,
-    "calculated_labor_total": itemsのwage合計（整数）,
-    "document_parts_total": 見積書記載の部品合計（pdf_parts_totalと同値・整数）,
-    "document_labor_total": 見積書記載の工賃合計（pdf_wage_totalと同値・整数）,
-    "parts_diff": calculated_parts_total - document_parts_total（差額・整数）,
-    "labor_diff": calculated_labor_total - document_labor_total（差額・整数）,
-    "is_match": partsとlaborの差額が両方0ならtrue、1円でもズレがあればfalse,
-    "validation_error": "差額がある場合は原因と推測箇所を記載。一致している場合はnull"
-  }
-}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-■ 【最最最重要】行と金額の一対一対応原則（全フォーマット共通）
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-これは全てのフォーマットに共通する絶対原則です。
-
-★ 各金額は必ずその行の品目にのみ属します ★
-★ 隣接する行の金額を別の行に割り当てることは絶対に禁止です ★
-★ 見積書の列見出し（部品/技術料）を確認してから全行に適用すること ★
-
-【処理手順（全フォーマット共通）】
-STEP-0: 表の見出し行を確認し、「部品/部品価格/部品・油脂」列と「工賃/技術料」列の位置を確定する
-STEP-1: テーブルの各行を上から順に1行ずつ処理する
-STEP-2: その行の「部品列」に値がある → parts_amountに設定
-STEP-3: その行の「技術料/工賃列」に値がある → wageに設定
-STEP-4: その行の両方の列に値がある → 両方に設定
-STEP-5: その行の両方の列が空 → その行はitemsに含めない
-
-【特に重要】列が空欄のときの扱い:
-- 部品列が空欄 → parts_amount = 0（前後の行の値を借用しない）
-- 技術料列が空欄 → wage = 0（前後の行の値を借用しない）
-- 「空欄 = その行にその種別の金額なし = 0」これが絶対ルール
-
-【列ズレが発生しやすい典型パターンと対策】
-パターン1: 金額列が1つ（CDE JK等）→ コード/種別で振り分け、絶対に前後借用しない
-パターン2: 材料名なのに技術料列に記載される → 見積書の実際の列配置を優先（推測不可）
-パターン3: 脱着行の直後の行の部品金額が視覚的に重なる → 脱着行のparts=0を徹底
-パターン4: ページ境界で行の対応がずれる → ページをまたいでも列構造は変わらない
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-■ 「取替（交換）」同一行パターンの部品代/工賃分離
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-見積書には、部品項目と作業項目が同一行に記載されている形式が頻出する。
-例: 「Fバンパー 取替  部品代21,300  工賃7,700」
-この場合:
-  → name="Fバンパー", method="取替", parts_amount=21300, wage=7700
-ルール:
-- 1行に「部品代（部品金額）」と「工賃（技術料）」の両方が存在する場合、必ず分離して記録
-- 「取替」「交換」「脱着組替」等の作業名が部品名に付随している場合、それはmethodに入れる
-- 金額が1列しかない場合でも、行の種別（部品行 or 作業行）を正確に判定する
-- 部品名の横の金額 → parts_amount、作業名の横の金額 → wage
-- 判定に迷う場合: 部品番号がある行の金額 → parts_amount、工数がある行の金額 → wage
-- 品質基準: 部品代と工賃の分離精度は99%以上を目標とする
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-■ 読み取りルール（厳守）
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-【STEP 1: 完全抽出】
-1. 明細テーブルの全行を1行ずつ正確に読み取る。行を絶対に飛ばさない。
-2. 複数ページにまたがる場合、全ページの明細を必ず結合する。
-3. 部品名は見積書に記載のとおり正確に転記する。
-4. 勝手な査定（アジャスト）、減額、工法変更、項目の削除や統合は一切行わない。
-5. 塗装明細の各パネル行は通常の明細行として含める（wage=塗装工賃）。
-6. 費用セクションの扱い:
-   - 「ショートパーツ」「小物部品」「雑品代」→ short_parts_wageに合算
-   - 「内張り費用」「室内清掃費」「写真代」等 → 通常の明細行（wage）
-7. parts_amountとwageの両方に値がある行もある。
-8. 合計行・小計行・ページ小計行はitemsに含めない。
-9. 「値引き」行はitemsに含めず discount_amount に記録する。
-10. FAX受信で画質が悪い場合でも、読み取れる文字は最大限読み取る。
-11. 「塗装に含む」「塗装費用」は工賃行として扱う（wage=金額）。
-12. 「油脂代」は部品扱い（parts_amountに入れる）。
-13. 数量が品名の後ろに「(数字」「（数字」形式で記載されている場合がある。
-    例: 「ｸﾘｯﾌﾟﾅｯﾄ 取替 (14 1,960」→ 品名=ｸﾘｯﾌﾟﾅｯﾄ, method=取替, quantity=14, parts_amount=1960
-    この「(数字」は数量であり、品名に含めない。先頭のゼロも除去して整数にする。
-14. 工賃欄に「**」「＊＊」「***」等のアスタリスクのみが記載されている場合は工賃なし（wage=0）として扱う。
-15. 「ショートパーツ」「雑品代」「小物部品代」はitemsに含めず、short_parts_wageに合算する。
-16. 「預託金」「廃棄処分費用」「産業廃棄物処理代」「産廃費用」「リサイクル預託金」は非課税費用。
-    itemsに含めず、必ず tax_exempt_amount に金額を記録する。
-17. 【コード類の確実な抽出】見積書に「コード」列がある場合、その値を work_code フィールドに必ず転記。
-    部品番号・品番がある場合は part_no フィールドに必ず転記すること。絶対に省略しない。
-18. 【税区分の明記】amount_basis と tax_reason を必ず返すこと。
-    tax_reason には「合計欄に消費税が別記されているため税抜」等、判定根拠を具体的に書く。
-19. 金額0の行も含める（0は0として記録する）。
-20. 【OBD点検・診断料の工賃抽出】「OBD点検」「OBD診断」「診断料」「システム診断」等の行は、
-    隣接する金額列（例: 11,000）を必ず wage として抽出すること。絶対に0にしない。
-    これらはスズキ・ダイハツ系フォーマットでは「工数×単価」方式で記載される。
-21. 【スズキ系塗装工賃】塗装セクションで「工数 | 工賃単価 | 係数 | 塗装工賃」の形式がある場合、
-    最右列の「塗装工賃」値（例: 7,425）をwageとして使う。中間の係数(0.45等)は無視してよい。
-22. 【取消線・抹消行の絶対除外（Honda Cars形式で特に重要）】
-    ★ 取消線のある行は存在しないものとして扱う ★
-    - 赤線・黒線・斜線等の取消線（打ち消し線）が文字や行に引かれている行は除外
-    - 取消線のある行の金額は絶対にparts_amount/wageに加算しない
-    - 一部の文字だけに取消線がある場合でもその行全体を除外する
-    【Honda Cars見積書での頻出パターン】
-    同一部品番号が3行記載され、うち2行に取消線（修正の経緯）:
-      行A: GARN ASSY*NH900L* 8412132R003ZA  3,850  ← 赤線あり → 除外
-      行B: LNG ASSY*NH900L*  8311132R003ZA  1,342  ← 赤線なし → 採用
-      行C: GARN ASSY*NH900L* 8420132R003ZA  1,702  ← 赤線あり → 除外
-      行D: モジュールASSY,ドライバ           44,000 ← 赤線なし → 採用
-      行E: LNG ASSY*NH900L*  8311132R003ZA  1,342  ← 赤線あり → 除外
-    → 採用するのは行B(1,342)と行D(44,000)のみ。行A・C・Eは全て除外。
-    - 取消線の色（赤・黒）にかかわらず、線が引かれている行は必ず除外すること
-23. 【重要: 脱着行の部品価格ゼロ強制】
-    ★ 作業内容（method）が「脱着」「取外」「取付」「脱外」等の脱着系の場合、
-      同じ行の部品列に金額が見えていても parts_amount = 0 とすること ★
-    - 「脱着」行には部品代が発生しない。列のアライメントずれで隣接行の金額が
-      視覚的に重なって見えることがあるが、その値は別の行（直後の取替行）のものである。
-    - 部品代を計上できる（parts_amount > 0 が正当）な作業区分は「取替」「交換」のみ。
-    - 「脱着組替」「取外組付」は部品代なしで工賃のみ（wage > 0, parts_amount = 0）。
-    例:
-      「左RrバンパアツパカバーR 脱着 [3,080に見える欄] **」
-       → method=脱着, parts_amount=0（3,080は直後の取替行の値）, wage=適切な値
-      「右RrバンパアツパカバーR 取替 3,080 **」
-       → method=取替, parts_amount=3080, wage=適切な値
-
-【STEP 2: DBマッチング用データ正規化】
-20. 【部品番号の正規化】part_no フィールドの値:
-    - 全角英数字 → 半角英数字に変換（例: 「７４０７５−０２０３０」→「74075-02030」）
-    - 前後の不要な空白を削除
-    - ハイフン（-）や全角文字が混在する場合も半角英数字に統一
-21. 【金額・数値の正規化】parts_amount・wage:
-    - カンマ（,）「¥」「円」は除去し、純粋な整数（Integer型）にする
-    - 例: 「¥19,550」→ 19550、「1.00」→ 1
-22. 【表記ゆれの正規化】部品名の全角・半角混在を内部的に認識:
-    - 半角カタカナ（ｱｲｳ）と全角カタカナ（アイウ）を同一視してマッチング精度を上げる
-    - ただし、part_noフィールドへの転記は必ず半角英数字で行う
-
-【STEP 3: 総額完全合致バリデーション】
-23. 【必須バリデーション】以下の計算を必ず内部実行し、totals_verificationに記録すること:
-    - calculated_parts_total = items全行のparts_amountの合計
-    - calculated_labor_total = items全行のwageの合計
-    - parts_diff = calculated_parts_total - document_parts_total（0なら一致）
-    - labor_diff = calculated_labor_total - document_labor_total（0なら一致）
-24. 【不一致時の対応】差額が1円でもある場合:
-    - is_match = false に設定する
-    - validation_error に差額と推測される原因（行の見落とし・金額の誤読等）を記載する
-    - 見積書を再精読して行の見落としがないか確認する
-25. 【合計一致が最優先】最終的にitemsの合計が見積書記載値と一致するよう、全力で正確な抽出を行うこと。
-"""
-    if page_instruction:
-        prompt = page_instruction + prompt
     from google.genai import types
     client = _get_genai_client(api_key)
     file_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
@@ -3090,6 +2645,7 @@ STEP-5: その行の両方の列が空 → その行はitemsに含めない
                     "temperature": 0.0,
                     "max_output_tokens": 65536,
                     "response_mime_type": "application/json",
+                    "response_schema": _schema_single,
                 },
             )
             if response.text and response.text.strip():
@@ -3406,11 +2962,12 @@ def validate_row_consistency(items):
 
 def build_estimate_summary(items, short_parts_wage, pdf_parts_total,
                            pdf_wage_total, pdf_grand_total, discount_amount=0,
-                           gemini_amount_basis=''):
+                           user_tax_basis='tax_exclusive'):
     """
-    税込/税抜を自動判定してNEO書込み用正規化サマリーを返す。
+    税区分はUIユーザー選択値のみを使用してNEO書込み用正規化サマリーを返す。
+    （AI自動判定は廃止。user_tax_basis='tax_inclusive' または 'tax_exclusive'）
     Returns: {
-      'basis': 'tax_inclusive' / 'tax_exclusive' / 'unknown',
+      'basis': 'tax_inclusive' / 'tax_exclusive',
       'norm_parts': 税抜部品合計,
       'norm_wage':  税抜工賃合計,
       'norm_sp':    税抜ショートパーツ,
@@ -3425,53 +2982,8 @@ def build_estimate_summary(items, short_parts_wage, pdf_parts_total,
     disc  = safe_int(discount_amount)
     grand = safe_int(pdf_grand_total)
 
-    if grand <= 0:
-        return {
-            'basis': 'tax_exclusive',
-            'norm_parts': calc_parts, 'norm_wage': calc_wage,
-            'norm_sp': sp, 'norm_disc': disc,
-            'grand': 0, 'reverse_match': False,
-        }
-
-    TOLERANCE = 50  # 円
-    items_sum = calc_parts + calc_wage + sp - disc
-    # 税込判定: (items_sum) ≈ grand (既に税込)
-    tax_incl = abs(items_sum - grand) <= TOLERANCE
-    # 税抜判定: round((sum) * 1.1) ≈ grand
-    tax_excl = abs(round(items_sum * (1 + TAX_RATE)) - grand) <= TOLERANCE
-
-    if tax_incl and not tax_excl:
-        basis = 'tax_inclusive'
-    elif tax_excl:
-        basis = 'tax_exclusive'
-    else:
-        # どちらにも合わない場合: PDFの列合計と grand を比較
-        # ① sp が pdf_parts_total に既に含まれている場合（多くのフォーマット）
-        #    pdf_parts_total + pdf_wage_total ≈ grand → tax_inclusive
-        # ② sp が列合計に含まれていない場合（コグニセブン等）
-        #    pdf_parts_total + pdf_wage_total + sp ≈ grand → tax_inclusive
-        # ※ 旧実装では sp を常に加算していたため、フォーマット①で二重計上となりバグ発生
-        pdf_parts = safe_int(pdf_parts_total)
-        pdf_wage  = safe_int(pdf_wage_total)
-        # ①: sp込みの列合計（フォーマットF等、spが部品列に含まれる場合）
-        pdf_sum_sp_in  = pdf_parts + pdf_wage - disc
-        # ②: sp別立ての列合計（フォーマットA等、spが費用セクションに別途記載の場合）
-        pdf_sum_sp_out = pdf_parts + pdf_wage + sp - disc
-        if abs(pdf_sum_sp_in - grand) <= TOLERANCE or abs(pdf_sum_sp_out - grand) <= TOLERANCE:
-            basis = 'tax_inclusive'
-        else:
-            basis = 'unknown'
-
-    # Geminiの明示的な判定で unknown を上書き
-    # 数値判定が不確定な場合に限り、AIの判断を補助シグナルとして採用
-    if basis == 'unknown' and gemini_amount_basis in ('tax_inclusive', 'tax_exclusive'):
-        basis = gemini_amount_basis
-    # 数値判定とGemini判定が一致する場合はそのまま採用（補強）
-    # 数値判定とGemini判定が矛盾する場合はGeminiを優先（数値だけでは曖昧なケースが多い）
-    elif basis != 'unknown' and gemini_amount_basis in ('tax_inclusive', 'tax_exclusive') and basis != gemini_amount_basis:
-        # 数値判定が曖昧（tax_inclとtax_exclの両方が合致する場合等）
-        if tax_incl and tax_excl:
-            basis = gemini_amount_basis  # 両方合致 → Geminiの文脈判定を優先
+    # 税区分はUIユーザー選択値のみを使用（AI判定廃止）
+    basis = user_tax_basis if user_tax_basis in ('tax_inclusive', 'tax_exclusive') else 'tax_exclusive'
 
     if basis == 'tax_inclusive':
         norm_parts = round(calc_parts / (1 + TAX_RATE))
@@ -3484,16 +2996,17 @@ def build_estimate_summary(items, short_parts_wage, pdf_parts_total,
         norm_sp    = sp
         norm_disc  = disc
 
+    TOLERANCE = 50  # 円
     reverse_grand = round((norm_parts + norm_wage + norm_sp - norm_disc) * (1 + TAX_RATE))
-    reverse_match = abs(reverse_grand - grand) <= TOLERANCE
+    reverse_match = abs(reverse_grand - grand) <= TOLERANCE if grand > 0 else False
 
     return {
-        'basis':       basis,
-        'norm_parts':  norm_parts,
-        'norm_wage':   norm_wage,
-        'norm_sp':     norm_sp,
-        'norm_disc':   norm_disc,
-        'grand':       grand,
+        'basis':         basis,
+        'norm_parts':    norm_parts,
+        'norm_wage':     norm_wage,
+        'norm_sp':       norm_sp,
+        'norm_disc':     norm_disc,
+        'grand':         grand,
         'reverse_match': reverse_match,
     }
 
@@ -3810,7 +3323,6 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
             results = list(executor.map(_analyze_page, page_data))
         # ページ順に結合
         results.sort(key=lambda x: x[0])
-        page_amount_bases = []  # 各ページのGemini税区分判定を収集
         page_boundary_indices = []  # ページ境界インデックスを追跡
         _prev_page_sp = None  # ページ境界でのshort_parts_wage二重計上防止用
         for idx, res in results:
@@ -3827,36 +3339,20 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
                 total_sp += page_sp
             _prev_page_sp = page_sp  # ゼロでも更新（非隣接の同値を重複とみなさないため）
             confidences.append(safe_float(res.get('confidence', 0.0)))
-            ab = res.get('amount_basis', '')
-            if ab in ('tax_inclusive', 'tax_exclusive'):
-                page_amount_bases.append(ab)
         # ページ境界のみで重複行を除去（同一ページ内の重複はPDF原本通り全て保持）
         all_items = deduplicate_page_boundary_items(all_items, page_boundary_indices)
-        # 各ページのGemini税判定を集約（tax_inclusiveが1つでもあれば採用）
-        gemini_amount_basis = ''
-        if page_amount_bases:
-            if 'tax_inclusive' in page_amount_bases:
-                gemini_amount_basis = 'tax_inclusive'
-            else:
-                from collections import Counter
-                gemini_amount_basis = Counter(page_amount_bases).most_common(1)[0][0]
-        # 1パス目の税判定も収集
-        if not gemini_amount_basis:
-            gemini_amount_basis = totals_data.get('amount_basis', '')
         result = {
-            'items':                all_items,
-            'short_parts_wage':     total_sp,
-            'pdf_parts_total':      target_parts,
-            'pdf_wage_total':       target_wage,
-            'pdf_grand_total':      pdf_grand,
-            'discount_amount':      discount,
-            'confidence':           (sum(confidences) / len(confidences)) if confidences else 0.5,
-            '_fax_filtered':        filtered_count,
-            '_page_count':          len(pages),
-            '_vehicle_info':        totals_data.get('vehicle_info', {}),
-            '_repair_shop_name':    totals_data.get('repair_shop_name', ''),
-            '_tax_reason':          totals_data.get('tax_reason', ''),
-            '_gemini_amount_basis': gemini_amount_basis,
+            'items':             all_items,
+            'short_parts_wage':  total_sp,
+            'pdf_parts_total':   target_parts,
+            'pdf_wage_total':    target_wage,
+            'pdf_grand_total':   pdf_grand,
+            'discount_amount':   discount,
+            'confidence':        (sum(confidences) / len(confidences)) if confidences else 0.5,
+            '_fax_filtered':     filtered_count,
+            '_page_count':       len(pages),
+            '_vehicle_info':     totals_data.get('vehicle_info', {}),
+            '_repair_shop_name': totals_data.get('repair_shop_name', ''),
         }
     else:
         # 単一ページ: ラスタライズ済みがあればそちらを使用
@@ -3873,7 +3369,6 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
         result['_fax_filtered']   = filtered_count
         result['_vehicle_info']   = totals_data.get('vehicle_info', {})
         result['_repair_shop_name'] = totals_data.get('repair_shop_name', '')
-        result['_tax_reason']     = totals_data.get('tax_reason', '')
 
     # ⑥ 辞書ベースバリデーション
     result['items'] = validate_and_correct_items(result['items'])
@@ -3953,7 +3448,9 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
             result['_self_corrected'] = True
             result['_correction_rounds'] = _correction_rounds
 
-    # ⑧ 税込/税抜 自動判定
+    # ⑧ 税区分はUIユーザー選択値のみを使用（AI自動判定廃止）
+    # 注: analyze_estimate 呼び出し後にセッションstate(tax_override)で上書きされる（line 4580付近）
+    # ここでは仮に tax_exclusive を設定しておき、後段のUI処理で正式に上書きされる
     summary = build_estimate_summary(
         result['items'],
         result.get('short_parts_wage', 0),
@@ -3961,20 +3458,11 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
         result.get('pdf_wage_total', 0),
         result.get('pdf_grand_total', 0),
         result.get('discount_amount', 0),
-        gemini_amount_basis=result.get('_gemini_amount_basis', ''),
+        user_tax_basis='tax_exclusive',  # 後段UIで上書きされる仮値
     )
     result['_tax_basis']     = summary['basis']
     result['_reverse_match'] = summary['reverse_match']
-    # tax_reason: Geminiが返した判定根拠を保持（UI表示用）
-    if 'tax_reason' not in result or not result.get('tax_reason'):
-        result['tax_reason'] = result.get('_thought_process', '')
-
-    # ⑨ 税込明細の場合でもそのままの金額を維持する仕様に変更（TaxKindFlagで制御するため）
-    # (以前は自動的に税抜変換していたが削除)
-    if summary['basis'] == 'tax_inclusive':
-        result['_tax_converted'] = False
-        result['_is_tax_inclusive'] = True
-
+    # _is_tax_inclusive は後段のUIオーバーライドで設定されるため、ここでは設定しない
 
     # ⑩ 値引きを負の工賃行として items に追加
     disc_outtax = summary.get('norm_disc', 0)
@@ -4376,22 +3864,24 @@ def main():
                 st.caption("🔍 OCR対象: 部品名・部品番号・単価・工賃・塗装・その他費用 全明細")
             else:
                 st.info("💡 見積書なしの場合、車両情報のみのNEOを作成します")
-            # ── 税区分 手動指定（任意）──
-            st.markdown('<div style="margin-top:8px;font-size:12px;color:#555;font-weight:600">💴 見積書の税区分（自動判定が外れる場合に手動指定）</div>', unsafe_allow_html=True)
-            _tax_options = ['自動判定（推奨）', '税込み（内税）', '税抜き（外税）']
-            _saved_tax_override = st.session_state.get('tax_override', '自動判定（推奨）')
+            # ── 税区分 選択（必須）──
+            st.markdown('<div style="margin-top:8px;font-size:12px;color:#555;font-weight:600">💴 見積書の税区分を選択してください</div>', unsafe_allow_html=True)
+            _tax_options = ['税抜き（外税）', '税込み（内税）']
+            _saved_tax_override = st.session_state.get('tax_override', '税抜き（外税）')
+            # 旧セッション値（自動判定）が残っている場合は税抜きにリセット
+            if _saved_tax_override not in _tax_options:
+                _saved_tax_override = '税抜き（外税）'
             _tax_sel = st.radio(
                 "税区分",
                 options=_tax_options,
-                index=_tax_options.index(_saved_tax_override) if _saved_tax_override in _tax_options else 0,
+                index=_tax_options.index(_saved_tax_override),
                 horizontal=True,
                 key='tax_override_radio',
                 label_visibility='collapsed',
-                help="工場見積の価格が税込みか税抜きかを手動指定できます。不明な場合は「自動判定」のままにしてください。"
+                help="見積書の明細金額が税込みか税抜きかを選択してください。不明な場合は「税抜き（外税）」を選択してください。"
             )
             st.session_state['tax_override'] = _tax_sel
-            if _tax_sel != '自動判定（推奨）':
-                st.caption(f"⚙️ 手動設定: {_tax_sel} — AI自動判定より優先されます")
+            st.caption(f"⚙️ 選択中: {_tax_sel}")
 
         # ── テンプレートNEOアップロード（任意） ──
         with st.expander("📁 テンプレートNEOファイル（任意）", expanded=False):
@@ -4576,16 +4066,15 @@ def main():
                     estimate_data['_veh_match_result'] = {'match_layer': 3, 'is_supported': False, 'reason': 'ベタ打ちモード（DB照合スキップ）'}
                     progress.progress(92, text="✏️ ベタ打ちモード — PDF見積をそのまま転記...")
                 
-                # --- 税区分 手動オーバーライドの適用 ---
-                _tax_override = st.session_state.get('tax_override', '自動判定（推奨）')
+                # --- 税区分 ユーザー選択値を常に適用（AI自動判定廃止）---
+                _tax_override = st.session_state.get('tax_override', '税抜き（外税）')
                 if _tax_override == '税込み（内税）':
                     estimate_data['_is_tax_inclusive'] = True
                     estimate_data['_tax_basis']        = 'tax_inclusive'
-                    estimate_data['_tax_manual']       = True
-                elif _tax_override == '税抜き（外税）':
+                else:
+                    # デフォルト: 税抜き（外税）
                     estimate_data['_is_tax_inclusive'] = False
                     estimate_data['_tax_basis']        = 'tax_exclusive'
-                    estimate_data['_tax_manual']       = True
                     estimate_data.pop('_tax_converted', None)
 
                 # --- セッションステートへの保存 ---
@@ -4624,10 +4113,6 @@ def main():
                 shop_name = estimate_data.get('_repair_shop_name', '')
                 if shop_name:
                     info_msgs.append(f"🏭 修理工場: {shop_name}")
-                # 税判定理由の表示
-                tax_reason = estimate_data.get('_tax_reason', '')
-                if tax_reason:
-                    info_msgs.append(f"💱 税区分判定根拠: {tax_reason}")
                 if estimate_data.get('_fax_filtered', 0) > 0:
                     info_msgs.append("🗑️ FAX送付状を自動除外しました")
                 if estimate_data.get('_self_corrected'):
@@ -4635,17 +4120,11 @@ def main():
                 page_count = estimate_data.get('_page_count', 1)
                 if page_count > 1:
                     info_msgs.append(f"📄 {page_count}ページ分割処理（重複除去済み）")
-                tax_basis = estimate_data.get('_tax_basis', 'unknown')
-                if _current_mode == 'beta':
-                    if tax_basis == 'tax_inclusive':
-                        info_msgs.append("💱 税込明細を検出 → NEOファイルも税込モードで生成します")
-                    elif tax_basis == 'tax_exclusive':
-                        info_msgs.append("✅ 税抜明細を検出 → NEOファイルも税抜モードで生成します")
+                tax_basis = estimate_data.get('_tax_basis', 'tax_exclusive')
+                if tax_basis == 'tax_inclusive':
+                    info_msgs.append("💱 税込モード（ユーザー選択）— NEOファイルも税込で生成します")
                 else:
-                    if tax_basis == 'tax_inclusive':
-                        info_msgs.append("💱 税込明細を検出 → 税抜に自動変換しました")
-                    elif tax_basis == 'tax_exclusive':
-                        info_msgs.append("✅ 税抜明細を検出")
+                    info_msgs.append("✅ 税抜モード（ユーザー選択）")
                 # 明細行整合性チェックの警告表示
                 row_warnings = estimate_data.get('_row_warnings', [])
                 if row_warnings:
@@ -4755,34 +4234,25 @@ def main():
             e_conf = safe_float(estimate_data.get('confidence', 1.0), 1.0)
             if e_conf < CONFIDENCE_THRESHOLD:
                 st.markdown(f'<div class="alert alert-warn">⚠️ 見積書の読み取り信頼度: <b>{e_conf:.0%}</b> — 内容をよくご確認ください。</div>', unsafe_allow_html=True)
-            tax_basis = estimate_data.get('_tax_basis', 'unknown')
+            tax_basis = estimate_data.get('_tax_basis', 'tax_exclusive')
             rev_match = estimate_data.get('_reverse_match', False)
-            tax_reason = estimate_data.get('_tax_reason', '') or estimate_data.get('tax_reason', '')
             shop_name  = estimate_data.get('_repair_shop_name', '')
-            # コグニセブン設定用 税モード（大きく明示）
+            # コグニセブン設定用 税モード（ユーザー選択値）
             if tax_basis == 'tax_inclusive':
                 cogni_tax_mode = '税込'
                 cogni_tax_color = '#1e40af'
                 cogni_tax_bg = '#dbeafe'
                 cogni_tax_border = '#3b82f6'
                 cogni_tax_icon = '🔵'
-                basis_label = '税込明細（税抜に自動変換済み）'
-            elif tax_basis == 'tax_exclusive':
+                basis_label = '税込明細（ユーザー設定）'
+            else:
                 cogni_tax_mode = '税抜'
                 cogni_tax_color = '#14532d'
                 cogni_tax_bg = '#dcfce7'
                 cogni_tax_border = '#22c55e'
                 cogni_tax_icon = '🟢'
-                basis_label = '税抜明細'
-            else:
-                cogni_tax_mode = '判定不能'
-                cogni_tax_color = '#92400e'
-                cogni_tax_bg = '#fef3c7'
-                cogni_tax_border = '#f59e0b'
-                cogni_tax_icon = '🟡'
-                basis_label = '判定不能（手動確認推奨）'
+                basis_label = '税抜明細（ユーザー設定）'
             rev_icon = '✅ 逆算一致' if rev_match else '⚠️ 逆算不一致（金額を確認してください）'
-            reason_html = f'<div style="font-size:12px;color:{cogni_tax_color};margin-top:4px">判定根拠: {tax_reason}</div>' if tax_reason else ''
             shop_html   = f'<div style="font-size:13px;color:#374151;margin-bottom:10px">🏭 修理工場: <b>{shop_name}</b></div>' if shop_name else ''
             st.markdown(f'''
 <div style="border:2px solid {cogni_tax_border};border-radius:8px;background:{cogni_tax_bg};padding:14px 18px;margin-bottom:12px">
@@ -4790,7 +4260,6 @@ def main():
   <div style="font-size:13px;color:{cogni_tax_color};font-weight:600;margin-bottom:6px">■ コグニセブン設定用 税区分</div>
   <div style="font-size:22px;font-weight:700;color:{cogni_tax_color}">{cogni_tax_icon} コグニセブンを <u>{cogni_tax_mode}モード</u> に設定してください</div>
   <div style="font-size:13px;color:{cogni_tax_color};margin-top:4px">（{basis_label} ／ {rev_icon}）</div>
-  {reason_html}
 </div>
 ''', unsafe_allow_html=True)
 
