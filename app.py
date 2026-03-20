@@ -73,15 +73,19 @@ except Exception:
 GEMINI_MODEL      = "gemini-2.5-flash"          # フォールバック（動的に上書きされる）
 CONFIDENCE_THRESHOLD = 0.6
 
-# 優先順位付きのモデル候補リスト（上位が最新・高精度）
+# 優先順位付きのモデル候補リスト（上位が最優先）
+# gemini-2.5-flashを最優先（安定・クォータ余裕あり）
+# gemini-3.1-pro-previewはクォータ250回/日の制限があるため後方に配置
 _PREFERRED_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
     "gemini-3.1-pro-preview",
     "gemini-3-pro-preview",
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
 ]
 _FALLBACK_MODEL = "gemini-2.5-flash"
 
+# クォータ超過で利用不可になったモデルを記録（セッション内キャッシュ）
+_quota_exhausted_models: set = set()
 
 _model_availability_cache: dict = {}  # key: api_key_hash, value: list of model IDs
 
@@ -108,9 +112,17 @@ def get_available_gemini_models(api_key: str) -> list:
                 available.append(model_id)
             except Exception as e:
                 err = str(e)
-                # 404/利用不可 → スキップ、それ以外のエラー（レート制限等）→ 利用可能と仮定
-                if '404' not in err and 'NOT_FOUND' not in err and 'no longer available' not in err:
+                # 404/利用不可/クォータ超過 → スキップ
+                # 429 RESOURCE_EXHAUSTED: クォータ超過のモデルは利用不可扱い
+                is_quota = ('429' in err or 'RESOURCE_EXHAUSTED' in err or
+                            'quota' in err.lower() or 'rate' in err.lower())
+                is_notfound = ('404' in err or 'NOT_FOUND' in err or
+                               'no longer available' in err)
+                if not is_notfound and not is_quota:
                     available.append(model_id)
+                elif is_quota:
+                    # クォータ超過モデルをグローバルキャッシュに記録
+                    _quota_exhausted_models.add(model_id)
         result = available if available else [_FALLBACK_MODEL]
         _model_availability_cache[cache_key] = result
         return result
@@ -119,8 +131,13 @@ def get_available_gemini_models(api_key: str) -> list:
 
 
 def get_default_gemini_model(api_key: str) -> str:
-    """利用可能なモデルの中から最優先モデルを返す。"""
+    """利用可能なモデルの中から最優先モデルを返す。クォータ超過モデルは除外。"""
     models = get_available_gemini_models(api_key)
+    # クォータ超過モデルを除外して最優先を返す
+    for m in models:
+        if m not in _quota_exhausted_models:
+            return m
+    # 全モデルがクォータ超過の場合はフォールバック
     return models[0] if models else _FALLBACK_MODEL
 SELF_CORRECTION_THRESHOLD = 0   # 差額が1円でもあれば自己修復を試行（100%一致を目指す）
 
@@ -2842,6 +2859,17 @@ NG例（絶対にしてはいけない）:
                     f"モデル '{model_name}' は利用できません。"
                     "サイドバーで「gemini-2.5-flash」または「gemini-2.5-pro」を選択してください。"
                 ) from e
+            # クォータ超過エラー: モデルを記録してリトライせずに再送出（呼び出し元でフォールバック）
+            if '429' in err_msg or 'RESOURCE_EXHAUSTED' in err_msg:
+                _quota_exhausted_models.add(model_name)
+                # キャッシュを無効化して次回は別モデルが選ばれるようにする
+                cache_key = api_key[-8:] if api_key else ''
+                if cache_key in _model_availability_cache:
+                    del _model_availability_cache[cache_key]
+                raise ValueError(
+                    f"モデル '{model_name}' のクォータが上限に達しました。"
+                    f"自動的に代替モデルに切り替えます。"
+                ) from e
             if attempt < 2:
                 import time; time.sleep(2)
                 continue
@@ -3216,6 +3244,16 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
       use_rasterize: PDF→JPEG変換してから送信（行ズレ防止）
     """
     used_model = model_name or GEMINI_MODEL
+
+    # クォータ超過モデルを除外して使用モデルを決定
+    if used_model in _quota_exhausted_models:
+        # 代替モデルを選択
+        for alt_model in _PREFERRED_MODELS:
+            if alt_model not in _quota_exhausted_models:
+                import sys
+                print(f"[INFO] モデル '{used_model}' はクォータ超過のため '{alt_model}' に切り替えます", file=sys.stderr)
+                used_model = alt_model
+                break
 
     # ① FAXページフィルタリング（オプション）
     filtered_count = 0
@@ -4136,8 +4174,35 @@ def main():
             st.rerun()
         except Exception as e:
             progress.empty()
-            st.error(f"⚠️ AI解析中にエラーが発生しました:\n\n{str(e)}")
-            st.code(traceback.format_exc())
+            err_str = str(e)
+            # クォータ超過エラーの場合、分かりやすいメッセージとリトライを促す
+            if '429' in err_str or 'RESOURCE_EXHAUSTED' in err_str or 'クォータが上限' in err_str:
+                _cur_model = st.session_state.get('selected_model', used_ai_model or 'gemini-3.1-pro-preview')
+                _quota_exhausted_models.add(_cur_model)
+                # キャッシュクリア
+                _api_key_for_err = st.session_state.get('api_key_input', '')
+                if _api_key_for_err:
+                    _ck = _api_key_for_err[-8:]
+                    if _ck in _model_availability_cache:
+                        del _model_availability_cache[_ck]
+                # 代替モデルを探す
+                _alt = next((m for m in _PREFERRED_MODELS if m not in _quota_exhausted_models), None)
+                if _alt:
+                    st.warning(
+                        f"⚠️ モデル「{_cur_model}」の1日クォータ（250回）が上限に達しました。\n\n"
+                        f"**🔄 代替モデル「{_alt}」に自動切り替えます。「② AI解析」ボタンをもう一度押してください。**",
+                        icon="⚠️"
+                    )
+                    # 自動的に代替モデルをセッションに設定
+                    st.session_state['selected_model'] = _alt
+                else:
+                    st.error(
+                        "⚠️ 全モデルのクォータが上限に達しました。\n\n"
+                        "翌日（リセット後）か、Google AI StudioでAPIキーの課金を有効化してください。"
+                    )
+            else:
+                st.error(f"⚠️ AI解析中にエラーが発生しました:\n\n{err_str}")
+                st.code(traceback.format_exc())
             if st.button("← ステップ①に戻る"):
                 st.session_state['step'] = 1
                 st.rerun()
