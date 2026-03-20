@@ -479,8 +479,32 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
     conn = sqlite3.connect(tf.name)
     cur  = conn.cursor()
     cur.execute('DELETE FROM ERParts')
-    # 全Expense行をクリア（LineNo=1,2,3,4,5）
-    for lno in (1, 2, 3, 4, 5):
+    # ── 塗装セクション・その他テーブルをリセット ──
+    # PaintingPanel: 複数行テーブル（パネル塗装行）→ 全削除
+    cur.execute('DELETE FROM PaintingPanel')
+    # PaintingLinkParts: 塗装リンクパーツ → 全削除
+    cur.execute('DELETE FROM PaintingLinkParts')
+    # PaintingOther: 1行固定テーブル。行名・LineNoは保持し工賃・時間をリセット
+    cur.execute("""UPDATE PaintingOther SET
+        Time=-1, WageOutTax=-1, WageInTax=-1, WageTax=-1, WageByManual=''""")
+    # PaintingTotal: 合計テーブルをゼロリセット
+    cur.execute("""UPDATE PaintingTotal SET
+        TimeTotalPanel=0, TimeTotalBumper=0, TimeTotalFrame=0,
+        TimeTotalEtcetera=0, TimeTotalOther=0, TimeTotal=0,
+        WageTotalPanelOutTax=0, WageTotalPanelInTax=0, WageTotalPanelTax=0,
+        WageTotalBumperOutTax=0, WageTotalBumperInTax=0, WageTotalBumperTax=0,
+        WageTotalFrameOutTax=0, WageTotalFrameInTax=0, WageTotalFrameTax=0,
+        WageTotalEtceteraOutTax=0, WageTotalEtceteraInTax=0, WageTotalEtceteraTax=0,
+        WageTotalOtherOutTax=0, WageTotalOtherInTax=0, WageTotalOtherTax=0,
+        WageTotalOutTax=0, WageTotalInTax=0, WageTotalTax=0, WageTotalByManual='',
+        MaterialTotalPanelOutTax=0, MaterialTotalPanelInTax=0, MaterialTotalPanelTax=0,
+        MaterialTotalBumperOutTax=0, MaterialTotalBumperInTax=0, MaterialTotalBumperTax=0,
+        MaterialTotalFrameOutTax=0, MaterialTotalFrameInTax=0, MaterialTotalFrameTax=0,
+        MaterialTotalEtceteraOutTax=0, MaterialTotalEtceteraInTax=0, MaterialTotalEtceteraTax=0,
+        MaterialTotalOutTax=0, MaterialTotalInTax=0, MaterialTotalTax=0, MaterialTotalbyManual='',
+        TotalOutTax=0, TotalInTax=0, TotalTax=0""")
+    # 全Expense行をクリア（LineNo=1〜8: 文字書き/内張り/配線/ショートパーツ/レッカー代１/レッカー代２/写真代他/その他控除）
+    for lno in (1, 2, 3, 4, 5, 6, 7, 8):
         cur.execute("""UPDATE Expense SET
             WageEnabled=0, WageOutTax=0, WageInTax=0, WageTax=0
             WHERE LineNo=?""", (lno,))
@@ -2956,6 +2980,33 @@ def deduplicate_page_items(all_items):
     return deduped
 
 
+def deduplicate_page_boundary_items(all_items, boundary_indices):
+    """
+    ページ境界付近でのみ重複行を除去する。
+    同一ページ内の重複行はPDF原本通り全て保持する（ユーザー指定）。
+    boundary_indices: 各ページの先頭インデックスのリスト
+    """
+    if len(all_items) <= 1:
+        return all_items
+    boundary_set = set(boundary_indices)
+    result = []
+    skip_next = False
+    for i, item in enumerate(all_items):
+        if skip_next:
+            skip_next = False
+            continue
+        # このインデックスがページ境界（ページ先頭）かつ前の行と内容が同じなら除去
+        if i in boundary_set and result:
+            prev = result[-1]
+            same_name  = str(item.get('name', '')).strip() == str(prev.get('name', '')).strip()
+            same_parts = safe_int(item.get('parts_amount', 0)) == safe_int(prev.get('parts_amount', 0))
+            same_wage  = safe_int(item.get('wage', 0))         == safe_int(prev.get('wage', 0))
+            if same_name and same_parts and same_wage and str(item.get('name', '')).strip():
+                continue  # ページ境界重複 → スキップ
+        result.append(item)
+    return result
+
+
 def validate_row_consistency(items):
     """
     明細行ごとの整合性チェック。
@@ -3386,15 +3437,19 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
         # ページ順に結合
         results.sort(key=lambda x: x[0])
         page_amount_bases = []  # 各ページのGemini税区分判定を収集
+        page_boundary_indices = []  # ページ境界インデックスを追跡
         for idx, res in results:
-            all_items.extend(res.get('items', []))
+            page_items = res.get('items', [])
+            if all_items:
+                page_boundary_indices.append(len(all_items))  # このページの先頭インデックス
+            all_items.extend(page_items)
             total_sp += safe_int(res.get('short_parts_wage', 0))
             confidences.append(safe_float(res.get('confidence', 0.0)))
             ab = res.get('amount_basis', '')
             if ab in ('tax_inclusive', 'tax_exclusive'):
                 page_amount_bases.append(ab)
-        # ページ境界の重複行を除去
-        all_items = deduplicate_page_items(all_items)
+        # ページ境界のみで重複行を除去（同一ページ内の重複はPDF原本通り全て保持）
+        all_items = deduplicate_page_boundary_items(all_items, page_boundary_indices)
         # 各ページのGemini税判定を集約（tax_inclusiveが1つでもあれば採用）
         gemini_amount_basis = ''
         if page_amount_bases:
