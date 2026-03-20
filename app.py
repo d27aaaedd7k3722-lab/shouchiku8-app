@@ -1167,6 +1167,66 @@ def try_split_pdf_pages(pdf_bytes):
         return None
 
 
+def detect_and_reorder_pages(pages):
+    """
+    PDFの各ページから「X/Y頁」「P.001/002」等のページ番号表記を検出し、
+    正しい順序に並び替えて返す。
+    【対応パターン】
+      - FAXヘッダ形式: "P.001/002" → 1ページ目
+      - 日本語形式: "1/2頁" "1／2頁" "1/2 頁"
+      - 逆形式: "頁1/2"
+    検出できない・全ページ揃わない場合は元の順序をそのまま返す。
+    """
+    import re
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return pages
+
+    page_numbers = []
+    for idx, page_bytes in enumerate(pages):
+        try:
+            reader = PdfReader(io.BytesIO(page_bytes))
+            text = reader.pages[0].extract_text() or ''
+        except Exception:
+            text = ''
+
+        cur_page = None
+        # パターン1: FAXヘッダ "P.001/002" 形式（大文字・小文字両対応）
+        m = re.search(r'[Pp]\.(\d+)\s*/\s*(\d+)', text)
+        if m:
+            cur_page = int(m.group(1))
+            page_numbers.append((idx, cur_page, int(m.group(2))))
+            continue
+        # パターン2: "1/2頁" "1／2頁" "1/2 頁" 形式
+        m = re.search(r'(\d+)\s*[/／]\s*(\d+)\s*[頁ページ]', text)
+        if m:
+            cur_page = int(m.group(1))
+            page_numbers.append((idx, cur_page, int(m.group(2))))
+            continue
+        # パターン3: "頁1/2" 逆形式
+        m = re.search(r'[頁ページ]\s*(\d+)\s*[/／]\s*(\d+)', text)
+        if m:
+            cur_page = int(m.group(1))
+            page_numbers.append((idx, cur_page, int(m.group(2))))
+            continue
+        # 検出できないページ
+        page_numbers.append((idx, None, None))
+
+    # 全ページでページ番号が検出できた場合のみ並び替え
+    if page_numbers and all(pn[1] is not None for pn in page_numbers):
+        original_order = [pn[0] for pn in page_numbers]
+        page_numbers.sort(key=lambda x: x[1])
+        new_order = [pn[0] for pn in page_numbers]
+        if new_order != original_order:
+            import sys
+            print(f"[INFO] ページ順序を自動修正: {[p[1] for p in page_numbers]} "
+                  f"(物理順 {original_order} → 文書順 {new_order})", file=sys.stderr)
+        return [pages[pn[0]] for pn in page_numbers]
+
+    return pages
+
+
 def _get_genai_client(api_key):
     """google.genai クライアントを取得（キャッシュ付き）"""
     from google import genai
@@ -2632,6 +2692,13 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
     これらはスズキ・ダイハツ系フォーマットでは「工数×単価」方式で記載される。
 21. 【スズキ系塗装工賃】塗装セクションで「工数 | 工賃単価 | 係数 | 塗装工賃」の形式がある場合、
     最右列の「塗装工賃」値（例: 7,425）をwageとして使う。中間の係数(0.45等)は無視してよい。
+22. 【取消線・抹消行の厳格除外】
+    - 赤線・黒線・斜線等の取消線（打ち消し線）が引かれた行は、訂正・取り消された項目です。
+    - 取消線のある行は絶対にitemsに含めないこと。金額もparts_amount/wageに加算しないこと。
+    - 同一の部品番号・品名が複数行に記載されており、一方に取消線がある場合は、
+      取消線のない行のみを採用し、取消線のある行は完全に無視すること。
+    - 例: 「GARN ASSY*NH900L* 8412132R003ZA 3,850」が2箇所あり、一方に赤線がある場合
+      → 赤線のない1行のみをitemsに含める。赤線のある行は除外。
 
 【STEP 2: DBマッチング用データ正規化】
 20. 【部品番号の正規化】part_no フィールドの値:
@@ -3023,6 +3090,9 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
 
     # ③ ページ分割
     pages = try_split_pdf_pages(file_bytes) if mime_type == 'application/pdf' else None
+    # ③-a ページ順序自動補正（FAXヘッダ等で逆順になっている場合を修正）
+    if pages and len(pages) > 1:
+        pages = detect_and_reorder_pages(pages)
 
     # ③-b ラスタライズ: PDF→JPEG変換（行ズレ防止）
     # 1パス目用: 合計欄が最終ページにある場合を考慮し、最終ページをラスタライズ
