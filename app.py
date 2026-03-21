@@ -3055,12 +3055,13 @@ def parse_detail_json_to_items(json_text: str, page_num: int = 1) -> list:
         return []
     items = []
     for row_idx, detail in enumerate(details, 1):
-        name     = str(detail.get('work_or_part_name', '') or '').strip()
-        category = str(detail.get('category', '') or '').strip()
-        wage_raw = detail.get('labor_fee', 0)
-        qty_raw  = detail.get('quantity', 1)
-        parts_raw= detail.get('part_price', 0)
-        part_no  = str(detail.get('part_number', '') or '').strip()
+        name        = str(detail.get('work_or_part_name', '') or '').strip()
+        category    = str(detail.get('category', '') or '').strip()
+        index_value = str(detail.get('index_value', '') or '').strip()
+        wage_raw    = detail.get('labor_fee', 0)
+        qty_raw     = detail.get('quantity', 1)
+        parts_raw   = detail.get('part_price', 0)
+        part_no     = str(detail.get('part_number', '') or '').strip()
         def _to_int(v):
             try:
                 return int(float(str(v).replace(',', '').replace('，', '').strip()))
@@ -3079,6 +3080,7 @@ def parse_detail_json_to_items(json_text: str, page_num: int = 1) -> list:
             'name':         name if name else '不明',
             'description':  '',
             'work_code':    category,
+            'index_value':  index_value,
             'part_no':      part_no,
             'quantity':     qty,
             'parts_amount': parts,
@@ -3120,13 +3122,13 @@ def parse_markdown_to_items(md_text: str, page_num: int = 1) -> list:
         if all(re.match(r'^[-:= ]*$', c) for c in cells):
             continue
 
-        name    = cells[0] if cells[0] else '不明'
-        method  = cells[1] if len(cells) > 1 else ''   # 区分
-        # cells[2] = 指数（内部では不使用）
-        wage    = to_int(cells[3]) if len(cells) > 3 else 0  # 技術料
-        qty     = to_int(cells[4]) if len(cells) > 4 else 1  # 数量
-        parts   = to_int(cells[5]) if len(cells) > 5 else 0  # 部品金額
-        part_no = cells[6].strip() if len(cells) > 6 else ''  # 部品品番
+        name        = cells[0] if cells[0] else '不明'
+        method      = cells[1] if len(cells) > 1 else ''   # 区分
+        index_value = cells[2].strip() if len(cells) > 2 else ''  # 指数（工数）
+        wage        = to_int(cells[3]) if len(cells) > 3 else 0  # 技術料
+        qty         = to_int(cells[4]) if len(cells) > 4 else 1  # 数量
+        parts       = to_int(cells[5]) if len(cells) > 5 else 0  # 部品金額
+        part_no     = cells[6].strip() if len(cells) > 6 else ''  # 部品品番
 
         if wage == 0 and parts == 0:
             continue  # 両方0は除外
@@ -3138,6 +3140,7 @@ def parse_markdown_to_items(md_text: str, page_num: int = 1) -> list:
             'name':         name,
             'description':  '',
             'work_code':    method,
+            'index_value':  index_value,
             'part_no':      part_no,
             'quantity':     qty if qty > 0 else 1,
             'parts_amount': parts,
@@ -5313,35 +5316,63 @@ def main():
                 st.session_state['_original_items'] = [dict(it) for it in estimate_data.get('items', [])]
 
             _items_src = estimate_data['items']
-            # 表示用DataFrame（7列）: No / 部品コード / 品名 / 作業コード / 数量 / 部品金額 / 工賃
+            # ── 行操作ボタン（挿入・コピー・削除） ──────────────────────
+            _op_col1, _op_col2, _op_col3, _op_col4 = st.columns([1, 1, 1, 5])
+            with _op_col1:
+                if st.button("➕ 行挿入", key="row_insert_btn", help="最終行に空白行を追加"):
+                    _new_row = {
+                        'name': '', 'method': '', 'work_code': '', 'index_value': '',
+                        'quantity': 1, 'parts_amount': 0, 'wage': 0, 'part_no': '',
+                        '_master_name': '', '_master_price': 0, '_master_part_no': '',
+                        '_master_repair_code': '', '_master_branch_code': '',
+                        '_master_part_code_r': '', '_master_part_code_l': '',
+                        '_match_level': 0, '_original_name': '', '_original_parts_amount': 0,
+                    }
+                    estimate_data['items'].append(_new_row)
+                    st.session_state['estimate_data'] = estimate_data
+                    st.rerun()
+            with _op_col2:
+                _copy_no = st.number_input("コピーNo", min_value=1, max_value=max(len(_items_src), 1),
+                                           value=1, step=1, key="row_copy_no", label_visibility="collapsed")
+            with _op_col3:
+                if st.button("📋 コピー", key="row_copy_btn", help="指定No行を複製して最終行に追加"):
+                    _cidx = int(_copy_no) - 1
+                    if 0 <= _cidx < len(_items_src):
+                        import copy as _copy
+                        _copied = _copy.deepcopy(_items_src[_cidx])
+                        estimate_data['items'].append(_copied)
+                        st.session_state['estimate_data'] = estimate_data
+                        st.rerun()
+
+            # 表示用DataFrame（7列）: No / 部品コード / 品名 / 数量 / 部品金額 / 工数 / 工賃
             _edit_rows = []
             for _i, _item in enumerate(_items_src):
-                _wk_code   = str(_item.get('work_code', '') or _item.get('method', '') or '')
-                _part_code = str(_item.get('part_no', '') or _item.get('_master_part_no', '') or '')
+                _part_code   = str(_item.get('part_no', '') or _item.get('_master_part_no', '') or '')
+                _index_value = str(_item.get('index_value', '') or '')
                 _edit_rows.append({
-                    'No':       _i + 1,
+                    'No':     _i + 1,
                     '部品コード': _part_code,
-                    '品名':     str(_item.get('name', '')),
-                    '作業コード': _wk_code,
-                    '数量':     safe_int(_item.get('quantity', 1), 1),
+                    '品名':   str(_item.get('name', '')),
+                    '数量':   safe_int(_item.get('quantity', 1), 1),
                     '部品金額': safe_int(_item.get('parts_amount', 0)),
-                    '工賃':     safe_int(_item.get('wage', 0)),
+                    '工数':   _index_value,
+                    '工賃':   safe_int(_item.get('wage', 0)),
                 })
             _df_edit = pd.DataFrame(_edit_rows) if _edit_rows else pd.DataFrame(
-                columns=['No', '部品コード', '品名', '作業コード', '数量', '部品金額', '工賃'])
+                columns=['No', '部品コード', '品名', '数量', '部品金額', '工数', '工賃'])
             _edited_df = st.data_editor(
                 _df_edit,
                 use_container_width=True,
                 hide_index=True,
                 num_rows="dynamic",
                 column_config={
-                    'No':       st.column_config.NumberColumn('No', disabled=True, width='small'),
+                    'No':     st.column_config.NumberColumn('No', disabled=True, width='small'),
                     '部品コード': st.column_config.TextColumn('部品コード'),
-                    '品名':     st.column_config.TextColumn('品名', width='large'),
-                    '作業コード': st.column_config.TextColumn('作業コード'),
-                    '数量':     st.column_config.NumberColumn('数量', min_value=1, step=1),
+                    '品名':   st.column_config.TextColumn('品名', width='large'),
+                    '数量':   st.column_config.NumberColumn('数量', min_value=1, step=1, width='small'),
                     '部品金額': st.column_config.NumberColumn('部品金額', step=1, format="¥%d"),
-                    '工賃':     st.column_config.NumberColumn('工賃', step=1, format="¥%d"),
+                    '工数':   st.column_config.TextColumn('工数', width='small'),
+                    '工賃':   st.column_config.NumberColumn('工賃', step=1, format="¥%d"),
                 },
                 key='items_editor',
             )
@@ -5351,12 +5382,14 @@ def main():
             edited_items = []
             for _i, _row in _edited_df.iterrows():
                 _nv = _row.get('品名', '');     _nv = '' if pd.isna(_nv) else str(_nv)
-                _wk = _row.get('作業コード', ''); _wk = '' if pd.isna(_wk) else str(_wk)
                 _pc = _row.get('部品コード', ''); _pc = '' if pd.isna(_pc) else str(_pc)
+                _iv = _row.get('工数', '');     _iv = '' if pd.isna(_iv) else str(_iv)
                 # 既存行のメタデータを引き継ぐ（新規追加行はデフォルト）
                 _orig = _items_src[_i] if _i < len(_items_src) else {}
+                _wk   = _orig.get('work_code', '') or _orig.get('method', '')
                 edited_items.append({
                     'name': _nv, 'method': _wk, 'work_code': _wk,
+                    'index_value': _iv,
                     'quantity': safe_int(_row.get('数量', 1), 1),
                     'parts_amount': safe_int(_row.get('部品金額', 0)),
                     'wage': safe_int(_row.get('工賃', 0)),
