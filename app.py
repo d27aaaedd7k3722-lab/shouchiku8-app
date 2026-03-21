@@ -540,7 +540,15 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
         # 品名から作業種別を自動推定（区分が空白の場合）
         if not method:
             _name_for_detect = str(item.get('name', ''))
-            if any(kw in _name_for_detect for kw in ('取替', '交換', '取換', '取り替え')):
+            _parts_amt = safe_int(item.get('parts_amount', 0))
+            _wage_amt  = safe_int(item.get('wage', 0))
+            # ルール7: 研磨・磨き・写真代・ショートパーツは空白のまま（最優先）
+            if any(kw in _name_for_detect for kw in ('研磨', '磨き', '写真代', 'ショートパーツ')):
+                method = ''
+            # ルール1: 部品金額あり・工賃なし → 取替
+            elif _parts_amt > 0 and _wage_amt == 0:
+                method = '取替'
+            elif any(kw in _name_for_detect for kw in ('取替', '交換', '取換', '取り替え')):
                 method = '取替'
             elif any(kw in _name_for_detect for kw in ('脱着', '取外', '取付', '組付', '脱外')):
                 method = '脱着'
@@ -554,7 +562,6 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
                 'シーリング', '点検', '消去', '設定', '調整',
             )):
                 method = '修理'
-            # 研磨・磨き・写真代・ショートパーツ等は空白のまま
 
         qty    = safe_int(item.get('quantity', 1), 1)
         if qty < 1:
@@ -612,6 +619,8 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
             '取替': 1, '交換': 1, '取換': 1,
             '脱着': 2, '取外': 2, '取付': 2, '組付': 2, '脱外': 2,
             '修理': 3, '補修': 3, '分解': 3, '修正': 3, '調整': 3,
+            '光軸': 3, 'フィッティング': 3, 'コーディング': 3, '穴あけ': 3,
+            'シーリング': 3, '点検': 3, '消去': 3, '設定': 3,
             '鈑金': 4, '板金': 4, '塗装': 4, 'ペイント': 4,
         }
         disposal_code = _disposal_map.get(method, -1)
@@ -3089,7 +3098,7 @@ def parse_markdown_to_items(md_text: str, page_num: int = 1) -> list:
     row_idx = 0
 
     def to_int(s):
-        s = re.sub(r'[,，\s¥￥円△▲\-\+]', '', str(s))
+        s = re.sub(r'[,，\s¥￥円△▲+\-]', '', str(s))
         try:
             return int(float(s))
         except Exception:
@@ -3105,10 +3114,10 @@ def parse_markdown_to_items(md_text: str, page_num: int = 1) -> list:
         if cells[0] in ('作業内容・使用部品名', '作業内容', '品名', '部品名'):
             continue
         # 区切り行（--- のみ）をスキップ
-        if re.match(r'^[-: ]+$', cells[0]):
+        if re.match(r'^[-: ]*$', cells[0]) and cells[0]:
             continue
         # 全セルが空または記号のみの行をスキップ
-        if all(re.match(r'^[-: ]*$', c) for c in cells):
+        if all(re.match(r'^[-:= ]*$', c) for c in cells):
             continue
 
         name    = cells[0] if cells[0] else '不明'
@@ -4211,7 +4220,7 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     _page_count = len(pages) if pages else 1
     _logw(f"⑤ 全ページ一括解析開始 ({_page_count}ページ)")
     result = analyze_estimate_single(
-        api_key, file_bytes, 'application/pdf', used_model, 1, 1
+        api_key, file_bytes, 'application/pdf', used_model, 1, _page_count
     ) or {}
     result.setdefault('items', [])
     result.setdefault('short_parts_wage', 0)
@@ -5869,12 +5878,12 @@ def main():
 
             # セッションに保存（STEP4で参照）
             st.session_state['classification_alerts'] = _classification_alerts
-            # classification_confirmed はcheckboxウィジェットのkeyと共有のため
-            # ウィジェットが存在する場合はStreamlitが自動管理→直接代入不可
-            try:
+            # classification_confirmed:
+            # エラーあり → checkboxウィジェット(key='classification_confirmed')がStreamlit自動管理
+            #               → 直接代入するとStreamlitAPIExceptionが発生するため代入しない
+            # エラーなし → checkboxが存在しないためセッションに手動設定
+            if not _error_alerts:
                 st.session_state['classification_confirmed'] = _classification_confirmed
-            except Exception:
-                pass  # checkboxウィジェットが管理中のため設定をスキップ
 
             # マスタ連携の差額計算とレポート表示（DBモード時のみ）
             discrepancies = []
