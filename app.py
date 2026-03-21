@@ -43,13 +43,11 @@ import tempfile
 import os
 import datetime
 import json
-import base64
 import io
 import re
-import math
 import traceback
 import pandas as pd
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 # PDF生成用 ReportLab
 from reportlab.pdfgen import canvas
@@ -621,7 +619,7 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
             '修理': 3, '補修': 3, '分解': 3, '修正': 3, '調整': 3,
             '光軸': 3, 'フィッティング': 3, 'コーディング': 3, '穴あけ': 3,
             'シーリング': 3, '点検': 3, '消去': 3, '設定': 3,
-            '鈑金': 4, '板金': 4, '塗装': 4, 'ペイント': 4,
+            '鈑金': 4, '板金': 4, '塗装': 4, 'ペイント': 4, 'ワックス': 4, '加算': 4, 'ブース': 4,
         }
         disposal_code = _disposal_map.get(method, -1)
         parts_code = item.get('_master_section_code', '')  # 部品コード大区分（例: '01'）
@@ -2519,7 +2517,7 @@ CORE_PROMPT = """<system_instruction>
   - 英数字・ハイフン混じりの品番は必ず「部品品番」へ。
 - 区分の判定ルール（作業内容から以下の優先順位で判定して文字列を割り当てる）:
   1. 【重要】部品名称および部品金額の計上があるが、技術料（工賃）の計上がない行 → "取替"
-  2. 「取替」「交換」「取換」を含む → "取替"
+  2. 「取替」「交換」「取換」「取り替え」を含む → "取替"
   3. 「脱着」「取外」「取付」「組付」を含む → "脱着"
   4. 「鈑金」「板金」を含む → "鈑金"
   5. 「塗装」「ペイント」「ワックス」「加算」「ブース」を含む → "塗装"
@@ -3062,14 +3060,9 @@ def parse_detail_json_to_items(json_text: str, page_num: int = 1) -> list:
         qty_raw     = detail.get('quantity', 1)
         parts_raw   = detail.get('part_price', 0)
         part_no     = str(detail.get('part_number', '') or '').strip()
-        def _to_int(v):
-            try:
-                return int(float(str(v).replace(',', '').replace('，', '').strip()))
-            except Exception:
-                return 0
-        wage  = _to_int(wage_raw)
-        qty   = _to_int(qty_raw)
-        parts = _to_int(parts_raw)
+        wage  = safe_int(wage_raw)
+        qty   = safe_int(qty_raw, 1)
+        parts = safe_int(parts_raw)
         if wage == 0 and parts == 0:
             continue
         if qty < 1:
