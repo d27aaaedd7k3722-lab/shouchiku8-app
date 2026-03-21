@@ -534,7 +534,23 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
             if not name.startswith('※'):
                 name = '※' + name
         
-        method = item.get('method', '')
+        # 区分: work_code（Markdownパーサー保存先）または method から取得
+        method = item.get('method', '') or item.get('work_code', '')
+
+        # 品名から作業種別を自動推定（区分が空白の場合）
+        if not method:
+            _name_for_detect = str(item.get('name', ''))
+            if any(kw in _name_for_detect for kw in ('取替', '交換', '取換', '取り替え')):
+                method = '取替'
+            elif any(kw in _name_for_detect for kw in ('脱着', '取外', '取付', '組付', '脱外')):
+                method = '脱着'
+            elif any(kw in _name_for_detect for kw in ('鈑金', '板金')):
+                method = '鈑金'
+            elif any(kw in _name_for_detect for kw in ('塗装', 'ペイント')):
+                method = '塗装'
+            elif any(kw in _name_for_detect for kw in ('修理', '補修', '分解', '修正')):
+                method = '修理'
+
         qty    = safe_int(item.get('quantity', 1), 1)
         if qty < 1:
             qty = 1
@@ -587,7 +603,12 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
         # 部品金額がある行のみ数量を設定。脱着など部品なし行は -1（空白）
         db_qty = qty if parts_total != 0 else -1
         # ── Addata マスタ照合結果から PartsCode / PartsCodeSub / DisposalCode を設定 ──
-        _disposal_map = {'取替': 1, '脱着': 2, '修理': 3, '板金': 4}
+        _disposal_map = {
+            '取替': 1, '交換': 1, '取換': 1,
+            '脱着': 2, '取外': 2, '取付': 2, '組付': 2, '脱外': 2,
+            '修理': 3, '補修': 3, '分解': 3, '修正': 3, '調整': 3,
+            '鈑金': 4, '板金': 4, '塗装': 4, 'ペイント': 4,
+        }
         disposal_code = _disposal_map.get(method, -1)
         parts_code = item.get('_master_section_code', '')  # 部品コード大区分（例: '01'）
         _branch_raw = item.get('_master_branch_code', '')  # 枝番（例: '00101', '001AA'）
@@ -2630,6 +2651,15 @@ TASK_PROMPTS["estimate_detail_page"] = """【解析ルール】
 
 行の結合と整理:
 テキストの改行位置がおかしい場合（部品名が2行に分かれているなど）は、文脈から判断して1つのセルに結合してください。
+
+区分の記入ルール:
+作業内容・品名の内容から以下の区分を判断し、「区分」欄に必ず記入してください。
+- 「取替」「交換」「取換」が含まれる行 → 区分：取替
+- 「脱着」「取外」「取付」「組付」が含まれる行 → 区分：脱着
+- 「鈑金」「板金」が含まれる行 → 区分：鈑金
+- 「塗装」「ペイント」が含まれる行 → 区分：塗装
+- 「修理」「補修」「分解」「修正」が含まれる行 → 区分：修理
+- 上記に該当しない部品名のみの行（部品代だけ計上） → 区分：空白
 
 部品と工賃の分離:
 見積書の金額列が1列しかなく、部品代と工賃が同じ列に混在している場合は、
