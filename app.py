@@ -2486,42 +2486,37 @@ def generate_beta_discrepancy_report_pdf(estimate_data, calc_parts, calc_wages, 
 # 送信形式: CORE_PROMPT + "\n\n" + TASK_PROMPTS[task_type]
 # ============================================================
 
-CORE_PROMPT = """あなたは、日本語の業務帳票解析に特化した高精度OCR/構造化抽出エンジンです。
-対象は以下です。
-- 日本の車検証（自動車検査証）
-- 自動車修理見積書
-- 工場見積書
-- FAX送付状・送信票・表紙
-- NEO転記用の明細抽出対象PDF/画像
+CORE_PROMPT = """<system_instruction>
+あなたは日本語の自動車関連業務帳票（自動車修理見積書、車検証、FAX表紙など）を解析し、後続のNEOシステム連携用に構造化データを抽出する高精度OCR・解析APIエンジンです。
+入力された画像またはPDFを精読し、推測を一切排除して、指定された<output_format>の厳格なJSONのみを出力してください。
+</system_instruction>
 
-目的は、入力された画像またはPDFを正確に読み取り、task_type に応じた厳格なJSONのみを返すことです。
+<golden_rules>
+1. 【完全転写】入力画像に記載されているテキスト・数値をそのまま抽出すること。存在しない値の推測、補完、勝手な計算は絶対に行わない。
+2. 【欠落防止】ページ跨ぎ、折り返し行、セクション区切り、ページ最下部の行などを絶対に漏らさないこと。
+3. 【ノイズ排除】挨拶、説明文、Markdownの装飾（```json など）は一切出力しない。純粋なJSON文字列のみを返すこと。
+4. 【数値の正規化】金額や数量は、カンマ(,)を除去した半角整数の数値型(Number)で出力すること。読み取れない数値は 0 とし、読み取れない文字は "不明" とする。
+</golden_rules>
 
-# 共通原則
-- 入力に記載されている内容を可能な限りそのまま抽出する
-- 推測補完をしない
-- 勝手な統合・省略・並べ替えをしない
-- 読み取れない値は各 task_type の規則に従う
-- JSON以外のテキストは一切返さない
-- 数字の整合性を重視する
-- 見積書では合計行、小計行、ページ小計行、総合計行を通常明細へ混入させない
-- ページ下端の行は特に注意して確認する
-
-# 共通禁止事項
-- 自由推測
-- 無根拠なOCR補正
-- 他行の金額を借用して補完
-- 見積書にない査定・減額・工法変更・項目削除
-- JSON以外の説明文出力
-
-# task_type
-有効な task_type:
-- shaken_ocr
-- estimate_cover_check
-- estimate_header_totals
-- estimate_detail_page
-- estimate_validation_repair
-
-必ず task_type に対応するJSONのみ返すこと。"""
+<extraction_logic>
+- カンマと空白: 連続するカンマ（例: ,,,,,）は「空白セル」を意味する。列の右ズレを防ぐこと。
+- 行の結合: 部品名などが不自然に改行されている場合は、文脈から1つのレコードに結合する。
+- 金額の分離（単一列に混在している場合）:
+  - 品番がある行、または「部品」「材料」の名称行 → 「部品金額」へ。
+  - 「交換」「脱着」「調整」「修理」「鈑金」「塗装」「点検」「診断」「設定」等の作業名行 → 「技術料」へ。
+- 外車ディーラー見積（BMW、ベンツ等）:
+  - 「Labor」「工賃」に相当する金額 → 「技術料」へ。
+  - 「Parts」「部品」に相当する金額 → 「部品金額」へ。
+  - 英数字・ハイフン混じりの品番は必ず「部品品番」へ。
+- 区分の判定ルール（作業内容から以下の優先順位で判定して文字列を割り当てる）:
+  1. 【重要】部品名称および部品金額の計上があるが、技術料（工賃）の計上がない行 → "取替"
+  2. 「取替」「交換」「取換」を含む → "取替"
+  3. 「脱着」「取外」「取付」「組付」を含む → "脱着"
+  4. 「鈑金」「板金」を含む → "鈑金"
+  5. 「塗装」「ペイント」「ワックス」「加算」「ブース」を含む → "塗装"
+  6. 「修理」「補修」「分解」「修正」「光軸」「フィッティング」「コーディング」「穴あけ」「シーリング」「点検」「消去」「設定」「調整」を含む → "修理"
+  7. 「研磨」「磨き」「写真代」「ショートパーツ」を含む → ""（空白）
+</extraction_logic>"""
 
 
 TASK_PROMPTS = {}
@@ -2572,64 +2567,44 @@ TASK_PROMPTS["shaken_ocr"] = """あなたは日本の車検証（自動車検査
 }"""
 
 
-TASK_PROMPTS["estimate_cover_check"] = """この画像はPDFの1ページです。
-このページがFAX送付状・送信票・表紙（本文ではないカバーページ）かどうかを判定してください。
+TASK_PROMPTS["estimate_cover_check"] = """<task_execution>
+タスク名: fax_cover_check
 
-ルール:
-- 見積本文ではなく送信票/送付状/表紙なら is_fax_cover = true
-- 見積明細や車両情報ページなら is_fax_cover = false
-- JSONのみ返す
+このページが宛先・件名・枚数・メッセージのみのFAX送付状（カバーシート）であるかを判定します。見積明細や金額合計が含まれていればfalseです。
 
 重要な判定基準:
-- ページ上部に「送信日時」「FAX番号」「送信元番号」などが印字されていても、ページ本体が見積書の表・明細・合計欄を含んでいれば is_fax_cover = false
-- FAX送付状とは「宛先・件名・枚数・メッセージのみ」のシンプルなカバーシートのことで、明細表がある場合は必ず false
-- 「御見積書」「見積書」「修理費用明細書」「部品代」「工賃」「合計」などが記載されていれば is_fax_cover = false
-- FAXで送られてきた見積書には上部にFAX送信日時・番号が印字されることが多いが、それは見積書本体であり FAX表紙ではない
+- ページ上部に「送信日時」「FAX番号」等が印字されていても、見積書の明細・合計欄を含んでいれば is_fax_cover = false
+- 「御見積書」「修理費用明細書」「部品代」「工賃」「合計」などが記載されていれば is_fax_cover = false
 
-page_type の値:
-- fax_cover（FAX送付状/送信票/表紙のみ。明細表なし）
-- estimate（見積書本文/明細）
-- vehicle（車検証/車両情報）
-- other（分類不能）
+page_type の値: fax_cover / estimate / vehicle / other
 
-返却JSON:
+<output_format>
 {
+  "step_by_step_reasoning": "見積明細や合計金額の有無を確認した結果",
   "is_fax_cover": false,
   "page_type": "estimate",
   "reason": ""
-}"""
+}
+</output_format>
+</task_execution>"""
 
 
-TASK_PROMPTS["estimate_header_totals"] = """あなたは、自動車修理見積書をNEOファイルへ転記するためのヘッダ/合計抽出アシスタントです。
-見積書ページから合計値・修理工場名・車両情報を抽出し、NEO転記用JSONを返してください。
+TASK_PROMPTS["estimate_header_totals"] = """<task_execution>
+タスク名: header_total_extraction
 
-ルール:
-- PDF記載内容を正確に抽出する
-- 推測補完・勝手な再計算をしない
-- 読めない文字列は "不明"
-- 読めない数値は 0
-- 税区分は判定しない
-- 数値はカンマを除去した整数で返す
-- 「ページ小計」は pdf_grand_total に使わない
-- Honda Cars系はページ1上部サマリーボックスの合計値も確認する
+合計値・修理工場名・車両情報を抽出します。「ページ小計」は総合計に使用しないでください。
+「部品計」「工賃計」の明示的な小計行が存在しない単列金額形式の場合は、部品計・工賃計を 0 とし、総合計のみを抽出してください。
 
 金額探索ルール:
-- 「部品計」「部品代」「部品合計」「部品・油脂」等の明示的な部品小計行 → pdf_parts_total
-- 「工賃計」「技術料」「工賃合計」等の明示的な工賃小計行 → pdf_wage_total
-- 「合計」「総合計」「見積金額」「請求金額」「御見積合計金額」「御見積金額」「御見積合計」等 → pdf_grand_total
-- 「税抜合計金額」「税抜合計」「＜税抜合計金額＞」「小計（税抜）」等は参考情報として pdf_grand_total の税抜値として使用するが pdf_parts_total には設定しない
-- 値引き額は discount_amount
-- 小計、ページ小計、参考値は総合計に混ぜない
+- 「部品計」「部品代」「部品合計」「部品・油脂」等の明示的な小計行 → pdf_parts_total
+- 「工賃計」「技術料合計」「工賃合計」等の明示的な小計行 → pdf_wage_total
+- 「合計」「総合計」「御見積合計金額」「御見積金額」「見積金額」「請求金額」等 → pdf_grand_total
+- 値引き額 → discount_amount
+- Honda Cars系はページ1上部サマリーボックスの合計値も確認する
 
-【重要】単列金額形式の判定と処理:
-- 見積表の列構成が「品名/数量/単価/金額」または「商品名/単位/数量/単価/金額」で、
-  「部品計」「工賃計」などの明示的な小計行が存在しない場合は「単列金額形式」と判定する
-- 単列金額形式の場合: pdf_parts_total=0, pdf_wage_total=0 として必ず 0 を返す
-- 単列金額形式では絶対に表の中間値・部分合計を pdf_parts_total や pdf_wage_total に充当しない
-- pdf_grand_total のみ正確に抽出する（「合計」「御見積合計金額」「税込合計」等から読む）
-
-返却JSON:
+<output_format>
 {
+  "step_by_step_reasoning": "金額がどこに記載されていたか、どのように数値を判定したかの簡潔な思考プロセス",
   "repair_shop_name": "不明",
   "car_name": "不明",
   "car_model": "不明",
@@ -2639,50 +2614,40 @@ TASK_PROMPTS["estimate_header_totals"] = """あなたは、自動車修理見積
   "pdf_wage_total": 0,
   "discount_amount": 0,
   "pdf_grand_total": 0
-}"""
+}
+</output_format>
+</task_execution>"""
 
 
-TASK_PROMPTS["estimate_detail_page"] = """【解析ルール】
+TASK_PROMPTS["estimate_detail_page"] = """<task_execution>
+タスク名: detail_extraction
 
-基本情報の抽出:
-文書の上部から「見積日付」「得意先名」「車種」「登録番号」「型式」を抽出し、箇条書きでまとめてください。
+文書上部から基本情報を抽出し、明細行を配列で抽出してください。合計行・小計行・消費税行は明細配列に含めないでください。
 
-明細の表形式化（Markdown）:
-以下の7つのカラムを持つMarkdown形式の表を作成してください。
-[作業内容・使用部品名 | 区分 | 指数 | 技術料 | 数量 | 部品金額 | 部品品番]
-
-カンマの処理:
-連続するカンマ（例: ,,,,,）は、該当する列のデータが存在しない「空白」を意味します。列が右にズレないよう、正確に空白セルとして処理してください。
-
-行の結合と整理:
-テキストの改行位置がおかしい場合（部品名が2行に分かれているなど）は、文脈から判断して1つのセルに結合してください。
-
-区分の記入ルール:
-作業内容・品名の内容から以下の区分を判断し、「区分」欄に必ず記入してください。
-- 「取替」「交換」「取換」が含まれる行 → 区分：取替
-- 「脱着」「取外」「取付」「組付」が含まれる行 → 区分：脱着
-- 「鈑金」「板金」が含まれる行 → 区分：鈑金
-- 「塗装」「ペイント」「ワックス」「加算」「ブース」が含まれる行 → 区分：塗装
-- 「修理」「補修」「分解」「修正」「光軸」「フィッティング」「コーディング」「穴あけ」「シーリング」「点検」「消去」「設定」「調整」が含まれる行 → 区分：修理
-- 「研磨」「磨き」「写真代」「ショートパーツ」が含まれる行 → 区分：空白
-- 上記に該当しない部品名のみの行（部品代だけ計上） → 区分：空白
-
-部品と工賃の分離:
-見積書の金額列が1列しかなく、部品代と工賃が同じ列に混在している場合は、
-品番（英数字コード）が付いている行や材料・部品名の行は「部品金額」欄に、
-「交換」「脱着」「調整」「修理」「鈑金」「塗装」「点検」「診断」「設定」等の作業名の行は「技術料」欄に振り分けて記載してください。
-
-外車・輸入車の見積書の場合:
-BMW・ベンツ・ボルボ・アウディ等の外車ディーラー見積は独自フォーマットの場合があります。
-「技術料」「工賃」「Labor」に相当する金額は「技術料」欄へ、「部品」「Parts」に相当する金額は「部品金額」欄へ必ず分けて記載してください。
-部品品番が英数字・ハイフン混じりの場合でも必ず「部品品番」欄に記載してください。
-
-行の欠落防止:
-- ページをまたいで続く表は、全ページ漏れなく抽出すること
-- 行が途中で折り返されている場合は1行に結合すること
-- セクション区切り（破線・空行）をまたいだ行も必ず含めること
-
-全ページ・全行を漏れなく抽出してください。合計行・小計行・消費税行は除外してください。"""
+<output_format>
+{
+  "step_by_step_reasoning": "行のズレや欠落がないか、部品と工賃の分離をどう行ったかの簡潔な思考プロセス",
+  "basic_info": {
+    "estimate_date": "文字列",
+    "customer_name": "文字列",
+    "car_type": "文字列",
+    "registration_number": "文字列",
+    "model_code": "文字列"
+  },
+  "details": [
+    {
+      "work_or_part_name": "文字列",
+      "category": "文字列 (区分判定ルールに従う)",
+      "index_value": "文字列 (指数)",
+      "labor_fee": 0,
+      "quantity": 0,
+      "part_price": 0,
+      "part_number": "文字列"
+    }
+  ]
+}
+</output_format>
+</task_execution>"""
 
 
 TASK_PROMPTS["estimate_validation_repair"] = """あなたは、見積書抽出結果の金額検算エンジンです。
@@ -3056,6 +3021,67 @@ def analyze_estimate_totals(api_key, file_bytes, mime_type, model_name):
     return None
 
 
+def parse_detail_json_to_items(json_text: str, page_num: int = 1) -> list:
+    """Geminiが出力したdetail_extraction JSONをitemsリスト（JSON互換）に変換する。
+    失敗した場合は空リストを返す（呼び出し元でMarkdownフォールバック）。
+    """
+    import re, json as _json
+    text = json_text.strip()
+    # ```json ... ``` ブロックを除去
+    text = re.sub(r'^```json\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^```\s*$', '', text, flags=re.MULTILINE)
+    # JSON部分を抽出
+    m = re.search(r'\{.*\}', text, re.DOTALL)
+    if not m:
+        return []
+    try:
+        data = _json.loads(m.group(0))
+    except Exception:
+        try:
+            data = _json.loads(repair_truncated_json(m.group(0)))
+        except Exception:
+            return []
+    details = data.get('details', [])
+    if not isinstance(details, list):
+        return []
+    items = []
+    for row_idx, detail in enumerate(details, 1):
+        name     = str(detail.get('work_or_part_name', '') or '').strip()
+        category = str(detail.get('category', '') or '').strip()
+        wage_raw = detail.get('labor_fee', 0)
+        qty_raw  = detail.get('quantity', 1)
+        parts_raw= detail.get('part_price', 0)
+        part_no  = str(detail.get('part_number', '') or '').strip()
+        def _to_int(v):
+            try:
+                return int(float(str(v).replace(',', '').replace('，', '').strip()))
+            except Exception:
+                return 0
+        wage  = _to_int(wage_raw)
+        qty   = _to_int(qty_raw)
+        parts = _to_int(parts_raw)
+        if wage == 0 and parts == 0:
+            continue
+        if qty < 1:
+            qty = 1
+        items.append({
+            'page':         page_num,
+            'row_type':     'detail',
+            'name':         name if name else '不明',
+            'description':  '',
+            'work_code':    category,
+            'part_no':      part_no,
+            'quantity':     qty,
+            'parts_amount': parts,
+            'wage':         wage,
+            'line_total':   wage + parts,
+            'raw_text':     str(detail),
+            'row_id':       f'p{page_num}_r{row_idx:03d}',
+            'row_bbox':     {'x1': 0, 'y1': 0, 'x2': 1000, 'y2': 50},
+        })
+    return items
+
+
 def parse_markdown_to_items(md_text: str, page_num: int = 1) -> list:
     """Geminiが出力したMarkdown表をitemsリスト（JSON互換）に変換する"""
     import re
@@ -3116,18 +3142,14 @@ def parse_markdown_to_items(md_text: str, page_num: int = 1) -> list:
 
 
 def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num=1, total_pages=1, tax_inclusive=False):
-    """見積書明細行をシンプルプロンプト（Markdown出力）で読み取り、JSON変換して返す"""
-    # 税込表記の場合は注記を追加
-    tax_note = (
-        "\n税込金額の処理:\nこの見積書は税込表記です。記載されている金額はすべて税込金額として読み取り、そのまま転写してください。税抜きへの変換は不要です。"
-        if tax_inclusive else ""
-    )
-    # 複数ページの場合はページ番号を付記
-    page_note = ''
+    """見積書明細行をJSON出力プロンプトで読み取り、itemsリストに変換して返す"""
+    extra_notes = ''
+    if tax_inclusive:
+        extra_notes += '\n\n【税込表記】この見積書は税込表記です。記載されている金額はすべて税込金額として読み取り、そのまま転写してください。税抜きへの変換は不要です。'
     if total_pages > 1:
-        page_note = f'\nこれは全{total_pages}ページ中の{page_num}ページ目です。このページの全明細行を漏れなく読み取ってください。'
+        extra_notes += f'\n\n【ページ指定】これは全{total_pages}ページ中の{page_num}ページ目です。このページの全明細行を漏れなく読み取ってください。'
 
-    prompt = TASK_PROMPTS["estimate_detail_page"] + tax_note + page_note
+    prompt = _build_prompt("estimate_detail_page", extra_notes)
 
     from google.genai import types
     client = _get_genai_client(api_key)
@@ -3144,7 +3166,11 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
                 },
             )
             if response.text and response.text.strip():
-                items = parse_markdown_to_items(response.text, page_num)
+                # まずJSONパーサーで試みる（新形式）
+                items = parse_detail_json_to_items(response.text, page_num)
+                # JSONパースが空ならMarkdownフォールバック
+                if not items:
+                    items = parse_markdown_to_items(response.text, page_num)
                 return {
                     'items':           items,
                     'discount_amount': 0,
