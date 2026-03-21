@@ -546,10 +546,15 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
                 method = '脱着'
             elif any(kw in _name_for_detect for kw in ('鈑金', '板金')):
                 method = '鈑金'
-            elif any(kw in _name_for_detect for kw in ('塗装', 'ペイント')):
+            elif any(kw in _name_for_detect for kw in ('塗装', 'ペイント', 'ワックス', '加算', 'ブース')):
                 method = '塗装'
-            elif any(kw in _name_for_detect for kw in ('修理', '補修', '分解', '修正')):
+            elif any(kw in _name_for_detect for kw in (
+                '修理', '補修', '分解', '修正',
+                '光軸', 'フィッティング', 'コーディング', '穴あけ',
+                'シーリング', '点検', '消去', '設定', '調整',
+            )):
                 method = '修理'
+            # 研磨・磨き・写真代・ショートパーツ等は空白のまま
 
         qty    = safe_int(item.get('quantity', 1), 1)
         if qty < 1:
@@ -2657,8 +2662,9 @@ TASK_PROMPTS["estimate_detail_page"] = """【解析ルール】
 - 「取替」「交換」「取換」が含まれる行 → 区分：取替
 - 「脱着」「取外」「取付」「組付」が含まれる行 → 区分：脱着
 - 「鈑金」「板金」が含まれる行 → 区分：鈑金
-- 「塗装」「ペイント」が含まれる行 → 区分：塗装
-- 「修理」「補修」「分解」「修正」が含まれる行 → 区分：修理
+- 「塗装」「ペイント」「ワックス」「加算」「ブース」が含まれる行 → 区分：塗装
+- 「修理」「補修」「分解」「修正」「光軸」「フィッティング」「コーディング」「穴あけ」「シーリング」「点検」「消去」「設定」「調整」が含まれる行 → 区分：修理
+- 「研磨」「磨き」「写真代」「ショートパーツ」が含まれる行 → 区分：空白
 - 上記に該当しない部品名のみの行（部品代だけ計上） → 区分：空白
 
 部品と工賃の分離:
