@@ -3465,116 +3465,6 @@ def analyze_page_with_chunks(api_key, page_bytes, mime_type, model_name,
     }
 
 
-def detect_suspicious_rows(items, pdf_parts_total, pdf_wage_total):
-    """
-    各明細行の疑わしさを判定し、suspicious_rows リストを返す。
-    戻り値: List[{row_index, name, page, severity, reason, row_bbox, parts_amount, wage}]
-    severity: "high"（赤）/ "medium"（オレンジ）/ "low"（黄）
-    """
-    suspicious = []
-    calc_parts = sum(safe_int(it.get('parts_amount', 0)) for it in items)
-    calc_wages = sum(safe_int(it.get('wage', 0)) for it in items)
-    parts_diff = abs(calc_parts - pdf_parts_total) if pdf_parts_total > 0 else 0
-    wage_diff  = abs(calc_wages - pdf_wage_total)  if pdf_wage_total  > 0 else 0
-    has_mismatch = (parts_diff > 1000 or wage_diff > 1000)
-
-    for i, it in enumerate(items):
-        name   = str(it.get('name', ''))
-        parts  = safe_int(it.get('parts_amount', 0))
-        wage   = safe_int(it.get('wage', 0))
-        method = str(it.get('method', ''))
-        reasons  = []
-        severity = None
-
-        # ① 脱着/修理系なのに parts > 0 → 列取り違えの疑い
-        REMOVE_KWS = ('脱着', '取外', '取付', '組付', '脱外')
-        REPAIR_KWS = ('修理', '塗装', '板金', '調整', '補修', '作業')
-        if any(kw in method for kw in REMOVE_KWS) and parts > 0:
-            reasons.append(f"「{method}」作業なのに部品¥{parts:,}計上（列取り違え疑い）")
-            severity = "high"
-        elif any(kw in method for kw in REPAIR_KWS) and parts > 0 and wage == 0:
-            reasons.append(f"「{method}」作業で工賃0円・部品¥{parts:,}（工賃列に記録すべき可能性）")
-            severity = "high"
-
-        # ② 部品も工賃も0円で品名がある行
-        if parts == 0 and wage == 0 and name and name not in ('不明', '値引き'):
-            reasons.append("部品・工賃ともに0円（読み落とし疑い）")
-            severity = severity or "medium"
-
-        # ③ 異常に大きい金額
-        if parts > 800000:
-            reasons.append(f"部品¥{parts:,}が異常に大きい（桁ずれ疑い）")
-            severity = severity or "medium"
-        if wage > 500000:
-            reasons.append(f"工賃¥{wage:,}が異常に大きい（桁ずれ疑い）")
-            severity = severity or "medium"
-
-        # ④ 品名が読み取れていない
-        if name in ('不明', ''):
-            reasons.append("品名が読み取れていない")
-            severity = severity or "low"
-
-        # ⑤ 金額不一致時の大金額行（差異原因の可能性）
-        if has_mismatch and (parts + wage) > 5000:
-            reasons.append(f"合計不一致中の大金額行（部品¥{parts:,}+工賃¥{wage:,}）")
-            severity = severity or "low"
-
-        if reasons:
-            suspicious.append({
-                'row_index':    i,
-                'name':         name,
-                'page':         it.get('page', 1),
-                'severity':     severity,
-                'reason':       '／'.join(reasons),
-                'row_bbox':     it.get('row_bbox'),
-                'parts_amount': parts,
-                'wage':         wage,
-                'raw_text':     it.get('raw_text', ''),
-            })
-    return suspicious
-
-
-def render_pdf_page_with_overlays(pdf_bytes, page_idx, suspicious_rows, dpi=130):
-    """
-    PDFページをラスタライズして suspicious_rows にカラーオーバーレイを描画。
-    severity: 'high'→赤, 'medium'→オレンジ, 'low'→黄
-    戻り値: PIL Image または None
-    """
-    try:
-        from PIL import Image, ImageDraw
-        page_img_bytes = rasterize_pdf_page(pdf_bytes, page_idx, dpi=dpi, enhance=False)
-        if not page_img_bytes:
-            return None
-        img = Image.open(io.BytesIO(page_img_bytes)).convert("RGBA")
-        W, H = img.width, img.height
-        overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        draw    = ImageDraw.Draw(overlay)
-
-        FILL_MAP   = {"high": (220, 38, 38, 75),  "medium": (234, 88, 12, 65),  "low": (202, 138, 4, 45)}
-        BORDER_MAP = {"high": (220, 38, 38, 210), "medium": (234, 88, 12, 190), "low": (202, 138, 4, 160)}
-
-        for row in suspicious_rows:
-            if row.get('page', 1) - 1 != page_idx:
-                continue
-            bbox = row.get('row_bbox')
-            if not bbox or not isinstance(bbox, dict):
-                continue
-            x1 = max(0, int(bbox.get('x1', 0)   / 1000 * W))
-            y1 = max(0, int(bbox.get('y1', 0)   / 1000 * H))
-            x2 = min(W, int(bbox.get('x2', 1000) / 1000 * W))
-            y2 = min(H, int(bbox.get('y2', 1000) / 1000 * H))
-            if x2 <= x1 or y2 <= y1:
-                continue
-            sev = row.get('severity', 'low')
-            draw.rectangle([x1, y1, x2, y2], fill=FILL_MAP.get(sev, FILL_MAP['low']))
-            draw.rectangle([x1, y1, x2, y2], outline=BORDER_MAP.get(sev, BORDER_MAP['low']), width=2)
-
-        result = Image.alpha_composite(img, overlay).convert("RGB")
-        return result
-    except Exception as e:
-        import sys
-        print(f"[WARN] render_pdf_page_with_overlays: {e}", file=sys.stderr)
-        return None
 
 
 def validate_and_correct_items(items):
@@ -5423,87 +5313,64 @@ def main():
                 st.session_state['_original_items'] = [dict(it) for it in estimate_data.get('items', [])]
 
             _items_src = estimate_data['items']
+            # 表示用DataFrame（7列）: No / 部品コード / 品名 / 作業コード / 数量 / 部品金額 / 工賃
             _edit_rows = []
             for _i, _item in enumerate(_items_src):
-                _m_level = _item.get('_match_level', 0)
-                _m_text  = {1:"🟢 完全", 2:"🟢 部分", 3:"🟢 前方",
-                             4:"🟡 あいまい", 5:"🟡 類似", 6:"🔴 未マッチ"}.get(_m_level, "")
-                if _item.get('_price_warning'): _m_text += " (価格⚠️)"
-                if _item.get('_reverse_match'): _m_text = "✅ 逆引 (" + _m_text.split(" ")[0] + ")"
+                _wk_code   = str(_item.get('work_code', '') or _item.get('method', '') or '')
                 _part_code = str(_item.get('part_no', '') or _item.get('_master_part_no', '') or '')
-                _wk_code   = str(_item.get('work_code', '') or '')
-                if not _wk_code:
-                    _sc = str(_item.get('_master_section_code','') or _item.get('_master_repair_code','') or '')
-                    _bc = str(_item.get('_master_branch_code','') or '')
-                    _wk_code = (_sc + _bc).strip()
                 _edit_rows.append({
-                    'No': _i + 1,
-                    '品名': str(_item.get('name', '')),
-                    '作業': str(_item.get('method', '')),
-                    '数量': safe_int(_item.get('quantity', 1), 1),
+                    'No':       _i + 1,
+                    '部品コード': _part_code,
+                    '品名':     str(_item.get('name', '')),
+                    '作業コード': _wk_code,
+                    '数量':     safe_int(_item.get('quantity', 1), 1),
                     '部品金額': safe_int(_item.get('parts_amount', 0)),
                     '工賃':     safe_int(_item.get('wage', 0)),
-                    '部品コード': _part_code,
-                    '作業コード': _wk_code,
-                    'マスタ照合': _m_text,
-                    '_master_name': _item.get('_master_name', ''),
-                    '_master_price': _item.get('_master_price', 0),
-                    '_master_part_no': _item.get('_master_part_no', ''),
-                    '_master_repair_code': _item.get('_master_repair_code', ''),
-                    '_master_branch_code': _item.get('_master_branch_code', ''),
-                    '_master_part_code_r': _item.get('_master_part_code_r', ''),
-                    '_master_part_code_l': _item.get('_master_part_code_l', ''),
-                    '_match_level': _m_level,
-                    '_original_name': _item.get('name', ''),
-                    '_original_parts_amount': safe_int(_item.get('parts_amount', 0)),
                 })
-            _df_edit = pd.DataFrame(_edit_rows)
+            _df_edit = pd.DataFrame(_edit_rows) if _edit_rows else pd.DataFrame(
+                columns=['No', '部品コード', '品名', '作業コード', '数量', '部品金額', '工賃'])
             _edited_df = st.data_editor(
                 _df_edit,
                 use_container_width=True,
                 hide_index=True,
                 num_rows="dynamic",
                 column_config={
-                    'No': st.column_config.NumberColumn('No', disabled=True, width='small'),
-                    '品名': st.column_config.TextColumn('品名', width='large'),
-                    '作業': st.column_config.TextColumn('作業'),
-                    '数量': st.column_config.NumberColumn('数量', min_value=1, step=1),
+                    'No':       st.column_config.NumberColumn('No', disabled=True, width='small'),
+                    '部品コード': st.column_config.TextColumn('部品コード'),
+                    '品名':     st.column_config.TextColumn('品名', width='large'),
+                    '作業コード': st.column_config.TextColumn('作業コード'),
+                    '数量':     st.column_config.NumberColumn('数量', min_value=1, step=1),
                     '部品金額': st.column_config.NumberColumn('部品金額', step=1, format="¥%d"),
                     '工賃':     st.column_config.NumberColumn('工賃', step=1, format="¥%d"),
-                    '部品コード': st.column_config.TextColumn('部品コード'),
-                    '作業コード': st.column_config.TextColumn('作業コード'),
-                    'マスタ照合': st.column_config.TextColumn('マスタ照合', disabled=True),
-                    '_master_name': None, '_master_price': None,
-                    '_master_part_no': None, '_master_repair_code': None,
-                    '_master_branch_code': None, '_master_part_code_r': None,
-                    '_master_part_code_l': None, '_match_level': None,
-                    '_original_name': None, '_original_parts_amount': None,
                 },
                 key='items_editor',
             )
-            # 編集後データを反映
+            # 編集後データを反映（既存行の内部メタデータを保持、新規行はデフォルト値）
+            _edited_df = _edited_df.reset_index(drop=True)
             _edited_df['No'] = range(1, len(_edited_df) + 1)
             edited_items = []
-            for _, _row in _edited_df.iterrows():
-                _nv = _row.get('品名', ''); _nv = '' if pd.isna(_nv) else str(_nv)
-                _mv = _row.get('作業', ''); _mv = '' if pd.isna(_mv) else str(_mv)
+            for _i, _row in _edited_df.iterrows():
+                _nv = _row.get('品名', '');     _nv = '' if pd.isna(_nv) else str(_nv)
+                _wk = _row.get('作業コード', ''); _wk = '' if pd.isna(_wk) else str(_wk)
+                _pc = _row.get('部品コード', ''); _pc = '' if pd.isna(_pc) else str(_pc)
+                # 既存行のメタデータを引き継ぐ（新規追加行はデフォルト）
+                _orig = _items_src[_i] if _i < len(_items_src) else {}
                 edited_items.append({
-                    'name': _nv, 'method': _mv,
+                    'name': _nv, 'method': _wk, 'work_code': _wk,
                     'quantity': safe_int(_row.get('数量', 1), 1),
                     'parts_amount': safe_int(_row.get('部品金額', 0)),
                     'wage': safe_int(_row.get('工賃', 0)),
-                    'part_no': str(_row.get('部品コード', '') or ''),
-                    'work_code': str(_row.get('作業コード', '') or ''),
-                    '_master_name': _row.get('_master_name', ''),
-                    '_master_price': _row.get('_master_price', 0),
-                    '_master_part_no': _row.get('_master_part_no', ''),
-                    '_master_repair_code': _row.get('_master_repair_code', ''),
-                    '_master_branch_code': _row.get('_master_branch_code', ''),
-                    '_master_part_code_r': _row.get('_master_part_code_r', ''),
-                    '_master_part_code_l': _row.get('_master_part_code_l', ''),
-                    '_match_level': _row.get('_match_level', 0),
-                    '_original_name': str(_row.get('_original_name', '')),
-                    '_original_parts_amount': safe_int(_row.get('_original_parts_amount', 0)),
+                    'part_no': _pc,
+                    '_master_name': _orig.get('_master_name', ''),
+                    '_master_price': _orig.get('_master_price', 0),
+                    '_master_part_no': _orig.get('_master_part_no', ''),
+                    '_master_repair_code': _orig.get('_master_repair_code', ''),
+                    '_master_branch_code': _orig.get('_master_branch_code', ''),
+                    '_master_part_code_r': _orig.get('_master_part_code_r', ''),
+                    '_master_part_code_l': _orig.get('_master_part_code_l', ''),
+                    '_match_level': _orig.get('_match_level', 0),
+                    '_original_name': _orig.get('name', _nv),
+                    '_original_parts_amount': _orig.get('parts_amount', safe_int(_row.get('部品金額', 0))),
                 })
             estimate_data['items'] = edited_items
             st.session_state['estimate_data'] = estimate_data
@@ -5557,78 +5424,6 @@ def main():
                     with _fbc2:
                         if st.button("⏭ スキップ", key="fb_skip_btn"):
                             st.session_state['_original_items'] = [dict(it) for it in edited_items]
-
-            # ── 🔍 AIマーカー確認パネル（疑わしい行の可視化）──────────────
-            _suspicious_rows = detect_suspicious_rows(
-                edited_items,
-                safe_int(estimate_data.get('pdf_parts_total', 0)),
-                safe_int(estimate_data.get('pdf_wage_total', 0)),
-            )
-            if _suspicious_rows:
-                with st.expander(
-                    f"🔍 AIマーカー確認パネル（{len(_suspicious_rows)}件の疑わしい行を検出）",
-                    expanded=True
-                ):
-                    # フィルターUI
-                    _mk_col1, _mk_col2, _mk_col3 = st.columns([2, 2, 4])
-                    with _mk_col1:
-                        _show_high_only = st.checkbox("🔴 highのみ表示", key="mk_high_only", value=False)
-                    with _mk_col2:
-                        _show_all_rows  = st.checkbox("全行表示（suspicious以外も）", key="mk_show_all", value=False)
-                    # フィルター適用
-                    _disp_rows = _suspicious_rows
-                    if _show_high_only:
-                        _disp_rows = [r for r in _suspicious_rows if r['severity'] == 'high']
-
-                    # 差異テーブル
-                    _mk_table = []
-                    for _sr in _disp_rows:
-                        _sev_icon = {"high": "🔴", "medium": "🟠", "low": "🟡"}.get(_sr['severity'], "⚪")
-                        _mk_table.append({
-                            "No":     _sr['row_index'] + 1,
-                            "ページ": _sr.get('page', 1),
-                            "品名":   _sr['name'][:20] if _sr['name'] else "(空)",
-                            "部品":   f"¥{_sr['parts_amount']:,}" if _sr['parts_amount'] else "-",
-                            "工賃":   f"¥{_sr['wage']:,}"         if _sr['wage'] else "-",
-                            "重要度": f"{_sev_icon} {_sr['severity']}",
-                            "疑い理由": _sr['reason'][:50],
-                        })
-                    if _mk_table:
-                        st.table(pd.DataFrame(_mk_table).set_index("No"))
-
-                    # PDFオーバーレイプレビュー
-                    _est_bytes_for_overlay = st.session_state.get('estimate_file_bytes')
-                    if _est_bytes_for_overlay:
-                        _mime_for_ov = st.session_state.get('estimate_file_name', '')
-                        _is_pdf_ov   = _mime_for_ov.lower().endswith('.pdf') if _mime_for_ov else True
-                        # ページ一覧を取得（疑わしい行があるページのみ）
-                        _ov_pages = sorted(set(r.get('page', 1) for r in _disp_rows if r.get('row_bbox')))
-                        if _is_pdf_ov and _ov_pages:
-                            st.markdown("**📄 PDFオーバーレイプレビュー（マーカー付き）**")
-                            st.caption("🔴 高リスク（列取り違え疑い）　🟠 中リスク（金額異常）　🟡 低リスク（要確認）")
-                            _ov_cols = st.columns(min(len(_ov_pages), 2))
-                            for _ci, _pg in enumerate(_ov_pages[:4]):
-                                with _ov_cols[_ci % len(_ov_cols)]:
-                                    try:
-                                        _ov_img = render_pdf_page_with_overlays(
-                                            _est_bytes_for_overlay,
-                                            _pg - 1,
-                                            _disp_rows,
-                                            dpi=130,
-                                        )
-                                        if _ov_img:
-                                            st.image(_ov_img, caption=f"ページ {_pg}（マーカー付き）", use_container_width=True)
-                                        else:
-                                            st.info(f"ページ{_pg}のプレビューを生成できませんでした")
-                                    except Exception as _oe:
-                                        st.warning(f"プレビューエラー（ページ{_pg}）: {_oe}")
-                        elif not _ov_pages:
-                            st.info("💡 行座標（row_bbox）情報がないため、PDFプレビューは表示できません。\nuse_rasterize=ONでチャンク解析を実行すると座標情報が付与されます。")
-                    st.markdown("---")
-                    st.markdown(
-                        "💡 **使い方:** 上記の疑わしい行を確認し、必要に応じて上の明細行エディタで修正してください。\n"
-                        "修正後はフィードバックとして記録することでAIの精度が向上します。"
-                    )
 
             st.markdown("---")
             # ── 金額サマリー ────────────────────────────────────
