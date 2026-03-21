@@ -2636,7 +2636,17 @@ TASK_PROMPTS["estimate_detail_page"] = """【解析ルール】
 品番（英数字コード）が付いている行や材料・部品名の行は「部品金額」欄に、
 「交換」「脱着」「調整」「修理」「鈑金」「塗装」「点検」「診断」「設定」等の作業名の行は「技術料」欄に振り分けて記載してください。
 
-全ページ・全行を漏れなく抽出してください。合計行・小計行は除外してください。"""
+外車・輸入車の見積書の場合:
+BMW・ベンツ・ボルボ・アウディ等の外車ディーラー見積は独自フォーマットの場合があります。
+「技術料」「工賃」「Labor」に相当する金額は「技術料」欄へ、「部品」「Parts」に相当する金額は「部品金額」欄へ必ず分けて記載してください。
+部品品番が英数字・ハイフン混じりの場合でも必ず「部品品番」欄に記載してください。
+
+行の欠落防止:
+- ページをまたいで続く表は、全ページ漏れなく抽出すること
+- 行が途中で折り返されている場合は1行に結合すること
+- セクション区切り（破線・空行）をまたいだ行も必ず含めること
+
+全ページ・全行を漏れなく抽出してください。合計行・小計行・消費税行は除外してください。"""
 
 
 TASK_PROMPTS["estimate_validation_repair"] = """あなたは、見積書抽出結果の金額検算エンジンです。
@@ -3015,26 +3025,29 @@ def parse_markdown_to_items(md_text: str, page_num: int = 1) -> list:
     import re
     items = []
     row_idx = 0
+
+    def to_int(s):
+        s = re.sub(r'[,，\s¥￥円△▲\-\+]', '', str(s))
+        try:
+            return int(float(s))
+        except Exception:
+            return 0
+
     for line in md_text.splitlines():
         if not line.startswith('|'):
             continue
         cells = [c.strip() for c in line.split('|')[1:-1]]
-        if len(cells) < 6:
+        if len(cells) < 3:
             continue
-        # ヘッダー行・区切り行をスキップ
-        if cells[0] in ('作業内容・使用部品名', ''):
+        # ヘッダー行をスキップ
+        if cells[0] in ('作業内容・使用部品名', '作業内容', '品名', '部品名'):
             continue
-        if all(set(c.replace(' ', '').replace('-', '').replace(':', '')) <= set() for c in cells):
-            continue
+        # 区切り行（--- のみ）をスキップ
         if re.match(r'^[-: ]+$', cells[0]):
             continue
-
-        def to_int(s):
-            s = re.sub(r'[,，\s¥￥円]', '', str(s))
-            try:
-                return int(float(s))
-            except Exception:
-                return 0
+        # 全セルが空または記号のみの行をスキップ
+        if all(re.match(r'^[-: ]*$', c) for c in cells):
+            continue
 
         name    = cells[0] if cells[0] else '不明'
         method  = cells[1] if len(cells) > 1 else ''   # 区分
@@ -5794,7 +5807,12 @@ def main():
 
             # セッションに保存（STEP4で参照）
             st.session_state['classification_alerts'] = _classification_alerts
-            st.session_state['classification_confirmed'] = _classification_confirmed
+            # classification_confirmed はcheckboxウィジェットのkeyと共有のため
+            # ウィジェットが存在する場合はStreamlitが自動管理→直接代入不可
+            try:
+                st.session_state['classification_confirmed'] = _classification_confirmed
+            except Exception:
+                pass  # checkboxウィジェットが管理中のため設定をスキップ
 
             # マスタ連携の差額計算とレポート表示（DBモード時のみ）
             discrepancies = []
