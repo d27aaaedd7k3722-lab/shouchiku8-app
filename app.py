@@ -5383,11 +5383,14 @@ def main():
                 columns=['No', '部品コード', '品名', '数量', '部品金額', '工数', '工賃'])
             # キーを行数と連動させることで行挿入後に data_editor を強制再初期化する
             _editor_key = f'items_editor_{len(_items_src)}'
+            # height を固定して描画行数を制限（全行フル展開すると100行超で重くなるため）
+            _editor_height = min(600, max(200, len(_items_src) * 35 + 60))
             _edited_df = st.data_editor(
                 _df_edit,
                 use_container_width=True,
                 hide_index=True,
                 num_rows="dynamic",
+                height=_editor_height,
                 column_config={
                     'No':     st.column_config.NumberColumn('No', disabled=True, width='small'),
                     '部品コード': st.column_config.TextColumn('部品コード'),
@@ -5926,8 +5929,9 @@ def main():
             reverse_match    = estimate_data.get('_reverse_match', False)
 
         progress = st.progress(0, text="NEOファイルを生成中...")
+        _neo_wait = st.info("📦 NEOファイルを生成しています。しばらくお待ちください...")
         try:
-            progress.progress(30, text="📦 テンプレートを処理中...")
+            progress.progress(20, text="📦 テンプレートを読み込み中...")
             is_tax_inclusive = estimate_data.get('_is_tax_inclusive', False) if estimate_data else False
             _step4_beta = st.session_state.get('selected_mode', 'db') == 'beta'
             # カスタムテンプレートNEOが指定されている場合はそちらを使用
@@ -5943,13 +5947,14 @@ def main():
             _active_template  = _custom_neo_bytes if _use_custom_neo else template_data
             if _use_custom_neo:
                 _custom_name = st.session_state.get('custom_neo_name', 'カスタムNEO')
-                progress.progress(40, text=f"📁 テンプレートNEO ({_custom_name}) を読み込み中...")
+                progress.progress(35, text=f"📁 テンプレートNEO ({_custom_name}) を読み込み中...")
+            progress.progress(50, text="⚙️ 明細データをNEOに書き込み中...")
             neo_data, total_parts, total_wages, grand_total = generate_neo_file(
                 _active_template, updated_vehicle, items, short_parts_wage, insurance_info,
                 expenses=expense_info, is_tax_inclusive=is_tax_inclusive, is_beta_mode=_step4_beta,
                 merge_mode=_use_custom_neo
             )
-            progress.progress(80, text="📝 ファイル名を生成中...")
+            progress.progress(85, text="📝 ファイル名を生成中...")
             filename = generate_filename(
                 updated_vehicle, calc_parts, calc_wages, pdf_parts, pdf_wages,
                 has_estimate, reverse_match, short_parts_wage
@@ -5957,6 +5962,7 @@ def main():
             st.session_state['neo_bytes']    = neo_data
             st.session_state['neo_filename'] = filename
             progress.progress(100, text="✅ 生成完了！")
+            _neo_wait.empty()  # 待機メッセージを消去
 
             # 不一致チェック
             _discrepancies_step4 = []
