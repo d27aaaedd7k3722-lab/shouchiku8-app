@@ -1,0 +1,41 @@
+name: Deploy to HuggingFace Spaces
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Deploy to HuggingFace Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          pip install huggingface_hub
+          python - <<'EOF'
+          from huggingface_hub import HfApi
+          import os
+          api = HfApi(token=os.environ['HF_TOKEN'])
+          api.upload_folder(
+              folder_path='.',
+              repo_id='Ryohey123/shouchiku8-neo',
+              repo_type='space',
+              ignore_patterns=[
+                  '.git*', '.github', '_開発資料', '.venv_local',
+                  '__pycache__', '*.db', '.env', '*.bat',
+                  'サンプル見積PDF', 'テスト要', '*.docx', '*.md',
+                  'null', 'streamlit_server.log', 'analysis.log'
+              ]
+          )
+          print('Deployed successfully!')
+          EOF
