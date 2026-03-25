@@ -6,3 +6,5 @@ jaconv
 Levenshtein
 python-dotenv
 Pillow
+pdf2image
+pypdfium2

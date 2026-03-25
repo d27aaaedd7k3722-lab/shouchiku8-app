@@ -14,10 +14,12 @@ services:
     container_name: shouchiku8-neo
     restart: unless-stopped
     ports:
-      - "8501:8501"
+      - "7860:7860"
     environment:
       # Gemini APIキー（.envファイルまたは直接設定）
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      # HuggingFace Token（Addata DBダウンロード用）
+      - HF_TOKEN=${HF_TOKEN}
       # Addata DBパス（コンテナ内パス）
       - ADDATA_PATH=/app/Addata
     volumes:
@@ -26,7 +28,7 @@ services:
       # ログ保存
       - ./logs:/app/logs
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:7860/_stcore/health"]
       interval: 30s
       timeout: 10s
       retries: 3
