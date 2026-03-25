@@ -5353,6 +5353,8 @@ def main():
                 })
             _df_edit = pd.DataFrame(_edit_rows) if _edit_rows else pd.DataFrame(
                 columns=['No', '部品コード', '品名', '数量', '部品金額', '工数', '工賃'])
+            # キーを行数と連動させることで行挿入後に data_editor を強制再初期化する
+            _editor_key = f'items_editor_{len(_items_src)}'
             _edited_df = st.data_editor(
                 _df_edit,
                 use_container_width=True,
@@ -5367,7 +5369,7 @@ def main():
                     '工数':   st.column_config.TextColumn('工数', width='small'),
                     '工賃':   st.column_config.NumberColumn('工賃', step=1, format="¥%d"),
                 },
-                key='items_editor',
+                key=_editor_key,
             )
             # 編集後データを反映（既存行の内部メタデータを保持、新規行はデフォルト値）
             _edited_df = _edited_df.reset_index(drop=True)
@@ -5630,6 +5632,7 @@ def main():
             # ── ベタ打ちモード専用: 部品・工賃区分確認パネル ──────────────────────────
             _classification_alerts = []
             _classification_confirmed = True
+            _error_alerts = []
             if _step3_mode == 'beta':
                 _classification_alerts = check_parts_labor_classification(edited_items)
                 _error_alerts   = [a for a in _classification_alerts if a['severity'] == 'error']
@@ -5701,10 +5704,13 @@ def main():
             st.session_state['classification_alerts'] = _classification_alerts
             # classification_confirmed:
             # エラーあり → checkboxウィジェット(key='classification_confirmed')がStreamlit自動管理
-            #               → 直接代入するとStreamlitAPIExceptionが発生するため代入しない
+            #               → 直接代入するとStreamlitAPIExceptionが発生する場合があるためtry/exceptで保護
             # エラーなし → checkboxが存在しないためセッションに手動設定
-            if not _error_alerts:
-                st.session_state['classification_confirmed'] = _classification_confirmed
+            try:
+                if not _error_alerts:
+                    st.session_state['classification_confirmed'] = _classification_confirmed
+            except Exception:
+                pass  # ウィジェット自動管理中の場合は無視
 
             # マスタ連携の差額計算とレポート表示（DBモード時のみ）
             discrepancies = []
