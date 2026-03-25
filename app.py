@@ -49,13 +49,6 @@ import traceback
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
 
-# PDF生成用 ReportLab
-from reportlab.pdfgen import canvas
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-
 # ============================================================
 # 定数・設定
 # ============================================================
@@ -93,44 +86,19 @@ _model_availability_cache: dict = {}  # key: api_key_hash, value: list of model 
 _analyze_result_cache: dict = {}
 
 def get_available_gemini_models(api_key: str) -> list:
-    """APIキーで利用可能なGeminiモデルを確認して返す（優先順位付き）。
-    モジュールレベルキャッシュで結果を保持（サーバー再起動まで有効）。"""
+    """利用可能なGeminiモデルを返す（優先順位付き）。
+    API疎通テストなしで即返却（高速化）。クォータ超過モデルのみ除外。"""
     if not api_key:
         return [_FALLBACK_MODEL]
-    cache_key = api_key[-8:]  # セキュリティのため末尾8文字をキーに使用
+    cache_key = api_key[-8:]
     if cache_key in _model_availability_cache:
         return _model_availability_cache[cache_key]
-    try:
-        import google.genai as genai
-        client = genai.Client(api_key=api_key)
-        available = []
-        for model_id in _PREFERRED_MODELS:
-            try:
-                # 軽量テストリクエストで利用可否を確認（max_output_tokens=100で思考モデルも対応）
-                client.models.generate_content(
-                    model=model_id,
-                    contents=["ping"],
-                    config={"max_output_tokens": 100},
-                )
-                available.append(model_id)
-            except Exception as e:
-                err = str(e)
-                # 404/利用不可/クォータ超過 → スキップ
-                # 429 RESOURCE_EXHAUSTED: クォータ超過のモデルは利用不可扱い
-                is_quota = ('429' in err or 'RESOURCE_EXHAUSTED' in err or
-                            'quota' in err.lower() or 'rate' in err.lower())
-                is_notfound = ('404' in err or 'NOT_FOUND' in err or
-                               'no longer available' in err)
-                if not is_notfound and not is_quota:
-                    available.append(model_id)
-                elif is_quota:
-                    # クォータ超過モデルをグローバルキャッシュに記録
-                    _quota_exhausted_models.add(model_id)
-        result = available if available else [_FALLBACK_MODEL]
-        _model_availability_cache[cache_key] = result
-        return result
-    except Exception:
-        return [_FALLBACK_MODEL]
+    # API呼び出しなしで優先リストをそのまま返す（疎通テスト廃止で高速化）
+    result = [m for m in _PREFERRED_MODELS if m not in _quota_exhausted_models]
+    if not result:
+        result = [_FALLBACK_MODEL]
+    _model_availability_cache[cache_key] = result
+    return result
 
 
 def get_default_gemini_model(api_key: str) -> str:
@@ -142,7 +110,7 @@ def get_default_gemini_model(api_key: str) -> str:
             return m
     # 全モデルがクォータ超過の場合はフォールバック
     return models[0] if models else _FALLBACK_MODEL
-SELF_CORRECTION_THRESHOLD = 0   # 差額が1円でもあれば自己修復を試行（100%一致を目指す）
+SELF_CORRECTION_THRESHOLD = 1000  # 差額が1000円以上の場合のみ自己修復を試行（高速化）
 
 DOS_DBVER = bytes.fromhex('334cc198')   # AnDBVersion.ini 固定値
 DOS_IMGE  = bytes.fromhex('2c365a67')   # AnSvImge.ini 固定値
@@ -1389,10 +1357,11 @@ def detect_and_reorder_pages(pages):
     return pages
 
 
+@st.cache_resource
 def _get_genai_client(api_key):
-    """google.genai クライアントを取得（キャッシュ付き）"""
+    """google.genai クライアントを取得（セッション間で再利用・タイムアウト付き）"""
     from google import genai
-    return genai.Client(api_key=api_key)
+    return genai.Client(api_key=api_key, http_options={'timeout': 180})
 
 
 def call_gemini(api_key, file_bytes, mime_type, prompt_text, model_name=None, use_json_mode=False):
@@ -1417,7 +1386,7 @@ def call_gemini(api_key, file_bytes, mime_type, prompt_text, model_name=None, us
             if response.text and response.text.strip():
                 return response.text
             if attempt < 2:
-                import time; time.sleep(2)
+                import time; time.sleep(1)
                 continue
             raise ValueError("Geminiから有効な応答が得られませんでした。")
         except ValueError:
@@ -1425,7 +1394,7 @@ def call_gemini(api_key, file_bytes, mime_type, prompt_text, model_name=None, us
         except Exception as e:
             last_error = e
             if attempt < 2:
-                import time; time.sleep(2)
+                import time; time.sleep(1)
                 continue
             raise ValueError(f"Gemini API呼び出しに失敗しました（{attempt+1}回試行）: {str(last_error)}")
 
@@ -3253,7 +3222,7 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
                     'confidence':      0.9,
                 }
             if attempt < 2:
-                import time; time.sleep(2)
+                import time; time.sleep(1)
                 continue
             raise ValueError("Geminiから有効な応答が得られませんでした。")
         except ValueError:
@@ -3278,7 +3247,7 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
                     "自動的に代替モデルに切り替えます。"
                 ) from e
             if attempt < 2:
-                import time; time.sleep(2)
+                import time; time.sleep(1)
                 continue
             raise ValueError(f"Gemini API呼び出しに失敗しました: {str(last_error)}")
 
@@ -3383,7 +3352,7 @@ def analyze_estimate_chunk(api_key, chunk_bytes, mime_type, model_name,
                         }
                 return res
             if attempt < 2:
-                import time; time.sleep(2)
+                import time; time.sleep(1)
         except Exception as e:
             err = str(e)
             if 'no longer available' in err or 'NOT_FOUND' in err:
@@ -4561,15 +4530,19 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
-    # テンプレートチェック
+    # テンプレートチェック（キャッシュ付き — 毎リランで再読込しない）
+    @st.cache_data(show_spinner=False)
+    def _load_template(path: str) -> bytes:
+        with open(path, 'rb') as f:
+            return f.read()
+
     if not os.path.exists(TEMPLATE_PATH):
         st.error(
             f"⚠️ テンプレートファイルが見つかりません: {TEMPLATE_FILENAME}\n\n"
             f"app.py と同じフォルダに「{TEMPLATE_FILENAME}」を配置してください。"
         )
         st.stop()
-    with open(TEMPLATE_PATH, 'rb') as f:
-        template_data = f.read()
+    template_data = _load_template(TEMPLATE_PATH)
 
     # ─── サイドバー ───────────────────────────────────
     with st.sidebar:
@@ -4854,77 +4827,18 @@ def main():
                 st.info("💡 車検証なしの場合、見積書から読み取れる車両情報のみでNEOを作成します")
         with col2:
             st.markdown('<div class="section-title">🧾 見積書</div>', unsafe_allow_html=True)
-            _est_tab1, _est_tab2 = st.tabs(["📄 PDF（AI解析）", "📊 CSV取り込み"])
-
-            with _est_tab1:
-                estimate_file = st.file_uploader(
-                    "見積書をアップロード（PDF・JPG・PNG 対応、FAX品質可）",
-                    type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
-                    key='estimate_upload',
-                )
-                if estimate_file:
-                    st.success(f"✅ {estimate_file.name} ({estimate_file.size:,} bytes)")
-                    st.caption("🔍 OCR対象: 部品名・部品番号・単価・工賃・塗装・その他費用 全明細")
-                    # CSVモードをクリア
-                    st.session_state.pop('csv_items', None)
-                    st.session_state.pop('csv_mode', None)
-                else:
-                    st.info("💡 見積書なしの場合、車両情報のみのNEOを作成します")
-
-            with _est_tab2:
-                st.markdown(
-                    '<div style="background:#f0fdf4;border:1px solid #86efac;border-radius:8px;'
-                    'padding:10px 14px;font-size:12px;margin-bottom:8px">'
-                    '💡 <b>Claude.ai / Gemini.ai</b> でPDFを解析し、出力されたCSVをここに貼り付けるか、<br>'
-                    'CSVファイルをアップロードしてください。<b>AI解析をスキップして直接取り込みます。</b>'
-                    '</div>',
-                    unsafe_allow_html=True
-                )
-                _csv_file = st.file_uploader(
-                    "CSVファイルをアップロード（.csv）",
-                    type=['csv', 'txt'],
-                    key='csv_file_upload',
-                )
-                _csv_paste = st.text_area(
-                    "またはCSVテキストを貼り付け",
-                    height=150,
-                    placeholder="品名,区分,数量,部品金額,工賃,部品コード\nフロントバンパー,取替,1,45000,0,\nバンパー交換工賃,取替,1,0,12000,",
-                    key='csv_paste_area',
-                )
-                # CSVファイルまたはペーストを処理
-                _csv_text = ''
-                if _csv_file:
-                    try:
-                        _raw = _csv_file.read()
-                        for _enc in ('utf-8-sig', 'utf-8', 'shift-jis', 'cp932'):
-                            try:
-                                _csv_text = _raw.decode(_enc)
-                                break
-                            except Exception:
-                                continue
-                    except Exception:
-                        pass
-                elif _csv_paste and _csv_paste.strip():
-                    _csv_text = _csv_paste.strip()
-
-                if _csv_text:
-                    _preview_items = parse_csv_to_items(_csv_text)
-                    if _preview_items:
-                        st.success(f"✅ {len(_preview_items)}行 読み込み済み")
-                        _p_sum = sum(safe_int(it.get('parts_amount', 0)) for it in _preview_items)
-                        _w_sum = sum(safe_int(it.get('wage', 0)) for it in _preview_items)
-                        st.caption(f"部品合計: ¥{_p_sum:,} / 工賃合計: ¥{_w_sum:,}")
-                        st.session_state['csv_items'] = _preview_items
-                        st.session_state['csv_mode']  = True
-                        estimate_file = None  # PDFアップロードは無効化
-                    else:
-                        st.error("CSVの読み込みに失敗しました。フォーマットを確認してください。")
-                        st.session_state.pop('csv_items', None)
-                        st.session_state.pop('csv_mode', None)
-                elif st.session_state.get('csv_mode'):
-                    _saved_csv = st.session_state.get('csv_items', [])
-                    if _saved_csv:
-                        st.success(f"✅ {len(_saved_csv)}行 取り込み済み（前回入力）")
+            estimate_file = st.file_uploader(
+                "見積書をアップロード（PDF・JPG・PNG 対応、FAX品質可）",
+                type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
+                key='estimate_upload',
+            )
+            if estimate_file:
+                st.success(f"✅ {estimate_file.name} ({estimate_file.size:,} bytes)")
+                st.caption("🔍 OCR対象: 部品名・部品番号・単価・工賃・塗装・その他費用 全明細")
+                st.session_state.pop('csv_items', None)
+                st.session_state.pop('csv_mode', None)
+            else:
+                st.info("💡 見積書なしの場合、車両情報のみのNEOを作成します")
 
             # ── 税区分 選択（必須）──
             st.markdown('<div style="margin-top:8px;font-size:12px;color:#555;font-weight:600">💴 見積書の税区分を選択してください</div>', unsafe_allow_html=True)
@@ -4944,6 +4858,71 @@ def main():
             )
             st.session_state['tax_override'] = _tax_sel
             st.caption(f"⚙️ 選択中: {_tax_sel}")
+
+        # ── CSV取り込みセクション ──
+        st.markdown(
+            '<div style="background:#f0fdf4;border:1px solid #86efac;border-radius:8px;'
+            'padding:12px 16px;font-size:13px;margin-bottom:4px">'
+            '📊 <b>CSV取り込み（AI解析をスキップ）</b> — '
+            'Claude.ai / Gemini.ai でPDFを解析してCSVを取得し、下欄に貼り付けるとすぐNEO生成に進めます。'
+            '</div>',
+            unsafe_allow_html=True
+        )
+        with st.expander("📊 CSVを貼り付けて取り込む", expanded=st.session_state.get('csv_mode', False)):
+            _csv_col1, _csv_col2 = st.columns([2, 1])
+            with _csv_col1:
+                _csv_paste = st.text_area(
+                    "CSVテキストを貼り付け（ヘッダー行必須）",
+                    height=160,
+                    placeholder="品名,区分,数量,部品金額,工賃,部品コード\nフロントバンパー,取替,1,45000,0,\nバンパー交換工賃,取替,1,0,12000,",
+                    key='csv_paste_area',
+                    value=st.session_state.get('_csv_paste_saved', ''),
+                )
+            with _csv_col2:
+                st.markdown("**CSVファイル（.csv/.txt）**")
+                _csv_file = st.file_uploader(
+                    "CSVファイル",
+                    type=['csv', 'txt'],
+                    key='csv_file_upload',
+                    label_visibility='collapsed',
+                )
+                if st.session_state.get('csv_mode') and st.session_state.get('csv_items'):
+                    _p = sum(safe_int(it.get('parts_amount', 0)) for it in st.session_state['csv_items'])
+                    _w = sum(safe_int(it.get('wage', 0)) for it in st.session_state['csv_items'])
+                    st.success(f"✅ {len(st.session_state['csv_items'])}行 取込済")
+                    st.caption(f"部品: ¥{_p:,} / 工賃: ¥{_w:,}")
+                    if st.button("🗑️ クリア", key='csv_clear_btn'):
+                        st.session_state.pop('csv_items', None)
+                        st.session_state.pop('csv_mode', None)
+                        st.session_state.pop('_csv_paste_saved', None)
+                        st.rerun()
+
+            _csv_text = ''
+            if _csv_file:
+                try:
+                    _raw = _csv_file.read()
+                    for _enc in ('utf-8-sig', 'utf-8', 'shift-jis', 'cp932'):
+                        try:
+                            _csv_text = _raw.decode(_enc)
+                            break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+            elif _csv_paste and _csv_paste.strip():
+                _csv_text = _csv_paste.strip()
+
+            if _csv_text:
+                _preview_items = parse_csv_to_items(_csv_text)
+                if _preview_items:
+                    st.success(f"✅ {len(_preview_items)}行 読み込み完了 — 部品: ¥{sum(safe_int(it.get('parts_amount',0)) for it in _preview_items):,} / 工賃: ¥{sum(safe_int(it.get('wage',0)) for it in _preview_items):,}")
+                    st.session_state['csv_items'] = _preview_items
+                    st.session_state['csv_mode']  = True
+                    st.session_state['_csv_paste_saved'] = _csv_text
+                else:
+                    st.error("❌ CSVの読み込みに失敗しました。1行目にヘッダー（品名,区分,数量,部品金額,工賃,部品コード）が必要です。")
+                    st.session_state.pop('csv_items', None)
+                    st.session_state.pop('csv_mode', None)
 
         # ── テンプレートNEOアップロード（任意） ──
         st.markdown("**📁 テンプレートNEOファイル（任意）**")
@@ -5611,9 +5590,13 @@ def main():
             pdf_parts = safe_int(estimate_data.get('pdf_parts_total', 0))
             pdf_wages = safe_int(estimate_data.get('pdf_wage_total', 0))
 
-            # ── フィードバック: 差分検出 ─────────────────────────
+            # ── フィードバック: 差分検出（アイテムが変わった時だけ再計算）─────
             _orig_items_fb = st.session_state.get('_original_items', [])
-            _fb_corrections = _detect_corrections(_orig_items_fb, edited_items)
+            _fb_hash = hash(str([(it.get('name',''), it.get('parts_amount',0), it.get('wage',0)) for it in edited_items]))
+            if st.session_state.get('_fb_hash') != _fb_hash:
+                st.session_state['_fb_cache'] = _detect_corrections(_orig_items_fb, edited_items)
+                st.session_state['_fb_hash']  = _fb_hash
+            _fb_corrections = st.session_state.get('_fb_cache', [])
             if _fb_corrections:
                 _fb_key = f"fb_open_{hash(str(_fb_corrections))}"
                 with st.expander(f"📝 読み取り訂正レポート（{len(_fb_corrections)}件の変更を検出）", expanded=False):
@@ -5836,7 +5819,12 @@ def main():
             _classification_confirmed = True
             _error_alerts = []
             if _step3_mode == 'beta':
-                _classification_alerts = check_parts_labor_classification(edited_items)
+                # アイテムが変わった時だけ再計算（session_stateでキャッシュ）
+                _items_hash = hash(str([(it.get('name',''), it.get('parts_amount',0), it.get('wage',0)) for it in edited_items]))
+                if st.session_state.get('_cls_hash') != _items_hash:
+                    st.session_state['_cls_cache'] = check_parts_labor_classification(edited_items)
+                    st.session_state['_cls_hash']  = _items_hash
+                _classification_alerts = st.session_state.get('_cls_cache', [])
                 _error_alerts   = [a for a in _classification_alerts if a['severity'] == 'error']
                 _warning_alerts = [a for a in _classification_alerts if a['severity'] == 'warning']
 
