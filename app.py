@@ -3028,6 +3028,77 @@ def analyze_estimate_totals(api_key, file_bytes, mime_type, model_name):
     return None
 
 
+def parse_csv_to_items(csv_text: str) -> list:
+    """Claude.ai / Gemini.ai 等から出力されたCSVテキストをitemsリストに変換する。
+    期待フォーマット（ヘッダあり）:
+        品名,区分,数量,部品金額,工賃,部品コード
+    """
+    import csv as _csv
+    import io as _io
+
+    # BOM除去・改行正規化
+    text = csv_text.strip().lstrip('\ufeff').replace('\r\n', '\n').replace('\r', '\n')
+    items = []
+    try:
+        reader = _csv.reader(_io.StringIO(text))
+        rows = list(reader)
+    except Exception:
+        return items
+
+    if not rows:
+        return items
+
+    # ヘッダ行を特定（"品名" を含む行を探す）
+    header_idx = 0
+    for i, row in enumerate(rows):
+        if row and '品名' in row[0]:
+            header_idx = i + 1  # 次行からデータ
+            break
+
+    row_idx = 0
+    for row in rows[header_idx:]:
+        if not row or not any(c.strip() for c in row):
+            continue
+        # 列数が足りない場合は右側を空文字で補完
+        while len(row) < 6:
+            row.append('')
+
+        name      = row[0].strip()
+        category  = row[1].strip() if len(row) > 1 else ''
+        qty       = safe_int(row[2].strip(), 1) if len(row) > 2 else 1
+        parts_amt = safe_int(row[3].strip()) if len(row) > 3 else 0
+        wage_amt  = safe_int(row[4].strip()) if len(row) > 4 else 0
+        part_no   = row[5].strip() if len(row) > 5 else ''
+
+        if not name:
+            continue
+        # 合計・小計行を除外
+        if any(kw in name for kw in ('合計', '小計', '消費税', '税額', '値引', '総額')):
+            continue
+        if qty < 1:
+            qty = 1
+
+        row_idx += 1
+        items.append({
+            'page':         1,
+            'row_type':     'detail',
+            'name':         to_halfwidth_katakana(name),
+            'description':  '',
+            'work_code':    category,
+            'method':       category,
+            'part_no':      part_no,
+            'quantity':     qty,
+            'parts_amount': parts_amt,
+            'wage':         wage_amt,
+            'line_total':   parts_amt + wage_amt,
+            'index_value':  '',
+            'raw_text':     ','.join(row),
+            'row_id':       f'p1_r{row_idx:03d}',
+            'row_bbox':     {'x1': 0, 'y1': 0, 'x2': 1000, 'y2': 50},
+        })
+    return items
+
+
 def parse_detail_json_to_items(json_text: str, page_num: int = 1) -> list:
     """Geminiが出力したdetail_extraction JSONをitemsリスト（JSON互換）に変換する。
     失敗した場合は空リストを返す（呼び出し元でMarkdownフォールバック）。
@@ -4783,16 +4854,78 @@ def main():
                 st.info("💡 車検証なしの場合、見積書から読み取れる車両情報のみでNEOを作成します")
         with col2:
             st.markdown('<div class="section-title">🧾 見積書</div>', unsafe_allow_html=True)
-            estimate_file = st.file_uploader(
-                "見積書をアップロード（PDF・JPG・PNG 対応、FAX品質可）",
-                type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
-                key='estimate_upload',
-            )
-            if estimate_file:
-                st.success(f"✅ {estimate_file.name} ({estimate_file.size:,} bytes)")
-                st.caption("🔍 OCR対象: 部品名・部品番号・単価・工賃・塗装・その他費用 全明細")
-            else:
-                st.info("💡 見積書なしの場合、車両情報のみのNEOを作成します")
+            _est_tab1, _est_tab2 = st.tabs(["📄 PDF（AI解析）", "📊 CSV取り込み"])
+
+            with _est_tab1:
+                estimate_file = st.file_uploader(
+                    "見積書をアップロード（PDF・JPG・PNG 対応、FAX品質可）",
+                    type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
+                    key='estimate_upload',
+                )
+                if estimate_file:
+                    st.success(f"✅ {estimate_file.name} ({estimate_file.size:,} bytes)")
+                    st.caption("🔍 OCR対象: 部品名・部品番号・単価・工賃・塗装・その他費用 全明細")
+                    # CSVモードをクリア
+                    st.session_state.pop('csv_items', None)
+                    st.session_state.pop('csv_mode', None)
+                else:
+                    st.info("💡 見積書なしの場合、車両情報のみのNEOを作成します")
+
+            with _est_tab2:
+                st.markdown(
+                    '<div style="background:#f0fdf4;border:1px solid #86efac;border-radius:8px;'
+                    'padding:10px 14px;font-size:12px;margin-bottom:8px">'
+                    '💡 <b>Claude.ai / Gemini.ai</b> でPDFを解析し、出力されたCSVをここに貼り付けるか、<br>'
+                    'CSVファイルをアップロードしてください。<b>AI解析をスキップして直接取り込みます。</b>'
+                    '</div>',
+                    unsafe_allow_html=True
+                )
+                _csv_file = st.file_uploader(
+                    "CSVファイルをアップロード（.csv）",
+                    type=['csv', 'txt'],
+                    key='csv_file_upload',
+                )
+                _csv_paste = st.text_area(
+                    "またはCSVテキストを貼り付け",
+                    height=150,
+                    placeholder="品名,区分,数量,部品金額,工賃,部品コード\nフロントバンパー,取替,1,45000,0,\nバンパー交換工賃,取替,1,0,12000,",
+                    key='csv_paste_area',
+                )
+                # CSVファイルまたはペーストを処理
+                _csv_text = ''
+                if _csv_file:
+                    try:
+                        _raw = _csv_file.read()
+                        for _enc in ('utf-8-sig', 'utf-8', 'shift-jis', 'cp932'):
+                            try:
+                                _csv_text = _raw.decode(_enc)
+                                break
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                elif _csv_paste and _csv_paste.strip():
+                    _csv_text = _csv_paste.strip()
+
+                if _csv_text:
+                    _preview_items = parse_csv_to_items(_csv_text)
+                    if _preview_items:
+                        st.success(f"✅ {len(_preview_items)}行 読み込み済み")
+                        _p_sum = sum(safe_int(it.get('parts_amount', 0)) for it in _preview_items)
+                        _w_sum = sum(safe_int(it.get('wage', 0)) for it in _preview_items)
+                        st.caption(f"部品合計: ¥{_p_sum:,} / 工賃合計: ¥{_w_sum:,}")
+                        st.session_state['csv_items'] = _preview_items
+                        st.session_state['csv_mode']  = True
+                        estimate_file = None  # PDFアップロードは無効化
+                    else:
+                        st.error("CSVの読み込みに失敗しました。フォーマットを確認してください。")
+                        st.session_state.pop('csv_items', None)
+                        st.session_state.pop('csv_mode', None)
+                elif st.session_state.get('csv_mode'):
+                    _saved_csv = st.session_state.get('csv_items', [])
+                    if _saved_csv:
+                        st.success(f"✅ {len(_saved_csv)}行 取り込み済み（前回入力）")
+
             # ── 税区分 選択（必須）──
             st.markdown('<div style="margin-top:8px;font-size:12px;color:#555;font-weight:600">💴 見積書の税区分を選択してください</div>', unsafe_allow_html=True)
             _tax_options = ['税抜き（外税）', '税込み（内税）']
@@ -4861,9 +4994,12 @@ def main():
             assignee_step1 = st.text_input("担当者名", placeholder="例: 田中 花子", key="assignee_step1")
 
         st.markdown("")
-        if vehicle_file or estimate_file:
-            if st.button("🚀 AI解析を開始 →", type="primary", use_container_width=True):
-                if not api_key:
+        _csv_mode_active = st.session_state.get('csv_mode') and st.session_state.get('csv_items')
+        _has_input = vehicle_file or estimate_file or _csv_mode_active
+        if _has_input:
+            _btn_label = "📊 CSV取り込みを開始 →" if _csv_mode_active and not estimate_file else "🚀 AI解析を開始 →"
+            if st.button(_btn_label, type="primary", use_container_width=True):
+                if not _csv_mode_active and not api_key:
                     st.error("⚠️ APIキーが未設定です。サイドバーで入力するか、app.py冒頭の GEMINI_API_KEY に貼り付けてください。")
                 else:
                     if vehicle_file:
@@ -4875,6 +5011,8 @@ def main():
                     if estimate_file:
                         st.session_state['estimate_file_bytes'] = estimate_file.read()
                         st.session_state['estimate_file_name']  = estimate_file.name
+                        st.session_state.pop('csv_mode', None)   # PDFがある場合はCSVモード解除
+                        st.session_state.pop('csv_items', None)
                     else:
                         st.session_state['estimate_file_bytes'] = None
                         st.session_state['estimate_file_name']  = None
@@ -4885,7 +5023,7 @@ def main():
                     st.session_state['step'] = 2
                     st.rerun()
         else:
-            st.warning("見積書または車検証をアップロードしてください")
+            st.warning("見積書・車検証のアップロード、またはCSVの取り込みを行ってください")
 
     # =========================================
     # STEP 2: AI解析
@@ -4903,6 +5041,39 @@ def main():
         # ベタ打ちモードでは自己修復ループを無効化（DB照合不要のため高速化）
         _is_beta_s2    = st.session_state.get('selected_mode', 'db') == 'beta'
         _enable_sc     = not _is_beta_s2
+
+        # ── CSV取り込みモード: 見積AI解析をスキップ ──
+        _csv_mode_s2   = st.session_state.get('csv_mode', False)
+        _csv_items_s2  = st.session_state.get('csv_items', [])
+        if _csv_mode_s2 and _csv_items_s2 and estimate_bytes is None:
+            st.info(f"📊 CSVモード: {len(_csv_items_s2)}行を取り込みます（AI解析をスキップ）")
+            # 車検証のみAI解析（ある場合）
+            vehicle_data = {}
+            if vehicle_bytes:
+                with st.spinner("🔍 車検証を解析中..."):
+                    vehicle_mime = get_mime_type(vehicle_name) if vehicle_bytes else None
+                    vehicle_data = analyze_vehicle_registration(api_key, vehicle_bytes, vehicle_mime) or {}
+            st.session_state['vehicle_data'] = vehicle_data
+            # CSVアイテムをestimate_dataとして格納
+            _tax_s2 = st.session_state.get('tax_override', '税抜き（外税）')
+            estimate_data = {
+                'items':            _csv_items_s2,
+                'discount_amount':  0,
+                'short_parts_wage': 0,
+                'confidence':       1.0,
+                'pdf_parts_total':  sum(safe_int(it.get('parts_amount', 0)) for it in _csv_items_s2),
+                'pdf_wage_total':   sum(safe_int(it.get('wage', 0)) for it in _csv_items_s2),
+                'pdf_grand_total':  0,
+                '_is_tax_inclusive': _tax_s2 == '税込み（内税）',
+                '_page_count':      1,
+                '_vehicle_info':    {},
+                '_repair_shop_name': '',
+                '_csv_import':      True,
+            }
+            st.session_state['estimate_data'] = estimate_data
+            st.success(f"✅ CSV取り込み完了（{len(_csv_items_s2)}行）")
+            st.session_state['step'] = 3
+            st.rerun()
 
         if vehicle_bytes is None and estimate_bytes is None:
             st.error("ファイルデータが見つかりません。ステップ①に戻ってください。")
