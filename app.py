@@ -3952,9 +3952,10 @@ def extract_honda_cars_subtotals(file_bytes):
 
 def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
                      use_fax_filter=False, use_rasterize=False, use_enhance=True,
-                     enable_self_correction=True):
+                     enable_self_correction=True, progress_cb=None):
     """
     見積書をAI-OCRで解析するメイン関数。
+    progress_cb: (pct: int, text: str) -> None  進捗コールバック（Noneなら使用しない）
     新機能:
       use_fax_filter: FAXページを自動除外する（追加APIコール1回）
       use_rasterize: PDF→JPEG変換してから送信（行ズレ防止）
@@ -3971,6 +3972,14 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     # ── ファイルハッシュキャッシュ: 同一ファイルの再解析を防ぐ ──────────────
     _cache_key = (hashlib.md5(file_bytes).hexdigest()
                   + f"_{used_model}_{use_rasterize}_{use_fax_filter}_{use_enhance}_{enable_self_correction}")
+    def _cb(pct, text):
+        """進捗コールバック呼び出し（Noneなら何もしない）"""
+        if progress_cb:
+            try:
+                progress_cb(pct, text)
+            except Exception:
+                pass
+
     if _cache_key in _analyze_result_cache:
         print("[INFO] キャッシュヒット: 再解析をスキップします", file=sys.stderr)
         return _analyze_result_cache[_cache_key]
@@ -3990,6 +3999,7 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     _logw(f"⚙️ オプション: FAXフィルター={'ON' if use_fax_filter else 'OFF'} / ラスタライズ={'ON' if use_rasterize else 'OFF'} / 自己修復={'ON' if enable_self_correction else 'OFF'}")
 
     # ① FAXページフィルタリング（オプション）
+    _cb(8, "① FAXページを確認中...")
     filtered_count = 0
     if use_fax_filter and mime_type == 'application/pdf':
         original_size = len(file_bytes)
@@ -3999,6 +4009,7 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     _logw(f"① FAXフィルター: {'1ページ除外' if filtered_count > 0 else '除外なし'}")
 
     # ② 横向きPDF補正
+    _cb(12, "② ページ補正・分割中...")
     if mime_type == 'application/pdf':
         file_bytes = try_fix_landscape_pdf(file_bytes)
 
@@ -4040,6 +4051,7 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
             first_raster_mime  = 'image/jpeg'
 
     # ④ 1パス目: 合計値＋車両情報抽出
+    _cb(20, "③ 合計金額・車両情報を読み取り中...（10〜20秒）")
     # 合計欄は最終ページ、車両情報は1ページ目にあることが多い
     # 複数ページの場合は最終ページと1ページ目を並列でAPI呼び出し（直列から並列化 → ~10s節約）
     _need_first_page = bool(pages and len(pages) > 1 and first_raster_bytes != raster_bytes)
@@ -4103,6 +4115,7 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
             totals_data['pdf_wage_total']  = _pypdf_wages
 
     # ⑤ 2パス目: 明細抽出（PDF全ページを一括送信 — ページ境界ズレを防ぐ）
+    _cb(45, f"④ 明細行を解析中...（{len(pages) if pages else 1}ページ / 30秒〜2分かかる場合があります）")
     _page_count = len(pages) if pages else 1
     _logw(f"⑤ 全ページ一括解析開始 ({_page_count}ページ)")
     result = analyze_estimate_single(
@@ -4123,6 +4136,7 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     _w = sum(safe_int(it.get('wage', 0)) for it in result['items'])
     _logw(f"  → {len(result['items'])}行 / 部品={_p:,} / 工賃={_w:,}")
 
+    _cb(80, "⑤ データを整理中...")
     # ⑥ 全ページ横断重複除去（AI出力のページ先読み・同一行二重出力を除去）
     # ページ境界に限らず全行を対象にした重複除去。
     # ・Page1のAIがPage2の明細を合計額に合わせて先読み出力するケースを防止
@@ -4898,13 +4912,25 @@ def main():
             st.stop()
 
         progress = st.progress(0, text="AI解析を開始しています...")
+        _wait_msg = st.info(
+            "📡 GeminiにPDFを送信し解析中です。"
+            "ページ数・ファイルサイズによって **30秒〜2分** かかる場合があります。"
+            "このページから移動せずにお待ちください。"
+        )
+
+        def _progress_cb(pct: int, text: str):
+            try:
+                progress.progress(pct, text=text)
+            except Exception:
+                pass
+
         try:
             vehicle_mime  = get_mime_type(vehicle_name) if vehicle_bytes else None
             estimate_mime = get_mime_type(estimate_name) if estimate_bytes else None
 
             if vehicle_bytes and estimate_bytes:
-                # 車検証＋見積書を並列で解析（高速化）
-                progress.progress(10, text="🔍 車検証＋見積書を同時解析中...")
+                # 車検証＋見積書を並列で解析
+                progress.progress(5, text="🔍 車検証＋見積書を同時解析中...")
                 with ThreadPoolExecutor(max_workers=2) as executor:
                     fut_vehicle = executor.submit(
                         analyze_vehicle_registration, api_key, vehicle_bytes, vehicle_mime
@@ -4914,7 +4940,7 @@ def main():
                         _use_fax, _use_raster, _use_enhance, _enable_sc
                     )
                     vehicle_data  = fut_vehicle.result()
-                    progress.progress(50, text="✅ 車検証の解析完了、見積書を処理中...")
+                    progress.progress(40, text="✅ 車検証の解析完了、見積書を処理中...")
                     estimate_data = fut_estimate.result() or {}
             elif vehicle_bytes:
                 # 車検証のみ
@@ -4922,16 +4948,18 @@ def main():
                 vehicle_data  = analyze_vehicle_registration(api_key, vehicle_bytes, vehicle_mime)
                 estimate_data = None
             else:
-                # 見積書のみ（車検証なし）
-                progress.progress(10, text="🔍 見積書を解析中（車検証なし）...")
+                # 見積書のみ（車検証なし）— 逐次解析でプログレス更新可能
+                progress.progress(5, text="🔍 見積書の解析を開始中...")
                 vehicle_data  = {}
                 estimate_data = analyze_estimate(
                     api_key, estimate_bytes, estimate_mime, _model,
-                    _use_fax, _use_raster, _use_enhance, _enable_sc
+                    _use_fax, _use_raster, _use_enhance, _enable_sc,
+                    progress_cb=_progress_cb,
                 ) or {}
 
             st.session_state['vehicle_data'] = vehicle_data
-            progress.progress(60, text="✅ 解析完了")
+            progress.progress(90, text="✅ 解析完了")
+            _wait_msg.empty()  # 「お待ちください」メッセージを非表示
 
             if vehicle_bytes:
                 v_conf = safe_float(vehicle_data.get('confidence', 1.0), 1.0)
