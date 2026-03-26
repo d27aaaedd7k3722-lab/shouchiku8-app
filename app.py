@@ -5779,6 +5779,11 @@ def main():
                     'discrepancies', 'total_diff',
                     'amount_confirmed',
                     '_original_items',
+                    # CSV取り込み関連
+                    'csv_mode', 'csv_items', '_csv_paste_saved',
+                    # その他の残留データ
+                    'use_fax_filter', 'use_rasterize', 'use_enhance', 'selected_model',
+                    'short_parts_wage',
                 ]:
                     if key in st.session_state:
                         del st.session_state[key]
