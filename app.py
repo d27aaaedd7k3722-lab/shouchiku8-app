@@ -4853,25 +4853,20 @@ def main():
             else:
                 st.info("💡 車検証なしの場合、見積書から読み取れる車両情報のみでNEOを作成します")
         with col2:
-            # 見積書タイトル＋税区分を1行に横並び
-            st.markdown(
-                '<div class="section-title" style="display:flex;align-items:center;gap:12px;">'
-                '🧾 見積書</div>',
-                unsafe_allow_html=True
-            )
-            _tax_options = ['税抜き（外税）', '税込み（内税）']
-            _saved_tax_override = st.session_state.get('tax_override', '税抜き（外税）')
-            if _saved_tax_override not in _tax_options:
-                _saved_tax_override = '税抜き（外税）'
-            _tax_sel = st.radio(
-                "税区分",
-                options=_tax_options,
-                index=_tax_options.index(_saved_tax_override),
-                horizontal=True,
-                key='tax_override_radio',
-                label_visibility='collapsed',
-            )
-            st.session_state['tax_override'] = _tax_sel
+            # 見積書 ＋ 外税/内税 を1行に表示（columnsで横並び）
+            _title_c, _radio_c = st.columns([1, 3], gap="small")
+            with _title_c:
+                st.markdown('<div style="font-weight:700;font-size:14px;padding-top:8px;">🧾 見積書</div>', unsafe_allow_html=True)
+            with _radio_c:
+                _tax_options = ['外税', '内税']
+                _saved_tax_override = st.session_state.get('tax_override', '税抜き（外税）')
+                _default_idx = 1 if '内税' in str(_saved_tax_override) or '税込' in str(_saved_tax_override) else 0
+                _tax_sel_short = st.radio("税区分", options=_tax_options,
+                                          index=_default_idx, horizontal=True,
+                                          key='tax_override_radio',
+                                          label_visibility='collapsed')
+                _tax_sel = '税込み（内税）' if _tax_sel_short == '内税' else '税抜き（外税）'
+                st.session_state['tax_override'] = _tax_sel
             estimate_file = st.file_uploader(
                 "見積書をアップロード（PDF・JPG・PNG 対応、FAX品質可）",
                 type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
