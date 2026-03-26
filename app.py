@@ -4853,38 +4853,34 @@ def main():
             else:
                 st.info("💡 車検証なしの場合、見積書から読み取れる車両情報のみでNEOを作成します")
         with col2:
-            # 見積書アップロード ＋ 税区分を横並び
-            _est_col, _tax_col = st.columns([3, 2])
-            with _est_col:
-                st.markdown('<div class="section-title">🧾 見積書</div>', unsafe_allow_html=True)
-                estimate_file = st.file_uploader(
-                    "見積書をアップロード（PDF・JPG・PNG 対応、FAX品質可）",
-                    type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
-                    key='estimate_upload',
-                )
-                if estimate_file:
-                    st.success(f"✅ {estimate_file.name}")
-                    st.session_state.pop('csv_items', None)
-                    st.session_state.pop('csv_mode', None)
-                else:
-                    st.caption("💡 見積書なしの場合、車両情報のみのNEOを作成します")
-            with _tax_col:
-                st.markdown('<div class="section-title">💴 税区分</div>', unsafe_allow_html=True)
-                _tax_options = ['税抜き（外税）', '税込み（内税）']
-                _saved_tax_override = st.session_state.get('tax_override', '税抜き（外税）')
-                if _saved_tax_override not in _tax_options:
-                    _saved_tax_override = '税抜き（外税）'
-                _tax_sel = st.radio(
-                    "税区分",
-                    options=_tax_options,
-                    index=_tax_options.index(_saved_tax_override),
-                    horizontal=False,
-                    key='tax_override_radio',
-                    label_visibility='collapsed',
-                    help="見積書の明細金額が税込みか税抜きかを選択してください。"
-                )
-                st.session_state['tax_override'] = _tax_sel
-                st.caption(f"⚙️ {_tax_sel}")
+            # 見積書タイトル＋税区分を1行に横並び
+            st.markdown(
+                '<div class="section-title" style="display:flex;align-items:center;gap:12px;">'
+                '🧾 見積書</div>',
+                unsafe_allow_html=True
+            )
+            _tax_options = ['税抜き（外税）', '税込み（内税）']
+            _saved_tax_override = st.session_state.get('tax_override', '税抜き（外税）')
+            if _saved_tax_override not in _tax_options:
+                _saved_tax_override = '税抜き（外税）'
+            _tax_sel = st.radio(
+                "税区分",
+                options=_tax_options,
+                index=_tax_options.index(_saved_tax_override),
+                horizontal=True,
+                key='tax_override_radio',
+                label_visibility='collapsed',
+            )
+            st.session_state['tax_override'] = _tax_sel
+            estimate_file = st.file_uploader(
+                "見積書をアップロード（PDF・JPG・PNG 対応、FAX品質可）",
+                type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
+                key='estimate_upload',
+            )
+            if estimate_file:
+                st.success(f"✅ {estimate_file.name}")
+                st.session_state.pop('csv_items', None)
+                st.session_state.pop('csv_mode', None)
 
         # ── CSV取り込みセクション ──
         _CSV_PROMPT = """添付の自動車修理見積書PDFを、以下のCSV形式で全明細行を転写してください。
@@ -5022,14 +5018,6 @@ def main():
 
         # ── テンプレートNEOアップロード（任意） ──
         st.markdown("**📁 テンプレートNEOファイル（任意）**")
-        st.markdown(
-            '<div style="background:#fffbeb;border:1px solid #fbbf24;border-radius:8px;padding:10px 14px;font-size:13px;margin-bottom:10px">'
-            '💡 <b>証券番号・工場名・車両情報など</b>が入力済みのNEOファイルをテンプレートとして使用できます。<br>'
-            '車検証OCRで取得した情報と照合し、<b>誤記入を自動訂正</b>した上で<b>明細欄をPDF解析結果でベタ打ち</b>します。<br>'
-            'テンプレートにしか存在しない情報（工場名・証券番号など）はそのまま保持されます。'
-            '</div>',
-            unsafe_allow_html=True
-        )
         custom_neo_file = st.file_uploader(
             "テンプレートNEOファイルをアップロード",
             type=['neo'],
