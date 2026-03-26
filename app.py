@@ -4882,16 +4882,6 @@ def main():
                 st.caption(f"⚙️ {_tax_sel}")
 
         # ── CSV取り込みセクション ──
-        st.markdown(
-            '<div style="background:#f0fdf4;border:1px solid #86efac;border-radius:8px;'
-            'padding:12px 16px;font-size:13px;margin-bottom:4px">'
-            '📊 <b>CSV取り込み（AI解析をスキップ）</b> — '
-            'Claude.ai / Gemini.ai でPDFを解析してCSVを取得し、下欄に貼り付けるとすぐNEO生成に進めます。'
-            '</div>',
-            unsafe_allow_html=True
-        )
-
-        # ── AI解析用プロンプト コピーボタン ──
         _CSV_PROMPT = """添付の自動車修理見積書PDFを、以下のCSV形式で全明細行を転写してください。
 
 【出力形式（ヘッダー行必須）】
@@ -4927,39 +4917,33 @@ def main():
 
 出力はCSVおよび相違確認結果のみ。説明文・コメント不要。"""
 
-        with st.expander("📋 Claude.ai / Gemini.ai 用プロンプトをコピー", expanded=False):
+        _escaped = _CSV_PROMPT.replace('`', '\\`').replace('\\', '\\\\').replace('\n', '\\n')
+
+        # CSV取り込みバー（テキスト＋コピーボタンを横並び）
+        _csv_bar_col, _csv_btn_col = st.columns([5, 2])
+        with _csv_bar_col:
             st.markdown(
-                '<div style="background:#fffbeb;border:1px solid #fbbf24;border-radius:6px;'
-                'padding:8px 12px;font-size:12px;margin-bottom:8px">'
-                '💡 <b>使い方</b>: 下のプロンプトをコピー → Claude.ai / Gemini.ai を開く → '
-                'PDFをアップロード → プロンプトを貼り付けて送信 → 出力されたCSVを下の取り込み欄に貼り付け'
+                '<div style="background:#f0fdf4;border:1px solid #86efac;border-radius:8px;'
+                'padding:10px 14px;font-size:13px;">'
+                '📊 <b>CSV取り込み（AI解析をスキップ）</b><br>'
+                '<span style="font-size:11px;color:#555;">Claude.ai / Gemini.ai にPDFと下のプロンプトを送信 → CSVをコピー → 下欄に貼り付け</span>'
                 '</div>',
                 unsafe_allow_html=True
             )
-            st.text_area(
-                "📄 プロンプト（全選択してコピー）",
-                value=_CSV_PROMPT,
-                height=260,
-                key='csv_prompt_display',
-                help="Ctrl+A で全選択 → Ctrl+C でコピー",
-            )
-            # JavaScriptクリップボードコピーボタン
-            _escaped = _CSV_PROMPT.replace('`', '\\`').replace('\\', '\\\\').replace('\n', '\\n')
+        with _csv_btn_col:
             st.components.v1.html(f"""
 <button onclick="navigator.clipboard.writeText(`{_escaped}`).then(()=>{{
     this.textContent='✅ コピーしました！';
     this.style.background='#16a34a';
-    setTimeout(()=>{{this.textContent='📋 クリップボードにコピー';this.style.background='#2563eb';}},2000);
+    setTimeout(()=>{{this.textContent='📋 AI用プロンプトをコピー';this.style.background='#2563eb';}},2000);
 }})" style="
-    background:#2563eb;color:white;border:none;border-radius:6px;
-    padding:8px 20px;font-size:14px;cursor:pointer;font-weight:600;width:100%;
-">📋 クリップボードにコピー</button>
-""", height=48)
+    background:#2563eb;color:white;border:none;border-radius:8px;
+    padding:10px 14px;font-size:13px;cursor:pointer;font-weight:600;width:100%;height:52px;
+">📋 AI用プロンプトをコピー</button>
+""", height=56)
 
         with st.expander("📊 CSVを貼り付けて取り込む", expanded=st.session_state.get('csv_mode', False)):
-            # コピーボタン（CSV欄の上部に配置）
-            st.markdown('<div style="font-size:12px;color:#555;margin-bottom:4px">📋 <b>手順</b>: ①下のボタンでプロンプトをコピー → ② Claude.ai / Gemini.ai にPDFと一緒に貼り付けて送信 → ③ 出力されたCSVを下欄に貼り付け</div>', unsafe_allow_html=True)
-            _escaped2 = _CSV_PROMPT.replace('`', '\\`').replace('\\', '\\\\').replace('\n', '\\n')
+            _escaped2 = _escaped  # 同じエスケープ済みプロンプトを再利用
             st.components.v1.html(f"""
 <button onclick="navigator.clipboard.writeText(`{_escaped2}`).then(()=>{{
     this.textContent='✅ コピーしました！';
