@@ -4271,266 +4271,214 @@ def main():
         # ベタ打ちモード固定
         st.session_state['selected_mode'] = 'beta'
 
-        st.markdown('<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;font-size:13px;margin-bottom:12px">✏️ <b>ベタ打ちモード</b> — 見積内容をそのままNEOファイルに転記します</div>', unsafe_allow_html=True)
-
-        # ── タイトル行（車検証 | 見積書 外税○ 内税○）──
-        _h1, _h2 = st.columns(2)
-        with _h1:
-            st.markdown('<div class="section-title">📋 車検証（任意）</div>', unsafe_allow_html=True)
-        with _h2:
-            _tax_options = ['外税', '内税']
-            _saved_tax_override = st.session_state.get('tax_override', '税抜き（外税）')
-            _default_idx = 1 if '内税' in str(_saved_tax_override) or '税込' in str(_saved_tax_override) else 0
-            _t_col, _r_col = st.columns([1, 3], gap="small")
-            with _t_col:
-                st.markdown('<div class="section-title">🧾 見積書</div>', unsafe_allow_html=True)
-            with _r_col:
-                _tax_sel_short = st.radio("税区分", options=_tax_options,
-                                          index=_default_idx, horizontal=True,
-                                          key='tax_override_radio',
-                                          label_visibility='collapsed')
-                _tax_sel = '税込み（内税）' if _tax_sel_short == '内税' else '税抜き（外税）'
-                st.session_state['tax_override'] = _tax_sel
-
-        # ── アップロードカード（高さ揃え）──
-        col1, col2 = st.columns(2)
-        with col1:
+        # ================================================================
+        # STEP 1-A: ファイルアップロード（車検証 + テンプレートNEO）
+        # ================================================================
+        st.markdown('<div class="section-title">📁 ファイルアップロード</div>', unsafe_allow_html=True)
+        _up_col1, _up_col2 = st.columns(2)
+        with _up_col1:
             vehicle_file = st.file_uploader(
-                "車検証をアップロード（PDF・JPG・PNG 対応）※なくても見積書のみで作成可",
+                "📋 車検証（任意）PDF・JPG・PNG 対応",
                 type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
                 key='vehicle_upload',
             )
             if vehicle_file:
                 st.success(f"✅ {vehicle_file.name}")
-        with col2:
-            estimate_file = st.file_uploader(
-                "見積書をアップロード（PDF・JPG・PNG 対応、FAX品質可）",
-                type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
-                key='estimate_upload',
+        with _up_col2:
+            custom_neo_file = st.file_uploader(
+                "📁 テンプレートNEOファイル（任意）",
+                type=['neo'],
+                key='custom_neo_upload',
+                help="コグニセブンで作成した.neoファイル。証券番号・工場名・車両情報等が入力済みのものを使用してください。"
             )
-            if estimate_file:
-                st.success(f"✅ {estimate_file.name}")
-                st.session_state.pop('csv_items', None)
-                st.session_state.pop('csv_mode', None)
+            if custom_neo_file:
+                _neo_bytes_read = custom_neo_file.read()
+                st.session_state['custom_neo_bytes'] = _neo_bytes_read
+                st.session_state['custom_neo_name']  = custom_neo_file.name
+                custom_neo_file.seek(0)
+                st.success(f"✅ {custom_neo_file.name} ({len(_neo_bytes_read):,} bytes)")
+                st.caption("📋 テンプレートの工場名・証券番号等はそのまま引き継ぎます")
+            elif st.session_state.get('custom_neo_bytes'):
+                _saved_name = st.session_state.get('custom_neo_name', 'テンプレートNEO')
+                _saved_size = len(st.session_state['custom_neo_bytes'])
+                st.success(f"✅ {_saved_name} ({_saved_size:,} bytes) — 前回アップロード済み")
+                if st.button("🗑️ リセット", key='clear_custom_neo'):
+                    st.session_state.pop('custom_neo_bytes', None)
+                    st.session_state.pop('custom_neo_name', None)
+                    st.rerun()
+            else:
+                st.caption(f"未選択 → デフォルトテンプレート（{TEMPLATE_FILENAME}）を使用")
 
-        # ── CSV取り込みセクション ──
+        # ================================================================
+        # STEP 1-B: Gemini解析 → CSV取り込み（メインフロー）
+        # ================================================================
+        st.markdown("---")
+        st.markdown(
+            '<div style="background:#f0fdf4;border:1px solid #86efac;border-radius:10px;'
+            'padding:14px 18px;font-size:14px;margin-bottom:12px;">'
+            '🤖 <b>見積書の解析手順</b><br>'
+            '<span style="font-size:12px;color:#555;">'
+            '① 下の「プロンプトをコピー」をクリック → '
+            '② 「Geminiを開く」でGoogle Geminiへ → '
+            '③ プロンプトを貼り付け＋見積書PDFを添付して送信 → '
+            '④ 結果のCSVをコピーして下欄に貼り付け'
+            '</span>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        # ── プロンプト定義 ──
         _CSV_PROMPT = """添付の自動車修理見積書PDFを、以下のCSV形式で全明細行を転写してください。
-
-【出力形式（ヘッダー行必須）】
-品名,区分,数量,部品金額,工賃,部品コード
-
-【各列の定義】
-- 品名：部品名または作業名（そのまま転写）
-- 区分：下記ルールで判定した1語のみ
-- 数量：半角整数（不明な場合は 1）
-- 部品金額：部品・材料費（半角整数・カンマなし）。工賃のみの行は 0
-- 工賃：技術料・作業料（半角整数・カンマなし）。部品のみの行は 0
-- 部品コード：見積書に記載の品番・部品番号（ない場合は空欄）
-
-【区分の判定ルール（必ずいずれか1語を記入。該当なしは空欄）】
-取替：「取替」「交換」「取換」を含む作業、または部品金額のみ（工賃0）の行
-脱着：「脱着」「取外」「取付」「組付」を含む作業
-鈑金：「鈑金」「板金」を含む作業
-塗装：「塗装」「ペイント」「ワックス」「加算」「ブース」を含む作業
-修理：「修理」「補修」「調整」「点検」「設定」「分解」「修正」を含む作業
-空欄：「研磨」「磨き」「写真代」「ショートパーツ」など上記に当てはまらないもの
-
-【重要ルール】
-- 部品と工賃は必ず別行に分けて記載する（同一行に両方入れない）
-- 部品金額と工賃が見積書で同一列の場合：品番付き行→部品金額列、作業名行→工賃列に振り分ける
-- 合計行・小計行・消費税行は除外する
-- 全ページ・全明細行を漏れなく抽出する
-
-【合計額の確認】
-明細抽出後、抽出した部品金額合計と工賃合計を計算し、見積書原本の合計額と照合してください。
-不一致の場合のみ、CSVの末尾に改行して以下を記載してください（一致している場合は記載不要）。
-部品相違○○○○円
-工賃相違●●●●円
-
-出力はCSVおよび相違確認結果のみ。説明文・コメント不要。"""
+【出力形式（ヘッダー行必須）】 品名,区分,数量,部品金額,工賃,部品コード
+【各列の抽出・加工ルール】
+* 品名：元の記載から「取替」「脱着」「修理」「鈑金」「塗装」などの作業を示す文言（後述の区分ルールに該当する語）を削除した、純粋な部品名・対象名。
+* 区分：元の記載に含まれる以下のキーワードを1語のみ抽出（該当なしは空欄）。 ・取替：「取替」「交換」「取換」（※部品金額のみで工賃0の行も「取替」とする） ・脱着：「脱着」「取外」「取付」「組付」 ・鈑金：「鈑金」「板金」 ・塗装：「塗装」「ペイント」「ワックス」「加算」「ブース」 ・修理：「修理」「補修」「調整」「点検」「設定」「分解」「修正」
+* 数量：半角整数（空欄や不明な場合は 1 を補完）
+* 部品金額：「部品、油脂」列の金額。半角整数・カンマなし（記載なしは 0）
+* 工賃：「技術料」列の金額。半角整数・カンマなし（記載なしは 0）
+* 部品コード：品番・部品番号（記載なしは空欄）
+【データ処理の重要ルール（高速化・精度向上）】
+1. 行の分割：1つの項目に対し「部品、油脂」「技術料」両方に金額がある場合、必ず2行に分割する。 ・1行目：部品金額のみ記載（工賃は0） ・2行目：工賃のみ記載（部品金額は0）
+2. 列の厳密照合：金額が部品列か技術料列か、PDFの表ヘッダーを厳密に確認する（例：「ショートパーツ」等、技術料列のみの数値を部品列に入れない）。
+3. 対象外：合計行、小計行、消費税行は出力しない。全ページ・全明細行を漏れなく処理する。
+【合計額の自動検算と出力】 明細抽出後、内部で以下の検算を実施すること。
+1. 抽出した全明細の「部品金額」の合計と「工賃」の合計を算出。
+2. 見積書原本の最終的な「部品代合計」「技術料（工賃）合計」と照合。
+3. 不一致の場合のみ、CSVの末尾に改行して以下を出力（一致時は出力しない）。※金額には必ずカンマ（,）を含めること。 部品相違〇,〇〇〇円 工賃相違●,●●●円
+出力はCSVデータおよび相違確認結果のみ。説明文・コメントは一切不要。"""
 
         _escaped = _CSV_PROMPT.replace('`', '\\`').replace('\\', '\\\\').replace('\n', '\\n')
 
-        # CSV取り込みバー（テキスト＋コピーボタンを横並び）
-        _csv_bar_col, _csv_btn_col = st.columns([5, 2])
-        with _csv_bar_col:
-            st.markdown(
-                '<div style="background:#f0fdf4;border:1px solid #86efac;border-radius:8px;'
-                'padding:10px 14px;font-size:13px;">'
-                '📊 <b>CSV取り込み（AI解析をスキップ）</b><br>'
-                '<span style="font-size:11px;color:#555;">Claude.ai / Gemini.ai にPDFと下のプロンプトを送信 → CSVをコピー → 下欄に貼り付け</span>'
-                '</div>',
-                unsafe_allow_html=True
-            )
-        with _csv_btn_col:
+        # ── ボタン行: プロンプトコピー ＋ Geminiを開く ──
+        _btn_col1, _btn_col2 = st.columns(2)
+        with _btn_col1:
             st.components.v1.html(f"""
 <button onclick="navigator.clipboard.writeText(`{_escaped}`).then(()=>{{
     this.textContent='✅ コピーしました！';
     this.style.background='#16a34a';
-    setTimeout(()=>{{this.textContent='📋 AI用プロンプトをコピー';this.style.background='#2563eb';}},2000);
+    setTimeout(()=>{{this.textContent='📋 プロンプトをコピー';this.style.background='#2563eb';}},2000);
 }})" style="
     background:#2563eb;color:white;border:none;border-radius:8px;
-    padding:10px 14px;font-size:13px;cursor:pointer;font-weight:600;width:100%;height:52px;
-">📋 AI用プロンプトをコピー</button>
+    padding:12px 14px;font-size:14px;cursor:pointer;font-weight:700;width:100%;height:52px;
+">📋 プロンプトをコピー</button>
+""", height=56)
+        with _btn_col2:
+            st.components.v1.html("""
+<a href="https://gemini.google.com/" target="_blank" rel="noopener noreferrer" style="
+    display:flex;align-items:center;justify-content:center;gap:8px;
+    background:#ea4335;color:white;border:none;border-radius:8px;
+    padding:12px 14px;font-size:14px;cursor:pointer;font-weight:700;width:100%;height:52px;
+    text-decoration:none;
+">🌐 Geminiを開く（別タブ）</a>
 """, height=56)
 
-        with st.expander("📊 CSVを貼り付けて取り込む", expanded=st.session_state.get('csv_mode', False)):
-            _escaped2 = _escaped  # 同じエスケープ済みプロンプトを再利用
-            _csv_top1, _csv_top2 = st.columns([1, 1])
-            with _csv_top1:
-                st.components.v1.html(f"""
-<button onclick="navigator.clipboard.writeText(`{_escaped2}`).then(()=>{{
-    this.textContent='✅ コピーしました！';
-    this.style.background='#16a34a';
-    setTimeout(()=>{{this.textContent='📋 AI用プロンプトをコピー';this.style.background='#2563eb';}},2000);
-}})" style="
-    background:#2563eb;color:white;border:none;border-radius:6px;
-    padding:7px 18px;font-size:13px;cursor:pointer;font-weight:600;margin-bottom:10px;
-">📋 AI用プロンプトをコピー</button>
-""", height=44)
-            with _csv_top2:
-                # CSV専用の税区分選択ボタン
-                _csv_tax_options = ['税抜き（外税）', '税込み（内税）']
-                _csv_saved_tax = st.session_state.get('tax_override', '税抜き（外税）')
-                _csv_tax_idx = 1 if '内税' in str(_csv_saved_tax) or '税込' in str(_csv_saved_tax) else 0
-                _csv_tax_sel = st.radio(
-                    "💴 CSVの金額表記",
-                    options=_csv_tax_options,
-                    index=_csv_tax_idx,
-                    horizontal=True,
-                    key='csv_tax_radio',
-                )
-                # CSV税区分の選択をtax_overrideに同期
-                st.session_state['tax_override'] = _csv_tax_sel
-            st.divider()
-            _csv_col1, _csv_col2 = st.columns([2, 1])
-            with _csv_col1:
-                _csv_paste = st.text_area(
-                    "CSVテキストを貼り付け（ヘッダー行必須）",
-                    height=160,
-                    placeholder="品名,区分,数量,部品金額,工賃,部品コード\nフロントバンパー,取替,1,45000,0,\nバンパー交換工賃,取替,1,0,12000,",
-                    key='csv_paste_area',
-                    value=st.session_state.get('_csv_paste_saved', ''),
-                )
-            with _csv_col2:
-                st.markdown("**CSVファイル（.csv/.txt）**")
-                _csv_file = st.file_uploader(
-                    "CSVファイル",
-                    type=['csv', 'txt'],
-                    key='csv_file_upload',
-                    label_visibility='collapsed',
-                )
-                if st.session_state.get('csv_mode') and st.session_state.get('csv_items'):
-                    _p = sum(safe_int(it.get('parts_amount', 0)) for it in st.session_state['csv_items'])
-                    _w = sum(safe_int(it.get('wage', 0)) for it in st.session_state['csv_items'])
-                    st.success(f"✅ {len(st.session_state['csv_items'])}行 取込済")
-                    st.caption(f"部品: ¥{_p:,} / 工賃: ¥{_w:,}")
-                    if st.button("🗑️ クリア", key='csv_clear_btn'):
-                        st.session_state.pop('csv_items', None)
-                        st.session_state.pop('csv_mode', None)
-                        st.session_state.pop('_csv_paste_saved', None)
-                        st.rerun()
+        # ── CSV取り込みエリア ──
+        st.markdown("")
+        st.markdown('<div class="section-title">📊 CSV取り込み</div>', unsafe_allow_html=True)
 
-            _csv_text = ''
-            if _csv_file:
-                try:
-                    _raw = _csv_file.read()
-                    for _enc in ('utf-8-sig', 'utf-8', 'shift-jis', 'cp932'):
-                        try:
-                            _csv_text = _raw.decode(_enc)
-                            break
-                        except Exception:
-                            continue
-                except Exception:
-                    pass
-            elif _csv_paste and _csv_paste.strip():
-                _csv_text = _csv_paste.strip()
+        # 税区分選択
+        _tax_options = ['税抜き（外税）', '税込み（内税）']
+        _saved_tax_override = st.session_state.get('tax_override', '税抜き（外税）')
+        _tax_default_idx = 1 if '内税' in str(_saved_tax_override) or '税込' in str(_saved_tax_override) else 0
+        _tax_sel = st.radio(
+            "💴 見積書の金額表記",
+            options=_tax_options,
+            index=_tax_default_idx,
+            horizontal=True,
+            key='csv_tax_radio',
+        )
+        st.session_state['tax_override'] = _tax_sel
 
-            if _csv_text:
-                _preview_items = parse_csv_to_items(_csv_text)
-                if _preview_items:
-                    st.success(f"✅ {len(_preview_items)}行 読み込み完了 — 部品: ¥{sum(safe_int(it.get('parts_amount',0)) for it in _preview_items):,} / 工賃: ¥{sum(safe_int(it.get('wage',0)) for it in _preview_items):,}")
-                    st.session_state['csv_items'] = _preview_items
-                    st.session_state['csv_mode']  = True
-                    st.session_state['_csv_paste_saved'] = _csv_text
-                else:
-                    st.error("❌ CSVの読み込みに失敗しました。1行目にヘッダー（品名,区分,数量,部品金額,工賃,部品コード）が必要です。")
+        _csv_col1, _csv_col2 = st.columns([2, 1])
+        with _csv_col1:
+            _csv_paste = st.text_area(
+                "Geminiの解析結果CSVを貼り付け（ヘッダー行必須）",
+                height=180,
+                placeholder="品名,区分,数量,部品金額,工賃,部品コード\nフロントバンパー,取替,1,45000,0,\nバンパー交換工賃,取替,1,0,12000,",
+                key='csv_paste_area',
+                value=st.session_state.get('_csv_paste_saved', ''),
+            )
+        with _csv_col2:
+            st.markdown("**CSVファイル（.csv/.txt）**")
+            _csv_file = st.file_uploader(
+                "CSVファイル",
+                type=['csv', 'txt'],
+                key='csv_file_upload',
+                label_visibility='collapsed',
+            )
+            if st.session_state.get('csv_mode') and st.session_state.get('csv_items'):
+                _p = sum(safe_int(it.get('parts_amount', 0)) for it in st.session_state['csv_items'])
+                _w = sum(safe_int(it.get('wage', 0)) for it in st.session_state['csv_items'])
+                st.success(f"✅ {len(st.session_state['csv_items'])}行 取込済")
+                st.caption(f"部品: ¥{_p:,} / 工賃: ¥{_w:,}")
+                if st.button("🗑️ クリア", key='csv_clear_btn'):
                     st.session_state.pop('csv_items', None)
                     st.session_state.pop('csv_mode', None)
+                    st.session_state.pop('_csv_paste_saved', None)
+                    st.rerun()
 
-            # 税区分はCSV専用ラジオボタン(csv_tax_radio)で設定済み
+        _csv_text = ''
+        if _csv_file:
+            try:
+                _raw = _csv_file.read()
+                for _enc in ('utf-8-sig', 'utf-8', 'shift-jis', 'cp932'):
+                    try:
+                        _csv_text = _raw.decode(_enc)
+                        break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        elif _csv_paste and _csv_paste.strip():
+            _csv_text = _csv_paste.strip()
 
-        # ── テンプレートNEOアップロード（任意） ──
-        st.markdown("**📁 テンプレートNEOファイル（任意）**")
-        custom_neo_file = st.file_uploader(
-            "テンプレートNEOファイルをアップロード",
-            type=['neo'],
-            key='custom_neo_upload',
-            help="コグニセブンで作成した.neoファイル。証券番号・工場名・車両情報等が入力済みのものを使用してください。"
-        )
-        if custom_neo_file:
-            # Streamlitのfile_uploaderはステップ遷移でウィジェットが非表示になると
-            # session_stateのキーがクリアされる。そのため、バイト列を別キーに保存して永続化する
-            _neo_bytes_read = custom_neo_file.read()
-            st.session_state['custom_neo_bytes'] = _neo_bytes_read
-            st.session_state['custom_neo_name']  = custom_neo_file.name
-            custom_neo_file.seek(0)
-            st.success(f"✅ {custom_neo_file.name} ({len(_neo_bytes_read):,} bytes)")
-            st.caption("📋 車検証OCRで誤記入を訂正し、テンプレートの工場名・証券番号等はそのまま引き継ぎます")
-        elif st.session_state.get('custom_neo_bytes'):
-            # 前回アップロード済みのファイルがある場合、その情報を表示
-            _saved_name = st.session_state.get('custom_neo_name', 'テンプレートNEO')
-            _saved_size = len(st.session_state['custom_neo_bytes'])
-            st.success(f"✅ {_saved_name} ({_saved_size:,} bytes) — 前回アップロード済み")
-            st.caption("📋 車検証OCRで誤記入を訂正し、テンプレートの工場名・証券番号等はそのまま引き継ぎます")
-            if st.button("🗑️ テンプレートNEOをリセット", key='clear_custom_neo'):
-                st.session_state.pop('custom_neo_bytes', None)
-                st.session_state.pop('custom_neo_name', None)
-                st.rerun()
-        else:
-            st.info(f"未選択の場合はデフォルトテンプレート（{TEMPLATE_FILENAME}）を使用します")
+        if _csv_text:
+            _preview_items = parse_csv_to_items(_csv_text)
+            if _preview_items:
+                st.success(f"✅ {len(_preview_items)}行 読み込み完了 — 部品: ¥{sum(safe_int(it.get('parts_amount',0)) for it in _preview_items):,} / 工賃: ¥{sum(safe_int(it.get('wage',0)) for it in _preview_items):,}")
+                st.session_state['csv_items'] = _preview_items
+                st.session_state['csv_mode']  = True
+                st.session_state['_csv_paste_saved'] = _csv_text
+            else:
+                st.error("❌ CSVの読み込みに失敗しました。1行目にヘッダー（品名,区分,数量,部品金額,工賃,部品コード）が必要です。")
+                st.session_state.pop('csv_items', None)
+                st.session_state.pop('csv_mode', None)
 
         # ── オプション設定 ──
-        st.markdown("**⚙️ オプション設定**")
-        opt_col1, opt_col2, opt_col3 = st.columns(3)
-        with opt_col1:
-            policy_no_step1 = st.text_input("保険会社", placeholder="例: 東京海上日動", key="ins_company_step1")
-        with opt_col2:
-            policy_no_step1b = st.text_input("証券番号", placeholder="例: TK-12345678", key="ins_policy_step1")
-        with opt_col3:
-            assignee_step1 = st.text_input("担当者名", placeholder="例: 田中 花子", key="assignee_step1")
+        with st.expander("⚙️ オプション設定", expanded=False):
+            opt_col1, opt_col2, opt_col3 = st.columns(3)
+            with opt_col1:
+                policy_no_step1 = st.text_input("保険会社", placeholder="例: 東京海上日動", key="ins_company_step1")
+            with opt_col2:
+                policy_no_step1b = st.text_input("証券番号", placeholder="例: TK-12345678", key="ins_policy_step1")
+            with opt_col3:
+                assignee_step1 = st.text_input("担当者名", placeholder="例: 田中 花子", key="assignee_step1")
 
+        # ── 開始ボタン ──
         st.markdown("")
+        estimate_file = None  # PDF見積書アップロード廃止（CSV取り込みに一本化）
         _csv_mode_active = st.session_state.get('csv_mode') and st.session_state.get('csv_items')
-        _has_input = vehicle_file or estimate_file or _csv_mode_active
+        _has_input = vehicle_file or _csv_mode_active
         if _has_input:
-            _btn_label = "📊 CSV取り込みを開始 →" if _csv_mode_active and not estimate_file else "🚀 AI解析を開始 →"
+            _btn_label = "🚀 NEO生成を開始 →"
             if st.button(_btn_label, type="primary", use_container_width=True):
-                if not _csv_mode_active and not api_key:
-                    st.error("⚠️ APIキーが未設定です。サイドバーで入力するか、app.py冒頭の GEMINI_API_KEY に貼り付けてください。")
+                if vehicle_file:
+                    st.session_state['vehicle_file_bytes'] = vehicle_file.read()
+                    st.session_state['vehicle_file_name']  = vehicle_file.name
                 else:
-                    if vehicle_file:
-                        st.session_state['vehicle_file_bytes'] = vehicle_file.read()
-                        st.session_state['vehicle_file_name']  = vehicle_file.name
-                    else:
-                        st.session_state['vehicle_file_bytes'] = None
-                        st.session_state['vehicle_file_name']  = None
-                    if estimate_file:
-                        st.session_state['estimate_file_bytes'] = estimate_file.read()
-                        st.session_state['estimate_file_name']  = estimate_file.name
-                        st.session_state.pop('csv_mode', None)   # PDFがある場合はCSVモード解除
-                        st.session_state.pop('csv_items', None)
-                    else:
-                        st.session_state['estimate_file_bytes'] = None
-                        st.session_state['estimate_file_name']  = None
-                    st.session_state['use_fax_filter'] = use_fax_filter
-                    st.session_state['use_rasterize']  = use_rasterize
-                    st.session_state['use_enhance']    = use_enhance
-                    st.session_state['selected_model'] = selected_model
-                    st.session_state['step'] = 2
-                    st.rerun()
+                    st.session_state['vehicle_file_bytes'] = None
+                    st.session_state['vehicle_file_name']  = None
+                # PDF見積書は使用しない（CSV取り込みに一本化）
+                st.session_state['estimate_file_bytes'] = None
+                st.session_state['estimate_file_name']  = None
+                st.session_state['use_fax_filter'] = False
+                st.session_state['use_rasterize']  = False
+                st.session_state['use_enhance']    = True
+                st.session_state['selected_model'] = selected_model
+                st.session_state['step'] = 2
+                st.rerun()
         else:
-            st.warning("見積書・車検証のアップロード、またはCSVの取り込みを行ってください")
+            st.info("📊 CSVを貼り付けるか、車検証をアップロードして「NEO生成を開始」を押してください")
 
     # =========================================
     # STEP 2: AI解析
