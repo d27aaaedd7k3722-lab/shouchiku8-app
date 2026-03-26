@@ -5109,8 +5109,12 @@ def main():
             vehicle_data = {}
             if vehicle_bytes:
                 with st.spinner("🔍 車検証を解析中..."):
-                    vehicle_mime = get_mime_type(vehicle_name) if vehicle_bytes else None
-                    vehicle_data = analyze_vehicle_registration(api_key, vehicle_bytes, vehicle_mime) or {}
+                    try:
+                        vehicle_mime = get_mime_type(vehicle_name) if vehicle_bytes else None
+                        vehicle_data = analyze_vehicle_registration(api_key, vehicle_bytes, vehicle_mime) or {}
+                    except Exception as _veh_err:
+                        st.warning(f"⚠️ 車検証OCRに失敗しました（{str(_veh_err)[:60]}）。車両情報なしで続行します。")
+                        vehicle_data = {}
             st.session_state['vehicle_data'] = vehicle_data
             # CSVアイテムをestimate_dataとして格納
             _tax_s2 = st.session_state.get('tax_override', '税抜き（外税）')
@@ -5168,7 +5172,11 @@ def main():
                         analyze_estimate, api_key, estimate_bytes, estimate_mime, _model,
                         _use_fax, _use_raster, _use_enhance, _enable_sc
                     )
-                    vehicle_data  = fut_vehicle.result()
+                    try:
+                        vehicle_data = fut_vehicle.result()
+                    except Exception as _veh_err:
+                        st.warning(f"⚠️ 車検証OCR失敗（{str(_veh_err)[:60]}）。車両情報なしで続行します。")
+                        vehicle_data = {}
                     progress.progress(40, text="✅ 車検証の解析完了、見積書を処理中...")
                     estimate_data = fut_estimate.result() or {}
             elif vehicle_bytes:
