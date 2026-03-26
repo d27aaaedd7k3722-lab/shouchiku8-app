@@ -1851,23 +1851,53 @@ CORE_PROMPT = """<system_instruction>
 
 TASK_PROMPTS = {}
 
-TASK_PROMPTS["shaken_ocr"] = """あなたは日本の車検証（自動車検査証）を読み取るOCRエキスパートです。
+TASK_PROMPTS["shaken_ocr"] = """<task_execution>
+タスク名: shaken_ocr（車検証OCR）
+
+あなたは日本の車検証（自動車検査証）を読み取るOCRエキスパートです。
 提供された画像またはPDFから以下の情報を正確に読み取ってください。
 
-ルール:
+対応書式:
+- 従来の車検証（自動車検査証）
+- 電子車検証の「自動車検査証記録事項」（A4用紙に印刷されたもの）
+
+読み取り対象フィールドと対応する記載欄:
+- customer_name: 使用者の氏名又は名称（***の場合は所有者名で代替）
+- owner_name: 所有者の氏名又は名称
+- postal_no: 所有者の住所から郵便番号を推定（不明なら""）
+- prefecture: 所有者の住所 → 都道府県
+- municipality: 所有者の住所 → 市区町村
+- address_other: 所有者の住所 → 町名・番地以降
+- car_reg_department: 自動車登録番号の地名部分（例: "北九州", "品川", "福岡"）
+- car_reg_division: 自動車登録番号の分類番号（例: "３４６"） → 全角数字で出力
+- car_reg_business: 自動車登録番号のひらがな（例: "の"） → 全角ひらがなで出力
+- car_reg_serial: 自動車登録番号の一連番号（例: "１２２４"） → 全角数字で出力
+- car_serial_no: 車台番号（例: "AYH30-0145328"）
+- car_name: 車名（例: "トヨタ"）
+- car_model: 型式（例: "6AA-AYH30W"）
+- car_model_designation: 型式指定番号（例: "19557"）
+- car_category_number: 類別区分番号（例: "0172"）
+- engine_model: 原動機の型式（例: "2AR-2JM-2FM"）
+- body_color: 車体の色（記載がなければ""）
+- color_code: カラーコード（記載がなければ""）
+- trim_code: トリムコード（記載がなければ""）
+- car_weight: 車両重量（kg、整数）
+- engine_displacement: 総排気量又は定格出力の数値（cc/L → cc整数に統一。例: 2.49L → 2490）
+- kilometer: 走行距離計表示値（km、整数。備考欄の「走行距離計表示値」から読み取る）
+- term_date: 有効期間の満了する日 → YYYYMMDD形式（和暦→西暦変換必須）
+- car_reg_date: 初度登録年月 → YYYYMM00形式（和暦→西暦変換必須）
+- confidence: 読み取り信頼度 0.0〜1.0
+
+重要ルール:
 - 入力資料に記載されている文字を一言一句そのまま抽出する
 - 推測での補完は絶対に行わない
 - 読み取り不能な文字列は "" にする
 - 読み取り不能な数値は 0 にする
-- 勝手な情報の統合・省略は行わない
-- 和暦は西暦へ変換する（令和1=2019, 令和6=2024, 令和8=2026 / 平成31=2019, 平成30=2018...）
-- car_reg_division と car_reg_serial は全角数字
-- car_reg_business は全角かな
-- car_reg_date は YYYYMM00 形式
-- term_date は YYYYMMDD 形式
-- confidence は 0.0〜1.0
+- 和暦→西暦変換: 令和1=2019, 令和2=2020, ..., 令和7=2025, 令和8=2026, 令和9=2027 / 平成31=2019, 平成30=2018
+- 自動車登録番号は「地名 分類番号 ひらがな 一連番号」の4要素に正確に分割する
+- 「自動車検査証記録事項」の場合、「1.基本情報」「2.所有者情報」「3.車両詳細情報」「4.備考」の各セクションを漏れなく読み取る
 
-返却JSON:
+<output_format>
 {
   "customer_name": "",
   "owner_name": "",
@@ -1894,7 +1924,9 @@ TASK_PROMPTS["shaken_ocr"] = """あなたは日本の車検証（自動車検査
   "term_date": "",
   "car_reg_date": "",
   "confidence": 0.0
-}"""
+}
+</output_format>
+</task_execution>"""
 
 
 TASK_PROMPTS["estimate_cover_check"] = """<task_execution>
@@ -2277,14 +2309,68 @@ def _detect_corrections(original_items: list, edited_items: list) -> list:
 
 
 def analyze_vehicle_registration(api_key, file_bytes, mime_type):
-    """車検証をAI-OCRで解析"""
+    """車検証をAI-OCRで解析（response_schema による構造化出力）"""
     prompt = _build_prompt("shaken_ocr")
-    result_text = call_gemini(api_key, file_bytes, mime_type, prompt, use_json_mode=True)
-    # JSON modeの場合は直接パース、フォールバックで従来のextract
+    # response_schema で Gemini に返却フィールドを強制指定（精度安定化）
+    _schema_shaken = {
+        "type": "object",
+        "properties": {
+            "customer_name":         {"type": "string"},
+            "owner_name":            {"type": "string"},
+            "postal_no":             {"type": "string"},
+            "prefecture":            {"type": "string"},
+            "municipality":          {"type": "string"},
+            "address_other":         {"type": "string"},
+            "car_reg_department":    {"type": "string"},
+            "car_reg_division":      {"type": "string"},
+            "car_reg_business":      {"type": "string"},
+            "car_reg_serial":        {"type": "string"},
+            "car_serial_no":         {"type": "string"},
+            "car_name":              {"type": "string"},
+            "car_model":             {"type": "string"},
+            "car_model_designation": {"type": "string"},
+            "car_category_number":   {"type": "string"},
+            "engine_model":          {"type": "string"},
+            "body_color":            {"type": "string"},
+            "color_code":            {"type": "string"},
+            "trim_code":             {"type": "string"},
+            "car_weight":            {"type": "integer"},
+            "engine_displacement":   {"type": "integer"},
+            "kilometer":             {"type": "integer"},
+            "term_date":             {"type": "string"},
+            "car_reg_date":          {"type": "string"},
+            "confidence":            {"type": "number"},
+        },
+    }
     try:
-        result = json.loads(result_text)
-    except (json.JSONDecodeError, TypeError):
-        result = extract_json_from_response(result_text)
+        from google.genai import types
+        client = _get_genai_client(api_key)
+        file_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[prompt, file_part],
+            config={
+                "temperature": 0.0,
+                "max_output_tokens": 4096,
+                "response_mime_type": "application/json",
+                "response_schema": _schema_shaken,
+            },
+        )
+        if response.text:
+            try:
+                result = json.loads(response.text)
+            except (json.JSONDecodeError, TypeError):
+                result = extract_json_from_response(response.text)
+        else:
+            result = {}
+    except Exception as e:
+        # response_schema 未対応モデルの場合、従来のJSON modeにフォールバック
+        print(f"[shaken_ocr] response_schema failed, fallback to json_mode: {e}")
+        result_text = call_gemini(api_key, file_bytes, mime_type, prompt, use_json_mode=True)
+        try:
+            result = json.loads(result_text)
+        except (json.JSONDecodeError, TypeError):
+            result = extract_json_from_response(result_text)
 
     # 車名が空欄の場合、車台番号からメーカーを推定
     if not result.get('car_name') and result.get('car_serial_no'):
