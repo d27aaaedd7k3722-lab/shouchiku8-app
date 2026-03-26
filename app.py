@@ -4985,6 +4985,24 @@ def main():
                     st.session_state.pop('csv_items', None)
                     st.session_state.pop('csv_mode', None)
 
+            # ── 税区分選択（CSV取り込み用）──
+            st.markdown('<div style="margin-top:10px;font-size:12px;color:#555;font-weight:600">💴 見積書の税区分を選択してください</div>', unsafe_allow_html=True)
+            _csv_tax_options = ['税抜き（外税）', '税込み（内税）']
+            _csv_saved_tax = st.session_state.get('tax_override', '税抜き（外税）')
+            if _csv_saved_tax not in _csv_tax_options:
+                _csv_saved_tax = '税抜き（外税）'
+            _csv_tax_sel = st.radio(
+                "CSV税区分",
+                options=_csv_tax_options,
+                index=_csv_tax_options.index(_csv_saved_tax),
+                horizontal=True,
+                key='csv_tax_radio',
+                label_visibility='collapsed',
+                help="CSVに記載されている金額が税込みか税抜きかを選択してください。"
+            )
+            st.session_state['tax_override'] = _csv_tax_sel
+            st.caption(f"⚙️ 選択中: {_csv_tax_sel}")
+
         # ── テンプレートNEOアップロード（任意） ──
         st.markdown("**📁 テンプレートNEOファイル（任意）**")
         st.markdown(
