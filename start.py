@@ -1,11 +1,13 @@
 import os, subprocess
-print("Downloading 2GB DB from private dataset...")
-from huggingface_hub import hf_hub_download
-try:
-    hf_hub_download(repo_id="Ryohey123/shouchiku-addata-db", repo_type="dataset", filename="cogni_code_master.db", local_dir=".", token=os.environ.get("HF_TOKEN"))
-    print("DB downloaded!")
-except Exception as e:
-    print("Download fail:", e)
 
-print("Starting Streamlit app...")
-subprocess.run(["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=7860", "--server.headless=true"])
+# Addataは使用しないためDBダウンロードをスキップ（高速起動）
+# Cloud Run は PORT 環境変数でポートを指定（デフォルト: 7860 = HuggingFace互換）
+port = os.environ.get("PORT", "7860")
+print(f"Starting Streamlit app on port {port}...")
+subprocess.run([
+    "streamlit", "run", "app.py",
+    "--server.address=0.0.0.0",
+    f"--server.port={port}",
+    "--server.headless=true",
+    "--browser.gatherUsageStats=false",
+])

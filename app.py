@@ -53,7 +53,7 @@ from concurrent.futures import ThreadPoolExecutor
 # 定数・設定
 # ============================================================
 SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
-TEMPLATE_FILENAME = "テンプレート_トヨタ汎用_.neo"
+TEMPLATE_FILENAME = "template_toyota.neo"
 TEMPLATE_PATH     = os.path.join(SCRIPT_DIR, TEMPLATE_FILENAME)
 ANALYSIS_LOG_PATH = os.path.join(SCRIPT_DIR, "analysis.log")
 TAX_RATE          = 0.10
