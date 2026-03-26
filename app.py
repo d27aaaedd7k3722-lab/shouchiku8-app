@@ -4838,35 +4838,36 @@ def main():
 
         st.markdown('<div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;font-size:13px;margin-bottom:12px">✏️ <b>ベタ打ちモード</b> — 見積内容をそのままNEOファイルに転記します</div>', unsafe_allow_html=True)
 
-        # ── アップロードカード ──
-        col1, col2 = st.columns(2)
-        with col1:
+        # ── タイトル行（車検証 | 見積書 外税○ 内税○）──
+        _h1, _h2 = st.columns(2)
+        with _h1:
             st.markdown('<div class="section-title">📋 車検証（任意）</div>', unsafe_allow_html=True)
-            vehicle_file = st.file_uploader(
-                "車検証をアップロード（PDF・JPG・PNG 対応）※なくても見積書のみで作成可",
-                type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
-                key='vehicle_upload',
-            )
-            if vehicle_file:
-                st.success(f"✅ {vehicle_file.name} ({vehicle_file.size:,} bytes)")
-                st.caption("🔍 OCR対象: 型式・型式指定番号・類別区分番号・エンジン型式・使用者情報")
-            else:
-                st.info("💡 車検証なしの場合、見積書から読み取れる車両情報のみでNEOを作成します")
-        with col2:
-            # 見積書 ＋ 外税/内税 を1行に表示（columnsで横並び）
-            _title_c, _radio_c = st.columns([1, 3], gap="small")
-            with _title_c:
-                st.markdown('<div style="font-weight:700;font-size:14px;padding-top:8px;">🧾 見積書</div>', unsafe_allow_html=True)
-            with _radio_c:
-                _tax_options = ['外税', '内税']
-                _saved_tax_override = st.session_state.get('tax_override', '税抜き（外税）')
-                _default_idx = 1 if '内税' in str(_saved_tax_override) or '税込' in str(_saved_tax_override) else 0
+        with _h2:
+            _tax_options = ['外税', '内税']
+            _saved_tax_override = st.session_state.get('tax_override', '税抜き（外税）')
+            _default_idx = 1 if '内税' in str(_saved_tax_override) or '税込' in str(_saved_tax_override) else 0
+            _t_col, _r_col = st.columns([1, 3], gap="small")
+            with _t_col:
+                st.markdown('<div class="section-title">🧾 見積書</div>', unsafe_allow_html=True)
+            with _r_col:
                 _tax_sel_short = st.radio("税区分", options=_tax_options,
                                           index=_default_idx, horizontal=True,
                                           key='tax_override_radio',
                                           label_visibility='collapsed')
                 _tax_sel = '税込み（内税）' if _tax_sel_short == '内税' else '税抜き（外税）'
                 st.session_state['tax_override'] = _tax_sel
+
+        # ── アップロードカード（高さ揃え）──
+        col1, col2 = st.columns(2)
+        with col1:
+            vehicle_file = st.file_uploader(
+                "車検証をアップロード（PDF・JPG・PNG 対応）※なくても見積書のみで作成可",
+                type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
+                key='vehicle_upload',
+            )
+            if vehicle_file:
+                st.success(f"✅ {vehicle_file.name}")
+        with col2:
             estimate_file = st.file_uploader(
                 "見積書をアップロード（PDF・JPG・PNG 対応、FAX品質可）",
                 type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
