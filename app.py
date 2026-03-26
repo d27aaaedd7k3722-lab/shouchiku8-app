@@ -4428,6 +4428,14 @@ def main():
     *, *::before, *::after { box-sizing: border-box; }
     body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; }
 
+    /* 上部の余白を詰める */
+    .block-container { padding-top: 8px !important; }
+    header[data-testid="stHeader"] { display: none !important; }
+
+    /* file_uploader の「Drag and drop」「Limit」テキストを非表示 */
+    [data-testid="stFileUploaderDropzoneInstructions"] { display: none !important; }
+    [data-testid="stFileUploaderDropzone"] { min-height: 60px !important; padding: 10px !important; }
+
     /* Topbar */
     .topbar { background: #1a2744; color: #fff; padding: 0 24px; height: 52px;
               display: flex; align-items: center; justify-content: space-between;
@@ -4938,6 +4946,20 @@ def main():
 """, height=48)
 
         with st.expander("📊 CSVを貼り付けて取り込む", expanded=st.session_state.get('csv_mode', False)):
+            # コピーボタン（CSV欄の上部に配置）
+            st.markdown('<div style="font-size:12px;color:#555;margin-bottom:4px">📋 <b>手順</b>: ①下のボタンでプロンプトをコピー → ② Claude.ai / Gemini.ai にPDFと一緒に貼り付けて送信 → ③ 出力されたCSVを下欄に貼り付け</div>', unsafe_allow_html=True)
+            _escaped2 = _CSV_PROMPT.replace('`', '\\`').replace('\\', '\\\\').replace('\n', '\\n')
+            st.components.v1.html(f"""
+<button onclick="navigator.clipboard.writeText(`{_escaped2}`).then(()=>{{
+    this.textContent='✅ コピーしました！';
+    this.style.background='#16a34a';
+    setTimeout(()=>{{this.textContent='📋 AI用プロンプトをコピー';this.style.background='#2563eb';}},2000);
+}})" style="
+    background:#2563eb;color:white;border:none;border-radius:6px;
+    padding:7px 18px;font-size:13px;cursor:pointer;font-weight:600;margin-bottom:10px;
+">📋 AI用プロンプトをコピー</button>
+""", height=44)
+            st.divider()
             _csv_col1, _csv_col2 = st.columns([2, 1])
             with _csv_col1:
                 _csv_paste = st.text_area(
