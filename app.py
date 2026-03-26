@@ -4376,7 +4376,9 @@ def main():
 
         with st.expander("📊 CSVを貼り付けて取り込む", expanded=st.session_state.get('csv_mode', False)):
             _escaped2 = _escaped  # 同じエスケープ済みプロンプトを再利用
-            st.components.v1.html(f"""
+            _csv_top1, _csv_top2 = st.columns([1, 1])
+            with _csv_top1:
+                st.components.v1.html(f"""
 <button onclick="navigator.clipboard.writeText(`{_escaped2}`).then(()=>{{
     this.textContent='✅ コピーしました！';
     this.style.background='#16a34a';
@@ -4386,6 +4388,20 @@ def main():
     padding:7px 18px;font-size:13px;cursor:pointer;font-weight:600;margin-bottom:10px;
 ">📋 AI用プロンプトをコピー</button>
 """, height=44)
+            with _csv_top2:
+                # CSV専用の税区分選択ボタン
+                _csv_tax_options = ['税抜き（外税）', '税込み（内税）']
+                _csv_saved_tax = st.session_state.get('tax_override', '税抜き（外税）')
+                _csv_tax_idx = 1 if '内税' in str(_csv_saved_tax) or '税込' in str(_csv_saved_tax) else 0
+                _csv_tax_sel = st.radio(
+                    "💴 CSVの金額表記",
+                    options=_csv_tax_options,
+                    index=_csv_tax_idx,
+                    horizontal=True,
+                    key='csv_tax_radio',
+                )
+                # CSV税区分の選択をtax_overrideに同期
+                st.session_state['tax_override'] = _csv_tax_sel
             st.divider()
             _csv_col1, _csv_col2 = st.columns([2, 1])
             with _csv_col1:
@@ -4442,10 +4458,7 @@ def main():
                     st.session_state.pop('csv_items', None)
                     st.session_state.pop('csv_mode', None)
 
-            # ── 税区分選択 ──
-            # ※ STEP1上部の税区分ラジオと同じ値を共有（二重書き込み回避のため表示のみ）
-            _current_tax = st.session_state.get('tax_override', '税抜き（外税）')
-            st.caption(f"💴 税区分: {_current_tax}（上部の税区分で変更可能）")
+            # 税区分はCSV専用ラジオボタン(csv_tax_radio)で設定済み
 
         # ── テンプレートNEOアップロード（任意） ──
         st.markdown("**📁 テンプレートNEOファイル（任意）**")
@@ -4554,6 +4567,7 @@ def main():
             st.session_state['vehicle_data'] = vehicle_data
             # CSVアイテムをestimate_dataとして格納
             _tax_s2 = st.session_state.get('tax_override', '税抜き（外税）')
+            _is_tax_incl_csv = '内税' in str(_tax_s2) or '税込' in str(_tax_s2)
             estimate_data = {
                 'items':            _csv_items_s2,
                 'discount_amount':  0,
@@ -4562,12 +4576,17 @@ def main():
                 'pdf_parts_total':  sum(safe_int(it.get('parts_amount', 0)) for it in _csv_items_s2),
                 'pdf_wage_total':   sum(safe_int(it.get('wage', 0)) for it in _csv_items_s2),
                 'pdf_grand_total':  0,
-                '_is_tax_inclusive': _tax_s2 == '税込み（内税）',
+                '_is_tax_inclusive': _is_tax_incl_csv,
+                '_tax_basis':       'tax_inclusive' if _is_tax_incl_csv else 'tax_exclusive',
                 '_page_count':      1,
                 '_vehicle_info':    {},
                 '_repair_shop_name': '',
                 '_csv_import':      True,
             }
+            if _is_tax_incl_csv:
+                st.info("💴 税込モード: CSVの金額は税込みとして処理されます")
+            else:
+                st.info("💴 税抜モード: CSVの金額は税抜きとして処理されます")
             st.session_state['estimate_data'] = estimate_data
             st.success(f"✅ CSV取り込み完了（{len(_csv_items_s2)}行）")
             st.session_state['step'] = 3
