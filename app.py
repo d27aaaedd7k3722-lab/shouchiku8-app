@@ -5043,14 +5043,14 @@ def main():
                         st.session_state['estimate_data'] = estimate_data
                         st.rerun()
 
-            # 表示用DataFrame（7列）: No / 部品コード / 品名 / 数量 / 部品金額 / 工数 / 工賃
+            # 表示用DataFrame（7列）: No / 部品番号 / 品名 / 数量 / 部品金額 / 工数 / 工賃
             _edit_rows = []
             for _i, _item in enumerate(_items_src):
                 _part_code   = str(_item.get('part_no', '') or _item.get('_master_part_no', '') or '')
                 _index_value = str(_item.get('index_value', '') or '')
                 _edit_rows.append({
                     'No':     _i + 1,
-                    '部品コード': _part_code,
+                    '部品番号': _part_code,
                     '品名':   str(_item.get('name', '')),
                     '数量':   safe_int(_item.get('quantity', 1), 1),
                     '部品金額': safe_int(_item.get('parts_amount', 0)),
@@ -5058,7 +5058,7 @@ def main():
                     '工賃':   safe_int(_item.get('wage', 0)),
                 })
             _df_edit = pd.DataFrame(_edit_rows) if _edit_rows else pd.DataFrame(
-                columns=['No', '部品コード', '品名', '数量', '部品金額', '工数', '工賃'])
+                columns=['No', '部品番号', '品名', '数量', '部品金額', '工数', '工賃'])
             # キーを行数と連動させることで行挿入後に data_editor を強制再初期化する
             _editor_key = f'items_editor_{len(_items_src)}'
             # height を固定して描画行数を制限（全行フル展開すると100行超で重くなるため）
@@ -5071,7 +5071,7 @@ def main():
                 height=_editor_height,
                 column_config={
                     'No':     st.column_config.NumberColumn('No', disabled=True, width='small'),
-                    '部品コード': st.column_config.TextColumn('部品コード'),
+                    '部品番号': st.column_config.TextColumn('部品番号'),
                     '品名':   st.column_config.TextColumn('品名', width='large'),
                     '数量':   st.column_config.NumberColumn('数量', min_value=1, step=1, width='small'),
                     '部品金額': st.column_config.NumberColumn('部品金額', step=1, format="¥%d"),
@@ -5086,7 +5086,7 @@ def main():
             edited_items = []
             for _i, _row in _edited_df.iterrows():
                 _nv = _row.get('品名', '');     _nv = '' if pd.isna(_nv) else str(_nv)
-                _pc = _row.get('部品コード', ''); _pc = '' if pd.isna(_pc) else str(_pc)
+                _pc = _row.get('部品番号', ''); _pc = '' if pd.isna(_pc) else str(_pc)
                 _iv = _row.get('工数', '');     _iv = '' if pd.isna(_iv) else str(_iv)
                 # 既存行のメタデータを引き継ぐ（新規追加行はデフォルト）
                 _orig = _items_src[_i] if _i < len(_items_src) else {}
