@@ -2239,6 +2239,8 @@ def generate_discrepancy_report_pdf(discrepancies, total_diff, vehicle_info):
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.pdfbase.cidfonts import UnicodeCIDFont
@@ -2248,11 +2250,11 @@ def generate_discrepancy_report_pdf(discrepancies, total_diff, vehicle_info):
     try:
         pdfmetrics.registerFont(TTFont('Meiryo', 'meiryo.ttc'))
         font_name = 'Meiryo'
-    except:
+    except Exception:
         try:
             pdfmetrics.registerFont(TTFont('MSGothic', 'msgothic.ttc'))
             font_name = 'MSGothic'
-        except:
+        except Exception:
             # フォールバック (ビルトインの HeiseiKakuGo-W5)
             pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5'))
             font_name = 'HeiseiKakuGo-W5'
@@ -2365,7 +2367,7 @@ def generate_beta_discrepancy_report_pdf(estimate_data, calc_parts, calc_wages, 
     try:
         pdfmetrics.registerFont(TTFont('Meiryo', 'meiryo.ttc'))
         font_name = 'Meiryo'
-    except:
+    except Exception:
         try:
             pdfmetrics.registerFont(TTFont('MSGothic', 'msgothic.ttc'))
             font_name = 'MSGothic'
@@ -3092,6 +3094,9 @@ def parse_detail_json_to_items(json_text: str, page_num: int = 1) -> list:
         except Exception:
             return []
     details = data.get('details', [])
+    # 'details' キーが空なら 'items' キーもフォールバック確認
+    if not details:
+        details = data.get('items', [])
     if not isinstance(details, list):
         return []
     items = []
@@ -3916,7 +3921,7 @@ def _self_correction_retry(api_key, file_bytes, mime_type, model_name,
             new_result = json.loads(response.text)
         except (json.JSONDecodeError, TypeError):
             new_result = extract_json_from_response(response.text)
-        new_items  = new_result.get('items', [])
+        new_items  = new_result.get('items', []) or new_result.get('details', [])
         if not new_items:
             return None
         new_parts  = sum(safe_int(it.get('parts_amount', 0)) for it in new_items)
@@ -5010,23 +5015,10 @@ def main():
                     st.session_state.pop('csv_items', None)
                     st.session_state.pop('csv_mode', None)
 
-            # ── 税区分選択（CSV取り込み用）──
-            st.markdown('<div style="margin-top:10px;font-size:12px;color:#555;font-weight:600">💴 見積書の税区分を選択してください</div>', unsafe_allow_html=True)
-            _csv_tax_options = ['税抜き（外税）', '税込み（内税）']
-            _csv_saved_tax = st.session_state.get('tax_override', '税抜き（外税）')
-            if _csv_saved_tax not in _csv_tax_options:
-                _csv_saved_tax = '税抜き（外税）'
-            _csv_tax_sel = st.radio(
-                "CSV税区分",
-                options=_csv_tax_options,
-                index=_csv_tax_options.index(_csv_saved_tax),
-                horizontal=True,
-                key='csv_tax_radio',
-                label_visibility='collapsed',
-                help="CSVに記載されている金額が税込みか税抜きかを選択してください。"
-            )
-            st.session_state['tax_override'] = _csv_tax_sel
-            st.caption(f"⚙️ 選択中: {_csv_tax_sel}")
+            # ── 税区分選択 ──
+            # ※ STEP1上部の税区分ラジオと同じ値を共有（二重書き込み回避のため表示のみ）
+            _current_tax = st.session_state.get('tax_override', '税抜き（外税）')
+            st.caption(f"💴 税区分: {_current_tax}（上部の税区分で変更可能）")
 
         # ── テンプレートNEOアップロード（任意） ──
         st.markdown("**📁 テンプレートNEOファイル（任意）**")
@@ -5996,15 +5988,11 @@ def main():
 
             # セッションに保存（STEP4で参照）
             st.session_state['classification_alerts'] = _classification_alerts
-            # classification_confirmed:
-            # エラーあり → checkboxウィジェット(key='classification_confirmed')がStreamlit自動管理
-            #               → 直接代入するとStreamlitAPIExceptionが発生する場合があるためtry/exceptで保護
-            # エラーなし → checkboxが存在しないためセッションに手動設定
-            try:
-                if not _error_alerts:
-                    st.session_state['classification_confirmed'] = _classification_confirmed
-            except Exception:
-                pass  # ウィジェット自動管理中の場合は無視
+            # classification_confirmed: 別キーで管理（ウィジェットキーとの衝突回避）
+            if not _error_alerts:
+                st.session_state['_cls_confirmed_value'] = _classification_confirmed
+            else:
+                st.session_state['_cls_confirmed_value'] = st.session_state.get('classification_confirmed', False)
 
             # マスタ連携の差額計算とレポート表示（DBモード時のみ）
             discrepancies = []
@@ -6115,7 +6103,7 @@ def main():
             amount_confirmed = True
 
         # ── 部品/工賃区分確認チェックの取得（ベタ打ちモード）──────────────────
-        _cls_confirmed   = st.session_state.get('classification_confirmed', True)
+        _cls_confirmed   = st.session_state.get('_cls_confirmed_value', True)
         _cls_alerts      = st.session_state.get('classification_alerts', [])
         _cls_errors      = [a for a in _cls_alerts if a['severity'] == 'error']
         # ベタ打ちモード以外は常にOK
