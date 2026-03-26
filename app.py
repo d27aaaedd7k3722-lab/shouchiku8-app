@@ -1364,7 +1364,7 @@ def detect_and_reorder_pages(pages):
 def _get_genai_client(api_key):
     """google.genai クライアントを取得（セッション間で再利用・タイムアウト付き）"""
     from google import genai
-    return genai.Client(api_key=api_key, http_options={'timeout': 180})
+    return genai.Client(api_key=api_key, http_options={'timeout': 600})
 
 
 def call_gemini(api_key, file_bytes, mime_type, prompt_text, model_name=None, use_json_mode=False):
@@ -2193,7 +2193,7 @@ def complement_vehicle_info_with_gemini(api_key, model_code, current_car_name, c
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key, http_options={'timeout': 600})
 
     prompt = f'''あなたは日本の自動車の専門家です。
 以下の型式（Model Code）を持つ自動車の「一般的な車種名（通称名）」と「エンジン型式」を特定し、厳密なJSON形式で出力してください。
@@ -5179,7 +5179,12 @@ def main():
                         st.warning(f"⚠️ 車検証OCR失敗（{str(_veh_err)[:60]}）。車両情報なしで続行します。")
                         vehicle_data = {}
                     progress.progress(40, text="✅ 車検証の解析完了、見積書を処理中...")
-                    estimate_data = fut_estimate.result() or {}
+                    try:
+                        estimate_data = fut_estimate.result() or {}
+                    except Exception as _est_err:
+                        st.error(f"⚠️ 見積書解析に失敗しました: {str(_est_err)[:100]}")
+                        st.warning("ネットワークが不安定な可能性があります。もう一度お試しください。")
+                        estimate_data = None
             elif vehicle_bytes:
                 # 車検証のみ
                 progress.progress(10, text="🔍 車検証を解析中...")
