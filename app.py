@@ -4868,6 +4868,60 @@ def main():
             '</div>',
             unsafe_allow_html=True
         )
+
+        # ── AI解析用プロンプト コピーボタン ──
+        _CSV_PROMPT = """添付の自動車修理見積書PDFを、以下のCSV形式で全明細行を転写してください。
+
+【出力形式】
+品名,区分,数量,部品金額,工賃,部品コード
+
+【区分の判定ルール】
+- 「取替」「交換」を含む作業、または部品金額のみの行 → 取替
+- 「脱着」「取外」「取付」「組付」を含む → 脱着
+- 「鈑金」「板金」を含む → 鈑金
+- 「塗装」「ペイント」「ワックス」「加算」を含む → 塗装
+- 「修理」「補修」「調整」「点検」「設定」「分解」を含む → 修理
+- 「研磨」「磨き」「写真代」等、上記に当てはまらない → （空白）
+
+【注意事項】
+- 合計行・小計行・消費税行は除外
+- 部品金額と工賃が同一列の場合：品番付き行は部品金額、作業名の行は工賃に振り分ける
+- 金額はカンマなしの半角数字のみ（例：12500）
+- 数量が不明な場合は 1
+- 部品コードがない場合は空白
+- ヘッダー行（品名,区分,数量,部品金額,工賃,部品コード）を必ず1行目に出力する
+
+出力はCSVのみ。説明文・コメント不要。"""
+
+        with st.expander("📋 Claude.ai / Gemini.ai 用プロンプトをコピー", expanded=False):
+            st.markdown(
+                '<div style="background:#fffbeb;border:1px solid #fbbf24;border-radius:6px;'
+                'padding:8px 12px;font-size:12px;margin-bottom:8px">'
+                '💡 <b>使い方</b>: 下のプロンプトをコピー → Claude.ai / Gemini.ai を開く → '
+                'PDFをアップロード → プロンプトを貼り付けて送信 → 出力されたCSVを下の取り込み欄に貼り付け'
+                '</div>',
+                unsafe_allow_html=True
+            )
+            st.text_area(
+                "📄 プロンプト（全選択してコピー）",
+                value=_CSV_PROMPT,
+                height=260,
+                key='csv_prompt_display',
+                help="Ctrl+A で全選択 → Ctrl+C でコピー",
+            )
+            # JavaScriptクリップボードコピーボタン
+            _escaped = _CSV_PROMPT.replace('`', '\\`').replace('\\', '\\\\').replace('\n', '\\n')
+            st.components.v1.html(f"""
+<button onclick="navigator.clipboard.writeText(`{_escaped}`).then(()=>{{
+    this.textContent='✅ コピーしました！';
+    this.style.background='#16a34a';
+    setTimeout(()=>{{this.textContent='📋 クリップボードにコピー';this.style.background='#2563eb';}},2000);
+}})" style="
+    background:#2563eb;color:white;border:none;border-radius:6px;
+    padding:8px 20px;font-size:14px;cursor:pointer;font-weight:600;width:100%;
+">📋 クリップボードにコピー</button>
+""", height=48)
+
         with st.expander("📊 CSVを貼り付けて取り込む", expanded=st.session_state.get('csv_mode', False)):
             _csv_col1, _csv_col2 = st.columns([2, 1])
             with _csv_col1:
