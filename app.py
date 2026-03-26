@@ -1362,9 +1362,9 @@ def detect_and_reorder_pages(pages):
 
 @st.cache_resource
 def _get_genai_client(api_key):
-    """google.genai クライアントを取得（セッション間で再利用・タイムアウト付き）"""
+    """google.genai クライアントを取得（セッション間で再利用）"""
     from google import genai
-    return genai.Client(api_key=api_key, http_options={'timeout': 600})
+    return genai.Client(api_key=api_key)
 
 
 def call_gemini(api_key, file_bytes, mime_type, prompt_text, model_name=None, use_json_mode=False):
