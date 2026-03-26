@@ -6110,15 +6110,12 @@ def main():
         # NEO生成ボタン
         st.markdown("---")
 
-        # 区分エラーがあって未確認の場合、警告を再表示
+        # 区分エラーがあって未確認の場合、警告を表示（ただし生成はブロックしない）
         if _cls_errors and not _cls_confirmed and _step3_mode == 'beta':
             st.markdown(
-                '<div class="mismatch-banner">'
-                '<div class="mismatch-title">🚫 部品・工賃区分の確認が必要です</div>'
-                '<div class="mismatch-body">'
-                f'{len(_cls_errors)}件の区分エラーが未確認です。<br>'
-                '上の「🔍 部品・工賃区分確認」パネルで内容を確認し、チェックボックスにチェックを入れてください。'
-                '</div>'
+                '<div style="background:#fffbeb;border:1px solid #d97706;border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:13px">'
+                f'⚠️ <b>部品・工賃区分に{len(_cls_errors)}件の注意事項があります</b>（上部の「🔍 部品・工賃区分確認」で確認可能）<br>'
+                'そのまま生成することもできます。'
                 '</div>',
                 unsafe_allow_html=True
             )
@@ -6131,7 +6128,8 @@ def main():
                 st.session_state['estimate_data'] = None
                 st.rerun()
         with bcol2:
-            gen_disabled = not amount_confirmed or not _cls_confirmed
+            # 金額差異未確認時のみボタンを無効化（分類エラーではブロックしない）
+            gen_disabled = not amount_confirmed
             if st.button("📦 NEOファイルを生成する →", type="primary", use_container_width=True, disabled=gen_disabled):
                 st.session_state['updated_vehicle'] = updated_vehicle
                 st.session_state['calc_parts']      = calc_parts
@@ -6144,8 +6142,6 @@ def main():
                 st.rerun()
             if not amount_confirmed:
                 st.caption("⬆️ 金額差異を確認してチェックを入れてください")
-            elif not _cls_confirmed:
-                st.caption("⬆️ 部品・工賃区分エラーを確認してチェックを入れてください")
 
     # =========================================
     # STEP 4: NEO生成・ダウンロード
