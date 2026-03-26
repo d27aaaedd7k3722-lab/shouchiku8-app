@@ -2309,9 +2309,10 @@ def _detect_corrections(original_items: list, edited_items: list) -> list:
 
 
 def analyze_vehicle_registration(api_key, file_bytes, mime_type):
-    """車検証をAI-OCRで解析（response_schema による構造化出力）"""
+    """車検証をAI-OCRで解析（JSON mode + プロンプトベースの構造化出力）"""
     prompt = _build_prompt("shaken_ocr")
-    # response_schema で Gemini に返却フィールドを強制指定（精度安定化）
+
+    # 方式1: response_schema を使用（全フィールドstring型で安全にパース）
     _schema_shaken = {
         "type": "object",
         "properties": {
@@ -2334,14 +2335,16 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type):
             "body_color":            {"type": "string"},
             "color_code":            {"type": "string"},
             "trim_code":             {"type": "string"},
-            "car_weight":            {"type": "integer"},
-            "engine_displacement":   {"type": "integer"},
-            "kilometer":             {"type": "integer"},
+            "car_weight":            {"type": "string"},
+            "engine_displacement":   {"type": "string"},
+            "kilometer":             {"type": "string"},
             "term_date":             {"type": "string"},
             "car_reg_date":          {"type": "string"},
-            "confidence":            {"type": "number"},
+            "confidence":            {"type": "string"},
         },
     }
+    result = {}
+    _method_used = ""
     try:
         from google.genai import types
         client = _get_genai_client(api_key)
@@ -2356,21 +2359,42 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type):
                 "response_schema": _schema_shaken,
             },
         )
-        if response.text:
+        if response.text and response.text.strip():
             try:
                 result = json.loads(response.text)
+                _method_used = "response_schema"
             except (json.JSONDecodeError, TypeError):
                 result = extract_json_from_response(response.text)
-        else:
-            result = {}
+                _method_used = "response_schema+extract"
     except Exception as e:
-        # response_schema 未対応モデルの場合、従来のJSON modeにフォールバック
-        print(f"[shaken_ocr] response_schema failed, fallback to json_mode: {e}")
-        result_text = call_gemini(api_key, file_bytes, mime_type, prompt, use_json_mode=True)
+        print(f"[shaken_ocr] response_schema failed: {e}")
+        _method_used = "fallback"
+
+    # 方式1で空結果 → 方式2: シンプルなJSON modeにフォールバック
+    if not result or not any(v for v in result.values() if v and str(v).strip()):
         try:
-            result = json.loads(result_text)
-        except (json.JSONDecodeError, TypeError):
-            result = extract_json_from_response(result_text)
+            print(f"[shaken_ocr] Method '{_method_used}' returned empty, trying json_mode fallback")
+            result_text = call_gemini(api_key, file_bytes, mime_type, prompt, use_json_mode=True)
+            if result_text:
+                try:
+                    result = json.loads(result_text)
+                    _method_used = "json_mode"
+                except (json.JSONDecodeError, TypeError):
+                    result = extract_json_from_response(result_text)
+                    _method_used = "json_mode+extract"
+        except Exception as e2:
+            print(f"[shaken_ocr] json_mode fallback also failed: {e2}")
+            result = {}
+
+    # 数値フィールドを文字列→数値に変換（response_schema が string 型で返すため）
+    for int_key in ('car_weight', 'engine_displacement', 'kilometer'):
+        if int_key in result:
+            result[int_key] = safe_int(result[int_key])
+    if 'confidence' in result:
+        result['confidence'] = safe_float(result.get('confidence', 0), 0.0)
+
+    print(f"[shaken_ocr] method={_method_used}, car_name={result.get('car_name','')}, "
+          f"car_model={result.get('car_model','')}, reg={result.get('car_reg_department','')}")
 
     # 車名が空欄の場合、車台番号からメーカーを推定
     if not result.get('car_name') and result.get('car_serial_no'):
@@ -4812,27 +4836,36 @@ def main():
         type_desig = safe_str(vehicle_data.get('car_model_designation', ''))
         cat_num = safe_str(vehicle_data.get('car_category_number', ''))
         v_code = veh_match_result.get('vehicle_code', '')
-        match_mode_html = f'<span class="badge-blue">🗂 DBモード</span>' if match_is_db else '<span class="badge-gray">✏️ ベタ打ち</span>'
         items_count = len(estimate_data.get('items', [])) if estimate_data else 0
-        match_ok_count = sum(1 for it in (estimate_data.get('items', []) if estimate_data else []) if safe_int(it.get('_match_level', 99), 99) <= 3)
-        st.markdown(f"""
-        <div class="vehicle-strip">
-            <span style="font-size:32px">🚗</span>
-            <div style="flex:1">
-                <div class="vehicle-strip-name">{car_name_strip} <span style="font-size:14px;font-weight:400">{car_model_strip}</span></div>
-                <div class="vehicle-strip-detail">{engine_strip} ／ {reg_date_display}登録 ／ {km_strip:,}km</div>
-                <div class="vehicle-strip-badges">
-                    {'<span class="badge-blue">型式指定 ' + type_desig + '</span>' if type_desig else ''}
-                    {'<span class="badge-blue">類別 ' + cat_num + '</span>' if cat_num else ''}
-                    {'<span class="badge-green">DBマッチ ✓ ' + v_code + '</span>' if match_is_db and v_code else ''}
-                </div>
-            </div>
-            <div style="text-align:right">
-                {match_mode_html}
-                {'<div style="font-size:11px;color:#94a3b8;margin-top:4px">マッチ率 ' + str(match_ok_count) + '/' + str(items_count) + '件</div>' if items_count > 0 else ''}
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+
+        # HTMLを安全に組み立て（f-string内の条件式を排除）
+        _badges_parts = []
+        if type_desig:
+            _badges_parts.append(f'<span style="background:#dbeafe;color:#1d4ed8;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600">型式指定 {type_desig}</span>')
+        if cat_num:
+            _badges_parts.append(f'<span style="background:#dbeafe;color:#1d4ed8;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600">類別 {cat_num}</span>')
+        _badges_html = ' '.join(_badges_parts)
+
+        _mode_badge = '<span style="background:#f1f5f9;color:#475569;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600">✏️ ベタ打ち</span>'
+
+        _detail_text = f'{engine_strip} ／ {reg_date_display}登録 ／ {km_strip:,}km'
+
+        _strip_html = (
+            '<div style="background:linear-gradient(135deg,#1a2744 0%,#1e3a5f 100%);color:#fff;'
+            'border-radius:10px;padding:16px 20px;margin-bottom:16px;display:flex;align-items:flex-start;gap:16px">'
+            '<span style="font-size:32px">🚗</span>'
+            '<div style="flex:1">'
+            f'<div style="font-size:18px;font-weight:700">{car_name_strip} '
+            f'<span style="font-size:14px;font-weight:400">{car_model_strip}</span></div>'
+            f'<div style="font-size:12px;color:#94a3b8;margin-top:2px">{_detail_text}</div>'
+            f'<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">{_badges_html}</div>'
+            '</div>'
+            f'<div style="text-align:right">{_mode_badge}'
+            f'<div style="font-size:11px;color:#94a3b8;margin-top:4px">{items_count}件</div>'
+            '</div>'
+            '</div>'
+        )
+        st.markdown(_strip_html, unsafe_allow_html=True)
 
         # ── 解析ログ表示 ──────────────────────────────────────────────────────────
         if estimate_data:
