@@ -1,6 +1,21 @@
 [server]
+enableXsrfProtection = false
+enableCORS = false
 headless = true
+address = "0.0.0.0"
+# Cloud Run: PORT環境変数で上書き（start.pyで制御）
+port = 8080
+# WebSocket接続を安定させる設定
 maxUploadSize = 200
+enableWebsocketCompression = false
 
 [browser]
 gatherUsageStats = false
+serverAddress = "0.0.0.0"
+
+[runner]
+# 長時間処理中もWebSocket接続を維持
+fastReruns = true
+
+[logger]
+level = "info"
