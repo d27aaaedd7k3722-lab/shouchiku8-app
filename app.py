@@ -4428,13 +4428,24 @@ def main():
     *, *::before, *::after { box-sizing: border-box; }
     body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; }
 
-    /* 上部の余白を詰める */
-    .block-container { padding-top: 8px !important; }
-    header[data-testid="stHeader"] { display: none !important; }
+    /* 上部の余白を完全に詰める */
+    .block-container { padding-top: 0px !important; margin-top: 0px !important; }
+    header[data-testid="stHeader"] { display: none !important; height: 0 !important; }
+    #root > div:first-child { padding-top: 0 !important; }
+    .stApp > header { display: none !important; }
+    .stApp { margin-top: 0 !important; }
+    section.main > div { padding-top: 0 !important; }
 
-    /* file_uploader の「Drag and drop」「Limit」テキストを非表示 */
+    /* file_uploader の「Drag and drop」「Limit」テキストを非表示（複数セレクタで対応） */
     [data-testid="stFileUploaderDropzoneInstructions"] { display: none !important; }
-    [data-testid="stFileUploaderDropzone"] { min-height: 60px !important; padding: 10px !important; }
+    [data-testid="stFileUploaderDropzone"] small,
+    [data-testid="stFileUploaderDropzone"] span:not(.st-emotion-cache-9ycgxx),
+    .uploadedFileName ~ small,
+    section[data-testid="stFileUploaderDropzone"] div > small { display: none !important; }
+    [data-testid="stFileUploaderDropzone"] { min-height: 56px !important; padding: 8px 12px !important; }
+    /* アイコンとBrowseボタンだけ残す */
+    [data-testid="stFileUploaderDropzone"] > div > div:first-child > span { display: none !important; }
+    [data-testid="stFileUploaderDropzone"] > div > div:first-child > small { display: none !important; }
 
     /* Topbar */
     .topbar { background: #1a2744; color: #fff; padding: 0 24px; height: 52px;
@@ -4837,38 +4848,38 @@ def main():
             else:
                 st.info("💡 車検証なしの場合、見積書から読み取れる車両情報のみでNEOを作成します")
         with col2:
-            st.markdown('<div class="section-title">🧾 見積書</div>', unsafe_allow_html=True)
-            estimate_file = st.file_uploader(
-                "見積書をアップロード（PDF・JPG・PNG 対応、FAX品質可）",
-                type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
-                key='estimate_upload',
-            )
-            if estimate_file:
-                st.success(f"✅ {estimate_file.name} ({estimate_file.size:,} bytes)")
-                st.caption("🔍 OCR対象: 部品名・部品番号・単価・工賃・塗装・その他費用 全明細")
-                st.session_state.pop('csv_items', None)
-                st.session_state.pop('csv_mode', None)
-            else:
-                st.info("💡 見積書なしの場合、車両情報のみのNEOを作成します")
-
-            # ── 税区分 選択（必須）──
-            st.markdown('<div style="margin-top:8px;font-size:12px;color:#555;font-weight:600">💴 見積書の税区分を選択してください</div>', unsafe_allow_html=True)
-            _tax_options = ['税抜き（外税）', '税込み（内税）']
-            _saved_tax_override = st.session_state.get('tax_override', '税抜き（外税）')
-            # 旧セッション値（自動判定）が残っている場合は税抜きにリセット
-            if _saved_tax_override not in _tax_options:
-                _saved_tax_override = '税抜き（外税）'
-            _tax_sel = st.radio(
-                "税区分",
-                options=_tax_options,
-                index=_tax_options.index(_saved_tax_override),
-                horizontal=True,
-                key='tax_override_radio',
-                label_visibility='collapsed',
-                help="見積書の明細金額が税込みか税抜きかを選択してください。不明な場合は「税抜き（外税）」を選択してください。"
-            )
-            st.session_state['tax_override'] = _tax_sel
-            st.caption(f"⚙️ 選択中: {_tax_sel}")
+            # 見積書アップロード ＋ 税区分を横並び
+            _est_col, _tax_col = st.columns([3, 2])
+            with _est_col:
+                st.markdown('<div class="section-title">🧾 見積書</div>', unsafe_allow_html=True)
+                estimate_file = st.file_uploader(
+                    "見積書をアップロード（PDF・JPG・PNG 対応、FAX品質可）",
+                    type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
+                    key='estimate_upload',
+                )
+                if estimate_file:
+                    st.success(f"✅ {estimate_file.name}")
+                    st.session_state.pop('csv_items', None)
+                    st.session_state.pop('csv_mode', None)
+                else:
+                    st.caption("💡 見積書なしの場合、車両情報のみのNEOを作成します")
+            with _tax_col:
+                st.markdown('<div class="section-title">💴 税区分</div>', unsafe_allow_html=True)
+                _tax_options = ['税抜き（外税）', '税込み（内税）']
+                _saved_tax_override = st.session_state.get('tax_override', '税抜き（外税）')
+                if _saved_tax_override not in _tax_options:
+                    _saved_tax_override = '税抜き（外税）'
+                _tax_sel = st.radio(
+                    "税区分",
+                    options=_tax_options,
+                    index=_tax_options.index(_saved_tax_override),
+                    horizontal=False,
+                    key='tax_override_radio',
+                    label_visibility='collapsed',
+                    help="見積書の明細金額が税込みか税抜きかを選択してください。"
+                )
+                st.session_state['tax_override'] = _tax_sel
+                st.caption(f"⚙️ {_tax_sel}")
 
         # ── CSV取り込みセクション ──
         st.markdown(
