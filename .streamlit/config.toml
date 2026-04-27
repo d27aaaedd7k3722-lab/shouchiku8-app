@@ -1,0 +1,26 @@
+[server]
+enableXsrfProtection = false
+enableCORS = false
+headless = true
+address = "0.0.0.0"
+port = 8080
+maxUploadSize = 200
+enableWebsocketCompression = false
+
+[browser]
+gatherUsageStats = false
+serverAddress = "0.0.0.0"
+
+[runner]
+fastReruns = true
+
+[logger]
+level = "info"
+
+# v6: ブランドカラーテーマ (SHOUCHIKU8)
+[theme]
+primaryColor = "#2563eb"          # 青系メインカラー
+backgroundColor = "#fafafa"        # 明るいグレー
+secondaryBackgroundColor = "#ffffff"  # サイドバー白
+textColor = "#1f2937"              # ダークグレー
+font = "sans serif"

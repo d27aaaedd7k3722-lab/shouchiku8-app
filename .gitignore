@@ -1,0 +1,64 @@
+# 環境設定・秘密情報
+.env
+.streamlit/secrets.toml
+
+# Claude Code / harness 作業フォルダ
+.claude/
+.cache/
+_harness_run_*/
+_archive/
+_開発資料/
+テスト要/
+サンプル見積PDF/
+
+# 大型ドキュメント
+*.docx
+社内デプロイガイド.docx
+SHOUCHIKU8_*.docx
+引き継ぎ書_*.docx
+
+# 一時マニュアル (デプロイ不要)
+CLAUDE.md
+Cloud_Run*.md
+デプロイ手順書.md
+デプロイ手順.md
+操作マニュアル.md
+社内共有マニュアル.txt
+社内デプロイガイド.docx
+"PDF→NEOマニュアル.md"
+
+# Local-only スクリプト
+deploy_cloudrun.bat
+起動.bat
+
+# 大容量DBファイル（除外）
+cogni_code_master.db
+partslink_items.db
+*.db
+
+# Pythonキャッシュ
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 開発用一時ファイル
+tmp_*.py
+tmp_*.txt
+*.log
+dump*.py
+dump*.txt
+check_*.py
+debug_*.txt
+test_*.py
+step*.py
+fix_*.py
+search_*.py
+find_*.py
+extract_*.py
+analyze_*.py
+cogni_*.py
+full_analysis_*.py
+deploy_hf.py
+keys.txt
+result.json
+match_output*.txt

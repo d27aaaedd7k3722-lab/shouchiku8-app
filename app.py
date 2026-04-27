@@ -1,0 +1,6353 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+AI-OCR連携 NEOファイル自動生成Webアプリ v3.2
+コグニセブン用NEOファイルを車検証PDF＋見積書PDFから自動生成
+
+【v3.2 追加・修正内容】
+- google.generativeai → google.genai SDK移行（FutureWarning解消）
+- 並列API呼び出しによる解析高速化（車検証＋見積書同時解析、マルチページ並列処理）
+- NEO生成前の金額検証アラート（部品/工賃の差額チェック＋確認必須）
+- 「**」工賃の0円処理（工賃欄の「**」は工賃なしとして読み取り）
+- ショートパーツ二重計上防止（明細行→Expense自動移行）
+- 預託/廃棄処分費用の非課税Expense自動振り分け（LineNo=5）
+
+【v3.1 追加・修正内容】
+- 画像前処理（コントラスト・シャープネス強化）によるFAX品質改善
+- Gemini構造化JSON出力モード（response_mime_type: application/json）
+- 明細行ごとの整合性チェック（数量×単価≠金額の検出・警告）
+- 画像前処理のON/OFFオプション（サイドバー）
+
+【v3.0 追加・修正内容】
+- APIキーのハードコード除去（サイドバー入力のみ）
+- FAXページ自動除外（ページ分類機能）
+- 税込/税抜 自動判定（build_estimate_summary）
+- 自己修復ループ（_self_correction_retry）
+- 辞書ベースバリデーション（validate_and_correct_items）
+- PDF→JPEG ラスタライズ（行ズレ防止オプション）
+- プロンプト強化（_thought_process + discount_amount + amount_basis）
+- 逆算一致時の誤警告抑制（reverse_match）
+"""
+
+import warnings
+warnings.filterwarnings("ignore", message=".*use_container_width.*")
+
+from dotenv import load_dotenv
+load_dotenv()
+
+import streamlit as st
+import struct
+import glob
+import zlib
+import sqlite3
+import tempfile
+import os
+import datetime
+import json
+import io
+import re
+import traceback
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
+
+# Addata DB照合エンジン（オプション読み込み・失敗してもアプリは動く）
+try:
+    from auto_matching import (
+        match_pdf_items_to_addata,
+        find_addata_dir as _am_find_addata_dir,
+        find_ka06_path as _am_find_ka06_path,
+        identify_vehicle_wrapper as _am_identify_vehicle,
+        match_parts_with_addata_wrapper as _am_match_parts,
+    )
+    _ADDATA_AVAILABLE = True
+except Exception as _addata_imp_err:
+    _ADDATA_AVAILABLE = False
+    _am_find_addata_dir = None
+    _am_find_ka06_path = None
+    _am_identify_vehicle = None
+    _am_match_parts = None
+    def match_pdf_items_to_addata(items, vehicle_info, addata_root):
+        return items
+
+# ============================================================
+# 定数・設定
+# ============================================================
+SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE_FILENAME = "template_toyota.neo"
+TEMPLATE_PATH     = os.path.join(SCRIPT_DIR, TEMPLATE_FILENAME)
+ANALYSIS_LOG_PATH = os.path.join(SCRIPT_DIR, "analysis.log")
+TAX_RATE          = 0.10
+# Streamlit Cloud の st.secrets にも対応（ローカルは .env を使用）
+try:
+    GEMINI_API_KEY = st.secrets.get('GEMINI_API_KEY', os.environ.get('GEMINI_API_KEY', ''))
+except Exception:
+    GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+GEMINI_MODEL      = "gemini-2.5-flash"          # フォールバック（動的に上書きされる）
+CONFIDENCE_THRESHOLD = 0.6
+
+# 優先順位付きのモデル候補リスト（上位が最優先）
+# gemini-2.5-flashを最優先（安定・クォータ余裕あり）
+# gemini-3.1-pro-previewはクォータ250回/日の制限があるため後方に配置
+_PREFERRED_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-3.1-pro-preview",
+    "gemini-3-pro-preview",
+]
+_FALLBACK_MODEL = "gemini-2.5-flash"
+
+# クォータ超過で利用不可になったモデルを記録（セッション内キャッシュ）
+_quota_exhausted_models: set = set()
+
+_model_availability_cache: dict = {}  # key: api_key_hash, value: list of model IDs
+
+# 解析結果キャッシュ: 同一ファイル（md5）の再解析を防ぐ（セッション中に有効）
+# key: md5_hex + "_" + model_name + "_" + str(use_rasterize) → value: 解析結果dict
+_analyze_result_cache: dict = {}
+
+def get_available_gemini_models(api_key: str) -> list:
+    """利用可能なGeminiモデルを返す（優先順位付き）。
+    API疎通テストなしで即返却（高速化）。クォータ超過モデルのみ除外。"""
+    if not api_key:
+        return [_FALLBACK_MODEL]
+    cache_key = api_key[-8:]
+    if cache_key in _model_availability_cache:
+        return _model_availability_cache[cache_key]
+    # API呼び出しなしで優先リストをそのまま返す（疎通テスト廃止で高速化）
+    result = [m for m in _PREFERRED_MODELS if m not in _quota_exhausted_models]
+    if not result:
+        result = [_FALLBACK_MODEL]
+    _model_availability_cache[cache_key] = result
+    return result
+
+
+def get_default_gemini_model(api_key: str) -> str:
+    """利用可能なモデルの中から最優先モデルを返す。クォータ超過モデルは除外。"""
+    models = get_available_gemini_models(api_key)
+    # クォータ超過モデルを除外して最優先を返す
+    for m in models:
+        if m not in _quota_exhausted_models:
+            return m
+    # 全モデルがクォータ超過の場合はフォールバック
+    return models[0] if models else _FALLBACK_MODEL
+SELF_CORRECTION_THRESHOLD = 1000  # 差額が1000円以上の場合のみ自己修復を試行（高速化）
+
+DOS_DBVER = bytes.fromhex('334cc198')   # AnDBVersion.ini 固定値
+DOS_IMGE  = bytes.fromhex('2c365a67')   # AnSvImge.ini 固定値
+
+# ============================================================
+# 全角→半角カタカナ変換テーブル
+# ============================================================
+FULL_TO_HALF_KANA = {
+    'ア': 'ｱ', 'イ': 'ｲ', 'ウ': 'ｳ', 'エ': 'ｴ', 'オ': 'ｵ',
+    'カ': 'ｶ', 'キ': 'ｷ', 'ク': 'ｸ', 'ケ': 'ｹ', 'コ': 'ｺ',
+    'サ': 'ｻ', 'シ': 'ｼ', 'ス': 'ｽ', 'セ': 'ｾ', 'ソ': 'ｿ',
+    'タ': 'ﾀ', 'チ': 'ﾁ', 'ツ': 'ﾂ', 'テ': 'ﾃ', 'ト': 'ﾄ',
+    'ナ': 'ﾅ', 'ニ': 'ﾆ', 'ヌ': 'ﾇ', 'ネ': 'ﾈ', 'ノ': 'ﾉ',
+    'ハ': 'ﾊ', 'ヒ': 'ﾋ', 'フ': 'ﾌ', 'ヘ': 'ﾍ', 'ホ': 'ﾎ',
+    'マ': 'ﾏ', 'ミ': 'ﾐ', 'ム': 'ﾑ', 'メ': 'ﾒ', 'モ': 'ﾓ',
+    'ヤ': 'ﾔ', 'ユ': 'ﾕ', 'ヨ': 'ﾖ',
+    'ラ': 'ﾗ', 'リ': 'ﾘ', 'ル': 'ﾙ', 'レ': 'ﾚ', 'ロ': 'ﾛ',
+    'ワ': 'ﾜ', 'ヲ': 'ｦ', 'ン': 'ﾝ',
+    'ァ': 'ｧ', 'ィ': 'ｨ', 'ゥ': 'ｩ', 'ェ': 'ｪ', 'ォ': 'ｫ',
+    'ッ': 'ｯ', 'ャ': 'ｬ', 'ュ': 'ｭ', 'ョ': 'ｮ',
+    'ガ': 'ｶﾞ', 'ギ': 'ｷﾞ', 'グ': 'ｸﾞ', 'ゲ': 'ｹﾞ', 'ゴ': 'ｺﾞ',
+    'ザ': 'ｻﾞ', 'ジ': 'ｼﾞ', 'ズ': 'ｽﾞ', 'ゼ': 'ｾﾞ', 'ゾ': 'ｿﾞ',
+    'ダ': 'ﾀﾞ', 'ヂ': 'ﾁﾞ', 'ヅ': 'ﾂﾞ', 'デ': 'ﾃﾞ', 'ド': 'ﾄﾞ',
+    'バ': 'ﾊﾞ', 'ビ': 'ﾋﾞ', 'ブ': 'ﾌﾞ', 'ベ': 'ﾍﾞ', 'ボ': 'ﾎﾞ',
+    'パ': 'ﾊﾟ', 'ピ': 'ﾋﾟ', 'プ': 'ﾌﾟ', 'ペ': 'ﾍﾟ', 'ポ': 'ﾎﾟ',
+    'ヴ': 'ｳﾞ', 'ー': 'ｰ',
+    '。': '｡', '「': '｢', '」': '｣', '、': '､', '・': '･',
+}
+
+
+# ============================================================
+# ユーティリティ関数
+# ============================================================
+
+def to_halfwidth_katakana(text):
+    """全角カタカナ・全角英数字・全角記号を半角に変換（部品名用）
+    変換対象: カタカナ→半角カタカナ、英数字→半角英数字、一部記号→半角記号
+    漢字など半角変換不可の文字はそのまま全角を維持する。
+    """
+    if not text:
+        return text
+    result = []
+    for ch in text:
+        # まずカタカナ変換テーブルをチェック
+        if ch in FULL_TO_HALF_KANA:
+            result.append(FULL_TO_HALF_KANA[ch])
+        # 全角英大文字 Ａ-Ｚ → A-Z
+        elif '\uff21' <= ch <= '\uff3a':
+            result.append(chr(ord(ch) - 0xFEE0))
+        # 全角英小文字 ａ-ｚ → a-z
+        elif '\uff41' <= ch <= '\uff5a':
+            result.append(chr(ord(ch) - 0xFEE0))
+        # 全角数字 ０-９ → 0-9
+        elif '\uff10' <= ch <= '\uff19':
+            result.append(chr(ord(ch) - 0xFEE0))
+        # 全角スペース → 半角スペース
+        elif ch == '\u3000':
+            result.append(' ')
+        # 全角記号の一部 → 半角記号
+        elif ch == '\uff08':  # （ → (
+            result.append('(')
+        elif ch == '\uff09':  # ） → )
+            result.append(')')
+        elif ch == '\uff0d':  # － → -
+            result.append('-')
+        elif ch == '\uff0f':  # ／ → /
+            result.append('/')
+        elif ch == '\uff0e':  # ． → .
+            result.append('.')
+        elif ch == '\uff0c':  # ， → ,
+            result.append(',')
+        else:
+            result.append(ch)
+    return ''.join(result)
+
+
+def datetime_to_dos(dt):
+    """Python datetime → DOS日時バイト列(4B)"""
+    dos_date = ((dt.year - 1980) << 9) | (dt.month << 5) | dt.day
+    dos_time = (dt.hour << 11) | (dt.minute << 5) | (dt.second // 2)
+    return struct.pack('<HH', dos_date, dos_time)
+
+
+def get_era_info(date_str):
+    """YYYYMMDD文字列 → (和暦名, 和暦年4桁ゼロ埋め)"""
+    if not date_str or len(date_str) < 4 or date_str == '00000000':
+        return '令和', '0000'
+    year = int(date_str[:4])
+    if year >= 2019:
+        return '令和', f'{year - 2018:04d}'
+    elif year >= 1989:
+        return '平成', f'{year - 1988:04d}'
+    elif year >= 1926:
+        return '昭和', f'{year - 1925:04d}'
+    return '令和', '0000'
+
+
+def repair_truncated_json(text):
+    """途中で切れたJSONを修復して読み取り可能にする"""
+    if not text:
+        return text
+    text = text.strip()
+    # 配列が未閉じ
+    open_brackets = text.count('[') - text.count(']')
+    open_braces   = text.count('{') - text.count('}')
+    for _ in range(open_brackets):
+        text += ']'
+    for _ in range(open_braces):
+        text += '}'
+    # 末尾のカンマ除去
+    text = re.sub(r',\s*([}\]])', r'\1', text)
+    return text
+
+
+def extract_json_from_response(text):
+    """GeminiレスポンスからJSONオブジェクトを抽出"""
+    if not text:
+        return {}
+    # コードブロック除去
+    cleaned = re.sub(r'```(?:json)?', '', text)
+    cleaned = re.sub(r'```', '', cleaned).strip()
+    # JSON部分を抽出
+    match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+    if match:
+        json_str = match.group(0)
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            try:
+                return json.loads(repair_truncated_json(json_str))
+            except Exception:
+                pass
+    return {}
+
+
+def get_mime_type(filename):
+    """ファイル名からMIMEタイプを判定"""
+    if not filename:
+        return 'application/octet-stream'
+    ext = filename.lower().rsplit('.', 1)[-1]
+    mime_map = {
+        'pdf':  'application/pdf',
+        'jpg':  'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'png':  'image/png',
+        'webp': 'image/webp',
+        'bmp':  'image/bmp',
+        'tiff': 'image/tiff',
+        'tif':  'image/tiff',
+        'heic': 'image/heic',
+        'heif': 'image/heif',
+    }
+    return mime_map.get(ext, 'application/octet-stream')
+
+
+def safe_int(val, default=0):
+    """OCR由来の「1個」「19,550円」「1.00」「8本」「**」「１２３」なども整数化"""
+    if val is None or val == '' or val == '*' or val == '**':
+        return default
+    if isinstance(val, str) and val.strip().replace('*', '') == '':
+        return default
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(round(val))
+    s = str(val).strip()
+    # 全角数字・全角マイナス・全角ピリオドを半角に変換（OCR/手入力対策）
+    s = s.translate(str.maketrans('０１２３４５６７８９．−', '0123456789.-'))
+    # 単位除去
+    s = re.sub(r'[個本枚セット台式時間]$', '', s)
+    s = re.sub(r'[円¥,，\s]', '', s)
+    s = re.sub(r'[^\d.\-]', '', s)
+    if not s or s == '-':
+        return default
+    try:
+        return int(round(float(s)))
+    except (ValueError, OverflowError):
+        return default
+
+
+def safe_float(val, default=0.0):
+    """安全な浮動小数変換"""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def safe_str(val, default=''):
+    """安全な文字列変換"""
+    if val is None:
+        return default
+    return str(val)
+
+
+def replace_xml_tag(text, tag_name, value):
+    """XMLタグの中身を現在値に関係なく置換"""
+    pattern = rf'<{re.escape(tag_name)}>[^<]*</{re.escape(tag_name)}>'
+    replacement = f'<{tag_name}>{value}</{tag_name}>'
+    result = re.sub(pattern, replacement, text)
+    # 空タグ形式も対応
+    empty_pattern = rf'<{re.escape(tag_name)}/>'
+    result = result.replace(empty_pattern, replacement)
+    return result
+
+
+def replace_ini_value(text, key, value):
+    """INIキー値を確実に更新"""
+    pattern = rf'^({re.escape(key)}\s*=).*$'
+    replacement = rf'\g<1>{value}'
+    return re.sub(pattern, replacement, text, flags=re.MULTILINE)
+
+
+# ============================================================
+# NEO バイナリ解析
+# ============================================================
+
+def find_real_cks(data, start=424):
+    """comp_len連鎖法でCK位置を特定（偽CK除外）"""
+    all_ck = []
+    for i in range(start, len(data) - 1):
+        if data[i] == 0x43 and data[i + 1] == 0x4B:
+            all_ck.append(i)
+    if not all_ck:
+        return []
+    real_ck = []
+    idx = 0
+    while idx < len(all_ck):
+        ck = all_ck[idx]
+        real_ck.append(ck)
+        cl = struct.unpack('<H', data[ck - 4:ck - 2])[0]
+        exp = ck + cl + 8
+        found = False
+        for j in range(idx + 1, len(all_ck)):
+            if all_ck[j] == exp:
+                idx = j
+                found = True
+                break
+        if not found:
+            break
+    return real_ck
+
+
+def decompress_neo(data, real_ck):
+    """辞書連鎖展開でrawデータを復元"""
+    full_raw = b''
+    for i, ck in enumerate(real_ck):
+        start = ck + 2
+        end   = real_ck[i + 1] - 8 if i + 1 < len(real_ck) else len(data)
+        chunk = data[start:end]
+        if i == 0:
+            raw = zlib.decompress(chunk, -15)
+        else:
+            dobj = zlib.decompressobj(-15, zdict=full_raw[-32768:])
+            raw  = dobj.decompress(chunk)
+        full_raw += raw
+    return full_raw
+
+
+def parse_entries(data, first_ck):
+    """管理領域とファイルテーブルを解析
+    NEOファイルテーブルの正しい構造:
+      Entry[0]: [DOS 4B][attr 2B][\\fn\\0]  ← 先頭ファイル(hidden), size/offsetは管理領域に格納
+      Entry[1]: (Entry[0]の末尾に付く [size 4B][offset 4B][00 00]) + [DOS 4B][attr 2B][\\fn\\0]
+      ...
+      Entry[N-1]: (Entry[N-2]の末尾に付く [size 4B][offset 4B][00 00]) + [DOS 4B][attr 2B][\\fn\\0]
+    つまり各エントリの\\0の直後の size/offset は「次のエントリ」のデータ位置を示す。
+    先頭エントリ(raw offset=0)にはテーブル内にsize/offsetがなく、管理領域から導出する。
+    """
+    table       = data[424:first_ck]
+    first_entry = None
+    for i in range(len(table) - 7):
+        if table[i + 6] == 0x5C and struct.unpack_from('<H', table, i + 4)[0] == 0x0020:
+            first_entry = i
+            break
+    if first_entry is None:
+        raise ValueError("ファイルテーブルのエントリが見つかりません")
+    mgmt    = table[:first_entry]
+    # まず全エントリをスキャンし、各エントリの名前と末尾データを収集
+    raw_entries = []
+    pos         = first_entry
+    while pos < len(table):
+        if pos + 6 >= len(table):
+            break
+        if table[pos + 6] != 0x5C:
+            pos += 1
+            continue
+        dos_bytes = table[pos:pos + 4]
+        nul       = table.find(b'\x00', pos + 7)
+        if nul == -1:
+            break
+        fn        = table[pos + 7:nul].decode('cp932', errors='replace')
+        remaining = len(table) - (nul + 1)
+        if remaining >= 10:
+            trailing_sz  = struct.unpack_from('<I', table, nul + 1)[0]
+            trailing_off = struct.unpack_from('<I', table, nul + 5)[0]
+            has_trailing  = trailing_sz < 10_000_000 and trailing_off < 10_000_000
+        else:
+            trailing_sz, trailing_off, has_trailing = None, None, False
+        raw_entries.append({
+            'name': fn, 'dos': dos_bytes,
+            'trailing_sz': trailing_sz, 'trailing_off': trailing_off,
+            'has_trailing': has_trailing,
+        })
+        if has_trailing:
+            pos = nul + 11
+        else:
+            pos = len(table)
+    # size/offsetの正しい割り当て:
+    #   raw_entries[i]の末尾データ → entries[i+1] のsize/offset
+    #   entries[0] は先頭ファイル(hidden): raw offset=0, sizeは他エントリの合計から逆算
+    entries = []
+    for i, raw in enumerate(raw_entries):
+        if i == 0:
+            entries.append({'name': raw['name'], 'size': None, 'offset': None,
+                            'is_last': True, 'dos': raw['dos']})
+        else:
+            prev = raw_entries[i - 1]
+            entries.append({'name': raw['name'],
+                            'size': prev['trailing_sz'], 'offset': prev['trailing_off'],
+                            'is_last': False, 'dos': raw['dos']})
+    return mgmt, entries
+
+
+def extract_files(full_raw, entries):
+    """rawデータから12ファイルを切り出し"""
+    files        = {}
+    normal_total = 0
+    for e in entries:
+        if not e['is_last']:
+            files[e['name']] = full_raw[e['offset']:e['offset'] + e['size']]
+            normal_total    += e['size']
+    last_entry = [e for e in entries if e['is_last']]
+    if not last_entry:
+        raise ValueError("最後エントリ（hidden先頭ファイル）が見つかりません")
+    last_name         = last_entry[0]['name']
+    files[last_name]  = full_raw[0:len(full_raw) - normal_total]
+    return files
+
+
+# ============================================================
+# 内部ファイル更新: AnSMB.txt（見積本体SQLite）
+# ============================================================
+
+def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclusive=False, is_beta_mode=False):
+    """ERParts/Expense/Total を更新（値引き行の負工賃も対応）
+    expenses: {
+        'towing': レッカー費用,              # LineNo=1
+        'rental_car': 代車費用,              # LineNo=2
+        'short_parts': ショートパーツ,       # LineNo=4（short_parts_wageと同義）
+        'tax_exempt': 非課税費用,            # LineNo=5（消費税なし）
+    }
+    is_tax_inclusive: True の場合、items の金額は税込値として扱い、
+                     OutTax/InTax/Tax を正しく逆算する。
+    is_beta_mode: True の場合、ベタ打ちモード（未マッチ部品に※を付与しない）
+    """
+    if expenses is None:
+        expenses = {}
+    tf = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+    tf.write(db_bytes)
+    tf.close()
+    conn = None
+    try:
+        conn = sqlite3.connect(tf.name)
+        cur  = conn.cursor()
+        cur.execute('DELETE FROM ERParts')
+        # ── 塗装セクション・その他テーブルをリセット ──
+        # PaintingPanel: 複数行テーブル（パネル塗装行）→ 全削除
+        cur.execute('DELETE FROM PaintingPanel')
+        # PaintingLinkParts: 塗装リンクパーツ → 全削除
+        cur.execute('DELETE FROM PaintingLinkParts')
+        # PaintingOther: 1行固定テーブル。行名・LineNoは保持し工賃・時間をリセット
+        cur.execute("""UPDATE PaintingOther SET
+            Time=-1, WageOutTax=-1, WageInTax=-1, WageTax=-1, WageByManual=''""")
+        # PaintingTotal: 合計テーブルをゼロリセット
+        cur.execute("""UPDATE PaintingTotal SET
+            TimeTotalPanel=0, TimeTotalBumper=0, TimeTotalFrame=0,
+            TimeTotalEtcetera=0, TimeTotalOther=0, TimeTotal=0,
+            WageTotalPanelOutTax=0, WageTotalPanelInTax=0, WageTotalPanelTax=0,
+            WageTotalBumperOutTax=0, WageTotalBumperInTax=0, WageTotalBumperTax=0,
+            WageTotalFrameOutTax=0, WageTotalFrameInTax=0, WageTotalFrameTax=0,
+            WageTotalEtceteraOutTax=0, WageTotalEtceteraInTax=0, WageTotalEtceteraTax=0,
+            WageTotalOtherOutTax=0, WageTotalOtherInTax=0, WageTotalOtherTax=0,
+            WageTotalOutTax=0, WageTotalInTax=0, WageTotalTax=0, WageTotalByManual='',
+            MaterialTotalPanelOutTax=0, MaterialTotalPanelInTax=0, MaterialTotalPanelTax=0,
+            MaterialTotalBumperOutTax=0, MaterialTotalBumperInTax=0, MaterialTotalBumperTax=0,
+            MaterialTotalFrameOutTax=0, MaterialTotalFrameInTax=0, MaterialTotalFrameTax=0,
+            MaterialTotalEtceteraOutTax=0, MaterialTotalEtceteraInTax=0, MaterialTotalEtceteraTax=0,
+            MaterialTotalOutTax=0, MaterialTotalInTax=0, MaterialTotalTax=0, MaterialTotalbyManual='',
+            TotalOutTax=0, TotalInTax=0, TotalTax=0""")
+        # 全Expense行をクリア（LineNo=1〜8: 文字書き/内張り/配線/ショートパーツ/レッカー代１/レッカー代２/写真代他/その他控除）
+        for lno in (1, 2, 3, 4, 5, 6, 7, 8):
+            cur.execute("""UPDATE Expense SET
+                WageEnabled=0, WageOutTax=0, WageInTax=0, WageTax=0
+                WHERE LineNo=?""", (lno,))
+        total_parts = 0
+        total_wages = 0
+        for i, item in enumerate(items):
+            name   = item.get('name', '')
+        
+            parts_no = str(item.get('part_no', '') or '')
+
+            # 区分: work_code（Markdownパーサー保存先）または method から取得
+            method = item.get('method', '') or item.get('work_code', '')
+
+            # 品名から作業種別を自動推定（区分が空白の場合）
+            # AnDefine.ini 準拠: 0=取替,1=脱着,2=修理,3=板金,4=脱着修理,5=脱着板金,6=点検,7=調整,8=点検調整,9=分解調整
+            # work_code='-1' のベタ打ち項目は自動判定せず、品名をそのままNEOに書き込む
+            if not method and item.get('work_code') != '-1':
+                _name_for_detect = str(item.get('name', ''))
+                _parts_amt = safe_int(item.get('parts_amount', 0))
+                _wage_amt  = safe_int(item.get('wage', 0))
+                # ルール0: 研磨・磨き・写真代・ショートパーツは空白のまま（最優先）
+                if any(kw in _name_for_detect for kw in ('研磨', '磨き', '写真代', 'ショートパーツ')):
+                    method = ''
+                # 複合作業（優先判定）
+                elif '分解調整' in _name_for_detect:
+                    method = '分解調整'  # DisposalCode=9
+                elif '点検調整' in _name_for_detect:
+                    method = '点検調整'  # DisposalCode=8
+                elif '脱着板金' in _name_for_detect:
+                    method = '脱着板金'  # DisposalCode=5
+                elif '脱着修理' in _name_for_detect:
+                    method = '脱着修理'  # DisposalCode=4
+                # ルール1: 部品金額あり → 取替（1行に部品+工賃が統合されたケースも含む）
+                elif _parts_amt > 0:
+                    method = '取替'
+                elif any(kw in _name_for_detect for kw in ('取替', '交換', '取換', '取り替え')):
+                    method = '取替'          # DisposalCode=0
+                elif any(kw in _name_for_detect for kw in ('脱着', '取外', '取付', '組付', '脱外')):
+                    method = '脱着'          # DisposalCode=1
+                elif any(kw in _name_for_detect for kw in ('板金', '鈑金')):
+                    method = '板金'          # DisposalCode=3
+                elif any(kw in _name_for_detect for kw in ('塗装', 'ペイント', 'ワックス', '加算', 'ブース')):
+                    method = '板金'          # 塗装系 → DisposalCode=3（板金グループ）
+                elif any(kw in _name_for_detect for kw in ('点検',)):
+                    method = '点検'          # DisposalCode=6
+                elif any(kw in _name_for_detect for kw in (
+                    '修理', '補修', '分解', '修正',
+                    'フィッティング', 'コーディング', '穴あけ', 'シーリング',
+                )):
+                    method = '修理'          # DisposalCode=2
+                elif any(kw in _name_for_detect for kw in (
+                    '光軸', '調整', '消去', '設定', 'エイミング',
+                )):
+                    method = '調整'          # DisposalCode=7
+
+            qty    = safe_int(item.get('quantity', 1), 1)
+            if qty < 1:
+                qty = 1
+            if 'parts_amount' in item:
+                parts_total = safe_int(item.get('parts_amount', 0))
+            else:
+                unit_price  = safe_int(item.get('unit_price', 0))
+                parts_total = unit_price * qty
+
+            index_val = float(item.get('index_value', 0.0) or 0.0)
+            db_time = round(index_val * 10) if index_val > 0 else -1
+
+            wage     = safe_int(item.get('wage', 0))
+            rec_no   = i + 1
+            line_no  = rec_no * 10
+            wage_total  = wage
+            if is_tax_inclusive:
+                # 税込: 金額は既に税込値 → OutTax=税抜逆算, InTax=そのまま, Tax=差額
+                if parts_total != 0:
+                    parts_outtax = round(parts_total / (1 + TAX_RATE))
+                    parts_intax  = parts_total
+                    parts_tax    = parts_total - parts_outtax
+                else:
+                    parts_outtax = 0; parts_intax = 0; parts_tax = 0
+                if wage_total != 0:
+                    wage_outtax  = round(abs(wage_total) / (1 + TAX_RATE))
+                    if wage_total < 0:
+                        wage_outtax = -wage_outtax
+                    wage_intax   = wage_total
+                    wage_tax     = wage_total - wage_outtax
+                else:
+                    wage_outtax = 0; wage_intax = 0; wage_tax = 0
+            else:
+                # 税抜: 従来通り
+                parts_outtax = parts_total
+                parts_tax    = round(parts_total * TAX_RATE) if parts_total != 0 else 0
+                parts_intax  = parts_total + parts_tax if parts_total != 0 else 0
+                wage_outtax  = wage_total
+                wage_tax_abs = round(abs(wage_total) * TAX_RATE) if wage_total != 0 else 0
+                wage_tax     = wage_tax_abs if wage_total >= 0 else -wage_tax_abs
+                wage_intax   = wage_total + wage_tax if wage_total != 0 else 0
+            total_parts += parts_outtax
+            total_wages += wage_outtax
+            # コグニセブンは -1 を空白として表示する（0やNULLは「0」と表示される）
+            db_parts_total = parts_outtax if parts_total != 0 else -1
+            db_parts_intax = parts_intax  if parts_total != 0 else -1
+            db_parts_tax   = parts_tax    if parts_total != 0 else -1
+            db_wage_total  = wage_outtax  if wage_total  != 0 else -1
+            db_wage_intax  = wage_intax   if wage_total  != 0 else -1
+            db_wage_tax    = wage_tax     if wage_total  != 0 else -1
+            # 部品金額がある行のみ数量を設定。脱着など部品なし行は -1（空白）
+            db_qty = qty if parts_total != 0 else -1
+            # CogniSeven 検証済み DisposalCode マッピング
+            _disposal_map = {
+                '取替': 0, '交換': 0, '取換': 0, '取り替え': 0,
+                '脱着': 1, '取外': 1, '取付': 1, '組付': 1, '脱外': 1,
+                '修理': 2, '補修': 2, '分解': 2, '修正': 2, '調整': 2,
+                '光軸': 2, 'フィッティング': 2, 'コーディング': 2, '穴あけ': 2,
+                'シーリング': 2, '点検': 2, '消去': 2, '設定': 2, 'エイミング': 2,
+                '分解調整': 5, 'オーバーホール': 5,
+                '板金': 6, '鈑金': 6, '塗装': 6, 'ペイント': 6, 'ワックス': 6, '加算': 6, 'ブース': 6,
+            }
+            disposal_code = _disposal_map.get(method, -1)
+            parts_code = ''
+            parts_code_sub = -1
+            cur.execute("""INSERT INTO ERParts (
+                RecordNo, LineNo, PartsCode, PartsCodeSub, DisposalCode,
+                DisposalName, DisposalNameStandard, PartsName, PartsNameStandard,
+                PartsNo, PartsNoStandard,
+                PartsPriceOutTax, PartsPriceInTax, PartsPriceTax,
+                PartsUnitPriceOutTax, PartsUnitPriceInTax, PartsUnitPriceTax,
+                PartsPriceStandardOutTax, PartsPriceStandardInTax, PartsPriceStandardTax,
+                PartsPriceByManual,
+                Time, TimeStandard,
+                WageOutTax, WageInTax, WageTax,
+                WageStandardOutTax, WageStandardInTax, WageStandardTax,
+                WageByManual, PartsCount,
+                ChangeTotalOutTax, ChangeTotalInTax, ChangeTotalTax,
+                PartsFileTime, WorkCode, ConstructGroup,
+                OrderFlag, Provisional, PartsPriceFlag, DuplicateFlag,
+                BlockCode, WageFileTime, ShapeModifyTime,
+                DamageArea, DamageRank,
+                DamageRankBtn1, DamageRankBtn2, DamageRankBtn3,
+                SATime1, SATime1ByManual, SATime1Flag,
+                SATime2, SATime2ByManual, SATime2Flag,
+                SATime3, SATime3ByManual, SATime3Flag,
+                SATime4, SATime4ByManual, SATime4Flag,
+                SATime5, SATime5ByManual, SATime5Flag,
+                BlockListFlag, RecycleFlag, RCRecordNo,
+                ReserveFlag, ReserveRecordNo,
+                CommentFlag, Comment1, Comment2, Comment3, RWLinkFlag
+            ) VALUES (
+                ?, ?, ?, ?, ?,
+                ?, '', ?, '',
+                ?, '',
+                ?, ?, ?,
+                -1, -1, -1,
+                NULL, NULL, NULL,
+                '*',
+                ?, 0,
+                ?, ?, ?,
+                -1, -1, -1,
+                '*', ?,
+                -1, -1, -1,
+                '', '', '',
+                '9', '', 0, 0,
+                '', '', '',
+                '', '',
+                0, 0, 0,
+                -1, '', 0,
+                -1, '', 0,
+                -1, '', 0,
+                -1, '', 0,
+                -1, '', 0,
+                0, 0, 0,
+                0, 0,
+                0, '', '', '', 0
+            )""", (
+                rec_no, line_no, parts_code, parts_code_sub, disposal_code,
+                method, name,
+                parts_no,
+                db_parts_total, db_parts_intax, db_parts_tax,
+                db_time,
+                db_wage_total, db_wage_intax, db_wage_tax,
+                db_qty
+            ))
+        # ── 税込/税抜に応じた費用計算ヘルパー ──
+        def _calc_tax(amount, inclusive=False):
+            """金額から OutTax, InTax, Tax を計算"""
+            if amount == 0:
+                return 0, 0, 0
+            if inclusive:
+                outtax = round(amount / (1 + TAX_RATE))
+                intax  = amount
+                tax    = amount - outtax
+            else:
+                outtax = amount
+                tax    = round(amount * TAX_RATE)
+                intax  = amount + tax
+            return outtax, intax, tax
+
+        # ── Expense各行を更新 ──
+        # LineNo=4: ショートパーツ（部品代として格納 — Audatex仕様）
+        sp_wage = safe_int(short_parts_wage)
+        sp_out, sp_intax, sp_tax = _calc_tax(sp_wage, is_tax_inclusive)
+        cur.execute("""UPDATE Expense SET
+            PartsPriceOutTax=?, PartsPriceInTax=?, PartsPriceTax=?
+            WHERE LineNo=4""", (sp_out, sp_intax, sp_tax))
+
+        # LineNo=1: レッカー費用（課税）
+        towing = safe_int(expenses.get('towing', 0))
+        tow_out, tow_intax, tow_tax = _calc_tax(towing, is_tax_inclusive)
+        cur.execute("""UPDATE Expense SET
+            WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
+            WHERE LineNo=1""", (1 if towing > 0 else 0, tow_out, tow_intax, tow_tax))
+
+        # LineNo=2: 代車費用（課税）
+        rental_car = safe_int(expenses.get('rental_car', 0))
+        rent_out, rent_intax, rent_tax = _calc_tax(rental_car, is_tax_inclusive)
+        cur.execute("""UPDATE Expense SET
+            WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
+            WHERE LineNo=2""", (1 if rental_car > 0 else 0, rent_out, rent_intax, rent_tax))
+
+        # LineNo=5: 非課税費用（消費税なし）
+        tax_exempt = safe_int(expenses.get('tax_exempt', 0))
+        cur.execute("""UPDATE Expense SET
+            WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
+            WHERE LineNo=5""", (1 if tax_exempt > 0 else 0, tax_exempt, tax_exempt, 0))
+
+        # ── Total計算 ──
+        # total_parts / total_wages は既に税抜値（is_tax_inclusive時は逆算済み）
+        taxable_expenses = sp_out + tow_out + rent_out
+        sub_total         = total_parts + total_wages + taxable_expenses
+        tax_total         = round(sub_total * TAX_RATE)
+        grand_total       = sub_total + tax_total + tax_exempt  # 非課税は税計算後に加算
+        parts_tax_total   = round(total_parts * TAX_RATE)
+        wages_tax_total   = round(total_wages * TAX_RATE)
+        sp_tax_total      = round(sp_out * TAX_RATE)
+        cur.execute("""UPDATE Total SET
+            ms_PartsTotalOutTax=?,
+            ms_PartsTotalInTax=?,
+            ms_PartsTotalTax=?,
+            ms_WageTotalOutTax=?,
+            ms_WageTotalInTax=?,
+            ms_WageTotalTax=?,
+            hy_WageTaxTotalOutTax=?,
+            hy_WageTaxTotalInTax=?,
+            hy_WageTaxTotalTax=?,
+            tx_TotalOutTax=?,
+            tx_TotalInTax=?,
+            SubTotal=?,
+            Total=?
+        """, (
+            total_parts, total_parts + parts_tax_total, parts_tax_total,
+            total_wages, total_wages + wages_tax_total, wages_tax_total,
+            taxable_expenses, taxable_expenses + round(taxable_expenses * TAX_RATE) if taxable_expenses > 0 else 0, round(taxable_expenses * TAX_RATE) if taxable_expenses > 0 else 0,
+            tax_total,   tax_total,
+            sub_total,   grand_total
+        ))
+        conn.commit()
+        conn.close()
+        conn = None
+        with open(tf.name, 'rb') as f:
+            result = f.read()
+        return result, total_parts, total_wages, grand_total
+    except Exception:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        raise
+    finally:
+        try:
+            os.unlink(tf.name)
+        except OSError:
+            pass
+
+
+# ============================================================
+# テンプレートNEO 車両・保険情報読み取り
+# ============================================================
+
+def read_vehicle_from_sld(db_bytes):
+    """テンプレートNEOの AnSvIf0001.sld から車両・顧客・保険の既存値を読み取る。
+    戻り値: dict（空文字 = 未設定フィールド）
+    """
+    result = {
+        'car_serial_no': '',       # 車体番号
+        'car_model_designation': '',  # 型式指定番号
+        'car_category_number': '',    # 類別区分番号
+        'car_reg_date': '',           # 初度登録年月日 (YYYYMMDD)
+        'term_date': '',              # 車検満了日 (YYYYMMDD)
+        'car_name': '',               # 車名
+        'car_model': '',              # 型式
+        'car_reg_department': '',     # 登録番号 地名
+        'car_reg_division': '',       # 登録番号 分類
+        'car_reg_business': '',       # 登録番号 用途
+        'car_reg_serial': '',         # 登録番号 一連番号
+        'customer_name': '',          # 顧客名
+        'policy_no': '',              # 証券番号
+        'contractor_name': '',        # 契約者名
+    }
+    tf_name = None
+    try:
+        tf = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        tf_name = tf.name
+        tf.write(db_bytes)
+        tf.close()
+        conn = sqlite3.connect(tf_name)
+        cur  = conn.cursor()
+
+        # Customer テーブルから車両 & 顧客情報を取得
+        cust_cols = {row[1] for row in cur.execute("PRAGMA table_info(Customer)").fetchall()}
+        _col_map = [
+            ('CarSerialNo',    'car_serial_no'),
+            ('CarMouldNo',     'car_model_designation'),
+            ('CarKindNo',      'car_category_number'),
+            ('CarRegDate',     'car_reg_date'),
+            ('TermDate',       'term_date'),
+            ('CarRegNoDepartment', 'car_reg_department'),
+            ('CarRegNoDivision',   'car_reg_division'),
+            ('CarRegNoBusiness',   'car_reg_business'),
+            ('CarRegNoSerial',     'car_reg_serial'),
+            ('Name1',          'customer_name'),
+        ]
+        readable = [(db_col, py_key) for db_col, py_key in _col_map if db_col in cust_cols]
+        if readable:
+            select_cols = ', '.join(c for c, _ in readable)
+            row = cur.execute(f"SELECT {select_cols} FROM Customer LIMIT 1").fetchone()
+            if row:
+                for i, (_, py_key) in enumerate(readable):
+                    result[py_key] = safe_str(row[i])
+
+        # Car テーブルから車名・型式を取得
+        car_cols = {row[1] for row in cur.execute("PRAGMA table_info(Car)").fetchall()}
+        _car_map = [('CarName', 'car_name')]
+        for db_col, py_key in _car_map:
+            if db_col in car_cols:
+                row = cur.execute(f"SELECT {db_col} FROM Car LIMIT 1").fetchone()
+                if row and row[0]:
+                    result[py_key] = safe_str(row[0])
+
+        # Insurance テーブルから証券番号・契約者名を取得
+        ins_cols = {row[1] for row in cur.execute("PRAGMA table_info(Insurance)").fetchall()}
+        _ins_map = [('PolicyNo', 'policy_no'), ('ContractorName', 'contractor_name')]
+        for db_col, py_key in _ins_map:
+            if db_col in ins_cols:
+                row = cur.execute(f"SELECT {db_col} FROM Insurance LIMIT 1").fetchone()
+                if row and row[0]:
+                    result[py_key] = safe_str(row[0])
+
+        conn.close()
+    except Exception as e:
+        print(f"read_vehicle_from_sld エラー: {e}")
+    finally:
+        if tf_name:
+            try:
+                os.unlink(tf_name)
+            except OSError:
+                pass
+    return result
+
+
+# ============================================================
+# 内部ファイル更新: AnSvEm0001Ex.db（顧客・車両・保険）
+# ============================================================
+
+def update_em_db(db_bytes, cust, insurance_info, estimated_date, is_tax_inclusive=False, merge_mode=False):
+    """Customer/FileInfo/Insurance/Setting テーブルを更新
+    merge_mode=True の場合、OCRで取得した非空の値のみでテンプレートの既存値を上書きする。
+    空値のフィールドはテンプレートNEOの値を保持する。
+    """
+    tf = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+    tf.write(db_bytes)
+    tf.close()
+    conn = None
+    try:
+        conn = sqlite3.connect(tf.name)
+        cur  = conn.cursor()
+        customer_name = safe_str(cust.get('customer_name', ''))
+        owner_name    = safe_str(cust.get('owner_name', ''))
+        postal_no     = safe_str(cust.get('postal_no', ''))
+        prefecture    = safe_str(cust.get('prefecture', ''))
+        municipality  = safe_str(cust.get('municipality', ''))
+        address_other = safe_str(cust.get('address_other', ''))
+        car_dept      = safe_str(cust.get('car_reg_department', ''))
+        car_div       = safe_str(cust.get('car_reg_division', ''))
+        car_biz       = safe_str(cust.get('car_reg_business', ''))
+        car_serial    = safe_str(cust.get('car_reg_serial', ''))
+        car_serial_no = safe_str(cust.get('car_serial_no', ''))
+        car_name       = safe_str(cust.get('car_name', ''))
+        car_model      = safe_str(cust.get('car_model', ''))
+        engine_model   = safe_str(cust.get('engine_model', ''))
+        body_color     = safe_str(cust.get('body_color', ''))
+        color_code     = safe_str(cust.get('color_code', ''))
+        trim_code      = safe_str(cust.get('trim_code', ''))
+        car_weight     = safe_int(cust.get('car_weight', 0))
+        displacement   = safe_int(cust.get('engine_displacement', 0))
+        model_desig    = safe_str(cust.get('car_model_designation', ''))
+        category_num   = safe_str(cust.get('car_category_number', ''))
+        kilometer      = safe_int(cust.get('kilometer', -1), -1)
+        term_date      = safe_str(cust.get('term_date', '00000000'))
+        car_reg_date   = safe_str(cust.get('car_reg_date', '00000000'))
+        if not term_date    or len(term_date) < 8:    term_date    = '00000000'
+        if not car_reg_date or len(car_reg_date) < 8: car_reg_date = '00000000'
+        term_era, term_era_year = get_era_info(term_date)
+        reg_era,  reg_era_year  = get_era_info(car_reg_date)
+
+        if merge_mode:
+            # マージモード: 非空の値のみでテンプレートの既存値を上書き
+            _cust_updates = []
+            _cust_values  = []
+            _field_map = [
+                ('Name1', customer_name), ('UserName', customer_name), ('OwnerName', owner_name),
+                # 住所欄はNEOに記載不要のため除外（PostalNo/Prefecture/Municipality/AddressOther1は書き込まない）
+                ('CarRegNoDepartment', car_dept), ('CarRegNoDivision', car_div),
+                ('CarRegNoBusiness', car_biz), ('CarRegNoSerial', car_serial),
+                ('CarSerialNo', car_serial_no), ('CarMouldNo', model_desig), ('CarKindNo', category_num),
+            ]
+            for col, val in _field_map:
+                if val:  # 非空のみ上書き
+                    _cust_updates.append(f'{col}=?')
+                    _cust_values.append(val)
+            # 日付系: 有効な日付（00000000以外）のみ上書き
+            if term_date != '00000000':
+                _cust_updates += ['TermDate=?', 'TermEra=?', 'TermEraYear=?']
+                _cust_values  += [term_date, term_era, term_era_year]
+            if car_reg_date != '00000000':
+                _cust_updates += ['CarRegDate=?', 'CarRegEra=?', 'CarRegEraYear=?']
+                _cust_values  += [car_reg_date, reg_era, reg_era_year]
+            if kilometer >= 0:
+                _cust_updates.append('Kilometer=?')
+                _cust_values.append(kilometer)
+            if _cust_updates:
+                cur.execute(f"UPDATE Customer SET {', '.join(_cust_updates)}", _cust_values)
+        else:
+            # 通常モード: 全フィールドを上書き（住所欄はNEO不要のため除外）
+            cur.execute('''UPDATE Customer SET
+                Name1=?, UserName=?, OwnerName=?,
+                CarRegNoDepartment=?, CarRegNoDivision=?,
+                CarRegNoBusiness=?, CarRegNoSerial=?,
+                CarSerialNo=?, CarMouldNo=?, CarKindNo=?,
+                TermDate=?, TermEra=?, TermEraYear=?,
+                CarRegDate=?, CarRegEra=?, CarRegEraYear=?,
+                Kilometer=?
+            ''', (
+                customer_name, customer_name, owner_name,
+                car_dept, car_div, car_biz, car_serial,
+                car_serial_no, model_desig, category_num,
+                term_date, term_era, term_era_year,
+                car_reg_date, reg_era, reg_era_year,
+                kilometer
+            ))
+
+        # Car テーブル更新（車名・カラーコード・トリムコード） — 非空の値のみ更新（通常・マージ共通）
+        car_cols = {row[1] for row in cur.execute("PRAGMA table_info(Car)").fetchall()}
+        car_update = [
+            ('CarName', car_name), ('CarNameByUser', car_name),
+            ('ColorCode', color_code), ('ColorName', body_color),
+            ('TrimCode', trim_code),
+        ]
+        valid_car = [(col, val) for col, val in car_update if col in car_cols and val]
+        if valid_car:
+            set_clause = ', '.join(f'{col}=?' for col, _ in valid_car)
+            values = [val for _, val in valid_car]
+            cur.execute(f'UPDATE Car SET {set_clause}', values)
+        est_era, est_era_year = get_era_info(estimated_date)
+        cur.execute('''UPDATE FileInfo SET
+            EstimatedDate=?, EstimatedEra=?, EstimatedEraYear=?
+        ''', (estimated_date, est_era, est_era_year))
+        policy_no  = safe_str(insurance_info.get('policy_no', ''))
+        contractor = safe_str(insurance_info.get('contractor_name', ''))
+        if merge_mode:
+            # マージモード: 非空の保険情報のみ上書き
+            _ins_updates = []
+            _ins_values  = []
+            if policy_no:
+                _ins_updates.append('PolicyNo=?')
+                _ins_values.append(policy_no)
+            if contractor:
+                _ins_updates.append('ContractorName=?')
+                _ins_values.append(contractor)
+            if _ins_updates:
+                cur.execute(f"UPDATE Insurance SET {', '.join(_ins_updates)}", _ins_values)
+        else:
+            cur.execute('''UPDATE Insurance SET
+                PolicyNo=?, ContractorName=?,
+                AccidentDate='00000000', AccidentEra='令和'
+            ''', (policy_no, contractor))
+        conn.commit()
+
+        # TaxKindFlag 更新 (1=内税, 0=外税)
+        try:
+            tax_flag = 1 if is_tax_inclusive else 0
+            cur.execute('UPDATE Setting SET TaxKindFlag=?', (tax_flag,))
+            conn.commit()
+        except Exception as e:
+            print("TaxKindFlag update failed:", e)
+
+        conn.close()
+        conn = None
+        with open(tf.name, 'rb') as f:
+            result = f.read()
+        return result
+    except Exception:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        raise
+    finally:
+        try:
+            os.unlink(tf.name)
+        except OSError:
+            pass
+
+
+# ============================================================
+# 内部ファイル更新: AnSvMail.ini（XML）
+# ============================================================
+
+def update_mail_ini(orig_bytes, cust, grand_total, merge_mode=False):
+    """Shift_JIS XMLの顧客・車両情報を更新
+    merge_mode=True の場合、非空の値のみ上書きする。
+    """
+    text         = orig_bytes.decode('cp932', errors='replace')
+    customer_name = safe_str(cust.get('customer_name', ''))
+    owner_name    = safe_str(cust.get('owner_name', ''))
+    car_dept      = safe_str(cust.get('car_reg_department', ''))
+    car_div       = safe_str(cust.get('car_reg_division', ''))
+    car_biz       = safe_str(cust.get('car_reg_business', ''))
+    car_serial    = safe_str(cust.get('car_reg_serial', ''))
+    car_no_full   = f'{car_dept}{car_div}{car_biz}{car_serial}'
+    car_name      = safe_str(cust.get('car_name', ''))
+    car_serial_no = safe_str(cust.get('car_serial_no', ''))
+    kilometer     = safe_str(cust.get('kilometer', ''))
+    car_reg_date  = safe_str(cust.get('car_reg_date', ''))
+    term_date     = safe_str(cust.get('term_date', ''))
+    tag_values = {
+        'CustomerName1': customer_name,
+        'OwnerName':     owner_name,
+        'UserName':      customer_name,
+        'CarNo':         car_no_full,
+        'CarName':       car_name,
+        'CarSerialNo':   car_serial_no,
+        'Kilometrage':   kilometer,
+        'CarNoArea':     car_dept,
+        'CarNoClass':    car_div,
+        'CarNoKana':     car_biz,
+        'CarNoSeries':   car_serial,
+        'Total':         grand_total,
+    }
+    if term_date and term_date != '00000000':
+        term_era, term_era_year = get_era_info(term_date)
+        era_year_int = int(term_era_year)
+        term_month = term_date[4:6] if len(term_date) >= 6 else ''
+        term_day   = term_date[6:8] if len(term_date) >= 8 else ''
+        tag_values['CarTermEraDate'] = (
+            f'{term_era}{era_year_int}年{int(term_month)}月{int(term_day)}日'
+            if term_month and term_day else ''
+        )
+    else:
+        tag_values['CarTermEraDate'] = ''
+    if car_reg_date and car_reg_date != '00000000':
+        reg_era, reg_era_year = get_era_info(car_reg_date)
+        reg_year_int = int(reg_era_year)
+        reg_month    = car_reg_date[4:6] if len(car_reg_date) >= 6 else ''
+        tag_values['CarRegistedDate'] = (
+            f'{reg_era}{reg_year_int}年{int(reg_month)}月'
+            if reg_month and reg_month != '00' else ''
+        )
+    else:
+        tag_values['CarRegistedDate'] = ''
+    for tag_name, value in tag_values.items():
+        if merge_mode and not value:
+            continue  # マージモード: 空値はスキップ（テンプレートの既存値を保持）
+        text = replace_xml_tag(text, tag_name, value)
+    return text.encode('cp932', errors='replace')
+
+
+# ============================================================
+# 内部ファイル更新: AnSvImge.ini（INI）
+# ============================================================
+
+def update_imge_ini(orig_bytes, cust, merge_mode=False):
+    """INIファイルの顧客・車両情報を更新
+    merge_mode=True の場合、非空の値のみ上書きする。
+    """
+    text      = orig_bytes.decode('cp932', errors='replace')
+    ini_values = {
+        'CustomerName':    safe_str(cust.get('customer_name', '')),
+        'CarNoDepartment': safe_str(cust.get('car_reg_department', '')),
+        'CarNoDivision':   safe_str(cust.get('car_reg_division', '')),
+        'CarNoBusiness':   safe_str(cust.get('car_reg_business', '')),
+        'CarNoSerial':     safe_str(cust.get('car_reg_serial', '')),
+        'CarName':         safe_str(cust.get('car_name', '')),
+    }
+    for key, value in ini_values.items():
+        if merge_mode and not value:
+            continue  # マージモード: 空値はスキップ（テンプレートの既存値を保持）
+        text = replace_ini_value(text, key, value)
+    return text.encode('cp932', errors='replace')
+
+
+# ============================================================
+# 内部ファイル更新: AnNote.ini（明細簡易表現）
+# ============================================================
+
+def generate_annote(items):
+    """142B固定長 × 行数 の AnSMB.txt を生成（ERParts概要行テキスト）"""
+    if not items:
+        return b''
+    lines = []
+    for i, item in enumerate(items):
+        name    = item.get('name', '')
+        qty     = safe_int(item.get('quantity', 1), 1)
+        rec_no  = i + 1
+        line_no = rec_no * 10
+        line    = bytearray(142)
+        for j in range(142):
+            line[j] = 0x20
+        ln_str = f'{line_no:08d}'
+        for j, c in enumerate(ln_str):
+            line[j] = ord(c)
+        name_bytes = name.encode('cp932', errors='replace')[:30]
+        for j, b in enumerate(name_bytes):
+            line[14 + j] = b
+        qty_str = f'{min(qty, 99):02d}'
+        line[98] = ord(qty_str[0])
+        line[99] = ord(qty_str[1])
+        for j, c in enumerate('90000'):
+            line[100 + j] = ord(c)
+        for j, c in enumerate('F99999'):
+            line[127 + j] = ord(c)
+        lines.append(bytes(line) + b'\r\n')
+    return b''.join(lines)
+
+
+# ============================================================
+# NEO リパッカー
+# ============================================================
+
+def repack_neo(orig_data, files, mgmt, entries):
+    """更新済みファイルをNEOバイナリに再パック
+    NEOファイルテーブルの正しい書き込み構造:
+      各エントリの\\0の直後に「次のエントリ」のsize/offset/padを配置する。
+      先頭エントリ(hidden)のデータはraw offset=0に配置される。
+      最終エントリの後にはsize/offset/padを付けない。
+    """
+    now     = datetime.datetime.now()
+    now_dos = datetime_to_dos(now)
+    entry_names  = [e['name'] for e in entries if e['name'] in files]
+    missing_names = [name for name in files.keys() if name not in entry_names]
+    ordered_names = entry_names + sorted(missing_names, key=lambda x: x.encode('cp932'))
+    hidden_entries = [e for e in entries if e.get('is_last')]
+    hidden_name    = hidden_entries[0]['name'] if hidden_entries else ordered_names[0]
+    normal_names   = [name for name in ordered_names if name != hidden_name]
+    raw     = files[hidden_name]
+    offsets = {}
+    sizes   = {}
+    for name in normal_names:
+        offsets[name] = len(raw)
+        sizes[name]   = len(files[name])
+        raw += files[name]
+    table_bytes = b''
+    for i, name in enumerate(ordered_names):
+        if name == 'AnDBVersion.ini':
+            dos = DOS_DBVER
+        elif name == 'AnSvImge.ini':
+            dos = DOS_IMGE
+        else:
+            dos = now_dos
+        attr      = struct.pack('<H', 0x0020)
+        name_enc  = ('\\' + name).encode('cp932') + b'\x00'
+        table_bytes += dos + attr + name_enc
+        # 次のエントリのsize/offsetを末尾に付加（最終エントリ以外）
+        if i + 1 < len(ordered_names):
+            next_name = ordered_names[i + 1]
+            if next_name in sizes:
+                table_bytes += struct.pack('<I', sizes[next_name])
+                table_bytes += struct.pack('<I', offsets[next_name])
+                table_bytes += b'\x00\x00'
+    CHUNK_SIZE      = 32768
+    raw_chunks      = [raw[i:i + CHUNK_SIZE] for i in range(0, len(raw), CHUNK_SIZE)]
+    num_chunks      = len(raw_chunks)
+    compressed_chunks = []
+    prev_raw        = b''
+    for i, raw_chunk in enumerate(raw_chunks):
+        if i == 0:
+            c = zlib.compressobj(level=9, method=zlib.DEFLATED, wbits=-15)
+        else:
+            dict_data = prev_raw[-32768:]
+            c = zlib.compressobj(level=9, method=zlib.DEFLATED, wbits=-15, zdict=dict_data)
+        compressed = c.compress(raw_chunk) + c.flush()
+        compressed_chunks.append(compressed)
+        prev_raw += raw_chunk
+    new_mgmt  = bytearray(mgmt)
+    last_size = len(files[hidden_name])
+    struct.pack_into('<H', new_mgmt, len(new_mgmt) - 14, num_chunks)
+    struct.pack_into('<H', new_mgmt, len(new_mgmt) - 10, last_size)
+    header  = orig_data[:424]
+    ck_data = b''
+    for i, comp in enumerate(compressed_chunks):
+        comp_len  = len(comp) + 2
+        decomp_len = len(raw_chunks[i])
+        ck_data   += b'\x00\x00\x00\x00' + struct.pack('<HH', comp_len, decomp_len) + b'CK' + comp
+    return header + bytes(new_mgmt) + table_bytes + ck_data
+
+
+def generate_neo_file(template_data, customer_info, items, short_parts_wage, insurance_info, expenses=None, is_tax_inclusive=False, is_beta_mode=False, merge_mode=False):
+    """テンプレートNEOから更新済みNEOを生成
+
+    merge_mode=True（テンプレートNEOあり）の優先ルール:
+    ・車両ID（車体番号/型式指定番号/類別区分番号/初度登録年月/車検満了日）は
+      テンプレートに入力済みの値を最優先。OCR値で上書きしない。
+    ・証券番号・契約者名も同様にテンプレート優先。
+    ・上記以外（車名・顧客名・走行距離など）は OCR非空値で上書き（既存の merge_mode 動作）。
+    """
+    # 破損/非NEOファイルの防御チェック
+    if not template_data or len(template_data) < 500:
+        raise ValueError("テンプレートNEOファイルが空または極端に小さいです。正しい.neoファイルを指定してください。")
+    try:
+        real_ck  = find_real_cks(template_data)
+    except Exception:
+        raise ValueError("テンプレートNEOファイルの構造が不正です。コグニセブンで作成した正しい.neoファイルを指定してください。")
+    if not real_ck:
+        raise ValueError("テンプレートNEOのCKチャンクが見つかりません。ファイルが破損しているか、NEO形式ではありません。")
+    try:
+        full_raw     = decompress_neo(template_data, real_ck)
+        mgmt, entries = parse_entries(template_data, real_ck[0])
+    except (zlib.error, struct.error, ValueError) as e:
+        raise ValueError(f"テンプレートNEOファイルの展開に失敗しました。ファイルが破損している可能性があります。\n詳細: {e}") from e
+    files        = extract_files(full_raw, entries)
+    # 必須内部ファイルの存在チェック
+    _required_files = ['AnSvEm0001.sld', 'AnSvIf0001.sld', 'AnSMB.txt', 'AnSvMail.ini']
+    _missing = [f for f in _required_files if f not in files]
+    if _missing:
+        raise ValueError(f"テンプレートNEOに必須ファイルが不足しています: {', '.join(_missing)}\nファイルが破損しているか、対応していない形式です。")
+    estimated_date = datetime.datetime.now().strftime('%Y%m%d')
+    normalized_items = items or []
+    insurance_info = insurance_info or {}
+
+    # merge_mode: テンプレートの車両ID・保険情報を読み取り、OCR値より優先させる
+    if merge_mode and 'AnSvIf0001.sld' in files:
+        tpl_veh = read_vehicle_from_sld(files['AnSvIf0001.sld'])
+        # 車両ID系: テンプレートに値があればOCR値を上書き（テンプレート優先）
+        _veh_priority_keys = [
+            'car_serial_no',          # 車体番号
+            'car_model_designation',  # 型式指定番号
+            'car_category_number',    # 類別区分番号
+            'car_reg_date',           # 初度登録年月日
+            'term_date',              # 車検満了日
+        ]
+        for key in _veh_priority_keys:
+            if tpl_veh.get(key):
+                customer_info[key] = tpl_veh[key]
+        # 保険・契約者情報: テンプレートに値があればOCR値を上書き
+        _ins_priority_keys = ['policy_no', 'contractor_name']
+        for key in _ins_priority_keys:
+            if tpl_veh.get(key):
+                insurance_info[key] = tpl_veh[key]
+
+    # ── 正しいファイル名でアクセス ──
+    # AnSvEm0001.sld = 見積本体SQLite DB (ERParts/Expense/Total 25テーブル)
+    files['AnSvEm0001.sld'], total_parts, total_wages, grand_total = update_ansmb(
+        files['AnSvEm0001.sld'], normalized_items, short_parts_wage,
+        expenses=expenses, is_tax_inclusive=is_tax_inclusive, is_beta_mode=is_beta_mode
+    )
+    # AnSMB.txt = 固定幅142B/行テキスト（ERPartsの概要行）
+    files['AnSMB.txt'] = generate_annote(normalized_items)
+    # AnSvIf0001.sld = 車両・顧客・保険SQLite DB (Car/Customer/Insurance 12テーブル)
+    files['AnSvIf0001.sld'] = update_em_db(
+        files['AnSvIf0001.sld'], customer_info, insurance_info, estimated_date,
+        is_tax_inclusive=is_tax_inclusive, merge_mode=merge_mode
+    )
+    # *.xml = Shift_JIS XML（見積概要、メール連携用）
+    xml_name = next((n for n in files if n.endswith('.xml')), None)
+    if xml_name:
+        files[xml_name] = update_mail_ini(files[xml_name], customer_info, grand_total, merge_mode=merge_mode)
+    # AnSvMail.ini = INI形式（顧客名・車番等のメール連携情報）
+    files['AnSvMail.ini'] = update_imge_ini(files['AnSvMail.ini'], customer_info, merge_mode=merge_mode)
+    # AnSvImge.ini, AnNote.ini 等はテンプレートのまま保持
+    neo_data = repack_neo(template_data, files, mgmt, entries)
+    return neo_data, total_parts, total_wages, grand_total
+
+
+# ============================================================
+# AI-OCR サポート関数
+# ============================================================
+
+def enhance_image_for_ocr(image_bytes):
+    """
+    OCR精度向上のための画像前処理（300dpi FAX品質対応強化版）。
+    グレースケール変換 → デスペックル → コントラスト補正 → アンシャープマスク の順で処理。
+    """
+    try:
+        from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+        img = Image.open(io.BytesIO(image_bytes))
+        # グレースケール変換（色ノイズを除去してOCR精度向上）
+        if img.mode not in ('L', 'LA'):
+            img = img.convert('L')
+        # デスペックル（MedianFilter でノイズ除去）
+        img = img.filter(ImageFilter.MedianFilter(size=3))
+        # コントラスト強化（FAXのかすれた文字を読みやすくする）
+        img = ImageEnhance.Contrast(img).enhance(1.8)
+        # アンシャープマスク（エッジを鮮明化）
+        img = img.filter(ImageFilter.UnsharpMask(radius=1, percent=150, threshold=2))
+        # 明るさ微調整（暗すぎる画像を補正）
+        img = ImageEnhance.Brightness(img).enhance(1.05)
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=94)
+        return buf.getvalue()
+    except Exception:
+        return image_bytes
+
+
+def rasterize_pdf_page(pdf_bytes, page_index, dpi=200, enhance=False):
+    """
+    PDFの指定ページをJPEG画像バイト列に変換。
+    行ズレ防止のためGeminiに送る前に使用。
+    enhance=True の場合、画像前処理（コントラスト・シャープネス強化）を適用。
+    優先順位: pdf2image(poppler) → pypdfium2 → None
+    """
+    result = None
+
+    # ── 方法1: pdf2image (poppler) ─────────────────────────
+    try:
+        from pdf2image import convert_from_bytes
+        images = convert_from_bytes(
+            pdf_bytes,
+            dpi=dpi,
+            first_page=page_index + 1,
+            last_page=page_index + 1,
+        )
+        if images:
+            buf = io.BytesIO()
+            images[0].save(buf, format='JPEG', quality=90)
+            result = buf.getvalue()
+    except Exception:
+        pass
+
+    # ── 方法2: pypdfium2 (フォールバック) ──────────────────
+    if result is None:
+        try:
+            import pypdfium2 as pdfium
+            doc     = pdfium.PdfDocument(pdf_bytes)
+            try:
+                page    = doc[page_index]
+                scale   = dpi / 72.0
+                bitmap  = page.render(scale=scale)
+                pil_img = bitmap.to_pil()
+                buf     = io.BytesIO()
+                pil_img.save(buf, format='JPEG', quality=90)
+                result = buf.getvalue()
+            finally:
+                doc.close()
+        except Exception:
+            pass
+
+    # ── 画像前処理（FAX品質改善用） ──────────────────
+    if result and enhance:
+        result = enhance_image_for_ocr(result)
+
+    return result
+
+
+def detect_table_region(image_bytes):
+    """
+    画像から明細テーブル領域を検出し、クロップされた画像バイトと位置比率を返す。
+    OpenCV が利用可能な場合は水平線検出を使用。
+    フォールバック: ヒューリスティック（上12%・下90%）。
+    戻り値: (cropped_bytes, top_ratio, bottom_ratio)
+    """
+    # ── OpenCV による水平線ベース検出 ─────────────────────────
+    try:
+        import cv2
+        import numpy as np
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img_cv = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+        if img_cv is not None:
+            h, w = img_cv.shape
+            _, thresh = cv2.threshold(img_cv, 200, 255, cv2.THRESH_BINARY_INV)
+            horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, w // 5), 1))
+            horiz = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horiz_kernel, iterations=2)
+            coords = cv2.findNonZero(horiz)
+            if coords is not None and len(coords) > 4:
+                ys = coords[:, 0, 1]
+                top_y = max(0, int(np.min(ys)) - 15)
+                bot_y = min(h, int(np.max(ys)) + 15)
+                top_ratio = top_y / h
+                bot_ratio = bot_y / h
+                if bot_ratio - top_ratio >= 0.3:
+                    from PIL import Image
+                    pil = Image.open(io.BytesIO(image_bytes))
+                    cropped = pil.crop((0, top_y, pil.width, bot_y))
+                    buf = io.BytesIO()
+                    cropped.save(buf, format='JPEG', quality=93)
+                    return buf.getvalue(), top_ratio, bot_ratio
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # ── フォールバック: ヒューリスティック ──────────────────────
+    try:
+        from PIL import Image
+        pil = Image.open(io.BytesIO(image_bytes))
+        h = pil.height
+        top_y = int(h * 0.12)
+        bot_y = int(h * 0.90)
+        cropped = pil.crop((0, top_y, pil.width, bot_y))
+        buf = io.BytesIO()
+        cropped.save(buf, format='JPEG', quality=93)
+        return buf.getvalue(), 0.12, 0.90
+    except Exception:
+        return image_bytes, 0.0, 1.0
+
+
+def split_into_vertical_chunks(image_bytes, n_chunks=3, overlap_ratio=0.08):
+    """
+    画像を縦方向に n_chunks 分割（オーバーラップあり）。
+    戻り値: List of (chunk_bytes, y_start_ratio, y_end_ratio)
+    ※ y比率はクロップ画像に対する 0-1 の値
+    """
+    try:
+        from PIL import Image
+        pil = Image.open(io.BytesIO(image_bytes))
+        w, h = pil.width, pil.height
+        if h < 200:
+            return [(image_bytes, 0.0, 1.0)]
+        chunk_h = h // n_chunks
+        overlap_px = max(10, int(h * overlap_ratio))
+        chunks = []
+        for i in range(n_chunks):
+            y_start = max(0, i * chunk_h - (overlap_px if i > 0 else 0))
+            y_end   = min(h, (i + 1) * chunk_h + (overlap_px if i < n_chunks - 1 else 0))
+            if y_end <= y_start:
+                continue
+            chunk = pil.crop((0, y_start, w, y_end))
+            buf = io.BytesIO()
+            chunk.save(buf, format='JPEG', quality=93)
+            chunks.append((buf.getvalue(), y_start / h, y_end / h))
+        return chunks if chunks else [(image_bytes, 0.0, 1.0)]
+    except Exception:
+        return [(image_bytes, 0.0, 1.0)]
+
+
+def try_fix_landscape_pdf(pdf_bytes):
+    """横向きPDFを検出して縦向きに回転する"""
+    try:
+        from pypdf import PdfReader, PdfWriter
+        reader       = PdfReader(io.BytesIO(pdf_bytes))
+        needs_rotation = False
+        for page in reader.pages:
+            box = page.mediabox
+            if float(box.width) > float(box.height) * 1.2:
+                needs_rotation = True
+                break
+        if not needs_rotation:
+            return pdf_bytes
+        writer = PdfWriter()
+        for page in reader.pages:
+            box = page.mediabox
+            if float(box.width) > float(box.height) * 1.2:
+                page.rotate(270)
+            writer.add_page(page)
+        buf = io.BytesIO()
+        writer.write(buf)
+        return buf.getvalue()
+    except Exception:
+        return pdf_bytes
+
+
+def try_split_pdf_pages(pdf_bytes):
+    """PDFを個別ページに分割（2ページ以上の場合のみ）"""
+    try:
+        from pypdf import PdfReader, PdfWriter
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        if len(reader.pages) <= 1:
+            return None
+        pages = []
+        for page in reader.pages:
+            writer = PdfWriter()
+            writer.add_page(page)
+            buf = io.BytesIO()
+            writer.write(buf)
+            pages.append(buf.getvalue())
+        return pages
+    except Exception:
+        return None
+
+
+def detect_and_reorder_pages(pages):
+    """
+    PDFの各ページから「X/Y頁」「P.001/002」等のページ番号表記を検出し、
+    正しい順序に並び替えて返す。
+    【対応パターン】
+      - FAXヘッダ形式: "P.001/002" → 1ページ目
+      - 日本語形式: "1/2頁" "1／2頁" "1/2 頁"
+      - 逆形式: "頁1/2"
+    検出できない・全ページ揃わない場合は元の順序をそのまま返す。
+    """
+    import re
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return pages
+
+    page_numbers = []
+    for idx, page_bytes in enumerate(pages):
+        try:
+            reader = PdfReader(io.BytesIO(page_bytes))
+            text = reader.pages[0].extract_text() or ''
+        except Exception:
+            text = ''
+
+        cur_page = None
+        # パターン1: FAXヘッダ "P.001/002" 形式（大文字・小文字両対応）
+        m = re.search(r'[Pp]\.(\d+)\s*/\s*(\d+)', text)
+        if m:
+            cur_page = int(m.group(1))
+            page_numbers.append((idx, cur_page, int(m.group(2))))
+            continue
+        # パターン2: "1/2頁" "1／2頁" "1/2 頁" 形式
+        m = re.search(r'(\d+)\s*[/／]\s*(\d+)\s*[頁ページ]', text)
+        if m:
+            cur_page = int(m.group(1))
+            page_numbers.append((idx, cur_page, int(m.group(2))))
+            continue
+        # パターン3: "頁1/2" 逆形式
+        m = re.search(r'[頁ページ]\s*(\d+)\s*[/／]\s*(\d+)', text)
+        if m:
+            cur_page = int(m.group(1))
+            page_numbers.append((idx, cur_page, int(m.group(2))))
+            continue
+        # 検出できないページ
+        page_numbers.append((idx, None, None))
+
+    # 全ページでページ番号が検出できた場合のみ並び替え
+    if page_numbers and all(pn[1] is not None for pn in page_numbers):
+        original_order = [pn[0] for pn in page_numbers]
+        page_numbers.sort(key=lambda x: x[1])
+        new_order = [pn[0] for pn in page_numbers]
+        if new_order != original_order:
+            import sys
+            print(f"[INFO] ページ順序を自動修正: {[p[1] for p in page_numbers]} "
+                  f"(物理順 {original_order} → 文書順 {new_order})", file=sys.stderr)
+        return [pages[pn[0]] for pn in page_numbers]
+
+    return pages
+
+
+@st.cache_resource
+def _get_genai_client(api_key):
+    """google.genai クライアントを取得（セッション間で再利用）"""
+    from google import genai
+    return genai.Client(api_key=api_key)
+
+
+# spec_iter4 課題B (S4-2): AddataSearchEngine をセッション間で共有
+@st.cache_resource
+def get_addata_engine(addata_root: str = r'C:\Addata'):
+    """AddataSearchEngine の singleton を Streamlit セッション間で共有。
+    auto_matching 側 _engine_singleton にも代入して二重持ちを防ぐ。"""
+    try:
+        import auto_matching as _am
+        try:
+            _eng = _am.AddataSearchEngine(addata_root)
+        except Exception:
+            _eng = _am.AddataEngine(addata_root)
+        try:
+            _am._engine_singleton = _eng
+            _am._engine_singleton_root = addata_root
+        except Exception:
+            pass
+        return _eng
+    except Exception:
+        return None
+
+
+def call_gemini(api_key, file_bytes, mime_type, prompt_text, model_name=None, use_json_mode=False):
+    """Gemini APIにファイルを送信して解析結果テキストを取得（最大3回リトライ）
+    use_json_mode=True の場合、構造化JSON出力モードを使用（解析精度向上）
+    """
+    from google.genai import types
+    client = _get_genai_client(api_key)
+    model = model_name or GEMINI_MODEL
+    file_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+    config = {"temperature": 0.0, "max_output_tokens": 65536}
+    if use_json_mode:
+        config["response_mime_type"] = "application/json"
+    # Iter6 v3: gemini-2.5-flash の thinking_budget=0 で 30%程度高速化
+    # 環境変数 NEO_FAST_OCR=0 で無効化可能 (精度モード)
+    try:
+        if "2.5-flash" in (model or "") and os.environ.get("NEO_FAST_OCR", "1") == "1":
+            config["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+    except Exception:
+        pass
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=[prompt_text, file_part],
+                config=config,
+            )
+            if response.text and response.text.strip():
+                return response.text
+            if attempt < 2:
+                import time; time.sleep(1)
+                continue
+            raise ValueError("Geminiから有効な応答が得られませんでした。")
+        except ValueError:
+            raise
+        except Exception as e:
+            last_error = e
+            if attempt < 2:
+                import time; time.sleep(1)
+                continue
+            raise ValueError(f"Gemini API呼び出しに失敗しました（{attempt+1}回試行）: {str(last_error)}")
+
+
+def classify_first_page_as_fax(api_key, pdf_bytes, model_name):
+    """
+    PDFの1ページ目がFAX送付状かどうかをAIで判定する。
+    True=FAX送付状 → 除外すべき、False=見積書・車検証などの本体ページ
+    """
+    try:
+        img_bytes = rasterize_pdf_page(pdf_bytes, 0, dpi=120)
+        if img_bytes is None:
+            return False
+        from google.genai import types
+        client = _get_genai_client(api_key)
+        prompt = _build_prompt("estimate_cover_check")
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[prompt, types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg")],
+            config={"temperature": 0.0, "max_output_tokens": 256, "response_mime_type": "application/json"},
+        )
+        result = extract_json_from_response(response.text)
+        return bool(result.get('is_fax_cover', False))
+    except Exception:
+        return False
+
+
+def filter_fax_pages(api_key, pdf_bytes, model_name):
+    """
+    FAX送付状（1ページ目）を除去した新しいPDFバイト列を返す。
+    2ページ以上かつ1ページ目がFAXと判定された場合のみ除去する。
+    """
+    try:
+        from pypdf import PdfReader, PdfWriter
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        if len(reader.pages) <= 1:
+            return pdf_bytes
+        is_fax = classify_first_page_as_fax(api_key, pdf_bytes, model_name)
+        if not is_fax:
+            return pdf_bytes
+        writer = PdfWriter()
+        for i in range(1, len(reader.pages)):
+            writer.add_page(reader.pages[i])
+        buf = io.BytesIO()
+        writer.write(buf)
+        return buf.getvalue()
+    except Exception:
+        return pdf_bytes
+
+
+def guess_manufacturer_from_vin(vin):
+    """車台番号の先頭文字列からメーカー・車種を推定する"""
+    if not vin:
+        return '', ''
+    vin = vin.upper().strip()
+    # WMI（先頭3文字）ベースのメーカー判定テーブル
+    WMI_MAP = {
+        # ドイツ車
+        'WUA': ('アウディ', ''), 'WAU': ('アウディ', ''), 'WA1': ('アウディ', ''),
+        'WBA': ('BMW', ''), 'WBS': ('BMW', 'M'), 'WBY': ('BMW', 'i'),
+        'WDB': ('メルセデス・ベンツ', ''), 'WDC': ('メルセデス・ベンツ', ''), 'WDD': ('メルセデス・ベンツ', ''),
+        'W1K': ('メルセデス・ベンツ', ''), 'W1N': ('メルセデス・ベンツ', ''),
+        'WVW': ('フォルクスワーゲン', ''), 'WV1': ('フォルクスワーゲン', ''), 'WV2': ('フォルクスワーゲン', ''),
+        'WP0': ('ポルシェ', ''), 'WP1': ('ポルシェ', ''),
+        # 日本車
+        'JTD': ('トヨタ', ''), 'JTE': ('トヨタ', ''), 'JTN': ('トヨタ', ''),
+        'JHM': ('ホンダ', ''), 'JHL': ('ホンダ', ''),
+        'JN1': ('日産', ''), 'JN3': ('日産', ''),
+        'JMA': ('マツダ', ''), 'JMZ': ('マツダ', ''),
+        'JSA': ('スズキ', ''), 'JS1': ('スズキ', ''),
+        'JF1': ('スバル', ''), 'JF2': ('スバル', ''),
+        'JDA': ('ダイハツ', ''),
+        'JMB': ('三菱', ''), 'JMY': ('三菱', ''),
+        # 韓国車
+        'KMH': ('ヒュンダイ', ''), 'KNA': ('キア', ''),
+        # イタリア車
+        'ZAR': ('アルファロメオ', ''), 'ZFF': ('フェラーリ', ''), 'ZHW': ('ランボルギーニ', ''),
+        'ZFA': ('フィアット', ''), 'ZAM': ('マセラティ', ''),
+        # イギリス車
+        'SAL': ('ランドローバー', ''), 'SAJ': ('ジャガー', ''), 'SAR': ('ランドローバー', ''),
+        'SCF': ('アストンマーティン', ''), 'SCC': ('ロータス', ''),
+        # フランス車
+        'VF1': ('ルノー', ''), 'VF3': ('プジョー', ''), 'VF7': ('シトロエン', ''),
+        # アメリカ車
+        '1FA': ('フォード', ''), '1FT': ('フォード', ''), '1G1': ('シボレー', ''),
+        '1GC': ('シボレー', ''), '1GM': ('GM', ''), '2T1': ('トヨタ(北米)', ''),
+        '3FA': ('フォード(メキシコ)', ''),
+        # スウェーデン車
+        'YV1': ('ボルボ', ''), 'YS3': ('サーブ', ''),
+    }
+    # 先頭3文字で判定
+    wmi3 = vin[:3]
+    if wmi3 in WMI_MAP:
+        return WMI_MAP[wmi3]
+    # 先頭2文字でフォールバック
+    COUNTRY_PREFIX = {
+        'WU': ('アウディ/VW系', ''), 'WB': ('BMW', ''), 'WD': ('メルセデス・ベンツ', ''),
+        'WV': ('フォルクスワーゲン', ''), 'WP': ('ポルシェ', ''), 'WF': ('フォード(独)', ''),
+        'JT': ('トヨタ', ''), 'JH': ('ホンダ', ''), 'JN': ('日産', ''),
+        'JM': ('マツダ/三菱', ''), 'JS': ('スズキ', ''), 'JF': ('スバル', ''),
+        'JD': ('ダイハツ', ''), 'ZA': ('イタリア車', ''), 'SA': ('イギリス車', ''),
+        'VF': ('フランス車', ''), 'YV': ('ボルボ', ''),
+    }
+    wmi2 = vin[:2]
+    if wmi2 in COUNTRY_PREFIX:
+        return COUNTRY_PREFIX[wmi2]
+    return '', ''
+
+
+# ============================================================
+# Addata / マスタ連携用関数群 — 除外済み（別途実装予定）
+# バックアップ: _開発資料/addata_app_integration_backup.py
+# ============================================================
+def find_addata_dir():
+    """Addataルートフォルダを返す（未検出/未統合時は None）。"""
+    if _ADDATA_AVAILABLE and _am_find_addata_dir:
+        try:
+            return _am_find_addata_dir()
+        except Exception:
+            return None
+    return None
+
+def find_ka06_path(addata_base):
+    """KA06_ALL.DB のパスを返す。"""
+    if _ADDATA_AVAILABLE and _am_find_ka06_path:
+        try:
+            return _am_find_ka06_path(addata_base)
+        except Exception:
+            return None
+    return None
+
+def identify_vehicle(addata_base, vehicle_data):
+    """車両を Addata と照合し、車種コード等を返す。"""
+    if _ADDATA_AVAILABLE and _am_identify_vehicle:
+        try:
+            return _am_identify_vehicle(addata_base, vehicle_data)
+        except Exception as e:
+            return {'match_layer': 4, 'is_supported': False, 'reason': f'error: {e}'}
+    return {'match_layer': 3, 'is_supported': False, 'reason': 'Addata連携は未統合'}
+
+def match_parts_with_addata(items, addata_folder, vehicle_info=None):
+    """部品明細を Addata と照合し、(matched_items, success_flag) を返す。"""
+    if _ADDATA_AVAILABLE and _am_match_parts:
+        try:
+            return _am_match_parts(items, addata_folder, vehicle_info)
+        except Exception:
+            return (items, False)
+    return (items, False)
+
+
+def complement_vehicle_info_with_gemini(api_key, model_code, current_car_name, current_engine):
+    """
+    車両特定(KA06_ALL)に失敗した場合、型式(model_code)からGemini Web検索等で補完を試みる。
+    Google Search Tool を有効化して正確な車種名とエンジン型式を取得する。
+    """
+    if not api_key or not model_code:
+        return {}
+
+    import json
+    from google.genai import types
+
+    client = _get_genai_client(api_key)
+
+    prompt = f'''あなたは日本の自動車の専門家です。
+以下の型式（Model Code）を持つ自動車の「一般的な車種名（通称名）」と「エンジン型式」を特定し、厳密なJSON形式で出力してください。
+型式: {model_code}
+現在の情報（空欄の場合あり）:
+- 車種名: {current_car_name}
+- エンジン型式: {current_engine}
+
+出力形式は必ず以下のJSONだけにしてください。マークダウンや説明は不要です。
+{{
+    "car_name": "車種名（例: プリウス, Ｎ－ＢＯＸ, アトレー など。メーカー名は含めない）",
+    "engine_model": "エンジン型式（例: 2ZR-FXE, S07B など）"
+}}
+もし明確に不明な場合は、無理に嘘をつかず空文字列にしてください。'''
+
+    try:
+        _avail = get_available_gemini_models(api_key)
+        _veh_model = _avail[0] if _avail else 'gemini-2.5-flash'
+        response = client.models.generate_content(
+            model=_veh_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=512,
+                response_mime_type='application/json',
+            ),
+        )
+        raw_text = response.text or ''
+        text = raw_text.strip()
+        if not text:
+            return {}
+        if text.startswith('```json'):
+            text = text[7:]
+        if text.endswith('```'):
+            text = text[:-3]
+        info = json.loads(text.strip())
+        return info
+    except Exception as e:
+        print("Gemini Fallback Error:", e)
+        return {}
+
+def generate_beta_discrepancy_report_pdf(estimate_data, calc_parts, calc_wages, pdf_parts, pdf_wages, vehicle_info):
+    """
+    ReportLabを使用してベタ打ちモード用の金額ズレ検証レポート(PDF)を生成する
+    """
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    import io
+
+    # 日本語フォントの登録 (Windows標準のメイリオを試行)
+    try:
+        pdfmetrics.registerFont(TTFont('Meiryo', 'meiryo.ttc'))
+        font_name = 'Meiryo'
+    except Exception:
+        try:
+            pdfmetrics.registerFont(TTFont('MSGothic', 'msgothic.ttc'))
+            font_name = 'MSGothic'
+        except Exception:
+            # フォールバック (ビルトイン)
+            pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5'))
+            font_name = 'HeiseiKakuGo-W5'
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=(595.27, 841.89), # A4
+                            rightMargin=15 * 2.83, leftMargin=15 * 2.83,
+                            topMargin=15 * 2.83, bottomMargin=15 * 2.83)
+
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name='JapaneseTitle', fontName=font_name, fontSize=16, alignment=1, spaceAfter=15))
+    styles.add(ParagraphStyle(name='JapaneseNormal', fontName=font_name, fontSize=10, spaceAfter=8))
+    styles.add(ParagraphStyle(name='JapaneseBold', fontName=font_name, fontSize=12, spaceAfter=8, textColor=colors.red))
+
+    elements = []
+    elements.append(Paragraph("ベタ打ちモード 金額ズレ検証レポート", styles['JapaneseTitle']))
+
+    if vehicle_info:
+        v_str = f"対象車両: {vehicle_info.get('car_name', '')} {vehicle_info.get('car_model', '')} (車台番号: {vehicle_info.get('car_serial_no', '')})"
+        elements.append(Paragraph(v_str, styles['JapaneseNormal']))
+    
+    import datetime
+    date_str = f"出力日時: {datetime.datetime.now().strftime('%Y/%m/%d %H:%M:%S')}"
+    elements.append(Paragraph(date_str, styles['JapaneseNormal']))
+    elements.append(Spacer(1, 5 * 2.83))
+
+    parts_diff = calc_parts - pdf_parts
+    wage_diff = calc_wages - pdf_wages
+
+    sum_data = [
+        ['項目', 'PDF原本 記載値', 'AI抽出 明細合算値', '差額'],
+        ['部品合計', f"¥{pdf_parts:,}", f"¥{calc_parts:,}", f"{'+' if parts_diff>0 else ''}{parts_diff:,}円"],
+        ['工賃合計', f"¥{pdf_wages:,}", f"¥{calc_wages:,}", f"{'+' if wage_diff>0 else ''}{wage_diff:,}円"]
+    ]
+    t_sum = Table(sum_data, colWidths=[30*2.83, 40*2.83, 40*2.83, 30*2.83])
+    t_sum.setStyle(TableStyle([
+        ('FONT', (0,0), (-1,-1), font_name, 10),
+        ('ALIGN', (0,0), (-1,0), 'CENTER'),
+        ('ALIGN', (1,1), (-1,-1), 'RIGHT'),
+        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.black),
+        ('TEXTCOLOR', (3,1), (3,1), colors.red if parts_diff != 0 else colors.black),
+        ('TEXTCOLOR', (3,2), (3,2), colors.red if wage_diff != 0 else colors.black),
+    ]))
+    elements.append(t_sum)
+    elements.append(Spacer(1, 10 * 2.83))
+
+    elements.append(Paragraph("【AIが抽出した全明細行】（※ズレ箇所特定のためのリスト）", styles['JapaneseNormal']))
+    table_data = [['No.', '部品/作業名', '区分', '数量', '部品金額', '工賃']]
+    items = estimate_data.get('items', [])
+    for i, it in enumerate(items):
+        name = it.get('name', '')
+        method = it.get('method', '')
+        # quantity might be float in some edges
+        try:
+            qty = int(float(it.get('quantity', 1)))
+        except (ValueError, TypeError):
+            qty = 1
+
+        try:
+            p_amt = int(float(it.get('parts_amount', 0)))
+        except (ValueError, TypeError):
+            p_amt = safe_int(it.get('_original_parts_amount', 0))
+
+        try:
+            w_amt = int(float(it.get('wage', 0)))
+        except (ValueError, TypeError):
+            w_amt = 0
+
+        table_data.append([
+            str(i + 1), name, method, str(qty), f"¥{p_amt:,}", f"¥{w_amt:,}"
+        ])
+    
+    t_items = Table(table_data, colWidths=[10*2.83, 75*2.83, 25*2.83, 15*2.83, 27*2.83, 27*2.83])
+    t_items.setStyle(TableStyle([
+        ('FONT', (0,0), (-1,-1), font_name, 8),
+        ('ALIGN', (0,0), (-1,0), 'CENTER'),
+        ('ALIGN', (3,1), (-1,-1), 'RIGHT'),
+        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.black),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('PADDING', (0,0), (-1,-1), 3),
+    ]))
+    elements.append(t_items)
+    doc.build(elements)
+    pdf_bytes = buf.getvalue()
+    buf.close()
+    return pdf_bytes
+
+
+# ============================================================
+# Gemini 2.5 Flash 向け共通プロンプト定義
+# 送信形式: CORE_PROMPT + "\n\n" + TASK_PROMPTS[task_type]
+# ============================================================
+
+CORE_PROMPT = """<system_instruction>
+あなたは日本語の自動車関連業務帳票（自動車修理見積書、車検証、FAX表紙など）を解析し、後続のNEOシステム連携用に構造化データを抽出する高精度OCR・解析APIエンジンです。
+入力された画像またはPDFを精読し、推測を一切排除して、指定された<output_format>の厳格なJSONのみを出力してください。
+</system_instruction>
+
+<golden_rules>
+1. 【完全転写】入力画像に記載されているテキスト・数値をそのまま抽出すること。存在しない値の推測、補完、勝手な計算は絶対に行わない。
+2. 【欠落防止】ページ跨ぎ、折り返し行、セクション区切り、ページ最下部の行などを絶対に漏らさないこと。
+3. 【ノイズ排除】挨拶、説明文、Markdownの装飾（```json など）は一切出力しない。純粋なJSON文字列のみを返すこと。
+4. 【数値の正規化】金額や数量は、カンマ(,)を除去した半角整数の数値型(Number)で出力すること。読み取れない数値は 0 とし、読み取れない文字は "不明" とする。
+</golden_rules>
+
+<extraction_logic>
+- カンマと空白: 連続するカンマ（例: ,,,,,）は「空白セル」を意味する。列の右ズレを防ぐこと。
+- 行の結合: 部品名などが不自然に改行されている場合は、文脈から1つのレコードに結合する。
+- 金額の分離（単一列に混在している場合）:
+  - 品番がある行、または「部品」「材料」の名称行 → 「部品金額」へ。
+  - 「交換」「脱着」「調整」「修理」「鈑金」「塗装」「点検」「診断」「設定」等の作業名行 → 「技術料」へ。
+- 外車ディーラー見積（BMW、ベンツ等）:
+  - 「Labor」「工賃」に相当する金額 → 「技術料」へ。
+  - 「Parts」「部品」に相当する金額 → 「部品金額」へ。
+  - 英数字・ハイフン混じりの品番は必ず「部品品番」へ。
+- 区分の判定ルール（AnDefine.ini DisposalCode準拠 — 以下の優先順位で判定し文字列を割り当てる）:
+  1. 【重要】部品名称および部品金額の計上があるが、技術料（工賃）の計上がない行 → "取替"
+  2. 「取替」「交換」「取換」「取り替え」を含む → "取替"
+  3. 「分解調整」を含む（複合語を先に判定）→ "分解調整"
+  4. 「点検調整」を含む → "点検調整"
+  5. 「脱着板金」を含む → "脱着板金"
+  6. 「脱着修理」を含む → "脱着修理"
+  7. 「脱着」「取外」「取付」「組付」「脱外」を含む → "脱着"
+  8. 「鈑金」「板金」を含む → "板金"
+  9. 「塗装」「ペイント」「ワックス」「加算」「ブース」を含む → "板金"（塗装系はNEOで板金グループ DisposalCode=3）
+  10. 「点検」を含む（単体）→ "点検"
+  11. 「修理」「補修」「修正」を含む → "修理"
+  12. 「調整」「光軸」「フィッティング」「コーディング」「穴あけ」「シーリング」「消去」「設定」「エイミング」を含む → "調整"
+  13. 「研磨」「磨き」「写真代」「ショートパーツ」を含む → ""（空白）
+  ※複合語（分解調整/点検調整/脱着板金/脱着修理）は単語より必ず先に判定すること
+</extraction_logic>"""
+
+
+TASK_PROMPTS = {}
+
+TASK_PROMPTS["shaken_ocr"] = """<task_execution>
+タスク名: shaken_ocr（車検証OCR）
+
+あなたは日本の車検証（自動車検査証）を読み取るOCRエキスパートです。
+提供された画像またはPDFから以下の情報を正確に読み取ってください。
+
+【複数ページPDFの場合の重要ルール】
+- PDFが複数ページある場合、全ページを確認し「自動車検査証」または「自動車検査証記録事項」が記載されたページを特定すること
+- 照会状、FAX送付状、見積書、写真などの車検証以外のページは無視すること
+- 「自動車検査証記録事項」（電子車検証のA4印刷版）と「自動車検査証」（従来のカード型）の両方がある場合は、「自動車検査証記録事項」を優先すること（情報量が多いため）
+- 車検証ページが見つからない場合は全フィールドを空にしてconfidence=0.0を返すこと
+
+対応書式:
+- 従来の車検証（自動車検査証）— カード型、透かし模様あり
+- 電子車検証の「自動車検査証記録事項」（A4用紙に印刷されたもの、セクション番号付き）
+
+読み取り対象フィールドと対応する記載欄:
+- customer_name: 使用者の氏名又は名称（***の場合は所有者名で代替）
+- owner_name: 所有者の氏名又は名称
+- postal_no: 所有者の住所から郵便番号を推定（不明なら""）
+- prefecture: 所有者の住所 → 都道府県
+- municipality: 所有者の住所 → 市区町村
+- address_other: 所有者の住所 → 町名・番地以降
+- car_reg_department: 自動車登録番号の地名部分（例: "北九州", "品川", "福岡"）
+- car_reg_division: 自動車登録番号の分類番号（例: "３４６"） → 全角数字で出力
+- car_reg_business: 自動車登録番号のひらがな（例: "の"） → 全角ひらがなで出力
+- car_reg_serial: 自動車登録番号の一連番号（例: "１２２４"） → 全角数字で出力
+- car_serial_no: 車台番号（例: "AYH30-0145328"）
+- car_name: 車名（例: "トヨタ"）
+- car_model: 型式（例: "6AA-AYH30W"）
+- car_model_designation: 型式指定番号（例: "19557"）
+- car_category_number: 類別区分番号（例: "0172"）
+- engine_model: 原動機の型式（例: "2AR-2JM-2FM"）
+- body_color: 車体の色（記載がなければ""）
+- color_code: カラーコード（記載がなければ""）
+- trim_code: トリムコード（記載がなければ""）
+- car_weight: 車両重量（kg、整数）
+- engine_displacement: 総排気量又は定格出力の数値（cc/L → cc整数に統一。例: 2.49L → 2490）
+- kilometer: 走行距離計表示値（km、整数。備考欄の「走行距離計表示値」から読み取る）
+- term_date: 有効期間の満了する日 → YYYYMMDD形式（和暦→西暦変換必須）
+- car_reg_date: 初度登録年月 → YYYYMM00形式（和暦→西暦変換必須）
+- confidence: 読み取り信頼度 0.0〜1.0
+
+重要ルール:
+- 入力資料に記載されている文字を一言一句そのまま抽出する
+- 推測での補完は絶対に行わない
+- 読み取り不能な文字列は "" にする
+- 読み取り不能な数値は 0 にする
+- 和暦→西暦変換: 令和1=2019, 令和2=2020, ..., 令和7=2025, 令和8=2026, 令和9=2027 / 平成31=2019, 平成30=2018
+- 自動車登録番号は「地名 分類番号 ひらがな 一連番号」の4要素に正確に分割する
+- 「自動車検査証記録事項」の場合、「1.基本情報」「2.所有者情報」「3.車両詳細情報」「4.備考」の各セクションを漏れなく読み取る
+
+<output_format>
+{
+  "customer_name": "",
+  "owner_name": "",
+  "postal_no": "",
+  "prefecture": "",
+  "municipality": "",
+  "address_other": "",
+  "car_reg_department": "",
+  "car_reg_division": "",
+  "car_reg_business": "",
+  "car_reg_serial": "",
+  "car_serial_no": "",
+  "car_name": "",
+  "car_model": "",
+  "car_model_designation": "",
+  "car_category_number": "",
+  "engine_model": "",
+  "body_color": "",
+  "color_code": "",
+  "trim_code": "",
+  "car_weight": 0,
+  "engine_displacement": 0,
+  "kilometer": 0,
+  "term_date": "",
+  "car_reg_date": "",
+  "confidence": 0.0
+}
+</output_format>
+</task_execution>"""
+
+
+TASK_PROMPTS["estimate_cover_check"] = """<task_execution>
+タスク名: fax_cover_check
+
+このページが宛先・件名・枚数・メッセージのみのFAX送付状（カバーシート）であるかを判定します。見積明細や金額合計が含まれていればfalseです。
+
+重要な判定基準:
+- ページ上部に「送信日時」「FAX番号」等が印字されていても、見積書の明細・合計欄を含んでいれば is_fax_cover = false
+- 「御見積書」「修理費用明細書」「部品代」「工賃」「合計」などが記載されていれば is_fax_cover = false
+
+page_type の値: fax_cover / estimate / vehicle / other
+
+<output_format>
+{
+  "step_by_step_reasoning": "見積明細や合計金額の有無を確認した結果",
+  "is_fax_cover": false,
+  "page_type": "estimate",
+  "reason": ""
+}
+</output_format>
+</task_execution>"""
+
+
+TASK_PROMPTS["estimate_header_totals"] = """<task_execution>
+タスク名: header_total_extraction
+
+合計値・修理工場名・車両情報を抽出します。「ページ小計」は総合計に使用しないでください。
+「部品計」「工賃計」の明示的な小計行が存在しない単列金額形式の場合は、部品計・工賃計を 0 とし、総合計のみを抽出してください。
+
+金額探索ルール:
+- 「部品計」「部品代」「部品合計」「部品・油脂」等の明示的な小計行 → pdf_parts_total
+- 「工賃計」「技術料合計」「工賃合計」等の明示的な小計行 → pdf_wage_total
+- 「合計」「総合計」「御見積合計金額」「御見積金額」「見積金額」「請求金額」等 → pdf_grand_total
+- 値引き額 → discount_amount
+- Honda Cars系はページ1上部サマリーボックスの合計値も確認する
+
+<output_format>
+{
+  "step_by_step_reasoning": "金額がどこに記載されていたか、どのように数値を判定したかの簡潔な思考プロセス",
+  "repair_shop_name": "不明",
+  "car_name": "不明",
+  "car_model": "不明",
+  "color_code": "不明",
+  "license_plate": "不明",
+  "pdf_parts_total": 0,
+  "pdf_wage_total": 0,
+  "discount_amount": 0,
+  "pdf_grand_total": 0
+}
+</output_format>
+</task_execution>"""
+
+
+TASK_PROMPTS["estimate_detail_page"] = """<task_execution>
+タスク名: detail_extraction
+
+文書上部から基本情報を抽出し、明細行を配列で抽出してください。合計行・小計行・消費税行は明細配列に含めないでください。
+
+<output_format>
+{
+  "step_by_step_reasoning": "行のズレや欠落がないか、部品と工賃の分離をどう行ったかの簡潔な思考プロセス",
+  "basic_info": {
+    "estimate_date": "文字列",
+    "customer_name": "文字列",
+    "car_type": "文字列",
+    "registration_number": "文字列",
+    "model_code": "文字列"
+  },
+  "details": [
+    {
+      "work_or_part_name": "文字列",
+      "category": "文字列 (区分判定ルールに従う)",
+      "index_value": "文字列 (指数)",
+      "labor_fee": 0,
+      "quantity": 0,
+      "part_price": 0,
+      "part_number": "文字列"
+    }
+  ]
+}
+</output_format>
+</task_execution>"""
+
+
+TASK_PROMPTS["estimate_validation_repair"] = """あなたは、見積書抽出結果の金額検算エンジンです。
+前回の読み取り結果に金額誤差が検出されたため、見積書を最初から再精読して完全に正確な抽出を行ってください。
+
+原則:
+- 1円の狂いも許されない
+- 見積書記載額を一言一句正確に読む
+- 勝手な査定、減額、工法変更、項目削除をしない
+- 前回結果を盲信せず最初から読み直す
+- 不一致原因を行単位で特定する
+
+必須チェック:
+1. 行の見落とし
+2. 部品列と工賃列の取り違え
+3. 数量の誤読
+4. 金額の読み取りミス（桁ずれ）
+5. 複数行を1行に合算している
+6. ページ下端の取りこぼし
+7. 小計/合計の誤加算
+8. 行ずれによる列誤認
+9. 値引き行を items に混入していないか
+10. 明細行を誤って除外していないか
+
+返却JSON形式は前回と同じ estimate_detail_page 形式で返すこと。
+status フィールドを追加すること:
+- "success": 期待合計と一致
+- "failed": 不一致あり
+
+成功条件:
+- expected_totals と calculated_totals が完全一致
+- ページ下端の取りこぼしなし
+- 不確定数字なし"""
+
+
+def _build_prompt(task_type: str, extra: str = "") -> str:
+    """CORE_PROMPT + TASK_PROMPTS[task_type] + learned_hints + extra を結合して返す"""
+    task_part = TASK_PROMPTS.get(task_type, "")
+    learned   = _load_learned_hints(task_type)
+    parts = [CORE_PROMPT, task_part, learned, extra]
+    return "\n\n".join(p for p in parts if p)
+
+
+# ============================================================
+# フィードバック学習DB
+# ============================================================
+import uuid as _uuid
+
+_FEEDBACK_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feedback.db")
+
+# エラー種別の日本語ラベル
+FEEDBACK_ERROR_TYPES = {
+    "column_swap":    "部品↔工賃の取り違え",
+    "missed_row":     "行の見落とし",
+    "amount_misread": "金額の読み取りミス",
+    "wrong_category": "分類誤り（合計行混入等）",
+    "name_error":     "品名の誤読",
+    "quantity_error": "数量の誤読",
+    "extra_row":      "不要な行が追加されている",
+    "other":          "その他",
+}
+
+# 積算しきい値（この件数を超えたらマスタ統合を推奨）
+FEEDBACK_MERGE_THRESHOLD = 5
+
+
+def _get_feedback_db():
+    """フィードバックDB接続を返す（テーブルが存在しない場合は作成）"""
+    conn = sqlite3.connect(_FEEDBACK_DB_PATH)
+    cur  = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS corrections (
+            id            TEXT PRIMARY KEY,
+            timestamp     TEXT NOT NULL,
+            document_type TEXT,
+            error_type    TEXT,
+            row_index     INTEGER,
+            orig_name     TEXT,
+            orig_parts    INTEGER,
+            orig_wage     INTEGER,
+            corr_name     TEXT,
+            corr_parts    INTEGER,
+            corr_wage     INTEGER,
+            user_comment  TEXT,
+            page_context  TEXT,
+            status        TEXT DEFAULT 'pending'
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS prompt_patches (
+            id          TEXT PRIMARY KEY,
+            task_type   TEXT NOT NULL,
+            patch_text  TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            is_active   INTEGER DEFAULT 1
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def record_correction(corrections: list, user_comment: str, document_type: str = "不明"):
+    """
+    明細の訂正データをDBに記録する。
+    corrections: [{"row_index": int, "error_type": str, "original": dict, "corrected": dict}]
+    """
+    if not corrections:
+        return
+    conn = _get_feedback_db()
+    cur  = conn.cursor()
+    ts   = datetime.datetime.now().isoformat()
+    for c in corrections:
+        orig = c.get("original", {})
+        corr = c.get("corrected", {})
+        cur.execute("""
+            INSERT INTO corrections
+            (id, timestamp, document_type, error_type, row_index,
+             orig_name, orig_parts, orig_wage,
+             corr_name, corr_parts, corr_wage,
+             user_comment, page_context, status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            str(_uuid.uuid4()), ts, document_type,
+            c.get("error_type", "other"),
+            c.get("row_index", 0),
+            str(orig.get("name", "")),
+            safe_int(orig.get("parts_amount", 0)),
+            safe_int(orig.get("wage", 0)),
+            str(corr.get("name", "")),
+            safe_int(corr.get("parts_amount", 0)),
+            safe_int(corr.get("wage", 0)),
+            user_comment,
+            c.get("page_context", ""),
+            "pending",
+        ))
+    conn.commit()
+    conn.close()
+
+
+def get_error_summary():
+    """エラー種別ごとの件数・代表例をまとめて返す"""
+    try:
+        conn = _get_feedback_db()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT error_type, COUNT(*) as cnt,
+                   GROUP_CONCAT(orig_name, '|') as names
+            FROM corrections
+            WHERE status = 'pending'
+            GROUP BY error_type
+            ORDER BY cnt DESC
+        """)
+        rows = cur.fetchall()
+        conn.close()
+        result = []
+        for r in rows:
+            names = list(set((r[2] or "").split("|")))[:5]
+            result.append({
+                "error_type": r[0],
+                "label": FEEDBACK_ERROR_TYPES.get(r[0], r[0]),
+                "count": r[1],
+                "sample_names": [n for n in names if n],
+            })
+        return result
+    except Exception:
+        return []
+
+
+def get_all_pending_corrections():
+    """未統合の全訂正レコードを返す"""
+    try:
+        conn = _get_feedback_db()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT id, timestamp, document_type, error_type,
+                   orig_name, orig_parts, orig_wage,
+                   corr_name, corr_parts, corr_wage,
+                   user_comment
+            FROM corrections
+            WHERE status = 'pending'
+            ORDER BY timestamp DESC
+        """)
+        rows = cur.fetchall()
+        conn.close()
+        cols = ["id","timestamp","document_type","error_type",
+                "orig_name","orig_parts","orig_wage",
+                "corr_name","corr_parts","corr_wage","user_comment"]
+        return [dict(zip(cols, r)) for r in rows]
+    except Exception:
+        return []
+
+
+def generate_and_save_patch(patch_text: str, task_type: str = "estimate_detail_page"):
+    """
+    生成されたプロンプトパッチをDBに保存し、既存のアクティブパッチを無効化する。
+    """
+    conn = _get_feedback_db()
+    cur  = conn.cursor()
+    # 既存アクティブパッチを無効化
+    cur.execute("UPDATE prompt_patches SET is_active = 0 WHERE task_type = ?", (task_type,))
+    # 新パッチを挿入
+    cur.execute("""
+        INSERT INTO prompt_patches (id, task_type, patch_text, created_at, is_active)
+        VALUES (?,?,?,?,1)
+    """, (str(_uuid.uuid4()), task_type, patch_text,
+          datetime.datetime.now().isoformat()))
+    # 統合済みの pending レコードを merged に更新
+    cur.execute("UPDATE corrections SET status = 'merged' WHERE status = 'pending'")
+    conn.commit()
+    conn.close()
+
+
+def _load_learned_hints(task_type: str = "estimate_detail_page") -> str:
+    """
+    現在アクティブなプロンプトパッチを返す。なければ空文字列。
+    _build_prompt() から呼ばれる。
+    """
+    try:
+        conn = _get_feedback_db()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT patch_text FROM prompt_patches
+            WHERE task_type = ? AND is_active = 1
+            ORDER BY created_at DESC LIMIT 1
+        """, (task_type,))
+        row = cur.fetchone()
+        conn.close()
+        return row[0] if row else ""
+    except Exception:
+        return ""
+
+
+def _detect_corrections(original_items: list, edited_items: list) -> list:
+    """
+    AIが出力したオリジナル明細とユーザー編集後を比較し、差分リストを返す。
+    Returns: [{"row_index", "error_type", "original", "corrected", "page_context"}]
+    """
+    corrections = []
+    max_len = max(len(original_items), len(edited_items))
+    for i in range(max_len):
+        if i >= len(original_items):
+            # 行追加
+            corr = edited_items[i]
+            corrections.append({
+                "row_index":    i + 1,
+                "error_type":   "missed_row",
+                "original":     {},
+                "corrected":    corr,
+                "page_context": f"{i+1}行目（追加）",
+            })
+            continue
+        if i >= len(edited_items):
+            # 行削除
+            orig = original_items[i]
+            corrections.append({
+                "row_index":    i + 1,
+                "error_type":   "extra_row",
+                "original":     orig,
+                "corrected":    {},
+                "page_context": f"{i+1}行目（削除）",
+            })
+            continue
+
+        orig = original_items[i]
+        corr = edited_items[i]
+        orig_p = safe_int(orig.get("parts_amount", 0))
+        orig_w = safe_int(orig.get("wage", 0))
+        corr_p = safe_int(corr.get("parts_amount", 0))
+        corr_w = safe_int(corr.get("wage", 0))
+        orig_n = str(orig.get("name", ""))
+        corr_n = str(corr.get("name", ""))
+
+        if orig_p == corr_p and orig_w == corr_w and orig_n == corr_n:
+            continue  # 変更なし
+
+        # エラー種別を自動推定
+        error_type = "other"
+        if orig_p == corr_w and orig_w == corr_p and orig_p != orig_w:
+            error_type = "column_swap"
+        elif orig_n != corr_n and orig_p == corr_p and orig_w == corr_w:
+            error_type = "name_error"
+        elif orig_p != corr_p and orig_w == corr_w:
+            error_type = "amount_misread"
+        elif orig_w != corr_w and orig_p == corr_p:
+            error_type = "column_swap"
+        elif orig_p != corr_p and orig_w != corr_w:
+            error_type = "column_swap"
+
+        corrections.append({
+            "row_index":    i + 1,
+            "error_type":   error_type,
+            "original":     orig,
+            "corrected":    corr,
+            "page_context": f"{i+1}行目: {orig_n}",
+        })
+    return corrections
+
+
+def analyze_vehicle_registration(api_key, file_bytes, mime_type):
+    """車検証をAI-OCRで解析（JSON mode + プロンプトベースの構造化出力）"""
+    prompt = _build_prompt("shaken_ocr")
+
+    # 方式1: response_schema を使用（全フィールドstring型で安全にパース）
+    _schema_shaken = {
+        "type": "object",
+        "properties": {
+            "customer_name":         {"type": "string"},
+            "owner_name":            {"type": "string"},
+            "postal_no":             {"type": "string"},
+            "prefecture":            {"type": "string"},
+            "municipality":          {"type": "string"},
+            "address_other":         {"type": "string"},
+            "car_reg_department":    {"type": "string"},
+            "car_reg_division":      {"type": "string"},
+            "car_reg_business":      {"type": "string"},
+            "car_reg_serial":        {"type": "string"},
+            "car_serial_no":         {"type": "string"},
+            "car_name":              {"type": "string"},
+            "car_model":             {"type": "string"},
+            "car_model_designation": {"type": "string"},
+            "car_category_number":   {"type": "string"},
+            "engine_model":          {"type": "string"},
+            "body_color":            {"type": "string"},
+            "color_code":            {"type": "string"},
+            "trim_code":             {"type": "string"},
+            "car_weight":            {"type": "string"},
+            "engine_displacement":   {"type": "string"},
+            "kilometer":             {"type": "string"},
+            "term_date":             {"type": "string"},
+            "car_reg_date":          {"type": "string"},
+            "confidence":            {"type": "string"},
+        },
+    }
+    result = {}
+    _method_used = ""
+    try:
+        from google.genai import types
+        client = _get_genai_client(api_key)
+        file_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[prompt, file_part],
+            config={
+                "temperature": 0.0,
+                "max_output_tokens": 4096,
+                "response_mime_type": "application/json",
+                "response_schema": _schema_shaken,
+                # Iter6 v3
+                **({"thinking_config": types.ThinkingConfig(thinking_budget=0)} if "2.5-flash" in GEMINI_MODEL else {}),
+            },
+        )
+        if response.text and response.text.strip():
+            try:
+                result = json.loads(response.text)
+                _method_used = "response_schema"
+            except (json.JSONDecodeError, TypeError):
+                result = extract_json_from_response(response.text)
+                _method_used = "response_schema+extract"
+    except Exception as e:
+        print(f"[shaken_ocr] response_schema failed: {e}")
+        _method_used = "fallback"
+
+    # 方式1で空結果 → 方式2: シンプルなJSON modeにフォールバック
+    if not result or not any(v for v in result.values() if v and str(v).strip()):
+        try:
+            print(f"[shaken_ocr] Method '{_method_used}' returned empty, trying json_mode fallback")
+            result_text = call_gemini(api_key, file_bytes, mime_type, prompt, use_json_mode=True)
+            if result_text:
+                try:
+                    result = json.loads(result_text)
+                    _method_used = "json_mode"
+                except (json.JSONDecodeError, TypeError):
+                    result = extract_json_from_response(result_text)
+                    _method_used = "json_mode+extract"
+        except Exception as e2:
+            print(f"[shaken_ocr] json_mode fallback also failed: {e2}")
+            result = {}
+
+    # 数値フィールドを文字列→数値に変換（response_schema が string 型で返すため）
+    for int_key in ('car_weight', 'engine_displacement', 'kilometer'):
+        if int_key in result:
+            result[int_key] = safe_int(result[int_key])
+    if 'confidence' in result:
+        result['confidence'] = safe_float(result.get('confidence', 0), 0.0)
+
+    print(f"[shaken_ocr] method={_method_used}, car_name={result.get('car_name','')}, "
+          f"car_model={result.get('car_model','')}, reg={result.get('car_reg_department','')}")
+
+    # 車名が空欄の場合、車台番号からメーカーを推定
+    if not result.get('car_name') and result.get('car_serial_no'):
+        maker, _ = guess_manufacturer_from_vin(result['car_serial_no'])
+        if maker:
+            result['car_name'] = maker
+
+    return result
+
+
+def analyze_estimate_totals(api_key, file_bytes, mime_type, model_name):
+    """1パス目: 合計値 + 見積書ヘッダの修理工場名・車両情報読み取り"""
+    _combined_prompt = _build_prompt("estimate_header_totals")
+    # response schema: totals + vehicle_info + customer_info (Iter22拡張)
+    _schema_totals = {
+        "type": "object",
+        "properties": {
+            "repair_shop_name": {"type": "string"},
+            "pdf_parts_total":  {"type": "integer"},
+            "pdf_wage_total":   {"type": "integer"},
+            "pdf_grand_total":  {"type": "integer"},
+            "discount_amount":  {"type": "integer"},
+            "confidence":       {"type": "number"},
+            "vehicle_info": {
+                "type": "object",
+                "properties": {
+                    "car_name":    {"type": "string"},
+                    "car_model":   {"type": "string"},
+                    "engine_model":{"type": "string"},
+                    "color_code":  {"type": "string"},
+                    "color_name":  {"type": "string"},
+                    "trim_code":   {"type": "string"},
+                    "grade":       {"type": "string"},
+                    "model_year":  {"type": "string"},
+                    "chassis_no":  {"type": "string"},
+                    "mileage":     {"type": "string"},
+                    # Iter22 追加
+                    "model_designation": {"type": "string"},  # 型式指定番号
+                    "category_number":   {"type": "string"},  # 類別区分番号
+                    "first_reg_date":    {"type": "string"},  # 初度登録年月
+                    "term_date":         {"type": "string"},  # 車検満了日
+                    "car_reg_no":        {"type": "string"},  # 登録番号(全体)
+                },
+            },
+            # Iter22: 顧客情報
+            "customer_info": {
+                "type": "object",
+                "properties": {
+                    "customer_name": {"type": "string"},  # 使用者氏名
+                    "owner_name":    {"type": "string"},  # 所有者氏名
+                    "receipt_no":    {"type": "string"},  # 受付番号
+                    "estimate_date": {"type": "string"},  # 見積書作成日
+                    "address":       {"type": "string"},  # 住所
+                    "phone":         {"type": "string"},  # 電話
+                },
+            },
+        },
+    }
+    try:
+        from google.genai import types
+        client = _get_genai_client(api_key)
+        file_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[_combined_prompt, file_part],
+            config={
+                "temperature": 0.0,
+                "max_output_tokens": 4096,
+                "response_mime_type": "application/json",
+                "response_schema": _schema_totals,
+                # Iter6 v3
+                **({"thinking_config": types.ThinkingConfig(thinking_budget=0)} if "2.5-flash" in (model_name or "") else {}),
+            },
+        )
+        if response.text:
+            try:
+                return json.loads(response.text)
+            except (json.JSONDecodeError, TypeError):
+                return extract_json_from_response(response.text)
+    except Exception as e:
+        err_msg = str(e)
+        if 'no longer available' in err_msg or '404' in err_msg or 'NOT_FOUND' in err_msg:
+            raise RuntimeError(f"モデル '{model_name}' は利用できません。サイドバーで別のモデルを選択してください。\n詳細: {err_msg}") from e
+    return None
+
+
+def parse_vehicle_from_text(text: str) -> dict:
+    """Gemini出力テキストの【1. 車両情報】セクションから車両データを抽出する。
+    CSVテキストと一緒に貼り付けられることを想定。
+    """
+    import re
+    result = {}
+    _field_map = {
+        '車名':         'car_name',
+        '型式':         'car_model',
+        '車台番号':     'car_serial_no',
+        '型式指定番号': 'car_model_designation',
+        '類別区分番号': 'car_category_number',
+        '初度登録年月': 'car_reg_date',
+        'エンジン型式': 'engine_model',
+        '車体の色':     'body_color',
+    }
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line or line.startswith('【'):
+            continue
+        for label, key in _field_map.items():
+            if line.startswith(label):
+                val = line.split(':', 1)[-1].strip() if ':' in line else ''
+                if not val:
+                    val = line.split('：', 1)[-1].strip() if '：' in line else ''
+                if val:
+                    result[key] = val
+                break
+    # 初度登録年月: 和暦→YYYYMM00 自動変換
+    if 'car_reg_date' in result:
+        rd = result['car_reg_date']
+        # 既にYYYYMM00形式ならそのまま
+        if not re.match(r'^\d{8}$', rd):
+            # 和暦変換 (令和X年Y月 → 20XXMM00)
+            _era_map = {'令和': 2018, '平成': 1988, '昭和': 1925, '大正': 1911}
+            m = re.search(r'(令和|平成|昭和|大正)\s*(\d+)\s*年\s*(\d+)\s*月', rd)
+            if m:
+                era_base = _era_map.get(m.group(1), 0)
+                year = era_base + int(m.group(2))
+                month = int(m.group(3))
+                result['car_reg_date'] = f'{year:04d}{month:02d}00'
+    return result
+
+
+def parse_csv_to_items(csv_text: str) -> list:
+    """Cogni7出力CSVまたはClaude/Gemini出力CSVをitemsリストに変換する。
+
+    対応フォーマット（ヘッダ行から列位置を自動検出）:
+      6列: 品名,区分,数量,部品金額,工賃,部品コード
+      7列: 品名,区分コード,数量,部品単価,部品金額,工賃,部品番号  ← Cogni7ネイティブ出力
+
+    区分コードの数値→日本語変換 (AnDefine.ini DisposalCode準拠):
+      0=取替, 1=脱着, 2=修理, 3=板金, 4=脱着修理, 5=脱着板金,
+      6=点検, 7=調整, 8=点検調整, 9=分解調整, -1=（空白：名称から自動判定）
+    """
+    import csv as _csv
+    import io as _io
+
+    # 区分コード数値 → 日本語method 変換テーブル
+    _code_to_method = {
+        '0': '取替', '1': '脱着', '2': '修理', '3': '板金',
+        '4': '脱着修理', '5': '脱着板金', '6': '点検',
+        '7': '調整', '8': '点検調整', '9': '分解調整',
+        '-1': '',  # ベタ打ち: 作業内容をそのままNEOに書き込む（自動判定スキップ）
+    }
+
+    # BOM除去・改行正規化
+    text = csv_text.strip().lstrip('\ufeff').replace('\r\n', '\n').replace('\r', '\n')
+    items = []
+    try:
+        reader = _csv.reader(_io.StringIO(text))
+        rows = list(reader)
+    except Exception:
+        return items
+
+    if not rows:
+        return items
+
+    # ── ヘッダ行を特定・列インデックスを動的に解決 ──
+    header_row_idx = 0
+    col_name       = 0
+    col_category   = 1
+    col_qty        = 2
+    col_unit_price = -1   # 部品単価（オプション列）
+    col_parts      = 3
+    col_wage       = 4
+    col_part_no    = 5
+
+    for i, row in enumerate(rows):
+        if row and '品名' in (row[0] or ''):
+            header_row_idx = i + 1
+            hdr = [c.strip() for c in row]
+            # 列名マッピング
+            _name_candidates  = ('品名',)
+            _cat_candidates   = ('区分コード', '区分')
+            _qty_candidates   = ('数量',)
+            _unit_candidates  = ('部品単価', '単価')
+            _parts_candidates = ('部品金額',)
+            _wage_candidates  = ('工賃', '技術料', '賃金')
+            _pno_candidates   = ('部品番号', '部品コード', '品番')
+
+            def _find_col(candidates, hdr):
+                for c in candidates:
+                    for idx, h in enumerate(hdr):
+                        if c in h:
+                            return idx
+                return -1
+
+            _c = _find_col(_cat_candidates,   hdr); col_category   = _c if _c >= 0 else 1
+            _c = _find_col(_qty_candidates,   hdr); col_qty        = _c if _c >= 0 else 2
+            _c = _find_col(_unit_candidates,  hdr); col_unit_price = _c  # -1 if not found
+            _c = _find_col(_parts_candidates, hdr); col_parts      = _c if _c >= 0 else (4 if col_unit_price >= 0 else 3)
+            _c = _find_col(_wage_candidates,  hdr); col_wage       = _c if _c >= 0 else (5 if col_unit_price >= 0 else 4)
+            _c = _find_col(_pno_candidates,   hdr); col_part_no    = _c if _c >= 0 else (6 if col_unit_price >= 0 else 5)
+            break
+
+    def _get(row, idx, default=''):
+        if idx < 0 or idx >= len(row):
+            return default
+        return row[idx].strip()
+
+    row_idx = 0
+    for row in rows[header_row_idx:]:
+        if not row or not any(c.strip() for c in row):
+            continue
+
+        name      = _get(row, col_name, '').strip()
+        category  = _get(row, col_category, '').strip()
+        qty       = safe_int(_get(row, col_qty, '1'), 1)
+        parts_amt = safe_int(_get(row, col_parts, '0'))
+        wage_amt  = safe_int(_get(row, col_wage, '0'))
+        part_no   = _get(row, col_part_no, '')
+
+        if not name and parts_amt == 0 and wage_amt == 0:
+            continue
+        # 合計・小計行を除外
+        if any(kw in name for kw in ('合計', '小計', '消費税', '税額', '値引', '総額')):
+            continue
+        if qty < 1:
+            qty = 1
+
+        # 数値区分コード → 日本語 method に変換
+        method = _code_to_method.get(category, category)
+
+        row_idx += 1
+        items.append({
+            'page':         1,
+            'row_type':     'detail',
+            'name':         to_halfwidth_katakana(name),
+            'description':  '',
+            'work_code':    category,
+            'method':       method,
+            'part_no':      part_no,
+            'quantity':     qty,
+            'parts_amount': parts_amt,
+            'wage':         wage_amt,
+            'line_total':   parts_amt + wage_amt,
+            'index_value':  '',
+            'raw_text':     ','.join(row),
+            'row_id':       f'p1_r{row_idx:03d}',
+            'row_bbox':     {'x1': 0, 'y1': 0, 'x2': 1000, 'y2': 50},
+        })
+
+    # ── 同一品名・同一区分コードの分割行マージ（NEO ERParts 1行=部品+工賃仕様） ──
+    # Geminiが「部品行(parts)」「工賃行(wage)」を2行に分割出力した場合、
+    # 同一品名・同一区分コードで 片方のみ金額がある連続行を1行に統合する。
+    merged = []
+    skip = set()
+    for i, item in enumerate(items):
+        if i in skip:
+            continue
+        if i + 1 < len(items):
+            nxt = items[i + 1]
+            same_name = item['name'] == nxt['name']
+            same_code = item['work_code'] == nxt['work_code']
+            i_parts = safe_int(item.get('parts_amount', 0))
+            i_wage  = safe_int(item.get('wage', 0))
+            n_parts = safe_int(nxt.get('parts_amount', 0))
+            n_wage  = safe_int(nxt.get('wage', 0))
+            # 同一品名・同一コードで、一方が部品のみ・他方が工賃のみ → 統合
+            if same_name and same_code and (
+                (i_parts > 0 and i_wage == 0 and n_parts == 0 and n_wage > 0) or
+                (i_parts == 0 and i_wage > 0 and n_parts > 0 and n_wage == 0)
+            ):
+                m = dict(item)
+                m['parts_amount'] = max(i_parts, n_parts)
+                m['wage']         = max(i_wage, n_wage)
+                m['line_total']   = m['parts_amount'] + m['wage']
+                if not m.get('part_no') and nxt.get('part_no'):
+                    m['part_no'] = nxt['part_no']
+                merged.append(m)
+                skip.add(i + 1)
+                continue
+        merged.append(item)
+    return merged
+
+
+def parse_detail_json_to_items(json_text: str, page_num: int = 1) -> list:
+    """Geminiが出力したdetail_extraction JSONをitemsリスト（JSON互換）に変換する。
+    失敗した場合は空リストを返す（呼び出し元でMarkdownフォールバック）。
+    """
+    import re, json as _json
+    text = json_text.strip()
+    # ```json ... ``` ブロックを除去
+    text = re.sub(r'^```json\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^```\s*$', '', text, flags=re.MULTILINE)
+    # JSON部分を抽出
+    m = re.search(r'\{.*\}', text, re.DOTALL)
+    if not m:
+        return []
+    try:
+        data = _json.loads(m.group(0))
+    except Exception:
+        try:
+            data = _json.loads(repair_truncated_json(m.group(0)))
+        except Exception:
+            return []
+    details = data.get('details', [])
+    # 'details' キーが空なら 'items' キーもフォールバック確認
+    if not details:
+        details = data.get('items', [])
+    if not isinstance(details, list):
+        return []
+    items = []
+    for row_idx, detail in enumerate(details, 1):
+        name        = str(detail.get('work_or_part_name', '') or '').strip()
+        category    = str(detail.get('category', '') or '').strip()
+        index_value = str(detail.get('index_value', '') or '').strip()
+        wage_raw    = detail.get('labor_fee', 0)
+        qty_raw     = detail.get('quantity', 1)
+        parts_raw   = detail.get('part_price', 0)
+        part_no     = str(detail.get('part_number', '') or '').strip()
+        wage  = safe_int(wage_raw)
+        qty   = safe_int(qty_raw, 1)
+        parts = safe_int(parts_raw)
+        if wage == 0 and parts == 0:
+            continue
+        if qty < 1:
+            qty = 1
+        items.append({
+            'page':         page_num,
+            'row_type':     'detail',
+            'name':         name if name else '不明',
+            'description':  '',
+            'work_code':    category,
+            'index_value':  index_value,
+            'part_no':      part_no,
+            'quantity':     qty,
+            'parts_amount': parts,
+            'wage':         wage,
+            'line_total':   wage + parts,
+            'raw_text':     str(detail),
+            'row_id':       f'p{page_num}_r{row_idx:03d}',
+            'row_bbox':     {'x1': 0, 'y1': 0, 'x2': 1000, 'y2': 50},
+        })
+    return items
+
+
+def parse_markdown_to_items(md_text: str, page_num: int = 1) -> list:
+    """Geminiが出力したMarkdown表をitemsリスト（JSON互換）に変換する"""
+    import re
+    items = []
+    row_idx = 0
+
+    def to_int(s):
+        s = str(s).strip()
+        # △▲は負数を示す会計表記
+        is_negative = bool(re.match(r'^[△▲\-]', s))
+        s = re.sub(r'[,，\s¥￥円△▲+]', '', s)
+        s = re.sub(r'[^\d.\-]', '', s)
+        try:
+            val = int(float(s))
+            return -abs(val) if is_negative and val > 0 else val
+        except Exception:
+            return 0
+
+    for line in md_text.splitlines():
+        if not line.startswith('|'):
+            continue
+        cells = [c.strip() for c in line.split('|')[1:-1]]
+        if len(cells) < 3:
+            continue
+        # ヘッダー行をスキップ
+        if cells[0] in ('作業内容・使用部品名', '作業内容', '品名', '部品名'):
+            continue
+        # 区切り行（--- のみ）をスキップ
+        if re.match(r'^[-: ]*$', cells[0]) and cells[0]:
+            continue
+        # 全セルが空または記号のみの行をスキップ
+        if all(re.match(r'^[-:= ]*$', c) for c in cells):
+            continue
+
+        name        = cells[0] if cells[0] else '不明'
+        method      = cells[1] if len(cells) > 1 else ''   # 区分
+        index_value = cells[2].strip() if len(cells) > 2 else ''  # 指数（工数）
+        wage        = to_int(cells[3]) if len(cells) > 3 else 0  # 技術料
+        qty         = to_int(cells[4]) if len(cells) > 4 else 1  # 数量
+        parts       = to_int(cells[5]) if len(cells) > 5 else 0  # 部品金額
+        part_no     = cells[6].strip() if len(cells) > 6 else ''  # 部品品番
+
+        if wage == 0 and parts == 0:
+            continue  # 両方0は除外
+
+        row_idx += 1
+        items.append({
+            'page':         page_num,
+            'row_type':     'detail',
+            'name':         name,
+            'description':  '',
+            'work_code':    method,
+            'index_value':  index_value,
+            'part_no':      part_no,
+            'quantity':     qty if qty > 0 else 1,
+            'parts_amount': parts,
+            'wage':         wage,
+            'line_total':   wage + parts,
+            'raw_text':     line,
+            'row_id':       f'p{page_num}_r{row_idx:03d}',
+            'row_bbox':     {'x1': 0, 'y1': 0, 'x2': 1000, 'y2': 50},
+        })
+    return items
+
+
+def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num=1, total_pages=1, tax_inclusive=False):
+    """見積書明細行をJSON出力プロンプトで読み取り、itemsリストに変換して返す"""
+    extra_notes = ''
+    if tax_inclusive:
+        extra_notes += '\n\n【税込表記】この見積書は税込表記です。記載されている金額はすべて税込金額として読み取り、そのまま転写してください。税抜きへの変換は不要です。'
+    if total_pages > 1:
+        extra_notes += f'\n\n【ページ指定】これは全{total_pages}ページ中の{page_num}ページ目です。このページの全明細行を漏れなく読み取ってください。'
+
+    prompt = _build_prompt("estimate_detail_page", extra_notes)
+
+    from google.genai import types
+    client = _get_genai_client(api_key)
+    file_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+    # Iter6 v3: thinking_budget=0 (NEO_FAST_OCR=0 で無効化)
+    _cfg = {"temperature": 0.0, "max_output_tokens": 65536}
+    try:
+        if "2.5-flash" in (model_name or "") and os.environ.get("NEO_FAST_OCR", "1") == "1":
+            _cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+    except Exception:
+        pass
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[prompt, file_part],
+                config=_cfg,
+            )
+            if response.text and response.text.strip():
+                # まずJSONパーサーで試みる（新形式）
+                items = parse_detail_json_to_items(response.text, page_num)
+                # JSONパースが空ならMarkdownフォールバック
+                if not items:
+                    items = parse_markdown_to_items(response.text, page_num)
+                return {
+                    'items':           items,
+                    'discount_amount': 0,
+                    'confidence':      0.9,
+                }
+            if attempt < 2:
+                import time; time.sleep(1)
+                continue
+            raise ValueError("Geminiから有効な応答が得られませんでした。")
+        except ValueError:
+            raise
+        except Exception as e:
+            last_error = e
+            err_msg = str(e)
+            # モデル廃止エラーはリトライせずに即座に再送出
+            if 'no longer available' in err_msg or 'NOT_FOUND' in err_msg:
+                raise RuntimeError(
+                    f"モデル '{model_name}' は利用できません。"
+                    "サイドバーで「gemini-2.5-flash」または「gemini-2.5-pro」を選択してください。"
+                ) from e
+            # クォータ超過エラー
+            if '429' in err_msg or 'RESOURCE_EXHAUSTED' in err_msg:
+                _quota_exhausted_models.add(model_name)
+                cache_key = api_key[-8:] if api_key else ''
+                if cache_key in _model_availability_cache:
+                    del _model_availability_cache[cache_key]
+                raise ValueError(
+                    f"モデル '{model_name}' のクォータが上限に達しました。"
+                    "自動的に代替モデルに切り替えます。"
+                ) from e
+            if attempt < 2:
+                import time; time.sleep(1)
+                continue
+            raise ValueError(f"Gemini API呼び出しに失敗しました: {str(last_error)}")
+
+
+# ============================================================
+# チャンク分割解析: 表領域を縦に分割して各チャンクをAIで解析
+# ============================================================
+
+def analyze_estimate_chunk(api_key, chunk_bytes, mime_type, model_name,
+                           page_num, chunk_idx, total_chunks,
+                           y_start_ratio=0.0, y_end_ratio=1.0,
+                           table_top_ratio=0.0, table_bot_ratio=1.0):
+    """
+    チャンク単位で明細行を解析する（analyze_estimate_single のチャンク版）。
+    y_start_ratio / y_end_ratio : チャンクが表領域内の何%にあたるか（row_bbox補正用）
+    """
+    chunk_instruction = (
+        f'【チャンク解析】ページ {page_num} の明細表を縦に {total_chunks} 分割した'
+        f' {chunk_idx + 1}/{total_chunks} チャンク'
+        f'（ページ上端から {y_start_ratio*100:.0f}%〜{y_end_ratio*100:.0f}% の範囲）。\n'
+        'このチャンクに含まれる全明細行を漏れなく読み取ってください。\n'
+        'row_bbox の y1/y2 はこのチャンク画像内の縦位置（0-1000スケール）で返してください。\n'
+    )
+    prompt = _build_prompt("estimate_detail_page", chunk_instruction)
+
+    _schema_chunk = {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name":          {"type": "string"},
+                        "description":   {"type": "string"},
+                        "method":        {"type": "string"},
+                        "quantity":      {"type": "integer"},
+                        "parts_amount":  {"type": "integer"},
+                        "wage":          {"type": "integer"},
+                        "line_total":    {"type": "integer"},
+                        "part_no":       {"type": "string"},
+                        "work_code":     {"type": "string"},
+                        "raw_text":      {"type": "string"},
+                        "row_id":        {"type": "string"},
+                        "row_bbox": {
+                            "type": "object",
+                            "properties": {
+                                "x1": {"type": "integer"},
+                                "y1": {"type": "integer"},
+                                "x2": {"type": "integer"},
+                                "y2": {"type": "integer"},
+                            },
+                        },
+                    },
+                },
+            },
+            "discount_amount": {"type": "integer"},
+        },
+    }
+
+    from google.genai import types
+    client = _get_genai_client(api_key)
+    file_part = types.Part.from_bytes(data=chunk_bytes, mime_type=mime_type)
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[prompt, file_part],
+                config={
+                    "temperature": 0.0,
+                    "max_output_tokens": 32768,
+                    "response_mime_type": "application/json",
+                    "response_schema": _schema_chunk,
+                },
+            )
+            if response.text and response.text.strip():
+                try:
+                    res = json.loads(response.text)
+                except Exception:
+                    res = extract_json_from_response(response.text) or {}
+                # row_bbox の y座標をページ全体座標系に変換（0-1000スケール）
+                table_range = max(0.01, table_bot_ratio - table_top_ratio)
+                chunk_range = max(0.01, y_end_ratio - y_start_ratio)
+                for it in res.get('items', []):
+                    it['_chunk_idx']    = chunk_idx
+                    it['_chunk_y_start'] = y_start_ratio
+                    it['_chunk_y_end']   = y_end_ratio
+                    bbox = it.get('row_bbox')
+                    if bbox and isinstance(bbox, dict):
+                        # チャンク内y(0-1000) → ページ内y(0-1000)への変換
+                        def _conv_y(vy):
+                            # チャンク内相対位置 → 表領域内相対位置 → ページ全体相対位置
+                            in_chunk  = vy / 1000.0           # 0-1
+                            in_table  = y_start_ratio + in_chunk * chunk_range   # 0-1
+                            in_page   = table_top_ratio + in_table * table_range # 0-1
+                            return max(0, min(1000, int(in_page * 1000)))
+                        it['row_bbox'] = {
+                            'x1': bbox.get('x1', 0),
+                            'y1': _conv_y(bbox.get('y1', 0)),
+                            'x2': bbox.get('x2', 1000),
+                            'y2': _conv_y(bbox.get('y2', 1000)),
+                        }
+                return res
+            if attempt < 2:
+                import time; time.sleep(1)
+        except Exception as e:
+            err = str(e)
+            if 'no longer available' in err or 'NOT_FOUND' in err:
+                raise RuntimeError(f"モデル '{model_name}' は利用できません。") from e
+            if '429' in err or 'RESOURCE_EXHAUSTED' in err:
+                _quota_exhausted_models.add(model_name)
+                raise ValueError(f"モデル '{model_name}' クォータ超過") from e
+            if attempt < 2:
+                import time; time.sleep(1)
+    return {"items": [], "discount_amount": 0}
+
+
+def merge_chunk_items(chunk_results, page_num):
+    """
+    複数チャンクの items を結合し、重複行を除去して page番号を付与して返す。
+    重複判定（3段階）:
+      1. raw_text 完全一致（OCR原文が同一 → 確実な重複）
+      2. 正規化name(半角化) + (parts, wage) 一致（全角/半角表記ゆれを吸収）
+      3. 絶対Y座標近傍 + 合計金額一致（チャンク境界部のOCR揺れを吸収）
+    """
+    all_items = []
+    seen_raw  = set()       # raw_text ベース
+    seen_norm = set()       # (normalized_name, parts, wage) ベース
+    seen_abs_y = []         # (abs_y, amount_total) リスト（近傍チェック用）
+    total_discount = 0
+    Y_THRESHOLD = 0.05      # ページ高さの 5% 以内 = 同一行とみなす許容誤差
+
+    for chunk_res in chunk_results:
+        total_discount += safe_int(chunk_res.get('discount_amount', 0))
+        for it in chunk_res.get('items', []):
+            name  = str(it.get('name', '')).strip()
+            parts = safe_int(it.get('parts_amount', 0))
+            wage  = safe_int(it.get('wage', 0))
+            # 完全空行はスキップ
+            if not name and parts == 0 and wage == 0:
+                continue
+            has_amount = (parts > 0 or wage > 0)
+            raw        = str(it.get('raw_text', '')).strip()
+            norm_name  = to_halfwidth_katakana(name)
+
+            # ── 重複チェック1: raw_text ──────────────────────────
+            if raw and has_amount:
+                if raw in seen_raw:
+                    continue
+
+            # ── 重複チェック2: 正規化name + (parts, wage) ────────
+            norm_key = (norm_name, parts, wage)
+            if has_amount and norm_key in seen_norm:
+                continue
+
+            # ── 重複チェック3: 絶対Y座標近傍 + 合計一致 ──────────
+            # チャンクローカル座標(0-1000)→ページ絶対座標(0.0-1.0)に変換して比較
+            bbox       = it.get('row_bbox', {})
+            local_y1   = float(bbox.get('y1', -1))
+            chunk_y_s  = float(it.get('_chunk_y_start', 0))
+            chunk_y_e  = float(it.get('_chunk_y_end', 1))
+            amt_total  = parts + wage
+            is_y_dup   = False
+            if local_y1 >= 0 and has_amount:
+                abs_y = chunk_y_s + (local_y1 / 1000.0) * (chunk_y_e - chunk_y_s)
+                for prev_y, prev_amt in seen_abs_y:
+                    if abs(abs_y - prev_y) <= Y_THRESHOLD and prev_amt == amt_total:
+                        is_y_dup = True
+                        break
+                if is_y_dup:
+                    continue
+
+            # ── 重複なし → 登録 ──────────────────────────────────
+            if raw and has_amount:
+                seen_raw.add(raw)
+            if has_amount:
+                seen_norm.add(norm_key)
+            if local_y1 >= 0 and has_amount:
+                seen_abs_y.append((abs_y, amt_total))
+
+            it['page'] = page_num
+            all_items.append(it)
+    return all_items, total_discount
+
+
+def analyze_page_with_chunks(api_key, page_bytes, mime_type, model_name,
+                              page_num, total_pages, n_chunks=3):
+    """
+    1ページ分の画像を表領域検出 → チャンク分割 → 各チャンク解析 → マージ するパイプライン。
+    JPEG画像でない場合は analyze_estimate_single にフォールバック。
+    """
+    # JPEG/PNG 画像でない場合はフォールバック
+    if mime_type not in ('image/jpeg', 'image/png'):
+        return analyze_estimate_single(api_key, page_bytes, mime_type, model_name, page_num, total_pages)
+
+    # ① 表領域を検出してクロップ
+    try:
+        table_bytes, table_top, table_bot = detect_table_region(page_bytes)
+    except Exception:
+        table_bytes, table_top, table_bot = page_bytes, 0.0, 1.0
+
+    # ② 縦分割（チャンク数は行数に応じて調整: 小さい画像は分割不要）
+    try:
+        from PIL import Image
+        _pil = Image.open(io.BytesIO(table_bytes))
+        _h = _pil.height
+        actual_chunks = n_chunks if _h >= 600 else (2 if _h >= 300 else 1)
+    except Exception:
+        actual_chunks = n_chunks
+
+    chunks = split_into_vertical_chunks(table_bytes, n_chunks=actual_chunks, overlap_ratio=0.02)
+
+    # ③ 各チャンクをAPIで解析（並列処理）
+    def _analyze_one_chunk(args):
+        ci, (cb, y_start, y_end) = args
+        try:
+            return analyze_estimate_chunk(
+                api_key, cb, 'image/jpeg', model_name,
+                page_num, ci, actual_chunks,
+                y_start_ratio=y_start, y_end_ratio=y_end,
+                table_top_ratio=table_top, table_bot_ratio=table_bot,
+            )
+        except Exception as e:
+            import sys
+            print(f"[WARN] チャンク{ci+1}解析失敗 (page={page_num}): {e}", file=sys.stderr)
+            return {"items": [], "discount_amount": 0}
+
+    chunk_results = []
+    if actual_chunks == 1:
+        # チャンク分割不要: ページ全体画像（クロップなし）をシンプルプロンプトで解析
+        chunk_results = [analyze_estimate_single(
+            api_key, page_bytes, 'image/jpeg', model_name, page_num, total_pages
+        )]
+    else:
+        with ThreadPoolExecutor(max_workers=min(actual_chunks, 3)) as _cx:
+            chunk_results = list(_cx.map(_analyze_one_chunk, enumerate(chunks)))
+
+    # ④ マージして重複除去
+    merged_items, merged_discount = merge_chunk_items(chunk_results, page_num)
+
+    # ⑤ 結果が空ならフォールバック
+    if not merged_items:
+        return analyze_estimate_single(api_key, page_bytes, mime_type, model_name, page_num, total_pages)
+
+    return {
+        "items":           merged_items,
+        "discount_amount": merged_discount,
+        "confidence":      0.85,
+        "_chunked":        True,
+        "_chunk_count":    actual_chunks,
+    }
+
+
+
+
+def validate_and_correct_items(items):
+    """
+    辞書ベースバリデーション: AIの誤分類を後処理で修正する。
+
+    【部品価格計上の必須ルール】
+    基本ルール: 部品価格を計上するのは、作業内容（method）が「取替」の場合のみ。
+    例外ルール: 作業内容が空白でも、部品価格欄に金額がある場合は「取替」とみなし計上。
+    それ以外（脱着・修理・板金等）の場合、parts_amount は強制的に 0 とする。
+    これにより「脱着」行の空欄によって次行の金額がズレて取り込まれる連鎖エラーを防ぐ。
+
+    【作業区分ごとの挙動 — AnDefine.ini DisposalCode準拠】
+    - 取替/交換系(0):         parts_amount 有効（工賃も同行にある場合はそのまま）
+    - 脱着系(1)/脱着修理(4)/脱着板金(5): parts_amount = 0 強制。工賃はそのまま保持。
+    - 修理(2)/板金(3)/点検(6)/調整(7)/点検調整(8)/分解調整(9):
+                              parts_amount = 0 強制。wage==0 のとき parts_amt を wage へ移動
+                              （AIが工賃を parts 列に誤分類したケースを救済）
+    - 空白method:             parts_amount > 0 ならそのまま（取替とみなす）
+    """
+    # 部品代計上が有効な作業区分 (DisposalCode=0: 取替)
+    PARTS_OK_METHODS = {'取替', '交換', '脱着組替', '取外組付'}
+
+    # 脱着系: parts_amount を 0 に強制。工賃は保持。wage への移動も行わない。
+    # DisposalCode=1(脱着), 4(脱着修理), 5(脱着板金)
+    REMOVAL_METHODS  = {'脱着', '取外', '取付', '組付', '脱外', '脱着修理', '脱着板金'}
+
+    # 修理・塗装系: parts_amount = 0 強制。wage==0 なら parts_amt を wage へ移動
+    # DisposalCode=2(修理), 3(板金), 6(点検), 7(調整), 8(点検調整), 9(分解調整)
+    REPAIR_METHODS   = {'修理', '補修', '修正', '板金', '鈑金', '塗装', 'ペイント', 'ワックス',
+                        '加算', 'ブース', '研磨', '清掃', '作業', '施工',
+                        '点検', '調整', '光軸', 'シーリング', '消去', '設定', 'エイミング',
+                        '点検調整', '分解調整'}
+
+    corrected = []
+    for item in items:
+        item      = dict(item)
+        method    = str(item.get('method', '')).strip()
+        name      = str(item.get('name', ''))
+        parts_amt = safe_int(item.get('parts_amount', 0))
+        wage      = safe_int(item.get('wage', 0))
+
+        # ケース1: 取替/交換系 → 部品代・工賃ともに有効（変更なし）
+        if any(kw in method for kw in PARTS_OK_METHODS):
+            corrected.append(item)
+            continue
+
+        # ケース2: 作業内容空白 + 部品価格あり → 「取替」とみなしそのまま計上
+        if not method and parts_amt > 0:
+            corrected.append(item)
+            continue
+
+        # ケース3: 脱着/取外系 → parts_amount を強制ゼロ（wage は触らない）
+        is_removal = any(kw in method for kw in REMOVAL_METHODS)
+        is_removal_name = any(kw in name for kw in {'脱着', '取外', '取付', '組付'})
+        if is_removal or is_removal_name:
+            item['parts_amount'] = 0
+            corrected.append(item)
+            continue
+
+        # ケース4: 修理・塗装等 → parts_amount = 0 強制。wage==0 なら wage へ救済移動
+        is_repair = any(kw in method for kw in REPAIR_METHODS)
+        is_repair_name = any(kw in name for kw in {'板金', '塗装', 'ペイント', '修理', '研磨'})
+        if (is_repair or is_repair_name) and parts_amt > 0:
+            if wage == 0:
+                # AIが工賃を parts 列に誤分類したとみなして wage へ移動
+                item['wage']  = parts_amt
+            item['parts_amount'] = 0
+
+        corrected.append(item)
+    return corrected
+
+
+def check_parts_labor_classification(items):
+    """
+    部品/工賃区分の疑わしい行を検出する。
+    AI抽出結果の parts_amount / wage の割り当てが不自然な行をフラグ付きで返す。
+
+    検出パターン:
+    1. 「脱着」「取外」系の行に parts_amount > 0 がある（脱着に部品代は不要）
+    2. 「材料」「ウレタン」「シーリング」等の材料系名称なのに wage > 0, parts_amount = 0
+       （材料費は部品・油脂列に入るべき）
+    3. 両方ゼロの行（金額未読み取りの可能性）
+    4. 「修理」「板金」「塗装」等の作業系なのに parts_amount > 0, wage = 0
+       （作業費は技術料列に入るべき）
+
+    Returns: list of dicts {
+        'row_no': int,      # 1始まりの行番号
+        'name': str,        # 品名
+        'parts_amount': int,
+        'wage': int,
+        'flag': str,        # 'parts_in_labor' / 'labor_in_parts' / 'both_zero' / 'ambiguous'
+        'message': str,     # 日本語の警告メッセージ
+        'severity': str,    # 'error' / 'warning'
+    }
+    """
+    # 脱着系キーワード（部品代なし）
+    REMOVAL_KW = {'脱着', '取外', '取付', '組付', '脱外'}
+    # 材料系キーワード（部品・油脂列に入るべき）
+    MATERIAL_KW = {'ウレタン', 'シーリング', 'アンダーコート', '防錆', '塗料', '材料',
+                   '充填', '発泡', '発砲', 'パネルボンド', '接着', '油脂', 'オイル'}
+    # 作業・修理系キーワード（技術料列に入るべき）
+    WORK_KW = {'修理', '板金', 'ペイント', '研磨', '塗装', '清掃', '点検', '作業', '施工', '補修'}
+
+    alerts = []
+    for i, item in enumerate(items):
+        name      = str(item.get('name', '')).strip()
+        method    = str(item.get('method', '')).strip()
+        parts_amt = safe_int(item.get('parts_amount', 0))
+        wage      = safe_int(item.get('wage', 0))
+        row_no    = i + 1
+
+        base = {'row_no': row_no, 'name': name, 'parts_amount': parts_amt, 'wage': wage}
+
+        # パターン1: 脱着系で parts_amount > 0
+        if any(kw in name or kw in method for kw in REMOVAL_KW) and parts_amt > 0:
+            alerts.append({**base,
+                'flag': 'parts_in_labor',
+                'message': f'行{row_no}「{name}」: 脱着系作業なのに部品金額 ¥{parts_amt:,} が計上されています。'
+                           '技術料欄の値が誤って部品欄に入った可能性があります。',
+                'severity': 'error'
+            })
+            continue
+
+        # パターン2: 材料系名称で wage > 0 かつ parts_amount = 0
+        if any(kw in name for kw in MATERIAL_KW) and wage > 0 and parts_amt == 0:
+            alerts.append({**base,
+                'flag': 'labor_in_parts',
+                'message': f'行{row_no}「{name}」: 材料系品名なのに工賃 ¥{wage:,} のみ計上されています。'
+                           '部品・油脂列の値が誤って技術料欄に入った可能性があります。',
+                'severity': 'error'
+            })
+            continue
+
+        # パターン3: 作業系名称で parts_amount > 0 かつ wage = 0 （取替除く）
+        if any(kw in name or kw in method for kw in WORK_KW):
+            if parts_amt > 0 and wage == 0 and '取替' not in method and '交換' not in method:
+                alerts.append({**base,
+                    'flag': 'parts_in_labor',
+                    'message': f'行{row_no}「{name}」: 作業系名称なのに部品金額 ¥{parts_amt:,} のみ計上されています。'
+                               '技術料列の値が誤って部品欄に入った可能性があります。',
+                    'severity': 'warning'
+                })
+                continue
+
+        # パターン4: 両方ゼロ（品名があるのに金額なし）
+        if parts_amt == 0 and wage == 0 and name:
+            zero_ok = {'脱着', '取外', '取付', '組付', '点検', '調整', '清掃'}
+            if not any(kw in name or kw in method for kw in zero_ok):
+                alerts.append({**base,
+                    'flag': 'both_zero',
+                    'message': f'行{row_no}「{name}」: 部品金額・工賃ともに0円です。金額の読み取り漏れがないか確認してください。',
+                    'severity': 'warning'
+                })
+
+    return alerts
+
+
+def extract_special_items(items, existing_sp=0, existing_exempt=0):
+    """
+    【廃止済み: 特殊分離は行わない】
+    明細欄に記載されている行はすべて items として通過させる。
+    ショートパーツ・雑品代・預託金・廃棄処分費用も通常明細として扱う。
+    Returns: (items, 0, 0)  ← 常に元のリストをそのまま返す
+    """
+    return list(items), 0, 0
+
+
+def deduplicate_page_items(all_items):
+    """
+    複数ページ分割時のページ境界での重複行を除去する。
+    同一品名＋同一金額の行がページ境界付近で連続する場合、重複とみなして除去。
+    """
+    if len(all_items) <= 1:
+        return all_items
+    deduped = [all_items[0]]
+    for i in range(1, len(all_items)):
+        curr = all_items[i]
+        prev = deduped[-1]
+        # 品名・部品金額・工賃が全て一致する場合は重複と判定
+        same_name  = str(curr.get('name', '')).strip() == str(prev.get('name', '')).strip()
+        same_parts = safe_int(curr.get('parts_amount', 0)) == safe_int(prev.get('parts_amount', 0))
+        same_wage  = safe_int(curr.get('wage', 0)) == safe_int(prev.get('wage', 0))
+        if same_name and same_parts and same_wage and str(curr.get('name', '')).strip():
+            continue  # 重複 → スキップ
+        deduped.append(curr)
+    return deduped
+
+
+def deduplicate_page_boundary_items(all_items, boundary_indices):
+    """
+    ページ境界付近でのみ重複行を除去する。
+    同一ページ内の重複行はPDF原本通り全て保持する（ユーザー指定）。
+    boundary_indices: 各ページの先頭インデックスのリスト
+    """
+    if len(all_items) <= 1:
+        return all_items
+    boundary_set = set(boundary_indices)
+    result = []
+    skip_next = False
+    for i, item in enumerate(all_items):
+        if skip_next:
+            skip_next = False
+            continue
+        # このインデックスがページ境界（ページ先頭）かつ前の行と内容が同じなら除去
+        if i in boundary_set and result:
+            prev = result[-1]
+            same_name  = str(item.get('name', '')).strip() == str(prev.get('name', '')).strip()
+            same_parts = safe_int(item.get('parts_amount', 0)) == safe_int(prev.get('parts_amount', 0))
+            same_wage  = safe_int(item.get('wage', 0))         == safe_int(prev.get('wage', 0))
+            if same_name and same_parts and same_wage and str(item.get('name', '')).strip():
+                continue  # ページ境界重複 → スキップ
+        result.append(item)
+    return result
+
+
+def global_dedup_items(items):
+    """
+    全ページ横断の重複行除去。
+    ページ境界に限らず、全 items の中で重複を検出して除去する。
+
+    除去ルール:
+      0. raw_text が完全一致 → 後出の行を除去（チャンク境界の重複対策）
+      1. (normalized_name, parts_amount, wage) が一致 → 後出の行を除去
+         ※ normalized_name は to_halfwidth_katakana で正規化（全角/半角の違いを吸収）
+      2. name が「不明」または空欄 の行と、同一 (parts_amount, wage) を持つ
+         名前付き行が存在する場合 → 「不明」側を除去（OCR誤読を優先排除）
+    """
+    # Pass0: raw_text ベースの重複除去（チャンク分割のオーバーラップ起因重複を除去）
+    seen_raw = set()
+    pass0 = []
+    for it in items:
+        raw   = str(it.get('raw_text', '')).strip()
+        parts = safe_int(it.get('parts_amount', 0))
+        wage  = safe_int(it.get('wage', 0))
+        if parts == 0 and wage == 0:
+            pass0.append(it)
+            continue
+        if raw:
+            if raw in seen_raw:
+                continue
+            seen_raw.add(raw)
+        pass0.append(it)
+
+    # Pass1: 正規化name + (parts, wage) による重複除去（全角/半角の表記ゆれを吸収）
+    seen_exact = set()
+    pass1 = []
+    for it in pass0:
+        name  = to_halfwidth_katakana(str(it.get('name', ''))).strip()
+        parts = safe_int(it.get('parts_amount', 0))
+        wage  = safe_int(it.get('wage', 0))
+        if parts == 0 and wage == 0:
+            pass1.append(it)
+            continue
+        key = (name, parts, wage)
+        if key in seen_exact:
+            continue
+        seen_exact.add(key)
+        pass1.append(it)
+
+    # Pass2: 「不明」行 vs 名前付き行の同一金額重複除去
+    named_amount_keys = set()
+    for it in pass1:
+        name  = str(it.get('name', '')).strip()
+        parts = safe_int(it.get('parts_amount', 0))
+        wage  = safe_int(it.get('wage', 0))
+        if name and name != '不明' and (parts > 0 or wage > 0):
+            named_amount_keys.add((parts, wage))
+
+    pass2 = []
+    for it in pass1:
+        name  = str(it.get('name', '')).strip()
+        parts = safe_int(it.get('parts_amount', 0))
+        wage  = safe_int(it.get('wage', 0))
+        if name in ('不明', '') and (parts, wage) in named_amount_keys:
+            continue  # 「不明」行と同額の名前付き行が存在 → 「不明」側を除去
+        pass2.append(it)
+
+    return pass2
+
+
+def validate_row_consistency(items):
+    """
+    明細行ごとの整合性チェック。
+    数量 × 単価 ≠ 部品金額 の不整合を検出し、可能な限り自動修正する。
+    Returns: (corrected_items, warnings_list)
+    """
+    corrected = []
+    warnings = []
+    for i, item in enumerate(items):
+        item = dict(item)
+        qty   = safe_int(item.get('quantity', 1), 1)
+        parts = safe_int(item.get('parts_amount', 0))
+        wage  = safe_int(item.get('wage', 0))
+        name  = str(item.get('name', ''))
+
+        if parts > 0 and qty > 1:
+            # 単価を逆算して整合性チェック
+            unit_price = parts / qty
+            # 単価が整数でなければ不整合の可能性
+            if abs(unit_price - round(unit_price)) > 0.01:
+                # 数量=1として全額を部品金額とみなす方が正しいか判定
+                # 例: parts_amount=1960, qty=14 → 140円/個 → 整合（OK）
+                # 例: parts_amount=5000, qty=3 → 1666.67円/個 → 不整合
+                warnings.append(
+                    f"行{i+1}「{name}」: 数量{qty} × 単価{unit_price:.1f} ≠ 部品金額¥{parts:,}（端数あり）"
+                )
+            # 単価が極端に小さい場合（1円未満）も警告
+            elif round(unit_price) < 1:
+                warnings.append(
+                    f"行{i+1}「{name}」: 単価が極端に小さい（¥{unit_price:.0f}/個）、数量{qty}を確認してください"
+                )
+
+        # 部品金額も工賃もゼロの行は警告（0円行が意図的でない可能性）
+        if parts == 0 and wage == 0 and name and name != '値引き':
+            # ただし method が「脱着」「取外」「組付」など工賃0円が妥当な作業は除外
+            method = str(item.get('method', ''))
+            zero_ok_methods = {'脱着', '取外', '取付', '組付', '点検', '調整', '清掃',
+                                   '脱着修理', '脱着板金', '点検調整', '分解調整'}
+            if not any(kw in method for kw in zero_ok_methods) and not any(kw in name for kw in zero_ok_methods):
+                warnings.append(
+                    f"行{i+1}「{name}」: 部品金額・工賃ともに0円です"
+                )
+
+        corrected.append(item)
+    return corrected, warnings
+
+
+def build_estimate_summary(items, short_parts_wage, pdf_parts_total,
+                           pdf_wage_total, pdf_grand_total, discount_amount=0,
+                           user_tax_basis='tax_exclusive'):
+    """
+    税区分はUIユーザー選択値のみを使用してNEO書込み用正規化サマリーを返す。
+    （AI自動判定は廃止。user_tax_basis='tax_inclusive' または 'tax_exclusive'）
+    Returns: {
+      'basis': 'tax_inclusive' / 'tax_exclusive',
+      'norm_parts': 税抜部品合計,
+      'norm_wage':  税抜工賃合計,
+      'norm_sp':    税抜ショートパーツ,
+      'norm_disc':  税抜値引き,
+      'grand':      税込総合計,
+      'reverse_match': bool  ← 逆算で総合計が一致するか
+    }
+    """
+    calc_parts = sum(safe_int(it.get('parts_amount', 0)) for it in items)
+    calc_wage  = sum(safe_int(it.get('wage', 0))         for it in items)
+    sp    = safe_int(short_parts_wage)
+    disc  = safe_int(discount_amount)
+    grand = safe_int(pdf_grand_total)
+
+    # 税区分はUIユーザー選択値のみを使用（AI判定廃止）
+    basis = user_tax_basis if user_tax_basis in ('tax_inclusive', 'tax_exclusive') else 'tax_exclusive'
+
+    if basis == 'tax_inclusive':
+        norm_parts = round(calc_parts / (1 + TAX_RATE))
+        norm_wage  = round(calc_wage  / (1 + TAX_RATE))
+        norm_sp    = round(sp         / (1 + TAX_RATE))
+        norm_disc  = round(disc       / (1 + TAX_RATE))
+    else:
+        norm_parts = calc_parts
+        norm_wage  = calc_wage
+        norm_sp    = sp
+        norm_disc  = disc
+
+    TOLERANCE = 50  # 円
+    reverse_grand = round((norm_parts + norm_wage + norm_sp - norm_disc) * (1 + TAX_RATE))
+    reverse_match = abs(reverse_grand - grand) <= TOLERANCE if grand > 0 else False
+
+    return {
+        'basis':         basis,
+        'norm_parts':    norm_parts,
+        'norm_wage':     norm_wage,
+        'norm_sp':       norm_sp,
+        'norm_disc':     norm_disc,
+        'grand':         grand,
+        'reverse_match': reverse_match,
+    }
+
+
+def _self_correction_retry(api_key, file_bytes, mime_type, model_name,
+                           original_items, target_parts, target_wage):
+    """
+    合計値との差額をフィードバックして再抽出し、改善された場合のみ採用する。
+    Returns: 改善後の result dict、または None（改善なし）
+    """
+    calc_parts = sum(safe_int(it.get('parts_amount', 0)) for it in original_items)
+    calc_wage  = sum(safe_int(it.get('wage', 0))         for it in original_items)
+    parts_diff = calc_parts - target_parts
+    wage_diff  = calc_wage  - target_wage
+
+    if (abs(parts_diff) <= SELF_CORRECTION_THRESHOLD and
+            abs(wage_diff) <= SELF_CORRECTION_THRESHOLD):
+        return None  # 差額が閾値以下 → 修正不要
+
+    _extra = (
+        f"【検出された誤差】\n"
+        f"- 部品合計: 計算値 ¥{calc_parts:,} ≠ PDF記載 ¥{target_parts:,} （差額 {parts_diff:+,}円）\n"
+        f"- 工賃合計: 計算値 ¥{calc_wage:,} ≠ PDF記載 ¥{target_wage:,} （差額 {wage_diff:+,}円）\n\n"
+        f"【修復指示】\n"
+        f"- 部品金額を合計{abs(parts_diff):,}円分{'追加' if parts_diff < 0 else '削減'}すること\n"
+        f"- 工賃を合計{abs(wage_diff):,}円分{'追加' if wage_diff < 0 else '削減'}すること\n"
+    )
+    correction_prompt = _build_prompt("estimate_validation_repair", _extra)
+    try:
+        from google.genai import types
+        client = _get_genai_client(api_key)
+        file_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[correction_prompt, file_part],
+            config={"temperature": 0.0, "max_output_tokens": 65536, "response_mime_type": "application/json"},
+        )
+        if not response.text:
+            return None
+        try:
+            new_result = json.loads(response.text)
+        except (json.JSONDecodeError, TypeError):
+            new_result = extract_json_from_response(response.text)
+        new_items  = new_result.get('items', []) or new_result.get('details', [])
+        if not new_items:
+            return None
+        new_parts  = sum(safe_int(it.get('parts_amount', 0)) for it in new_items)
+        new_wage   = sum(safe_int(it.get('wage', 0))         for it in new_items)
+        old_error  = abs(parts_diff) + abs(wage_diff)
+        new_error  = abs(new_parts - target_parts) + abs(new_wage - target_wage)
+        if new_error < old_error:
+            return new_result  # 改善された → 採用
+        return None  # 改善なし
+    except Exception as e:
+        import sys
+        print(f"[WARN] _self_correction_retry 例外: {e}", file=sys.stderr)
+        return None
+
+
+def extract_honda_cars_subtotals(file_bytes):
+    """
+    Honda Cars形式PDFから pypdf テキスト解析で部品/工賃合計を確実に抽出する。
+    Geminiが誤読するケースを防ぐため、pypdfのテキスト抽出結果を使用する。
+
+    pypdf特有のパターン:
+      - 「小      計 195,398 482,976」行 → 最終的な部品/工賃合計
+      - 「ページ小計 140,547 175,246」行 → ページ別小計（全ページを加算）
+
+    戻り値: (parts_total, wages_total) または None（Honda Cars形式でない場合）
+    """
+    import re
+    try:
+        from pypdf import PdfReader
+        import io as _io
+        reader = PdfReader(_io.BytesIO(file_bytes))
+    except Exception:
+        return None
+
+    all_text = ''
+    for page in reader.pages:
+        try:
+            t = page.extract_text() or ''
+            all_text += t + '\n'
+        except Exception:
+            pass
+
+    if not all_text.strip():
+        return None
+
+    # Honda Cars形式を識別: 「部品価格(税込)」列ヘッダが存在する
+    if '部品価格(税込)' not in all_text and '部品価格（税込）' not in all_text:
+        return None
+
+    # パターン1: 「小      計 195,398 482,976」（最終合計行・スペース多め）
+    m = re.search(r'小\s{2,}計\s+([\d,]+)\s+([\d,]+)', all_text)
+    if m:
+        parts = int(m.group(1).replace(',', ''))
+        wages = int(m.group(2).replace(',', ''))
+        if parts > 0 or wages > 0:
+            return (parts, wages)
+
+    # パターン2: 「小計 NNN NNN」（スペース少ない場合）
+    m = re.search(r'小\s*計\s+([\d,]+)\s+([\d,]+)', all_text)
+    if m:
+        parts = int(m.group(1).replace(',', ''))
+        wages = int(m.group(2).replace(',', ''))
+        if parts > 0 or wages > 0:
+            return (parts, wages)
+
+    # パターン3: ページ小計を全ページ合算
+    page_totals = re.findall(r'ページ小計\s+([\d,]+)\s+([\d,]+)', all_text)
+    if page_totals:
+        total_parts = sum(int(p.replace(',', '')) for p, w in page_totals)
+        total_wages = sum(int(w.replace(',', '')) for p, w in page_totals)
+        if total_parts > 0 or total_wages > 0:
+            return (total_parts, total_wages)
+
+    return None
+
+
+def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
+                     use_fax_filter=False, use_rasterize=False, use_enhance=True,
+                     enable_self_correction=True, progress_cb=None):
+    """
+    見積書をAI-OCRで解析するメイン関数。
+    progress_cb: (pct: int, text: str) -> None  進捗コールバック（Noneなら使用しない）
+    新機能:
+      use_fax_filter: FAXページを自動除外する（追加APIコール1回）
+      use_rasterize: PDF→JPEG変換してから送信（行ズレ防止）
+    """
+    import hashlib, sys
+    used_model = model_name or GEMINI_MODEL
+    _log: list = []  # 解析ログ収集リスト
+
+    def _logw(msg: str):
+        """ログをリストと stderr 両方に出力する"""
+        _log.append(msg)
+        print(f"[ANALYZE] {msg}", file=sys.stderr)
+
+    # ── ファイルハッシュキャッシュ: 同一ファイルの再解析を防ぐ ──────────────
+    _cache_key = (hashlib.md5(file_bytes).hexdigest()
+                  + f"_{used_model}_{use_rasterize}_{use_fax_filter}_{use_enhance}_{enable_self_correction}")
+    def _cb(pct, text):
+        """進捗コールバック呼び出し（Noneなら何もしない）"""
+        if progress_cb:
+            try:
+                progress_cb(pct, text)
+            except Exception:
+                pass
+
+    if _cache_key in _analyze_result_cache:
+        print("[INFO] キャッシュヒット: 再解析をスキップします", file=sys.stderr)
+        return _analyze_result_cache[_cache_key]
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # クォータ超過モデルを除外して使用モデルを決定
+    if used_model in _quota_exhausted_models:
+        # 代替モデルを選択
+        for alt_model in _PREFERRED_MODELS:
+            if alt_model not in _quota_exhausted_models:
+                print(f"[INFO] モデル '{used_model}' はクォータ超過のため '{alt_model}' に切り替えます", file=sys.stderr)
+                used_model = alt_model
+                break
+
+    _logw(f"🤖 使用モデル: {used_model}")
+    _logw(f"📂 ファイルサイズ: {len(file_bytes):,} bytes / MIMEタイプ: {mime_type}")
+    _logw(f"⚙️ オプション: FAXフィルター={'ON' if use_fax_filter else 'OFF'} / ラスタライズ={'ON' if use_rasterize else 'OFF'} / 自己修復={'ON' if enable_self_correction else 'OFF'}")
+
+    # ① FAXページフィルタリング（オプション）
+    _cb(8, "① FAXページを確認中...")
+    filtered_count = 0
+    if use_fax_filter and mime_type == 'application/pdf':
+        original_size = len(file_bytes)
+        file_bytes    = filter_fax_pages(api_key, file_bytes, used_model)
+        if len(file_bytes) < original_size:
+            filtered_count = 1
+    _logw(f"① FAXフィルター: {'1ページ除外' if filtered_count > 0 else '除外なし'}")
+
+    # ② 横向きPDF補正
+    _cb(12, "② ページ補正・分割中...")
+    if mime_type == 'application/pdf':
+        file_bytes = try_fix_landscape_pdf(file_bytes)
+
+    # ③ ページ分割
+    pages = try_split_pdf_pages(file_bytes) if mime_type == 'application/pdf' else None
+    # ③-a ページ順序自動補正（FAXヘッダ等で逆順になっている場合を修正）
+    if pages and len(pages) > 1:
+        pages = detect_and_reorder_pages(pages)
+    _logw(f"③ ページ分割: {len(pages) if pages else 1}ページ")
+
+    # ③-b&c ラスタライズ: PDF→JPEG変換（行ズレ防止）
+    # 最終ページ（合計欄）と1ページ目（車両情報）を並列でラスタライズ
+    raster_bytes       = file_bytes
+    raster_mime        = mime_type
+    first_raster_bytes = file_bytes
+    first_raster_mime  = mime_type
+    if use_rasterize and mime_type == 'application/pdf':
+        try:
+            from pypdf import PdfReader
+            num_pages = len(PdfReader(io.BytesIO(file_bytes)).pages)
+        except Exception:
+            num_pages = 1
+        last_page_idx = max(0, num_pages - 1)
+        # 最終ページと1ページ目を並列ラスタライズ（直列から並列化 → ~2s節約）
+        def _raster_last(_):
+            return rasterize_pdf_page(file_bytes, last_page_idx, dpi=300, enhance=use_enhance)
+        def _raster_first(_):
+            return rasterize_pdf_page(file_bytes, 0, dpi=300, enhance=use_enhance)
+        with ThreadPoolExecutor(max_workers=2) as _ex:
+            _fut_last  = _ex.submit(_raster_last, None)
+            _fut_first = _ex.submit(_raster_first, None)
+            img  = _fut_last.result()
+            img1 = _fut_first.result()
+        if img:
+            raster_bytes = img
+            raster_mime  = 'image/jpeg'
+        if img1:
+            first_raster_bytes = img1
+            first_raster_mime  = 'image/jpeg'
+
+    # ④ 1パス目: 合計値＋車両情報抽出
+    _cb(20, "③ 合計金額・車両情報を読み取り中...（10〜20秒）")
+    # 合計欄は最終ページ、車両情報は1ページ目にあることが多い
+    # 複数ページの場合は最終ページと1ページ目を並列でAPI呼び出し（直列から並列化 → ~10s節約）
+    _need_first_page = bool(pages and len(pages) > 1 and first_raster_bytes != raster_bytes)
+    if _need_first_page:
+        with ThreadPoolExecutor(max_workers=2) as _ex:
+            _fut_totals = _ex.submit(
+                analyze_estimate_totals, api_key, raster_bytes, raster_mime, used_model)
+            _fut_first  = _ex.submit(
+                analyze_estimate_totals, api_key, first_raster_bytes, first_raster_mime, used_model)
+            totals_data     = _fut_totals.result() or {}
+            first_page_data = _fut_first.result() or {}
+    else:
+        totals_data = analyze_estimate_totals(api_key, raster_bytes, raster_mime, used_model) or {}
+    if _need_first_page:
+        # 車両情報は1ページ目の結果を優先
+        vinfo_first = first_page_data.get('vehicle_info', {})
+        vinfo_last  = totals_data.get('vehicle_info', {})
+        merged_vinfo = {k: (vinfo_first.get(k) or vinfo_last.get(k, '')) for k in
+                        set(list(vinfo_first.keys()) + list(vinfo_last.keys()))}
+        totals_data['vehicle_info'] = merged_vinfo
+        # 税区分判定: 最終ページ不明の場合、1ページ目の判定を優先採用
+        # 例: 「内消費税」「(税込)」表記は1ページ目にある場合が多い
+        last_basis  = totals_data.get('amount_basis', 'unknown')
+        first_basis = first_page_data.get('amount_basis', 'unknown')
+        if last_basis not in ('tax_inclusive', 'tax_exclusive') and first_basis in ('tax_inclusive', 'tax_exclusive'):
+            totals_data['amount_basis'] = first_basis
+            totals_data['tax_reason']   = first_page_data.get('tax_reason', totals_data.get('tax_reason', ''))
+        # 合計値の補完: 最終ページに合計がない場合（pdf_grand_total=0）、1ページ目の値を使用
+        # 例: Honda Cars系フォーマット（合計がページ1ヘッダのサマリーボックスに記載）
+        last_grand = safe_int(totals_data.get('pdf_grand_total', 0))
+        if last_grand == 0:
+            first_grand = safe_int(first_page_data.get('pdf_grand_total', 0))
+            if first_grand > 0:
+                totals_data['pdf_grand_total'] = first_grand
+                # 部品合計・工賃合計・値引きも1ページ目から補完（最終ページに0の場合のみ）
+                if safe_int(totals_data.get('pdf_parts_total', 0)) == 0:
+                    totals_data['pdf_parts_total'] = first_page_data.get('pdf_parts_total', 0)
+                if safe_int(totals_data.get('pdf_wage_total', 0)) == 0:
+                    totals_data['pdf_wage_total'] = first_page_data.get('pdf_wage_total', 0)
+                if safe_int(totals_data.get('discount_amount', 0)) == 0:
+                    totals_data['discount_amount'] = first_page_data.get('discount_amount', 0)
+    target_parts = safe_int(totals_data.get('pdf_parts_total', 0))
+    target_wage  = safe_int(totals_data.get('pdf_wage_total', 0))
+    pdf_grand    = safe_int(totals_data.get('pdf_grand_total', 0))
+    discount     = safe_int(totals_data.get('discount_amount', 0))
+    _logw(f"④ 合計抽出: 部品計={target_parts:,} / 工賃計={target_wage:,} / 総合計={pdf_grand:,} / 値引={discount:,}")
+
+    # ④-a Honda Cars形式: pypdfで正確な合計値を取得（Gemini誤読を防ぐ）
+    # Geminiは「小計 195,398 482,976」の数値を誤認することがある。
+    # pypdf解析は列レイアウトに依存しないため確実。
+    if mime_type == 'application/pdf':
+        _pypdf_totals = extract_honda_cars_subtotals(file_bytes)
+        if _pypdf_totals:
+            _pypdf_parts, _pypdf_wages = _pypdf_totals
+            import sys
+            print(f"[INFO] Honda Cars pypdf合計: 部品={_pypdf_parts:,}, 工賃={_pypdf_wages:,} "
+                  f"(Gemini推測: 部品={target_parts:,}, 工賃={target_wage:,})", file=sys.stderr)
+            target_parts = _pypdf_parts
+            target_wage  = _pypdf_wages
+            totals_data['pdf_parts_total'] = _pypdf_parts
+            totals_data['pdf_wage_total']  = _pypdf_wages
+
+    # ⑤ 2パス目: 明細抽出（PDF全ページを一括送信 — ページ境界ズレを防ぐ）
+    _cb(45, f"④ 明細行を解析中...（{len(pages) if pages else 1}ページ / 30秒〜2分かかる場合があります）")
+    _page_count = len(pages) if pages else 1
+    _logw(f"⑤ 全ページ一括解析開始 ({_page_count}ページ)")
+    result = analyze_estimate_single(
+        api_key, file_bytes, 'application/pdf', used_model, 1, _page_count
+    ) or {}
+    result.setdefault('items', [])
+    result.setdefault('short_parts_wage', 0)
+    result['pdf_parts_total']   = target_parts or safe_int(result.get('pdf_parts_total', 0))
+    result['pdf_wage_total']    = target_wage  or safe_int(result.get('pdf_wage_total', 0))
+    result['pdf_grand_total']   = pdf_grand    or safe_int(result.get('pdf_grand_total', 0))
+    result['discount_amount']   = discount     or safe_int(result.get('discount_amount', 0))
+    result['confidence']        = safe_float(result.get('confidence', 0.5))
+    result['_fax_filtered']     = filtered_count
+    result['_page_count']       = _page_count
+    result['_vehicle_info']     = totals_data.get('vehicle_info', {})
+    result['_repair_shop_name'] = totals_data.get('repair_shop_name', '')
+    # Iter22-23: customer_info 抽出 (顧客名・受付番号・住所 等)
+    result['customer_info']     = totals_data.get('customer_info', {}) or {}
+    _p = sum(safe_int(it.get('parts_amount', 0)) for it in result['items'])
+    _w = sum(safe_int(it.get('wage', 0)) for it in result['items'])
+    _logw(f"  → {len(result['items'])}行 / 部品={_p:,} / 工賃={_w:,}")
+
+    _cb(80, "⑤ データを整理中...")
+    # ⑥ 全ページ横断重複除去（AI出力のページ先読み・同一行二重出力を除去）
+    # ページ境界に限らず全行を対象にした重複除去。
+    # ・Page1のAIがPage2の明細を合計額に合わせて先読み出力するケースを防止
+    # ・同一ページ内で先頭数行を2回出力するAIの誤動作を防止
+    _before_dedup = len(result['items'])
+    result['items'] = global_dedup_items(result['items'])
+    _after_dedup = len(result['items'])
+    _logw(f"⑥ 全体重複除去: {_before_dedup}行 → {_after_dedup}行 ({_before_dedup - _after_dedup}件除去)")
+
+    # ⑥-b 辞書ベースバリデーション
+    result['items'] = validate_and_correct_items(result['items'])
+
+    # ⑥-c 品名空白フォールバック（AIが名称を読み取れなかった行を保護）
+    # work_code が非空なら品名の代替として使用し、それもなければ「不明」を設定
+    for _it in result['items']:
+        if not str(_it.get('name', '')).strip():
+            _wc = str(_it.get('work_code', '')).strip()
+            _it['name'] = _wc if _wc else '不明'
+
+    # ⑥-d 明細行ごとの整合性チェック
+    result['items'], row_warnings = validate_row_consistency(result['items'])
+    if row_warnings:
+        result['_row_warnings'] = row_warnings
+
+    # ⑥-c ショートパーツ・預託金の明細行からの分離（二重計上防止）
+    existing_sp = safe_int(result.get('short_parts_wage', 0))
+    existing_exempt = safe_int(result.get('tax_exempt_amount', 0))
+    result['items'], sp_total, exempt_total = extract_special_items(
+        result['items'], existing_sp, existing_exempt
+    )
+    result['short_parts_wage'] = sp_total
+    result['tax_exempt_amount'] = exempt_total
+
+    # ⑥-d スキャンPDF等でpypdf取得失敗時のクロスバリデーション
+    # Geminiが誤った小計値を返した場合（スキャンPDF等）、明細合算＋grand_totalで検証して上書き
+    _cv_items_nd = [it for it in result['items'] if it.get('name') != '値引き']
+    _cv_calc_p   = sum(safe_int(it.get('parts_amount', 0)) for it in _cv_items_nd)
+    _cv_calc_w   = sum(safe_int(it.get('wage', 0))         for it in _cv_items_nd)
+    _cv_sp       = safe_int(result.get('short_parts_wage', 0))
+    _cv_grand    = safe_int(result.get('pdf_grand_total', 0))
+    _cv_p_stated = safe_int(result.get('pdf_parts_total', 0))
+    _cv_w_stated = safe_int(result.get('pdf_wage_total', 0))
+    if _cv_p_stated > 0 and _cv_w_stated > 0 and _cv_grand > 0 and _cv_calc_p > 0:
+        _cv_item_total = _cv_calc_p + _cv_calc_w + _cv_sp
+        # 明細合算＋sp が grand_total に近い（2%以内）か確認
+        _cv_match_grand = abs(_cv_item_total - _cv_grand) / _cv_grand < 0.02
+        # Geminiのstated totalsが明細合算と大きくずれているか（10%超）
+        _cv_p_wrong = abs(_cv_calc_p - _cv_p_stated) / max(_cv_calc_p, 1) > 0.10
+        _cv_w_wrong = abs(_cv_calc_w + _cv_sp - _cv_w_stated) / max(_cv_calc_w + _cv_sp, 1) > 0.10
+        if _cv_match_grand and (_cv_p_wrong or _cv_w_wrong):
+            import sys as _sys_cv
+            print(f"[INFO] cross-validation: Gemini stated totals誤り検出 → 明細合算値で上書き", file=_sys_cv.stderr)
+            print(f"  Gemini: 部品={_cv_p_stated:,}, 工賃={_cv_w_stated:,}", file=_sys_cv.stderr)
+            print(f"  明細合算: 部品={_cv_calc_p:,}, 工賃={_cv_calc_w+_cv_sp:,} (sp={_cv_sp:,}), 合計={_cv_item_total:,}≈{_cv_grand:,}", file=_sys_cv.stderr)
+            result['pdf_parts_total'] = _cv_calc_p
+            result['pdf_wage_total']  = _cv_calc_w + _cv_sp
+
+    # ⑦ 自己修復ループ（合計値が取得できた場合のみ、最大2回）
+    # enable_self_correction=False（ベタ打ちモード等）の場合はスキップして高速化
+    if enable_self_correction and (result['pdf_parts_total'] > 0 or result['pdf_wage_total'] > 0):
+        _correction_rounds = 0
+        for _sc_round in range(2):
+            _cur_items = result['items']
+            _cur_parts = sum(safe_int(it.get('parts_amount', 0)) for it in _cur_items)
+            _cur_wage  = sum(safe_int(it.get('wage', 0))         for it in _cur_items)
+            _sc_sp     = safe_int(result.get('short_parts_wage', 0))
+            _p_diff = abs(_cur_parts - result['pdf_parts_total'])
+            # 工賃比較はショートパーツを加味（Honda Cars等でspが工賃列に含まれるため）
+            _w_diff = abs((_cur_wage + _sc_sp) - result['pdf_wage_total'])
+            if _p_diff == 0 and _w_diff == 0:
+                break  # 完全一致 → 修正不要
+            retry = _self_correction_retry(
+                api_key, raster_bytes, raster_mime, used_model,
+                result['items'],
+                result['pdf_parts_total'],
+                result['pdf_wage_total'],
+            )
+            if retry and retry.get('items'):
+                result['items']            = validate_and_correct_items(retry['items'])
+                result['short_parts_wage'] = safe_int(retry.get('short_parts_wage', result.get('short_parts_wage', 0)))
+                _correction_rounds += 1
+            else:
+                break  # 改善なし → 終了
+        if _correction_rounds > 0:
+            result['_self_corrected'] = True
+            result['_correction_rounds'] = _correction_rounds
+
+    # ⑧ 税区分はUIユーザー選択値のみを使用（AI自動判定廃止）
+    # 注: analyze_estimate 呼び出し後にセッションstate(tax_override)で上書きされる（line 4580付近）
+    # ここでは仮に tax_exclusive を設定しておき、後段のUI処理で正式に上書きされる
+    summary = build_estimate_summary(
+        result['items'],
+        result.get('short_parts_wage', 0),
+        result.get('pdf_parts_total', 0),
+        result.get('pdf_wage_total', 0),
+        result.get('pdf_grand_total', 0),
+        result.get('discount_amount', 0),
+        user_tax_basis='tax_exclusive',  # 後段UIで上書きされる仮値
+    )
+    result['_tax_basis']     = summary['basis']
+    result['_reverse_match'] = summary['reverse_match']
+    # _is_tax_inclusive は後段のUIオーバーライドで設定されるため、ここでは設定しない
+
+    # ⑩ 値引きを負の工賃行として items に追加
+    disc_outtax = summary.get('norm_disc', 0)
+    if disc_outtax > 0:
+        result['items'].append({
+            'name':         '値引き',
+            'method':       '値引き',
+            'quantity':     1,
+            'parts_amount': 0,
+            'wage':         -disc_outtax,
+            'line_total':   -disc_outtax,
+            'part_no':      '',
+            'row_type':     'detail',
+            'page':         1,
+            'raw_text':     '',
+            'row_bbox':     {'x1': 0, 'y1': 0, 'x2': 1000, 'y2': 50},
+        })
+
+    # ⑪ STEP 3 最終バリデーション結果の生成（APIが返したものを優先、なければ再計算）
+    final_items = [it for it in result['items'] if it.get('name') != '値引き']
+    calc_p = sum(safe_int(it.get('parts_amount', 0)) for it in final_items)
+    calc_w = sum(safe_int(it.get('wage', 0))         for it in final_items)
+    doc_p  = safe_int(result.get('pdf_parts_total', 0))
+    doc_w  = safe_int(result.get('pdf_wage_total', 0))
+    p_diff = calc_p - doc_p
+    w_diff = calc_w - doc_w
+    # doc=0 は「PDF未記載」扱い → 不一致カウントしない
+    p_mismatch = (doc_p > 0) and (p_diff != 0)
+    w_mismatch = (doc_w > 0) and (w_diff != 0)
+    is_match = (not p_mismatch and not w_mismatch)
+    # Geminiが返したtotals_verificationがある場合はそちらを優先
+    if not result.get('totals_verification'):
+        _err_parts = []
+        if p_mismatch: _err_parts.append(f'部品差額{p_diff:+,}円')
+        if w_mismatch: _err_parts.append(f'工賃差額{w_diff:+,}円')
+        result['totals_verification'] = {
+            'calculated_parts_total': calc_p,
+            'calculated_labor_total': calc_w,
+            'document_parts_total':   doc_p,
+            'document_labor_total':   doc_w,
+            'parts_diff':             p_diff if doc_p > 0 else 0,
+            'labor_diff':             w_diff if doc_w > 0 else 0,
+            'is_match':               is_match,
+            'validation_error':       '・'.join(_err_parts) if _err_parts else None,
+        }
+    else:
+        # Gemini返却値がある場合も、PDF未記載(=0)の工賃・部品は不一致扱いしない
+        _tv = result['totals_verification']
+        _tv_doc_p = safe_int(_tv.get('document_parts_total', 0))
+        _tv_doc_w = safe_int(_tv.get('document_labor_total', 0))
+        _tv_p_diff = safe_int(_tv.get('parts_diff', 0))
+        _tv_w_diff = safe_int(_tv.get('labor_diff', 0))
+        if _tv_doc_w == 0 and _tv_w_diff != 0:
+            _tv['labor_diff'] = 0
+        if _tv_doc_p == 0 and _tv_p_diff != 0:
+            _tv['parts_diff'] = 0
+        _tv_p_mis = (_tv_doc_p > 0) and (_tv['parts_diff'] != 0)
+        _tv_w_mis = (_tv_doc_w > 0) and (_tv['labor_diff'] != 0)
+        _tv['is_match'] = not _tv_p_mis and not _tv_w_mis
+        _err_parts = []
+        if _tv_p_mis: _err_parts.append(f'部品差額{_tv["parts_diff"]:+,}円')
+        if _tv_w_mis: _err_parts.append(f'工賃差額{_tv["labor_diff"]:+,}円')
+        _tv['validation_error'] = '・'.join(_err_parts) if _err_parts else None
+        result['totals_verification'] = _tv
+
+    # 最終集計ログ
+    _final_items = result.get('items', [])
+    _final_p = sum(safe_int(it.get('parts_amount', 0)) for it in _final_items)
+    _final_w = sum(safe_int(it.get('wage', 0)) for it in _final_items)
+    _final_total = _final_p + _final_w
+    _final_grand = safe_int(result.get('pdf_grand_total', 0))
+    _diff = _final_total - _final_grand
+    _match_str = "✅ 完全一致" if abs(_diff) <= 1 else f"⚠️ 差額 {_diff:+,}円"
+    _logw(f"─────────────────────────────")
+    _logw(f"📊 最終結果: {len(_final_items)}行 / 部品={_final_p:,} / 工賃={_final_w:,} / 計={_final_total:,}")
+    _logw(f"  PDF総合計={_final_grand:,} → {_match_str}")
+    result['_analysis_log'] = _log
+
+    # ── 解析ログをファイルに書き出し ──────────────────────────────────────────
+    try:
+        _ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        with open(ANALYSIS_LOG_PATH, 'a', encoding='utf-8') as _lf:
+            _lf.write(f"\n{'='*60}\n")
+            _lf.write(f"[{_ts}] 解析開始\n")
+            for _entry in _log:
+                _lf.write(f"  {_entry}\n")
+            _lf.write(f"[{_ts}] 解析終了\n")
+    except Exception as _le:
+        print(f"[WARN] analysis.log 書き込み失敗: {_le}", file=sys.stderr)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # ── キャッシュ保存 ──────────────────────────────────────────────────────────
+    _analyze_result_cache[_cache_key] = result
+    # キャッシュが大きくなりすぎないよう古いエントリを削除（最大20件）
+    while len(_analyze_result_cache) > 20:
+        oldest_key = next(iter(_analyze_result_cache))
+        del _analyze_result_cache[oldest_key]
+    # ──────────────────────────────────────────────────────────────────────────
+
+    return result
+
+
+# ============================================================
+# ファイル名生成
+# ============================================================
+
+def generate_filename(cust, calc_parts, calc_wages, pdf_parts, pdf_wages,
+                      has_estimate, reverse_match=False, short_parts_wage=0,
+                      is_tax_inclusive=False, items_count=0):
+    """
+    登録番号から出力ファイル名を生成。
+    reverse_match=True の場合は部品・工賃相違を抑制する。
+    ショートパーツがPDF側の部品合計に含まれているケースも考慮して比較する。
+    is_tax_inclusive=True の場合、税込丸め誤差（items_count円）を許容する。
+    """
+    dept   = safe_str(cust.get('car_reg_department', ''))
+    div    = safe_str(cust.get('car_reg_division', ''))
+    biz    = safe_str(cust.get('car_reg_business', ''))
+    serial = safe_str(cust.get('car_reg_serial', ''))
+    base   = f'{dept}{div}{biz}{serial}'
+    if not base.strip():
+        base = '新規見積'
+    sp = safe_int(short_parts_wage)
+    _tol = items_count if is_tax_inclusive else 0
+    discrepancies = []
+    if not reverse_match and has_estimate:
+        # ショートパーツがPDF部品合計に含まれている場合も一致とみなす
+        # 税込の場合は丸め誤差（最大items_count円）を許容
+        parts_match = (calc_parts == pdf_parts) or (calc_parts + sp == pdf_parts) \
+            or (pdf_parts is not None and abs(calc_parts - pdf_parts) <= _tol) \
+            or (pdf_parts is not None and abs(calc_parts + sp - pdf_parts) <= _tol)
+        if pdf_parts is not None and pdf_parts > 0 and not parts_match:
+            discrepancies.append('部品相違')
+        wage_match = (calc_wages == pdf_wages) or (calc_wages + sp == pdf_wages) \
+            or (pdf_wages is not None and abs(calc_wages - pdf_wages) <= _tol) \
+            or (pdf_wages is not None and abs(calc_wages + sp - pdf_wages) <= _tol)
+        if pdf_wages is not None and pdf_wages > 0 and not wage_match:
+            discrepancies.append('工賃相違')
+    if discrepancies:
+        suffix = '（' + '・'.join(discrepancies) + '）'
+    else:
+        suffix = ''
+    return f'{base}_見積{suffix}.neo'
+
+
+# ============================================================
+# Streamlit UI
+# ============================================================
+
+def main():
+    st.set_page_config(
+        page_title="NEO自動生成アプリ",
+        page_icon="🚗",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    st.markdown("""
+    <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; }
+
+    /* 上部の余白を完全に詰める */
+    .block-container { padding-top: 0px !important; margin-top: 0px !important; }
+    header[data-testid="stHeader"] { display: none !important; height: 0 !important; }
+    #root > div:first-child { padding-top: 0 !important; }
+    .stApp > header { display: none !important; }
+    .stApp { margin-top: 0 !important; }
+    section.main > div { padding-top: 0 !important; }
+
+    /* file_uploader の「Drag and drop」「Limit」テキストを非表示（複数セレクタで対応） */
+    [data-testid="stFileUploaderDropzoneInstructions"] { display: none !important; }
+    [data-testid="stFileUploaderDropzone"] small,
+    [data-testid="stFileUploaderDropzone"] span:not(.st-emotion-cache-9ycgxx),
+    .uploadedFileName ~ small,
+    section[data-testid="stFileUploaderDropzone"] div > small { display: none !important; }
+    [data-testid="stFileUploaderDropzone"] { min-height: 56px !important; padding: 8px 12px !important; }
+    /* アイコンとBrowseボタンだけ残す */
+    [data-testid="stFileUploaderDropzone"] > div > div:first-child > span { display: none !important; }
+    [data-testid="stFileUploaderDropzone"] > div > div:first-child > small { display: none !important; }
+
+    /* Topbar */
+    .topbar { background: #1a2744; color: #fff; padding: 0 24px; height: 52px;
+              display: flex; align-items: center; justify-content: space-between;
+              box-shadow: 0 2px 8px rgba(0,0,0,.25); border-radius: 8px; margin-bottom: 20px; }
+    .topbar-title { font-size: 16px; font-weight: 700; letter-spacing: .04em;
+                    display: flex; align-items: center; gap: 10px; }
+    .topbar-badge { background: #3b82f6; font-size: 10px; padding: 2px 7px;
+                    border-radius: 10px; font-weight: 600; }
+    .topbar-right { display: flex; align-items: center; gap: 16px; font-size: 12px; color: #94a3b8; }
+    .api-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 4px; vertical-align: middle; }
+
+    /* Step bar */
+    .step-bar { display: flex; align-items: center; background: #fff; border-radius: 10px;
+                padding: 16px 24px; margin-bottom: 20px; box-shadow: 0 1px 4px rgba(0,0,0,.07); }
+    .step-item { display: flex; align-items: center; gap: 10px; }
+    .step-circle { width: 32px; height: 32px; border-radius: 50%; display: inline-flex;
+                   align-items: center; justify-content: center; font-weight: 700; font-size: 13px; flex-shrink: 0; }
+    .step-circle-done { background: #22c55e; color: #fff; }
+    .step-circle-active { background: #1d4ed8; color: #fff; box-shadow: 0 0 0 4px #bfdbfe; }
+    .step-circle-pending { background: #e2e8f0; color: #94a3b8; }
+    .step-label-active { font-size: 12px; font-weight: 600; color: #1d4ed8; }
+    .step-label-done { font-size: 12px; font-weight: 600; color: #15803d; }
+    .step-label-pending { font-size: 12px; font-weight: 600; color: #94a3b8; }
+    .step-connector { flex: 1; height: 2px; background: #e2e8f0; margin: 0 8px; min-width: 20px; }
+    .step-connector-done { background: #22c55e; }
+
+    /* Mode selector */
+    .mode-selector { display: flex; gap: 8px; margin-bottom: 16px; }
+    .mode-btn { flex: 1; padding: 12px 16px; border: 2px solid #e2e8f0; border-radius: 8px;
+                background: #fff; text-align: center; }
+    .mode-btn-active { border-color: #1d4ed8; background: #eff6ff; }
+    .mode-icon { font-size: 22px; display: block; margin-bottom: 4px; }
+    .mode-label { font-size: 13px; font-weight: 700; color: #1e293b; }
+    .mode-label-active { color: #1d4ed8; }
+    .mode-desc { font-size: 11px; color: #94a3b8; margin-top: 2px; }
+
+    /* Vehicle strip */
+    .vehicle-strip { background: linear-gradient(135deg, #1a2744 0%, #1e3a5f 100%); color: #fff;
+                     border-radius: 10px; padding: 16px 20px; margin-bottom: 16px;
+                     display: flex; align-items: flex-start; gap: 16px; }
+    .vehicle-strip-name { font-size: 18px; font-weight: 700; }
+    .vehicle-strip-detail { font-size: 12px; color: #94a3b8; margin-top: 2px; }
+    .vehicle-strip-badges { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+
+    /* Total strip */
+    .total-strip { background: #1a2744; color: #fff; border-radius: 10px; padding: 16px 24px;
+                   display: flex; align-items: center; gap: 20px; margin-top: 16px; flex-wrap: wrap; }
+    .total-item { text-align: center; }
+    .total-label { font-size: 10px; color: #94a3b8; font-weight: 600; letter-spacing: .05em; }
+    .total-value { font-size: 18px; font-weight: 700; }
+    .total-value-highlight { font-size: 22px; font-weight: 700; color: #fbbf24; }
+    .total-sep { color: #334155; font-size: 18px; }
+
+    /* Badges */
+    .badge-green  { background: #dcfce7; color: #15803d; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .badge-blue   { background: #dbeafe; color: #1d4ed8; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .badge-orange { background: #ffedd5; color: #c2410c; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .badge-red    { background: #fee2e2; color: #b91c1c; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .badge-gray   { background: #f1f5f9; color: #475569; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .badge-purple { background: #f3e8ff; color: #7e22ce; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+
+    /* Alert boxes */
+    .alert { border-radius: 8px; padding: 12px 16px; margin-bottom: 12px; font-size: 13px; }
+    .alert-info    { background: #eff6ff; border: 1px solid #bfdbfe; color: #1d4ed8; }
+    .alert-warn    { background: #fffbeb; border: 1px solid #fde68a; color: #92400e; }
+    .alert-success { background: #f0fdf4; border: 1px solid #bbf7d0; color: #15803d; }
+    .alert-error   { background: #fef2f2; border: 1px solid #fca5a5; color: #991b1b; }
+
+    /* Mismatch banner */
+    .mismatch-banner { background: #fef2f2; border: 1px solid #fca5a5; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+    .mismatch-title  { font-weight: 700; color: #991b1b; font-size: 14px; margin-bottom: 4px; }
+    .mismatch-body   { font-size: 12px; color: #7f1d1d; line-height: 1.6; margin-bottom: 8px; }
+
+    /* DB status */
+    .db-status-item { font-size: 11px; color: #475569; line-height: 1.8; }
+    .db-dot-green { color: #22c55e; }
+    .db-dot-yellow { color: #f59e0b; }
+
+    /* Section title */
+    .section-title { font-size: 13px; font-weight: 700; color: #334155; margin-bottom: 12px;
+                     padding-bottom: 8px; border-bottom: 1px solid #f1f5f9; display: flex; align-items: center; gap: 8px; }
+
+    /* Legacy classes (keep for backward compat) */
+    .main-title   { font-size: 1.8rem; font-weight: bold; color: #1a5276; margin-bottom: 0.5rem; }
+    .step-header  { font-size: 1.3rem; font-weight: bold; color: #2c3e50; padding: 0.5rem 0; border-bottom: 2px solid #3498db; margin-bottom: 1rem; }
+    .success-box  { background: #d4edda; border: 1px solid #c3e6cb; border-radius: 8px; padding: 1rem; margin: 0.5rem 0; }
+    .warning-box  { background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 8px; padding: 1rem; margin: 0.5rem 0; }
+    .error-box    { background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 8px; padding: 1rem; margin: 0.5rem 0; }
+    .info-box     { background: #d1ecf1; border: 1px solid #bee5eb; border-radius: 8px; padding: 1rem; margin: 0.5rem 0; }
+    .tax-box      { background: #e8f5e9; border: 1px solid #a5d6a7; border-radius: 8px; padding: 0.8rem; margin: 0.5rem 0; font-size: 0.9rem; }
+
+    /* File uploader */
+    [data-testid="stFileUploader"] {
+        border: 2px dashed #cbd5e1 !important;
+        border-radius: 10px !important;
+        padding: 12px !important;
+        background-color: #f8fafc !important;
+    }
+    [data-testid="stFileUploader"]:hover {
+        border-color: #3b82f6 !important;
+        background-color: #eff6ff !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # テンプレートチェック（キャッシュ付き — 毎リランで再読込しない）
+    @st.cache_data(show_spinner=False)
+    def _load_template(path: str) -> bytes:
+        with open(path, 'rb') as f:
+            return f.read()
+
+    if not os.path.exists(TEMPLATE_PATH):
+        st.error(
+            f"⚠️ テンプレートファイルが見つかりません: {TEMPLATE_FILENAME}\n\n"
+            f"app.py と同じフォルダに「{TEMPLATE_FILENAME}」を配置してください。"
+        )
+        st.stop()
+    template_data = _load_template(TEMPLATE_PATH)
+
+    # ─── サイドバー ───────────────────────────────────
+    with st.sidebar:
+        # ── メニュー ──
+        st.markdown('<div style="font-size:10px;font-weight:700;color:#94a3b8;letter-spacing:.08em;text-transform:uppercase;padding:8px 0 4px">メニュー</div>', unsafe_allow_html=True)
+        st.markdown('🏠 **ホーム**')
+        st.markdown('<div style="background:#eff6ff;color:#1d4ed8;padding:6px 10px;border-radius:6px;font-size:13px;font-weight:600;margin-bottom:2px">📝 新規作成</div>', unsafe_allow_html=True)
+        st.markdown('📂 作成履歴（準備中）')
+        st.markdown("---")
+
+        # ── 設定 ──
+        st.markdown('<div style="font-size:10px;font-weight:700;color:#94a3b8;letter-spacing:.08em;text-transform:uppercase;padding:4px 0">設定</div>', unsafe_allow_html=True)
+        st.header("🔑 APIキー設定")
+        if GEMINI_API_KEY:
+            api_key = GEMINI_API_KEY
+            st.success("APIキー: 設定済み (.env)")
+        else:
+            api_key = st.text_input(
+                "Gemini APIキー",
+                type="password",
+                help=".envファイルの GEMINI_API_KEY にキーを設定すれば毎回入力不要"
+            )
+        # 利用可能なモデルをAPIで動的取得（APIキーがある場合のみ）
+        if api_key:
+            _ck = api_key[-8:] if len(api_key) >= 8 else api_key
+            if _ck in _model_availability_cache:
+                _avail_models = _model_availability_cache[_ck]
+            else:
+                with st.spinner("利用可能なモデルを確認中..."):
+                    _avail_models = get_available_gemini_models(api_key)
+        else:
+            _avail_models = [_FALLBACK_MODEL]
+        selected_model = st.selectbox(
+            "🤖 AIモデル",
+            options=_avail_models,
+            index=0,
+            key="model_selector_v2",
+            help="APIで利用可能なモデルを自動検出。3.1 Pro=最高精度、2.5 Flash=高速・コスパ良好"
+        )
+        st.markdown("---")
+        st.header("🗂️ Addata DB照合")
+        use_addata = st.sidebar.checkbox(
+            "Addata DB照合を使う",
+            value=_ADDATA_AVAILABLE,
+            help="ローカルAddata DBと照合して品番・価格・工数を補完します（C:\\Addata 等）"
+        )
+        # v6: OneDrive配下のADDATAを自動検索 (各PCで動的に検出)
+        try:
+            from addata_locator import find_addata as _find_ad
+            _auto_ad = _find_ad()
+        except Exception:
+            _auto_ad = None
+        _default_ad = _auto_ad or st.session_state.get('_addata_path_last') or r"C:\Addata"
+        addata_path = st.sidebar.text_input(
+            "Addataフォルダ",
+            _default_ad,
+            help="自動検索結果を表示。違うパスを指定したい場合は手動入力可。"
+        )
+        st.session_state['_addata_path_last'] = addata_path
+        if _auto_ad and addata_path == _auto_ad:
+            st.sidebar.caption(f"✅ 自動検出: OneDrive内ADDATA")
+        elif not os.path.isdir(addata_path):
+            st.sidebar.caption("⚠️ 指定パスが存在しません")
+        if st.sidebar.button("🔄 ADDATA再検索", help="OneDriveを再走査"):
+            try:
+                from addata_locator import find_addata as _refind
+                _new = _refind(force_refresh=True)
+                if _new:
+                    st.sidebar.success(f"検出: {_new}")
+                    st.session_state['_addata_path_last'] = _new
+                    st.rerun()
+                else:
+                    st.sidebar.warning("見つかりませんでした")
+            except Exception as e:
+                st.sidebar.error(f"検索失敗: {e}")
+        st.session_state['_use_addata'] = use_addata
+        st.session_state['_addata_path'] = addata_path
+        # Iter4 v2 / R2: PDF→NEO 完全自動判定モード（A/B/C 3モード）— デフォルトON
+        use_auto_pipeline = st.sidebar.checkbox(
+            "🚀 PDF→NEO 自動判定 (3モード)",
+            value=True,
+            help="車種特定→ADDATA収録判定→A(ベタ打ち)/B(コグニ完全複製)/C(他社あいまい検索)を自動選択。pdf_to_neo_pipeline 経由"
+        )
+        st.session_state['_use_auto_pipeline'] = use_auto_pipeline
+        # Iter25 v3: 精度モード切替 (NEO_FAST_OCR)
+        precision_mode = st.sidebar.checkbox(
+            "🎯 精度モード (Gemini thinking ON)",
+            value=False,
+            help="ON: 精度↑(約30%遅) / OFF: thinking_budget=0 で高速 (デフォルト)"
+        )
+        os.environ["NEO_FAST_OCR"] = "0" if precision_mode else "1"
+        # Iter27 v3: パイプラインキャッシュクリアボタン
+        if st.sidebar.button("🗑️ OCRキャッシュクリア", help="同じPDFの再OCRをやり直したい場合"):
+            try:
+                from pdf_to_neo_pipeline import clear_pipeline_cache
+                clear_pipeline_cache()
+                st.sidebar.success("クリア完了")
+            except Exception as e:
+                st.sidebar.warning(f"クリア失敗: {e}")
+        st.markdown("---")
+        st.header("🔬 精度オプション")
+        use_fax_filter = st.checkbox(
+            "FAXページ自動除外",
+            value=True,
+            help="FAX送付状が混在するPDFの1ページ目を自動検出・除外します。APIコールが1回増えます。"
+        )
+        use_rasterize = st.checkbox(
+            "PDF→画像変換（行ズレ防止）",
+            value=False,
+            help="PDFをJPEG画像に変換してからAIに送ります。通常はOFFのままで精度が高くなります。"
+        )
+        use_enhance = st.checkbox(
+            "画像前処理（FAX品質改善）",
+            value=True,
+            help="コントラスト・シャープネスを強化してFAX品質の画像を読みやすくします。ラスタライズ有効時のみ機能します。"
+        )
+        st.markdown("---")
+        st.header("🛡️ 保険情報")
+        policy_no       = st.text_input("証券番号",  value=st.session_state.get('policy_no', ''))
+        contractor_name = st.text_input("契約者名", value=st.session_state.get('contractor_name', ''))
+        st.session_state['policy_no']       = policy_no
+        st.session_state['contractor_name'] = contractor_name
+        st.markdown("---")
+        st.header("💰 費用（Expense）")
+        exp_towing    = st.number_input("レッカー費用（税抜）",  value=st.session_state.get('exp_towing', 0),    min_value=0, step=1000, key='exp_towing_input')
+        exp_rental    = st.number_input("代車費用（税抜）",      value=st.session_state.get('exp_rental', 0),    min_value=0, step=1000, key='exp_rental_input')
+        exp_exempt    = st.number_input("非課税費用",            value=st.session_state.get('exp_exempt', 0),    min_value=0, step=1000, key='exp_exempt_input')
+        st.session_state['exp_towing'] = exp_towing
+        st.session_state['exp_rental'] = exp_rental
+        st.session_state['exp_exempt'] = exp_exempt
+        st.markdown("---")
+        st.caption(f"消費税率: {int(TAX_RATE * 100)}%（固定）")
+        st.caption(f"見積日: {datetime.datetime.now().strftime('%Y/%m/%d')}（自動）")
+
+        # ── 🧠 学習データ管理 ──────────────────────────────────
+        st.markdown("---")
+        with st.expander("🧠 学習データ管理", expanded=False):
+            _err_summary = get_error_summary()
+            _total_pending = sum(s['count'] for s in _err_summary)
+
+            if _total_pending == 0:
+                st.info("訂正データはまだありません。\nSTEP③で明細を修正するとここに蓄積されます。")
+            else:
+                st.markdown(f"**未統合の訂正データ: {_total_pending}件**")
+                for _es in _err_summary:
+                    _names_str = "、".join(_es['sample_names'][:3]) if _es['sample_names'] else ""
+                    st.markdown(
+                        f"- **{_es['label']}**: {_es['count']}件"
+                        + (f"（例: {_names_str}）" if _names_str else "")
+                    )
+
+                st.markdown("---")
+                # 蓄積データ詳細
+                with st.expander("📋 訂正データ詳細", expanded=False):
+                    _all_corr = get_all_pending_corrections()
+                    if _all_corr:
+                        _corr_rows = []
+                        for _cr in _all_corr:
+                            _corr_rows.append({
+                                "日時": _cr['timestamp'][:16],
+                                "エラー種別": FEEDBACK_ERROR_TYPES.get(_cr['error_type'], _cr['error_type']),
+                                "修正前": f"{_cr['orig_name']} 部品¥{_cr['orig_parts']:,}/工賃¥{_cr['orig_wage']:,}",
+                                "修正後": f"{_cr['corr_name']} 部品¥{_cr['corr_parts']:,}/工賃¥{_cr['corr_wage']:,}",
+                                "コメント": (_cr['user_comment'] or "")[:40],
+                            })
+                        st.dataframe(pd.DataFrame(_corr_rows), use_container_width=True, hide_index=True)
+
+                st.markdown("---")
+                # マスタ統合
+                st.markdown("**プロンプトへのマスタ統合**")
+                if _total_pending < FEEDBACK_MERGE_THRESHOLD:
+                    st.caption(f"※ あと{FEEDBACK_MERGE_THRESHOLD - _total_pending}件蓄積されると統合推奨になります（現在{_total_pending}件）")
+
+                # 統合用パッチテキストを自動生成
+                _patch_lines = ["【学習済み訂正パターン（自動生成）】"]
+                _seen_types = set()
+                _all_corr2 = get_all_pending_corrections()
+                for _cr2 in _all_corr2:
+                    _et = _cr2['error_type']
+                    _on = _cr2['orig_name']
+                    _cp = _cr2['corr_parts']
+                    _cw = _cr2['corr_wage']
+                    _cm = _cr2['user_comment'] or ""
+                    _key = (_et, _on)
+                    if _key in _seen_types:
+                        continue
+                    _seen_types.add(_key)
+                    if _et == "column_swap":
+                        if _cp == 0 and _cw > 0:
+                            _patch_lines.append(f"- 「{_on}」は部品列に記載されていても工賃（wage）として扱うこと")
+                        elif _cp > 0 and _cw == 0:
+                            _patch_lines.append(f"- 「{_on}」は工賃列に記載されていても部品（parts_amount）として扱うこと")
+                    elif _et == "missed_row":
+                        _patch_lines.append(f"- 「{_on}」のような行を見落とさないこと")
+                    elif _et == "amount_misread":
+                        _patch_lines.append(f"- 「{_on}」の金額を正確に読み取ること（桁ずれ注意）")
+                    if _cm:
+                        _patch_lines.append(f"  （補足: {_cm[:60]}）")
+
+                _auto_patch = "\n".join(_patch_lines) if len(_patch_lines) > 1 else ""
+                _patch_text = st.text_area(
+                    "統合するプロンプトパッチ（編集可）",
+                    value=_auto_patch,
+                    height=200,
+                    key="patch_text_input",
+                )
+
+                _mc1, _mc2 = st.columns(2)
+                with _mc1:
+                    if st.button("🔄 マスタ版に統合する", key="merge_patch_btn", type="primary",
+                                 disabled=(_total_pending == 0)):
+                        if _patch_text.strip():
+                            generate_and_save_patch(_patch_text.strip(), "estimate_detail_page")
+                            st.success("✅ プロンプトパッチを適用しました。次回解析から有効になります。")
+                            st.rerun()
+                        else:
+                            st.warning("パッチテキストが空です。")
+                with _mc2:
+                    if st.button("🗑 パッチを無効化", key="deactivate_patch_btn"):
+                        try:
+                            _conn = _get_feedback_db()
+                            _conn.execute("UPDATE prompt_patches SET is_active = 0")
+                            _conn.commit(); _conn.close()
+                            st.success("パッチを無効化しました。")
+                            st.rerun()
+                        except Exception as _pe:
+                            st.error(f"エラー: {_pe}")
+
+            # 現在適用中のパッチ表示
+            _current_patch = _load_learned_hints("estimate_detail_page")
+            if _current_patch:
+                with st.expander("📌 現在適用中のパッチ", expanded=False):
+                    st.code(_current_patch, language=None)
+
+    # セッション状態初期化
+    for key, default in [
+        ('step', 1), ('vehicle_data', None), ('estimate_data', None),
+        ('neo_bytes', None), ('neo_filename', None)
+    ]:
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+    current_step = st.session_state['step']
+
+    # ── Topbar ──
+    api_dot_color = "#22c55e" if api_key else "#ef4444"
+    api_status_text = "接続中" if api_key else "未設定"
+    st.markdown(f"""
+    <div class="topbar">
+        <div class="topbar-title">
+            🚗 SHOUCHIKU8 — NEO自動生成
+            <span class="topbar-badge">v4.0</span>
+        </div>
+        <div class="topbar-right">
+            <span><span class="api-dot" style="background:{api_dot_color}"></span>Gemini API {api_status_text}</span>
+            <span>|</span>
+            <span>モデル: {selected_model}</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Step progress bar ──
+    step_labels = ["① アップロード", "② AI解析", "③ プレビュー・修正", "④ NEO生成"]
+    step_html = '<div class="step-bar">'
+    for i, label in enumerate(step_labels):
+        sn = i + 1
+        if sn < current_step:
+            c_cls = "step-circle step-circle-done"
+            c_txt = "✓"
+            l_cls = "step-label-done"
+        elif sn == current_step:
+            c_cls = "step-circle step-circle-active"
+            c_txt = str(sn)
+            l_cls = "step-label-active"
+        else:
+            c_cls = "step-circle step-circle-pending"
+            c_txt = str(sn)
+            l_cls = "step-label-pending"
+        step_html += f'<div class="step-item"><div class="{c_cls}">{c_txt}</div><span class="{l_cls}" style="font-size:12px;font-weight:600;margin-left:8px">{label}</span></div>'
+        if i < len(step_labels) - 1:
+            conn_cls = "step-connector step-connector-done" if sn < current_step else "step-connector"
+            step_html += f'<div class="{conn_cls}"></div>'
+    step_html += '</div>'
+    st.markdown(step_html, unsafe_allow_html=True)
+
+    # =========================================
+    # STEP 1: アップロード
+    # =========================================
+    if current_step == 1:
+        # ベタ打ちモード固定
+        st.session_state['selected_mode'] = 'beta'
+
+        # ================================================================
+        # STEP 1-A: ファイルアップロード（車検証 + テンプレートNEO）
+        # ================================================================
+        st.markdown('<div class="section-title">📁 ファイルアップロード</div>', unsafe_allow_html=True)
+        _up_col1, _up_col2 = st.columns(2)
+        with _up_col1:
+            vehicle_file = st.file_uploader(
+                "📋 車検証（任意）PDF・JPG・PNG 対応",
+                type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
+                key='vehicle_upload',
+            )
+            if vehicle_file:
+                st.success(f"✅ {vehicle_file.name}")
+                # spec_iter3 課題C (S3-4): ファイルドロップ即解析シグネチャ検知
+                try:
+                    _file_sig = (vehicle_file.name, vehicle_file.size)
+                    if st.session_state.get("last_processed_sig") != _file_sig:
+                        st.session_state["pending_analysis"] = True
+                        st.session_state["last_processed_sig"] = _file_sig
+                except Exception:
+                    pass
+        with _up_col2:
+            custom_neo_file = st.file_uploader(
+                "📁 テンプレートNEOファイル（任意）",
+                type=['neo'],
+                key='custom_neo_upload',
+                help="コグニセブンで作成した.neoファイル。証券番号・工場名・車両情報等が入力済みのものを使用してください。"
+            )
+            if custom_neo_file:
+                _neo_bytes_read = custom_neo_file.read()
+                st.session_state['custom_neo_bytes'] = _neo_bytes_read
+                st.session_state['custom_neo_name']  = custom_neo_file.name
+                custom_neo_file.seek(0)
+                st.success(f"✅ {custom_neo_file.name} ({len(_neo_bytes_read):,} bytes)")
+                st.caption("📋 テンプレートの工場名・証券番号等はそのまま引き継ぎます")
+            elif st.session_state.get('custom_neo_bytes'):
+                _saved_name = st.session_state.get('custom_neo_name', 'テンプレートNEO')
+                _saved_size = len(st.session_state['custom_neo_bytes'])
+                st.success(f"✅ {_saved_name} ({_saved_size:,} bytes) — 前回アップロード済み")
+                if st.button("🗑️ リセット", key='clear_custom_neo'):
+                    st.session_state.pop('custom_neo_bytes', None)
+                    st.session_state.pop('custom_neo_name', None)
+                    st.rerun()
+            else:
+                st.caption(f"未選択 → デフォルトテンプレート（{TEMPLATE_FILENAME}）を使用")
+
+        # ================================================================
+        # STEP 1-B: Gemini解析 → CSV取り込み（メインフロー）
+        # ================================================================
+        st.markdown("---")
+        st.markdown(
+            '<div style="background:#f0fdf4;border:1px solid #86efac;border-radius:10px;'
+            'padding:14px 18px;font-size:14px;margin-bottom:12px;">'
+            '🤖 <b>見積書の解析手順</b><br>'
+            '<span style="font-size:12px;color:#555;">'
+            '① 下の「プロンプトをコピー」をクリック → '
+            '② 「Geminiを開く」でGoogle Geminiへ → '
+            '③ プロンプトを貼り付け＋見積書PDFを添付して送信 → '
+            '④ 結果のCSVをコピーして下欄に貼り付け'
+            '</span>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        # ── プロンプト定義 ──
+        _CSV_PROMPT = """添付の自動車修理見積書PDFを解析し、コグニセブン（Audatex）互換のNEOファイルへ取り込むための構造化データを抽出してください。
+説明文やコメントは一切出力せず、【1. 車両情報】【2. 見積明細（CSV）】、不一致時のみ【3. 検算結果】を出力してください。
+【1. 車両情報（記載がない項目は空欄）】
+車名:
+型式:
+車台番号:
+型式指定番号:
+類別区分番号:
+初度登録年月: （西暦YYYYMM00形式。例: 令和6年9月 → 20240900）
+エンジン型式:
+車体の色:
+【2. 見積明細（CSV形式・ヘッダー行必須）】
+品名,区分コード,数量,部品単価,部品金額,工賃,部品番号
+■ 品名
+元の記載から作業区分キーワード（後述）のみ削除し、部品・部位名称を抽出。
+・カタカナは全て半角カタカナに変換（漢字・ひらがなは全角のまま）。
+・「Fr」「Rr」「ASSY」「左」「右」「NO.」等の部位略語は削除しない。
+・「(ﾄｿｳｽﾞﾐ)」「(ﾒｯｷ)」等カッコ内の部品属性は作業名ではないため削除しない。
+・「費用」「ｼｮｰﾄﾊﾟｰﾂ」「写真代」等の諸費用名称はそのまま残す。
+■ 区分コード（DisposalCode）
+品名の元記載に含まれる作業キーワードから数値コードを1つ判定。
+【重要】複合語は単語より必ず先に判定すること。
+0（取替）：取替、交換、取換、取り替え ※部品金額のみ工賃0の行も 0
+1（脱着）：脱着、取外、取付、組付、脱外
+2（修理）：修理、補修、分解、修正、調整、光軸、フィッティング、コーディング、穴あけ、シーリング、点検、消去、設定、エイミング
+5（分解調整）：分解調整、オーバーホール、点検調整、脱着板金、脱着修理
+6（板金）：鈑金、板金、塗装、ペイント、ワックス、加算、ブース
+-1（該当なし）：上記いずれにも該当しない場合。-1の行は品名から作業キーワードを削除せず
+元の記載をそのまま残すこと（NEOに作業内容としてベタ打ちする）。
+■ その他の列
+・数量：半角整数（不明は 1）
+・部品単価：半角整数カンマなし（なしは 0）
+・部品金額：半角整数カンマなし（数量×部品単価。なしは 0）
+・工賃：半角整数カンマなし（なしは 0）
+・部品番号：品番（なしは空欄）
+【データ処理ルール（厳守事項）】
+出力前に必ず以下の手順で検証を行うこと。※検算は「読み落としや重複がないかを確認するアラート機能」であり、無理やり合計を合わせるためのプロセスではない。
+
+【絶対ルール：数値の捏造禁止とOCRエラーの論理的補正】
+明細の合計額と原本の最終合計が一致しない場合でも、つじつまを合わせるために架空の金額を作り出すなど、数値を「勝手に変更・捏造」することは厳禁とする。
+ただし、PDFのテキスト化（OCR）に起因する以下の「構造的エラー」が明白な場合は、PDFの本来の印字意図に従って論理的に補正・復元して抽出すること。これは改ざんにはあたらない。
+・明らかな文字結合の分離：数量「1」と工賃「22,000」が結合して「122000」と認識されている等、文脈や合計から見て異常な桁数の結合は、本来の列（数量と金額）に分離すること。
+・列ズレの適正化：金額の読み取り位置がズレて部品代と工賃が逆転している場合、作業区分（例：取替＝部品代が発生、脱着・修理＝工賃のみ）を考慮し、正しい列へ配置すること。
+・行分断の結合：品名のない金額だけの行や、複雑な改行により品名と金額が泣き別れになっている場合は、直前直後の項目から文脈を読み解き、本来紐づくべき1行のデータとして結合すること。
+同一部品の統合：
+同一品名かつ同一区分コードで部品金額のみの行と工賃のみの行がある場合、1行にまとめる。
+NEOでは1行に部品代・工賃を同時格納可能。
+例）Frﾊﾞﾝﾊﾞｶﾊﾞｰ,0,1,44440,44440,13200,
+※区分コードが異なる場合は別行（例: 部品=取替(0) + 脱着工賃=脱着(1) → 2行）。
+重複行の扱い：
+クリップ・リテーナ・ボルト等の汎用小部品は、品名・単価が同一でも取付箇所・数量が異なるため複数行が正当に存在する。
+合計額と照合して一致する限り重複行を勝手にマージしない。OCR二重読取が明白な場合（合計超過の原因）のみマージする。
+参考計上の除外：
+最終の部品代合計に含まれていない参考表示部品は部品金額を 0 にして出力。
+合計額不一致時の対応（読み落とし確認）：
+明細の部品金額合計や工賃合計が原本の合計額と不一致の場合、以下の手順で原因を特定すること。
+① まずPDFを再精読し、見落とした行・金額の読み間違いがないか確認する。
+② 特に「ルール1に記載したOCR起因のエラー（列ズレ、行分断、文字結合）」が起きていないか重点的にチェックし、見つかった場合は本来の構造に修正してCSVへ反映する。
+③ 再精読しても原因が不明な不足分・超過分については、勝手に金額を作り出したり数値を調整したりせず、ありのままの状態で出力し、【3. 検算結果】で差額を報告すること。
+諸費用の振り分け：
+「ショートパーツ」「写真代」等は原本の合計構成を確認し正しい列（部品金額 or 工賃）に配置。
+対象外：合計行、小計行、消費税行、値引行は出力しない。全ページ漏れなく処理する。
+【3. 検算結果（不一致時のみ出力）】
+抽出データの部品金額合計・工賃合計を算出し原本と照合。完全一致なら出力しない。
+合わない場合は数値を捏造せず、ありのままの差額（読み落としアラート）を以下の形式で末尾に出力すること。
+部品相違〇,〇〇〇円
+工賃相違●,●●●円"""
+
+        _escaped = _CSV_PROMPT.replace('\\', '\\\\').replace('`', '\\`').replace('$', '\\$').replace('\n', '\\n')
+
+        # ── ボタン行: プロンプトコピー ＋ Geminiを開く ──
+        _btn_col1, _btn_col2 = st.columns(2)
+        with _btn_col1:
+            st.components.v1.html(f"""
+<button onclick="navigator.clipboard.writeText(`{_escaped}`).then(()=>{{
+    this.textContent='✅ コピーしました！';
+    this.style.background='#16a34a';
+    setTimeout(()=>{{this.textContent='📋 プロンプトをコピー';this.style.background='#2563eb';}},2000);
+}})" style="
+    background:#2563eb;color:white;border:none;border-radius:8px;
+    padding:12px 14px;font-size:14px;cursor:pointer;font-weight:700;width:100%;height:52px;
+">📋 プロンプトをコピー</button>
+""", height=56)
+        with _btn_col2:
+            st.components.v1.html("""
+<a href="https://gemini.google.com/" target="_blank" rel="noopener noreferrer" style="
+    display:flex;align-items:center;justify-content:center;gap:8px;
+    background:#ea4335;color:white;border:none;border-radius:8px;
+    padding:12px 14px;font-size:14px;cursor:pointer;font-weight:700;width:100%;height:52px;
+    text-decoration:none;
+">🌐 Geminiを開く（別タブ）</a>
+""", height=56)
+
+        # ── CSV取り込みエリア ──
+        st.markdown("")
+        st.markdown('<div class="section-title">📊 CSV取り込み</div>', unsafe_allow_html=True)
+
+        # 税区分選択
+        _tax_options = ['税抜き（外税）', '税込み（内税）']
+        _saved_tax_override = st.session_state.get('tax_override', '税抜き（外税）')
+        _tax_default_idx = 1 if '内税' in str(_saved_tax_override) or '税込' in str(_saved_tax_override) else 0
+        _tax_sel = st.radio(
+            "💴 見積書の金額表記",
+            options=_tax_options,
+            index=_tax_default_idx,
+            horizontal=True,
+            key='csv_tax_radio',
+        )
+        st.session_state['tax_override'] = _tax_sel
+
+        _csv_col1, _csv_col2 = st.columns([2, 1])
+        with _csv_col1:
+            _csv_paste = st.text_area(
+                "Geminiの解析結果CSVを貼り付け（ヘッダー行必須）",
+                height=180,
+                placeholder="品名,区分コード,数量,部品単価,部品金額,工賃,部品番号\nFrﾊﾞﾝﾊﾞｶﾊﾞｰ(ﾄｿｳｽﾞﾐ),0,1,45000,45000,0,\nFrﾊﾞﾝﾊﾞｶﾊﾞｰ,0,1,0,0,12000,",
+                key='csv_paste_area',
+                value=st.session_state.get('_csv_paste_saved', ''),
+            )
+        with _csv_col2:
+            st.markdown("**CSVファイル（.csv/.txt）**")
+            _csv_file = st.file_uploader(
+                "CSVファイル",
+                type=['csv', 'txt'],
+                key='csv_file_upload',
+                label_visibility='collapsed',
+            )
+            if st.session_state.get('csv_mode') and st.session_state.get('csv_items'):
+                _p = sum(safe_int(it.get('parts_amount', 0)) for it in st.session_state['csv_items'])
+                _w = sum(safe_int(it.get('wage', 0)) for it in st.session_state['csv_items'])
+                st.success(f"✅ {len(st.session_state['csv_items'])}行 取込済")
+                st.caption(f"部品: ¥{_p:,} / 工賃: ¥{_w:,}")
+                if st.button("🗑️ クリア", key='csv_clear_btn'):
+                    st.session_state.pop('csv_items', None)
+                    st.session_state.pop('csv_mode', None)
+                    st.session_state.pop('_csv_paste_saved', None)
+                    st.rerun()
+
+        _csv_text = ''
+        if _csv_file:
+            try:
+                _raw = _csv_file.read()
+                for _enc in ('utf-8-sig', 'utf-8', 'shift-jis', 'cp932'):
+                    try:
+                        _csv_text = _raw.decode(_enc)
+                        break
+                    except Exception:
+                        continue
+                if not _csv_text:
+                    st.error(
+                        "**原因**: CSVファイルの文字コードを判別できませんでした。\n\n"
+                        "**対処**: ① ファイルを UTF-8 または Shift-JIS で保存し直してください "
+                        "② Excelの場合「CSV UTF-8」形式で書き出し ③ それでも解決しない場合は "
+                        "テキストエディタで開いて貼り付けでお試しください。"
+                    )
+            except Exception as e:
+                st.error(
+                    "**原因**: CSVファイルの読み込み中に予期せぬエラーが発生しました。\n\n"
+                    "**対処**: ① ファイルが破損していないか確認 ② 別のCSVで試す "
+                    "③ 解決しない場合は下の技術詳細を竹下さんに送付してください。"
+                )
+                with st.expander("技術詳細（開発者向け）"):
+                    st.exception(e)
+        elif _csv_paste and _csv_paste.strip():
+            _csv_text = _csv_paste.strip()
+
+        if _csv_text:
+            # 車両情報セクション自動パース（Gemini出力に【1. 車両情報】が含まれている場合）
+            _csv_vehicle = parse_vehicle_from_text(_csv_text)
+            if _csv_vehicle:
+                st.session_state['csv_vehicle_info'] = _csv_vehicle
+            _preview_items = parse_csv_to_items(_csv_text)
+            if _preview_items:
+                _veh_label = f" ／ 車両情報: {_csv_vehicle.get('car_name','')} {_csv_vehicle.get('car_model','')}" if _csv_vehicle.get('car_name') else ''
+                st.success(f"✅ {len(_preview_items)}行 読み込み完了 — 部品: ¥{sum(safe_int(it.get('parts_amount',0)) for it in _preview_items):,} / 工賃: ¥{sum(safe_int(it.get('wage',0)) for it in _preview_items):,}{_veh_label}")
+                st.session_state['csv_items'] = _preview_items
+                st.session_state['csv_mode']  = True
+                st.session_state['_csv_paste_saved'] = _csv_text
+            else:
+                st.error(
+                    "**原因**: CSVの1行目にヘッダー行が見つかりませんでした。\n\n"
+                    "**対処**: ① 1行目を `品名,区分コード,数量,部品単価,部品金額,工賃,部品番号` にする "
+                    "② 区切りはカンマ（,）に統一 ③ Geminiの解析結果を再貼り付けして確認。"
+                )
+                st.session_state.pop('csv_items', None)
+                st.session_state.pop('csv_mode', None)
+
+        # ── オプション設定 ──
+        with st.expander("⚙️ オプション設定", expanded=False):
+            opt_col1, opt_col2, opt_col3 = st.columns(3)
+            with opt_col1:
+                policy_no_step1 = st.text_input("保険会社", placeholder="例: 東京海上日動", key="ins_company_step1")
+            with opt_col2:
+                policy_no_step1b = st.text_input("証券番号", placeholder="例: TK-12345678", key="ins_policy_step1")
+            with opt_col3:
+                assignee_step1 = st.text_input("担当者名", placeholder="例: 田中 花子", key="assignee_step1")
+
+        # ── 開始ボタン ──
+        st.markdown("")
+        estimate_file = None  # PDF見積書アップロード廃止（CSV取り込みに一本化）
+        _csv_mode_active = st.session_state.get('csv_mode') and st.session_state.get('csv_items')
+        _has_input = vehicle_file or _csv_mode_active
+        if _has_input:
+            _btn_label = "🚀 NEO生成を開始 →"
+            if st.button(_btn_label, type="primary", use_container_width=True):
+                if vehicle_file:
+                    st.session_state['vehicle_file_bytes'] = vehicle_file.read()
+                    st.session_state['vehicle_file_name']  = vehicle_file.name
+                else:
+                    st.session_state['vehicle_file_bytes'] = None
+                    st.session_state['vehicle_file_name']  = None
+                # PDF見積書は使用しない（CSV取り込みに一本化）
+                st.session_state['estimate_file_bytes'] = None
+                st.session_state['estimate_file_name']  = None
+                st.session_state['use_fax_filter'] = False
+                st.session_state['use_rasterize']  = False
+                st.session_state['use_enhance']    = True
+                st.session_state['selected_model'] = selected_model
+                st.session_state['step'] = 2
+                st.rerun()
+        else:
+            st.info("📊 CSVを貼り付けるか、車検証をアップロードして「NEO生成を開始」を押してください")
+
+    # =========================================
+    # STEP 2: AI解析
+    # =========================================
+    elif current_step == 2:
+        st.markdown('<div class="step-header">② AI解析中...</div>', unsafe_allow_html=True)
+        vehicle_bytes  = st.session_state.get('vehicle_file_bytes')
+        vehicle_name   = st.session_state.get('vehicle_file_name', '')
+        estimate_bytes = st.session_state.get('estimate_file_bytes')
+        estimate_name  = st.session_state.get('estimate_file_name', '')
+        _use_fax       = st.session_state.get('use_fax_filter', False)
+        _use_raster    = st.session_state.get('use_rasterize', False)  # デフォルトFalse（PDF直接送信）
+        _use_enhance   = st.session_state.get('use_enhance', True)
+        _model         = st.session_state.get('selected_model', GEMINI_MODEL)
+        # ベタ打ちモードでは自己修復ループを無効化（DB照合不要のため高速化）
+        _is_beta_s2    = st.session_state.get('selected_mode', 'db') == 'beta'
+        _enable_sc     = not _is_beta_s2
+
+        # ── CSV取り込みモード: 見積AI解析をスキップ ──
+        _csv_mode_s2   = st.session_state.get('csv_mode', False)
+        _csv_items_s2  = st.session_state.get('csv_items', [])
+        if _csv_mode_s2 and _csv_items_s2 and estimate_bytes is None:
+            st.info(f"📊 CSVモード: {len(_csv_items_s2)}行を取り込みます（AI解析をスキップ）")
+            # 車検証のみAI解析（ある場合）
+            vehicle_data = {}
+            if vehicle_bytes:
+                with st.spinner("🔍 車検証を解析中..."):
+                    try:
+                        vehicle_mime = get_mime_type(vehicle_name) if vehicle_bytes else None
+                        vehicle_data = analyze_vehicle_registration(api_key, vehicle_bytes, vehicle_mime) or {}
+                    except Exception as _veh_err:
+                        st.warning(f"⚠️ 車検証OCRに失敗しました（{str(_veh_err)[:60]}）。車両情報なしで続行します。")
+                        vehicle_data = {}
+            # CSV貼り付けテキストから抽出した車両情報をマージ（OCRが無い/空のフィールドを補完）
+            _csv_veh_info = st.session_state.get('csv_vehicle_info', {})
+            if _csv_veh_info:
+                for _k, _v in _csv_veh_info.items():
+                    if _v and not vehicle_data.get(_k):
+                        vehicle_data[_k] = _v
+            st.session_state['vehicle_data'] = vehicle_data
+            # CSVアイテムをestimate_dataとして格納
+            _tax_s2 = st.session_state.get('tax_override', '税抜き（外税）')
+            _is_tax_incl_csv = '内税' in str(_tax_s2) or '税込' in str(_tax_s2)
+            estimate_data = {
+                'items':            _csv_items_s2,
+                'discount_amount':  0,
+                'short_parts_wage': 0,
+                'confidence':       1.0,
+                'pdf_parts_total':  sum(safe_int(it.get('parts_amount', 0)) for it in _csv_items_s2),
+                'pdf_wage_total':   sum(safe_int(it.get('wage', 0)) for it in _csv_items_s2),
+                'pdf_grand_total':  0,
+                '_is_tax_inclusive': _is_tax_incl_csv,
+                '_tax_basis':       'tax_inclusive' if _is_tax_incl_csv else 'tax_exclusive',
+                '_page_count':      1,
+                '_vehicle_info':    {},
+                '_repair_shop_name': '',
+                '_csv_import':      True,
+            }
+            if _is_tax_incl_csv:
+                st.info("💴 税込モード: CSVの金額は税込みとして処理されます")
+            else:
+                st.info("💴 税抜モード: CSVの金額は税抜きとして処理されます")
+            st.session_state['estimate_data'] = estimate_data
+            st.success(f"✅ CSV取り込み完了（{len(_csv_items_s2)}行）")
+            st.session_state['step'] = 3
+            st.rerun()
+
+        if vehicle_bytes is None and estimate_bytes is None:
+            st.error("ファイルデータが見つかりません。ステップ①に戻ってください。")
+            if st.button("← ステップ①に戻る"):
+                st.session_state['step'] = 1
+                st.rerun()
+            st.stop()
+
+        progress = st.progress(0, text="AI解析を開始しています...")
+        _wait_msg = st.info(
+            "📡 GeminiにPDFを送信し解析中です。"
+            "ページ数・ファイルサイズによって **30秒〜2分** かかる場合があります。"
+            "このページから移動せずにお待ちください。"
+        )
+
+        # spec_iter4 課題E (S4-5): 計測開始
+        import time as _time_iter4
+        _t0_iter4 = _time_iter4.perf_counter()
+
+        # spec_iter4 課題D (S4-4): 同一ファイル再アップロード時のキャッシュヒット
+        try:
+            _sig_iter4 = (
+                (vehicle_name or '', len(vehicle_bytes or b'')),
+                (estimate_name or '', len(estimate_bytes or b'')),
+            )
+            _ac = st.session_state.get('analysis_cache')
+            if _ac and _ac.get('sig') == _sig_iter4 and _ac.get('items') is not None:
+                st.info("⚡ 同一ファイルを検出しました — キャッシュから即座に復元します。")
+                vehicle_data = _ac.get('vehicle_info') or {}
+                estimate_data = {
+                    'items': _ac.get('items') or [],
+                    'discount_amount': 0,
+                    'short_parts_wage': 0,
+                    'confidence': 1.0,
+                    '_vehicle_info': {},
+                    '_repair_shop_name': '',
+                    '_cache_hit': True,
+                }
+                if _ac.get('neo_bytes'):
+                    st.session_state['neo_bytes'] = _ac['neo_bytes']
+                st.session_state['vehicle_data'] = vehicle_data
+                st.session_state['estimate_data'] = estimate_data
+                st.caption(
+                    f"⏱ 処理時間: キャッシュ再利用 (合計 {_time_iter4.perf_counter() - _t0_iter4:.2f}s)"
+                )
+                st.session_state['step'] = 3
+                st.rerun()
+        except Exception:
+            pass
+
+        def _progress_cb(pct: int, text: str):
+            try:
+                progress.progress(pct, text=text)
+            except Exception:
+                pass
+
+        try:
+            vehicle_mime  = get_mime_type(vehicle_name) if vehicle_bytes else None
+            estimate_mime = get_mime_type(estimate_name) if estimate_bytes else None
+
+            if vehicle_bytes and estimate_bytes:
+                # 車検証＋見積書を並列で解析
+                progress.progress(5, text="🔍 車検証＋見積書を同時解析中...")
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    fut_vehicle = executor.submit(
+                        analyze_vehicle_registration, api_key, vehicle_bytes, vehicle_mime
+                    )
+                    fut_estimate = executor.submit(
+                        analyze_estimate, api_key, estimate_bytes, estimate_mime, _model,
+                        _use_fax, _use_raster, _use_enhance, _enable_sc
+                    )
+                    try:
+                        vehicle_data = fut_vehicle.result()
+                    except Exception as _veh_err:
+                        st.warning(f"⚠️ 車検証OCR失敗（{str(_veh_err)[:60]}）。車両情報なしで続行します。")
+                        vehicle_data = {}
+                    progress.progress(40, text="✅ 車検証の解析完了、見積書を処理中...")
+                    try:
+                        estimate_data = fut_estimate.result() or {}
+                    except Exception as _est_err:
+                        st.error(f"⚠️ 見積書解析に失敗しました: {str(_est_err)[:100]}")
+                        st.warning("ネットワークが不安定な可能性があります。もう一度お試しください。")
+                        estimate_data = None
+            elif vehicle_bytes:
+                # 車検証のみ
+                progress.progress(10, text="🔍 車検証を解析中...")
+                vehicle_data  = analyze_vehicle_registration(api_key, vehicle_bytes, vehicle_mime)
+                estimate_data = None
+            else:
+                # 見積書のみ（車検証なし）— 逐次解析でプログレス更新可能
+                progress.progress(5, text="🔍 見積書の解析を開始中...")
+                vehicle_data  = {}
+                estimate_data = analyze_estimate(
+                    api_key, estimate_bytes, estimate_mime, _model,
+                    _use_fax, _use_raster, _use_enhance, _enable_sc,
+                    progress_cb=_progress_cb,
+                ) or {}
+
+            st.session_state['vehicle_data'] = vehicle_data
+            progress.progress(90, text="✅ 解析完了")
+            _wait_msg.empty()  # 「お待ちください」メッセージを非表示
+
+            if vehicle_bytes:
+                v_conf = safe_float(vehicle_data.get('confidence', 1.0), 1.0)
+                if v_conf < CONFIDENCE_THRESHOLD:
+                    st.warning(f"⚠️ 車検証の読み取り信頼度が低いです（{v_conf:.0%}）。プレビュー画面で内容をご確認ください。")
+
+            # 見積書の後処理
+            if estimate_data:
+                # 部品名を半角カタカナに変換
+                for item in estimate_data.get('items', []):
+                    if item.get('name'):
+                        item['name'] = to_halfwidth_katakana(item['name'])
+
+                # 見積書ヘッダの車両情報で車検証データの空欄を補完
+                # （車検証なしの場合は見積書の車両情報が唯一の情報源となる）
+                est_vinfo = estimate_data.get('_vehicle_info', {})
+                if est_vinfo and vehicle_data is not None:
+                    MERGE_MAP = {
+                        'car_name':      'car_name',
+                        'car_model':     'car_model',
+                        'engine_model':  'engine_model',
+                        'color_code':    'color_code',
+                        'color_name':    'body_color',
+                        'trim_code':     'trim_code',
+                        'grade':         'grade',
+                        'chassis_no':    'car_serial_no',
+                        'mileage':       'kilometer',
+                    }
+                    supplemented = []
+                    for est_key, veh_key in MERGE_MAP.items():
+                        est_val = est_vinfo.get(est_key, '')
+                        if est_val and not vehicle_data.get(veh_key):
+                            vehicle_data[veh_key] = est_val
+                            supplemented.append(veh_key)
+                    if supplemented:
+                        st.session_state['vehicle_data'] = vehicle_data
+                        st.info(f"📋 見積書から車両情報を補完: {', '.join(supplemented)}")
+
+                st.session_state['estimate_data'] = estimate_data
+                progress.progress(90, text="✅ 見積書の解析完了")
+
+                e_conf = safe_float(estimate_data.get('confidence', 1.0), 1.0)
+                if e_conf < CONFIDENCE_THRESHOLD:
+                    st.warning(f"⚠️ 見積書の読み取り信頼度が低いです（{e_conf:.0%}）。プレビュー画面で内容をご確認ください。")
+
+                # --- 11. ベタ打ちモード: PDF見積をそのまま転記 ---
+                estimate_data['_veh_match_result'] = {'match_layer': 3, 'is_supported': False, 'reason': 'ベタ打ちモード'}
+                progress.progress(92, text="✏️ PDF見積をそのまま転記中...")
+                
+                # --- 税区分 ユーザー選択値を常に適用（AI自動判定廃止）---
+                _tax_override = st.session_state.get('tax_override', '税抜き（外税）')
+                if _tax_override == '税込み（内税）':
+                    estimate_data['_is_tax_inclusive'] = True
+                    estimate_data['_tax_basis']        = 'tax_inclusive'
+                else:
+                    # デフォルト: 税抜き（外税）
+                    estimate_data['_is_tax_inclusive'] = False
+                    estimate_data['_tax_basis']        = 'tax_exclusive'
+                    estimate_data.pop('_tax_converted', None)
+
+                # --- セッションステートへの保存 ---
+                st.session_state['estimate_data'] = estimate_data
+
+                # 精度処理の結果を表示
+                _current_mode = st.session_state.get('selected_mode', 'beta')
+                info_msgs = []
+                if not vehicle_bytes:
+                    info_msgs.append("📋 車検証なしモード: 見積書から読み取れた車両情報のみでNEOを作成します。ステップ③で車両情報を確認・補完してください。")
+                info_msgs.append("✏️ ベタ打ちモード: PDF見積の全明細をそのままNEOファイルに転記します")
+
+                # 修理工場名の表示
+                shop_name = estimate_data.get('_repair_shop_name', '')
+                if shop_name:
+                    info_msgs.append(f"🏭 修理工場: {shop_name}")
+                if estimate_data.get('_fax_filtered', 0) > 0:
+                    info_msgs.append("🗑️ FAX送付状を自動除外しました")
+                if estimate_data.get('_self_corrected'):
+                    info_msgs.append("🔧 自己修復ループが有効になりました")
+                page_count = estimate_data.get('_page_count', 1)
+                if page_count > 1:
+                    info_msgs.append(f"📄 {page_count}ページ分割処理（重複除去済み）")
+                tax_basis = estimate_data.get('_tax_basis', 'tax_exclusive')
+                if tax_basis == 'tax_inclusive':
+                    info_msgs.append("💱 税込モード（ユーザー選択）— NEOファイルも税込で生成します")
+                else:
+                    info_msgs.append("✅ 税抜モード（ユーザー選択）")
+                # 明細行整合性チェックの警告表示
+                row_warnings = estimate_data.get('_row_warnings', [])
+                if row_warnings:
+                    info_msgs.append(f"🔍 明細行整合性チェック: {len(row_warnings)}件の注意事項")
+                if info_msgs:
+                    for msg in info_msgs:
+                        st.info(msg)
+                if row_warnings:
+                    with st.expander(f"⚠️ 整合性チェック詳細（{len(row_warnings)}件）", expanded=False):
+                        for w in row_warnings:
+                            st.warning(w)
+            else:
+                st.session_state['estimate_data'] = None
+                progress.progress(90, text="（見積書なし）")
+
+            progress.progress(100, text="✅ 解析完了！")
+            st.session_state['step'] = 3
+            st.rerun()
+        except Exception as e:
+            progress.empty()
+            err_str = str(e)
+            # クォータ超過エラーの場合、分かりやすいメッセージとリトライを促す
+            if '429' in err_str or 'RESOURCE_EXHAUSTED' in err_str or 'クォータが上限' in err_str:
+                _cur_model = st.session_state.get('selected_model', _model or 'gemini-2.5-flash')
+                _quota_exhausted_models.add(_cur_model)
+                # キャッシュクリア
+                _api_key_for_err = api_key
+                if _api_key_for_err:
+                    _ck = _api_key_for_err[-8:]
+                    if _ck in _model_availability_cache:
+                        del _model_availability_cache[_ck]
+                # 代替モデルを探す
+                _alt = next((m for m in _PREFERRED_MODELS if m not in _quota_exhausted_models), None)
+                if _alt:
+                    st.warning(
+                        f"⚠️ モデル「{_cur_model}」の1日クォータ（250回）が上限に達しました。\n\n"
+                        f"**🔄 代替モデル「{_alt}」に自動切り替えます。「② AI解析」ボタンをもう一度押してください。**",
+                        icon="⚠️"
+                    )
+                    # 自動的に代替モデルをセッションに設定
+                    st.session_state['selected_model'] = _alt
+                else:
+                    st.error(
+                        "⚠️ 全モデルのクォータが上限に達しました。\n\n"
+                        "翌日（リセット後）か、Google AI StudioでAPIキーの課金を有効化してください。"
+                    )
+            else:
+                st.error(f"⚠️ AI解析中にエラーが発生しました:\n\n{err_str}")
+                st.code(traceback.format_exc())
+            if st.button("← ステップ①に戻る"):
+                st.session_state['step'] = 1
+                st.rerun()
+
+    # =========================================
+    # STEP 3: プレビュー・修正
+    # =========================================
+    elif current_step == 3:
+        vehicle_data  = st.session_state.get('vehicle_data') or {}
+        estimate_data = st.session_state.get('estimate_data')
+
+        if not vehicle_data and not estimate_data:
+            st.error("解析データがありません。ステップ①に戻ってください。")
+            if st.button("← ステップ①に戻る"):
+                st.session_state['step'] = 1
+                st.rerun()
+            st.stop()
+
+        # ── 車両ストリップ ──
+        veh_match_result = estimate_data.get('_veh_match_result', {}) if estimate_data else {}
+        match_is_db = veh_match_result.get('is_supported', False)
+        car_name_strip = safe_str(vehicle_data.get('car_name', ''))
+        car_model_strip = safe_str(vehicle_data.get('car_model', ''))
+        engine_strip = safe_str(vehicle_data.get('engine_model', ''))
+        reg_date_strip = safe_str(vehicle_data.get('car_reg_date', ''))
+        if len(reg_date_strip) >= 6:
+            reg_date_display = f"{reg_date_strip[:4]}/{reg_date_strip[4:6]}"
+        else:
+            reg_date_display = reg_date_strip
+        km_strip = safe_int(vehicle_data.get('kilometer', 0))
+        type_desig = safe_str(vehicle_data.get('car_model_designation', ''))
+        cat_num = safe_str(vehicle_data.get('car_category_number', ''))
+        v_code = veh_match_result.get('vehicle_code', '')
+        items_count = len(estimate_data.get('items', [])) if estimate_data else 0
+
+        # HTMLを安全に組み立て（f-string内の条件式を排除）
+        _badges_parts = []
+        if type_desig:
+            _badges_parts.append(f'<span style="background:#dbeafe;color:#1d4ed8;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600">型式指定 {type_desig}</span>')
+        if cat_num:
+            _badges_parts.append(f'<span style="background:#dbeafe;color:#1d4ed8;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600">類別 {cat_num}</span>')
+        _badges_html = ' '.join(_badges_parts)
+
+        _mode_badge = '<span style="background:#f1f5f9;color:#475569;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600">✏️ ベタ打ち</span>'
+
+        _detail_text = f'{engine_strip} ／ {reg_date_display}登録 ／ {km_strip:,}km'
+
+        _strip_html = (
+            '<div style="background:linear-gradient(135deg,#1a2744 0%,#1e3a5f 100%);color:#fff;'
+            'border-radius:10px;padding:16px 20px;margin-bottom:16px;display:flex;align-items:flex-start;gap:16px">'
+            '<span style="font-size:32px">🚗</span>'
+            '<div style="flex:1">'
+            f'<div style="font-size:18px;font-weight:700">{car_name_strip} '
+            f'<span style="font-size:14px;font-weight:400">{car_model_strip}</span></div>'
+            f'<div style="font-size:12px;color:#94a3b8;margin-top:2px">{_detail_text}</div>'
+            f'<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">{_badges_html}</div>'
+            '</div>'
+            f'<div style="text-align:right">{_mode_badge}'
+            f'<div style="font-size:11px;color:#94a3b8;margin-top:4px">{items_count}件</div>'
+            '</div>'
+            '</div>'
+        )
+        st.markdown(_strip_html, unsafe_allow_html=True)
+
+        # ── 解析ログ表示 ──────────────────────────────────────────────────────────
+        if estimate_data:
+            _analysis_log = estimate_data.get('_analysis_log', [])
+            if _analysis_log:
+                # 最終行から一致・不一致を判定してラベルを変える
+                _log_label_ok = any('✅' in l for l in _analysis_log)
+                _log_label_ng = any('⚠️ 差額' in l for l in _analysis_log)
+                _log_icon = '✅' if _log_label_ok and not _log_label_ng else ('⚠️' if _log_label_ng else '🔍')
+                with st.expander(f"{_log_icon} 解析ログ（詳細）", expanded=False):
+                    st.code('\n'.join(_analysis_log), language=None)
+
+        # 信頼度・税区分の警告
+        v_conf = safe_float(vehicle_data.get('confidence', 1.0), 1.0)
+        if v_conf < CONFIDENCE_THRESHOLD:
+            st.markdown(f'<div class="alert alert-warn">⚠️ 車検証の読み取り信頼度: <b>{v_conf:.0%}</b> — 内容をよくご確認ください。</div>', unsafe_allow_html=True)
+        if estimate_data:
+            e_conf = safe_float(estimate_data.get('confidence', 1.0), 1.0)
+            if e_conf < CONFIDENCE_THRESHOLD:
+                st.markdown(f'<div class="alert alert-warn">⚠️ 見積書の読み取り信頼度: <b>{e_conf:.0%}</b> — 内容をよくご確認ください。</div>', unsafe_allow_html=True)
+            tax_basis = estimate_data.get('_tax_basis', 'tax_exclusive')
+            rev_match = estimate_data.get('_reverse_match', False)
+            shop_name  = estimate_data.get('_repair_shop_name', '')
+            # コグニセブン設定用 税モード（ユーザー選択値）
+            if tax_basis == 'tax_inclusive':
+                cogni_tax_mode = '税込'
+                cogni_tax_color = '#1e40af'
+                cogni_tax_bg = '#dbeafe'
+                cogni_tax_border = '#3b82f6'
+                cogni_tax_icon = '🔵'
+                basis_label = '税込明細（ユーザー設定）'
+            else:
+                cogni_tax_mode = '税抜'
+                cogni_tax_color = '#14532d'
+                cogni_tax_bg = '#dcfce7'
+                cogni_tax_border = '#22c55e'
+                cogni_tax_icon = '🟢'
+                basis_label = '税抜明細（ユーザー設定）'
+            rev_icon = '✅ 逆算一致' if rev_match else '⚠️ 逆算不一致（金額を確認してください）'
+            shop_html   = f'<div style="font-size:13px;color:#374151;margin-bottom:10px">🏭 修理工場: <b>{shop_name}</b></div>' if shop_name else ''
+            st.markdown(f'''
+<div style="border:2px solid {cogni_tax_border};border-radius:8px;background:{cogni_tax_bg};padding:14px 18px;margin-bottom:12px">
+  {shop_html}
+  <div style="font-size:13px;color:{cogni_tax_color};font-weight:600;margin-bottom:6px">■ コグニセブン設定用 税区分</div>
+  <div style="font-size:22px;font-weight:700;color:{cogni_tax_color}">{cogni_tax_icon} コグニセブンを <u>{cogni_tax_mode}モード</u> に設定してください</div>
+  <div style="font-size:13px;color:{cogni_tax_color};margin-top:4px">（{basis_label} ／ {rev_icon}）</div>
+</div>
+''', unsafe_allow_html=True)
+
+        # ── タブ（見積明細タブ廃止・編集は合計・費用タブへ統合）──
+        tab_vehicle, tab_totals = st.tabs(["🚗 車両情報", "💰 合計・費用"])
+
+        with tab_vehicle:
+            st.markdown('<div class="section-title">📋 車検証情報</div>', unsafe_allow_html=True)
+            # 車両情報（修正可能なフォーム）
+            col1, col2 = st.columns(2)
+            with col1:
+                v_customer = st.text_input("使用者名",    value=safe_str(vehicle_data.get('customer_name', '')),    key='v_customer')
+                v_owner    = st.text_input("所有者名",    value=safe_str(vehicle_data.get('owner_name', '')),       key='v_owner')
+                v_postal   = st.text_input("郵便番号",    value=safe_str(vehicle_data.get('postal_no', '')),        key='v_postal')
+                v_pref     = st.text_input("都道府県",    value=safe_str(vehicle_data.get('prefecture', '')),       key='v_pref')
+                v_muni     = st.text_input("市区町村",    value=safe_str(vehicle_data.get('municipality', '')),     key='v_muni')
+                v_addr     = st.text_input("その他住所",  value=safe_str(vehicle_data.get('address_other', '')),    key='v_addr')
+            with col2:
+                v_dept   = st.text_input("登録番号 地名",   value=safe_str(vehicle_data.get('car_reg_department', '')), key='v_dept')
+                v_div    = st.text_input("登録番号 分類番号", value=safe_str(vehicle_data.get('car_reg_division', '')),   key='v_div')
+                v_biz    = st.text_input("登録番号 かな",   value=safe_str(vehicle_data.get('car_reg_business', '')),   key='v_biz')
+                v_serial = st.text_input("登録番号 一連番号", value=safe_str(vehicle_data.get('car_reg_serial', '')),    key='v_serial')
+                v_carname = st.text_input("車名",           value=safe_str(vehicle_data.get('car_name', '')),             key='v_carname')
+                v_model   = st.text_input("型式",            value=safe_str(vehicle_data.get('car_model', '')),            key='v_model')
+
+            # ── 車種特定情報（NEO車両IDの核となるフィールド）──
+            st.markdown('<div class="section-title" style="margin-top:14px">🔑 車種特定情報</div>', unsafe_allow_html=True)
+            id1, id2, id3, id4 = st.columns(4)
+            with id1:
+                v_csn        = st.text_input("車台番号",              value=safe_str(vehicle_data.get('car_serial_no', '')),          key='v_csn')
+            with id2:
+                v_modeldesig = st.text_input("型式指定番号",          value=safe_str(vehicle_data.get('car_model_designation', '')),  key='v_modeldesig')
+            with id3:
+                v_catnum     = st.text_input("類別区分番号",          value=safe_str(vehicle_data.get('car_category_number', '')),    key='v_catnum')
+            with id4:
+                v_regdate    = st.text_input("初度登録年月 (YYYYMM00)", value=safe_str(vehicle_data.get('car_reg_date', '')),         key='v_regdate')
+            col3, col4 = st.columns(2)
+            with col3:
+                v_km      = st.number_input("走行距離 (km)", value=safe_int(vehicle_data.get('kilometer', 0)), min_value=0, step=1000, key='v_km')
+            with col4:
+                v_term    = st.text_input("有効期限 (YYYYMMDD)",   value=safe_str(vehicle_data.get('term_date', '')),    key='v_term')
+
+            # 車両詳細情報
+            st.markdown('<div class="section-title" style="margin-top:16px">🔧 車両詳細</div>', unsafe_allow_html=True)
+            dc1, dc2, dc3 = st.columns(3)
+            with dc1:
+                v_engine    = st.text_input("エンジン型式", value=safe_str(vehicle_data.get('engine_model', '')),           key='v_engine')
+                v_trimcode  = st.text_input("トリムコード", value=safe_str(vehicle_data.get('trim_code', '')),              key='v_trimcode')
+            with dc2:
+                v_color     = st.text_input("車体の色",     value=safe_str(vehicle_data.get('body_color', '')),             key='v_color')
+                v_colorcode = st.text_input("カラーコード", value=safe_str(vehicle_data.get('color_code', '')),             key='v_colorcode')
+            with dc3:
+                v_weight    = st.number_input("車両重量 (kg)",  value=safe_int(vehicle_data.get('car_weight', 0)),          min_value=0, step=10, key='v_weight')
+                v_displace  = st.number_input("排気量 (cc)",    value=safe_int(vehicle_data.get('engine_displacement', 0)), min_value=0, step=100, key='v_displace')
+
+        updated_vehicle = {
+            'customer_name':      v_customer,
+            'owner_name':         v_owner,
+            'postal_no':          v_postal,
+            'prefecture':         v_pref,
+            'municipality':       v_muni,
+            'address_other':      v_addr,
+            'car_reg_department': v_dept,
+            'car_reg_division':   v_div,
+            'car_reg_business':   v_biz,
+            'car_reg_serial':     v_serial,
+            'car_serial_no':      v_csn,
+            'car_name':           v_carname,
+            'car_model':          v_model,
+            'engine_model':       v_engine,
+            'body_color':         v_color,
+            'color_code':         v_colorcode,
+            'trim_code':          v_trimcode,
+            'car_model_designation': v_modeldesig,
+            'car_category_number':   v_catnum,
+            'car_weight':         v_weight,
+            'engine_displacement': v_displace,
+            'kilometer':          v_km,
+            'term_date':          v_term,
+            'car_reg_date':       v_regdate,
+        }
+
+        # 見積明細（合計・費用タブ内で編集）
+        calc_parts    = 0
+        calc_wages    = 0
+        pdf_parts     = 0
+        pdf_wages     = 0
+        sp            = 0
+        wage_match_sp = False  # Step4でも参照するため初期化
+        # tab_totals 内の条件分岐に依存する変数を安全のため事前初期化
+        _step3_mode       = st.session_state.get('selected_mode', 'db')
+        discrepancies     = []
+        total_diff        = 0
+        edited_items      = []
+
+        with tab_totals:
+          if estimate_data and estimate_data.get('items'):
+
+            # ── 明細行一覧 (編集可) ──────────────────────────────
+            st.markdown('<div class="section-title">📋 明細行一覧（全項目・編集可）</div>', unsafe_allow_html=True)
+
+            # AI初期出力を _original_items として保存（初回のみ）
+            if '_original_items' not in st.session_state:
+                st.session_state['_original_items'] = [dict(it) for it in estimate_data.get('items', [])]
+
+            _items_src = estimate_data['items']
+            # ── 行操作ボタン（挿入・コピー・削除） ──────────────────────
+            _op_col1, _op_col2, _op_col3, _op_col4 = st.columns([1, 1, 1, 5])
+            with _op_col1:
+                if st.button("➕ 行挿入", key="row_insert_btn", help="最終行に空白行を追加"):
+                    _new_row = {
+                        'name': '', 'method': '', 'work_code': '', 'index_value': '',
+                        'quantity': 1, 'parts_amount': 0, 'wage': 0, 'part_no': '',
+                    }
+                    estimate_data['items'].append(_new_row)
+                    st.session_state['estimate_data'] = estimate_data
+                    st.rerun()
+            with _op_col2:
+                _copy_no = st.number_input("コピーNo", min_value=1, max_value=max(len(_items_src), 1),
+                                           value=1, step=1, key="row_copy_no", label_visibility="collapsed")
+            with _op_col3:
+                if st.button("📋 コピー", key="row_copy_btn", help="指定No行を複製して最終行に追加"):
+                    _cidx = int(_copy_no) - 1
+                    if 0 <= _cidx < len(_items_src):
+                        import copy as _copy
+                        _copied = _copy.deepcopy(_items_src[_cidx])
+                        estimate_data['items'].append(_copied)
+                        st.session_state['estimate_data'] = estimate_data
+                        st.rerun()
+
+            # 表示用DataFrame（7列）: No / 部品番号 / 品名 / 数量 / 部品金額 / 工数 / 工賃
+            _edit_rows = []
+            for _i, _item in enumerate(_items_src):
+                _part_code   = str(_item.get('part_no', '') or '')
+                _index_value = str(_item.get('index_value', '') or '')
+                _edit_rows.append({
+                    'No':     _i + 1,
+                    '部品番号': _part_code,
+                    '品名':   str(_item.get('name', '')),
+                    '数量':   safe_int(_item.get('quantity', 1), 1),
+                    '部品金額': safe_int(_item.get('parts_amount', 0)),
+                    '工数':   _index_value,
+                    '工賃':   safe_int(_item.get('wage', 0)),
+                })
+            _df_edit = pd.DataFrame(_edit_rows) if _edit_rows else pd.DataFrame(
+                columns=['No', '部品番号', '品名', '数量', '部品金額', '工数', '工賃'])
+            # キーを行数と連動させることで行挿入後に data_editor を強制再初期化する
+            _editor_key = f'items_editor_{len(_items_src)}'
+            # height を固定して描画行数を制限（全行フル展開すると100行超で重くなるため）
+            _editor_height = min(600, max(200, len(_items_src) * 35 + 60))
+            _edited_df = st.data_editor(
+                _df_edit,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic",
+                height=_editor_height,
+                column_config={
+                    'No':     st.column_config.NumberColumn('No', disabled=True, width='small'),
+                    '部品番号': st.column_config.TextColumn('部品番号'),
+                    '品名':   st.column_config.TextColumn('品名', width='large'),
+                    '数量':   st.column_config.NumberColumn('数量', min_value=1, step=1, width='small'),
+                    '部品金額': st.column_config.NumberColumn('部品金額', step=1, format="¥%d"),
+                    '工数':   st.column_config.TextColumn('工数', width='small'),
+                    '工賃':   st.column_config.NumberColumn('工賃', step=1, format="¥%d"),
+                },
+                key=_editor_key,
+            )
+            # 編集後データを反映（既存行の内部メタデータを保持、新規行はデフォルト値）
+            _edited_df = _edited_df.reset_index(drop=True)
+            _edited_df['No'] = range(1, len(_edited_df) + 1)
+            edited_items = []
+            for _i, _row in _edited_df.iterrows():
+                _nv = _row.get('品名', '');     _nv = '' if pd.isna(_nv) else str(_nv)
+                _pc = _row.get('部品番号', ''); _pc = '' if pd.isna(_pc) else str(_pc)
+                _iv = _row.get('工数', '');     _iv = '' if pd.isna(_iv) else str(_iv)
+                # 既存行のメタデータを引き継ぐ（新規追加行はデフォルト）
+                _orig = _items_src[_i] if _i < len(_items_src) else {}
+                _method_val = _orig.get('method', '')
+                _wcode_val  = _orig.get('work_code', '')
+                edited_items.append({
+                    'name': _nv, 'method': _method_val, 'work_code': _wcode_val,
+                    'index_value': _iv,
+                    'quantity': safe_int(_row.get('数量', 1), 1),
+                    'parts_amount': safe_int(_row.get('部品金額', 0)),
+                    'wage': safe_int(_row.get('工賃', 0)),
+                    'part_no': _pc,
+                })
+            estimate_data['items'] = edited_items
+            st.session_state['estimate_data'] = estimate_data
+            for _it in edited_items:
+                calc_parts += safe_int(_it.get('parts_amount', 0))
+                calc_wages += safe_int(_it.get('wage', 0))
+            sp = safe_int(estimate_data.get('short_parts_wage', 0))
+            pdf_parts = safe_int(estimate_data.get('pdf_parts_total', 0))
+            pdf_wages = safe_int(estimate_data.get('pdf_wage_total', 0))
+
+            # ── フィードバック: 差分検出（アイテムが変わった時だけ再計算）─────
+            _orig_items_fb = st.session_state.get('_original_items', [])
+            _fb_hash = hash(str([(it.get('name',''), it.get('parts_amount',0), it.get('wage',0)) for it in edited_items]))
+            if st.session_state.get('_fb_hash') != _fb_hash:
+                st.session_state['_fb_cache'] = _detect_corrections(_orig_items_fb, edited_items)
+                st.session_state['_fb_hash']  = _fb_hash
+            _fb_corrections = st.session_state.get('_fb_cache', [])
+            if _fb_corrections:
+                _fb_key = f"fb_open_{hash(str(_fb_corrections))}"
+                with st.expander(f"📝 読み取り訂正レポート（{len(_fb_corrections)}件の変更を検出）", expanded=False):
+                    st.markdown("**以下の行が修正されました。AIへのフィードバックとして記録できます。**")
+                    _fb_rows = []
+                    for _fc in _fb_corrections:
+                        _orig = _fc.get("original", {})
+                        _corr = _fc.get("corrected", {})
+                        _fb_rows.append({
+                            "行": _fc["row_index"],
+                            "品名(修正前)": _orig.get("name", "-"),
+                            "部品(修正前)": f"¥{safe_int(_orig.get('parts_amount',0)):,}" if _orig else "-",
+                            "工賃(修正前)": f"¥{safe_int(_orig.get('wage',0)):,}" if _orig else "-",
+                            "品名(修正後)": _corr.get("name", "-") if _corr else "（削除）",
+                            "部品(修正後)": f"¥{safe_int(_corr.get('parts_amount',0)):,}" if _corr else "-",
+                            "工賃(修正後)": f"¥{safe_int(_corr.get('wage',0)):,}" if _corr else "-",
+                            "推定エラー種別": FEEDBACK_ERROR_TYPES.get(_fc.get("error_type","other"), _fc.get("error_type","")),
+                        })
+                    st.table(pd.DataFrame(_fb_rows).set_index("行"))
+
+                    st.markdown("**エラーの原因を文章で教えてください（任意）:**")
+                    _fb_comment = st.text_area(
+                        "例: 工賃列に記載されているのに部品として読み取られた",
+                        key="fb_comment_input", height=80, label_visibility="collapsed"
+                    )
+                    _fb_doc_type = estimate_data.get('_document_type', '不明')
+                    _fbc1, _fbc2 = st.columns([1, 3])
+                    with _fbc1:
+                        if st.button("✅ フィードバックを記録する", key="fb_record_btn", type="primary"):
+                            record_correction(_fb_corrections, _fb_comment, _fb_doc_type)
+                            st.session_state['_original_items'] = [dict(it) for it in edited_items]
+                            st.success(f"✅ {len(_fb_corrections)}件の訂正をDBに記録しました")
+                            # 蓄積件数チェック
+                            _summary = get_error_summary()
+                            _total_pending = sum(s['count'] for s in _summary)
+                            if _total_pending >= FEEDBACK_MERGE_THRESHOLD:
+                                st.info(f"💡 訂正データが{_total_pending}件蓄積されました。サイドバーの「🧠 学習データ管理」からマスタ統合を実行できます。")
+                    with _fbc2:
+                        if st.button("⏭ スキップ", key="fb_skip_btn"):
+                            st.session_state['_original_items'] = [dict(it) for it in edited_items]
+
+            st.markdown("---")
+            # ── 金額サマリー ────────────────────────────────────
+            st.markdown('<div class="section-title">💰 金額サマリー</div>', unsafe_allow_html=True)
+            scol1, scol2, scol3 = st.columns(3)
+            rev_match = estimate_data.get('_reverse_match', False)
+
+            # 税込/税抜モード判定
+            is_tax_incl_s3 = estimate_data.get('_is_tax_inclusive', False)
+            tax_label_sfx  = "税込" if is_tax_incl_s3 else "税抜"
+
+            # 金額差額の計算
+            parts_diff = calc_parts - pdf_parts if pdf_parts > 0 else 0
+            # SP込みでも一致チェック（部品）
+            parts_match_sp = (calc_parts + sp == pdf_parts) if pdf_parts > 0 else False
+            # 税込モードでは明細合算とPDF記載値の小差（明細行数×1円以内）も一致とみなす
+            _parts_tol = len(edited_items) if is_tax_incl_s3 else 0
+            parts_match_tol = (abs(calc_parts - pdf_parts) <= _parts_tol) if pdf_parts > 0 else False
+            parts_match_tol_sp = (abs(calc_parts + sp - pdf_parts) <= _parts_tol) if pdf_parts > 0 else False
+            parts_match = (calc_parts == pdf_parts) or parts_match_sp or parts_match_tol or parts_match_tol_sp
+            wage_diff = calc_wages - pdf_wages if pdf_wages > 0 else 0
+            # SP込みでも一致チェック（工賃）: Honda Cars等でSPが工賃列に含まれる場合
+            wage_match_sp = (calc_wages + sp == pdf_wages) if pdf_wages > 0 else False
+            _wages_tol = len(edited_items) if is_tax_incl_s3 else 0
+            wage_match_tol = (abs(calc_wages - pdf_wages) <= _wages_tol) if pdf_wages > 0 else False
+            wage_match_tol_sp = (abs(calc_wages + sp - pdf_wages) <= _wages_tol) if pdf_wages > 0 else False
+            wage_match = (calc_wages == pdf_wages) or wage_match_sp or wage_match_tol or wage_match_tol_sp
+            has_discrepancy = False
+
+            with scol1:
+                st.metric(f"部品合計（{tax_label_sfx}）", f"¥{calc_parts:,}")
+                if pdf_parts > 0 and not parts_match and not rev_match:
+                    has_discrepancy = True
+                    st.markdown(
+                        f'<div class="error-box">⚠️ <b>部品相違</b>: PDF ¥{pdf_parts:,} ≠ 計算 ¥{calc_parts:,}（差額: {parts_diff:+,}円）</div>',
+                        unsafe_allow_html=True
+                    )
+                elif pdf_parts > 0:
+                    st.markdown('<div class="success-box">✅ PDF金額と一致</div>', unsafe_allow_html=True)
+            with scol2:
+                st.metric(f"工賃合計（{tax_label_sfx}）", f"¥{calc_wages:,}")
+                if pdf_wages > 0 and not wage_match and not rev_match:
+                    has_discrepancy = True
+                    st.markdown(
+                        f'<div class="error-box">⚠️ <b>工賃相違</b>: PDF ¥{pdf_wages:,} ≠ 計算 ¥{calc_wages:,}（差額: {wage_diff:+,}円）</div>',
+                        unsafe_allow_html=True
+                    )
+                elif pdf_wages > 0:
+                    st.markdown('<div class="success-box">✅ PDF金額と一致</div>', unsafe_allow_html=True)
+            with scol3:
+                exp_tow = st.session_state.get('exp_towing', 0)
+                exp_ren = st.session_state.get('exp_rental', 0)
+                exp_exm = st.session_state.get('exp_exempt', 0)
+                sub = calc_parts + calc_wages + sp + exp_tow + exp_ren
+                if is_tax_incl_s3:
+                    # 税込モード: 明細金額は既に税込 → 消費税を加算しない
+                    total = sub + exp_exm
+                else:
+                    tax   = round(sub * TAX_RATE)
+                    total = sub + tax + exp_exm
+                st.metric("合計（税込）", f"¥{total:,}")
+                if rev_match:
+                    st.markdown('<div class="success-box">✅ 逆算一致</div>', unsafe_allow_html=True)
+
+            # ── STEP 3 バリデーション結果パネル ──
+            # parts_match / wage_match はこの直上でリアルタイム再計算済みの値を使用する
+            # (estimate_data['totals_verification'] は解析時の古い判定のため使わない)
+            _tv_has_data = (pdf_parts > 0 or pdf_wages > 0)
+            if _tv_has_data:
+                _tv_p_mismatch = pdf_parts > 0 and not parts_match and not rev_match
+                _tv_w_mismatch = pdf_wages > 0 and not wage_match and not rev_match
+                if not _tv_p_mismatch and not _tv_w_mismatch:
+                    st.markdown(
+                        '<div class="success-box" style="padding:10px 16px;margin-bottom:12px">'
+                        '✅ <b>【STEP 3 バリデーション: 合格】</b> 見積書記載の合計値と1円の誤差もなく一致しています。'
+                        '</div>', unsafe_allow_html=True)
+                else:
+                    _disp_p_diff = parts_diff if _tv_p_mismatch else 0
+                    _disp_w_diff = wage_diff  if _tv_w_mismatch else 0
+                    _err_parts_list = []
+                    if _disp_p_diff != 0: _err_parts_list.append(f'部品差額{_disp_p_diff:+,}円')
+                    if _disp_w_diff != 0: _err_parts_list.append(f'工賃差額{_disp_w_diff:+,}円')
+                    err_text = f'<br>推定原因: {"・".join(_err_parts_list)}' if _err_parts_list else ''
+                    st.markdown(
+                        f'<div class="error-box" style="padding:10px 16px;margin-bottom:12px">'
+                        f'🚨 <b>【STEP 3 バリデーション: 不合格】</b> 金額の不一致が検出されています。<br>'
+                        f'部品差額: {_disp_p_diff:+,}円 ／ 工賃差額: {_disp_w_diff:+,}円{err_text}'
+                        f'</div>', unsafe_allow_html=True)
+
+            # ── ベタ打ちモード専用: 包括的金額一致検証パネル ──
+            _step3_mode = st.session_state.get('selected_mode', 'db')
+            if _step3_mode == 'beta':
+                st.markdown('<div class="section-title">📋 ベタ打ちモード — 金額一致検証レポート</div>', unsafe_allow_html=True)
+                pdf_grand = safe_int(estimate_data.get('pdf_grand_total', 0))
+                tax_basis_s3 = estimate_data.get('_tax_basis', 'unknown')
+                _beta_verification_rows = []
+                _beta_all_ok = True
+
+                # 各行ごとの部品価格・工賃の記録
+                for idx_b, item_b in enumerate(edited_items):
+                    row_name = item_b.get('name', f'行{idx_b+1}')
+                    row_parts = safe_int(item_b.get('parts_amount', 0))
+                    row_wage = safe_int(item_b.get('wage', 0))
+                    _beta_verification_rows.append({
+                        'No': idx_b + 1,
+                        '品名': row_name,
+                        '部品価格': f"¥{row_parts:,}" if row_parts != 0 else '-',
+                        '工賃': f"¥{row_wage:,}" if row_wage != 0 else '-',
+                    })
+
+                with st.expander("📊 明細行一覧（全項目）", expanded=False):
+                    st.table(pd.DataFrame(_beta_verification_rows).set_index('No'))
+
+                # 合算値の一致確認
+                _verify_items = []
+                # ① 部品合計
+                parts_ok = parts_match or rev_match
+                _verify_items.append(('部品合計', pdf_parts, calc_parts, parts_ok))
+                if not parts_ok and pdf_parts > 0:
+                    _beta_all_ok = False
+                # ② 工賃合計
+                wage_ok = wage_match or rev_match
+                _verify_items.append(('工賃合計', pdf_wages, calc_wages, wage_ok))
+                if not wage_ok and pdf_wages > 0:
+                    _beta_all_ok = False
+                # ③ 見積合計（税込or税抜）
+                if pdf_grand > 0:
+                    grand_label = '見積合計（税込）' if tax_basis_s3 == 'tax_inclusive' else '見積合計（税抜→税込算出）'
+                    # 丸め誤差の許容: 明細行数 × 1円 + 基本許容10円（最大50円）
+                    _n_items = len(edited_items)
+                    _grand_tolerance = min(_n_items + 10, 50)
+                    grand_ok = abs(total - pdf_grand) <= _grand_tolerance
+                    _verify_items.append((grand_label, pdf_grand, total, grand_ok))
+                    if not grand_ok:
+                        _beta_all_ok = False
+
+                verify_html = '<table style="width:100%;border-collapse:collapse;font-size:13px;margin:8px 0">'
+                verify_html += '<tr style="background:#f1f5f9;font-weight:600"><td style="padding:6px 10px">検証項目</td><td style="padding:6px 10px;text-align:right">PDF記載</td><td style="padding:6px 10px;text-align:right">計算値</td><td style="padding:6px 10px;text-align:center">結果</td></tr>'
+                for v_label, v_pdf, v_calc, v_ok in _verify_items:
+                    v_icon = '✅' if v_ok else '❌'
+                    v_color = '#16a34a' if v_ok else '#dc2626'
+                    v_diff = v_calc - v_pdf
+                    v_diff_text = f' ({v_diff:+,}円)' if not v_ok and v_pdf > 0 else ''
+                    verify_html += f'<tr style="border-bottom:1px solid #e2e8f0"><td style="padding:6px 10px">{v_label}</td><td style="padding:6px 10px;text-align:right">¥{v_pdf:,}</td><td style="padding:6px 10px;text-align:right">¥{v_calc:,}{v_diff_text}</td><td style="padding:6px 10px;text-align:center;color:{v_color};font-weight:600">{v_icon}</td></tr>'
+
+                # ④ 逆算チェック: 合計から逆算して個別金額との不整合チェック
+                reverse_ok = False  # ブロック外からの参照に備えて初期化
+                if pdf_grand > 0 and (pdf_parts > 0 or pdf_wages > 0):
+                    _rev_exp_tow = st.session_state.get('exp_towing', 0)
+                    _rev_exp_ren = st.session_state.get('exp_rental', 0)
+                    reverse_sub = calc_parts + calc_wages + sp + _rev_exp_tow + _rev_exp_ren
+                    if is_tax_incl_s3:
+                        # 税込モード: 金額は既に税込 → 消費税を加算しない
+                        reverse_grand = reverse_sub + st.session_state.get('exp_exempt', 0)
+                    else:
+                        reverse_tax = round(reverse_sub * TAX_RATE)
+                        reverse_grand = reverse_sub + reverse_tax + st.session_state.get('exp_exempt', 0)
+                    _rev_tolerance = min(_n_items + 10, 50)
+                    reverse_ok = abs(reverse_grand - pdf_grand) <= _rev_tolerance
+                    reverse_icon = '✅' if reverse_ok else '⚠️'
+                    reverse_color = '#16a34a' if reverse_ok else '#d97706'
+                    if not reverse_ok:
+                        _beta_all_ok = False
+                    verify_html += f'<tr style="border-bottom:1px solid #e2e8f0;background:#fefce8"><td style="padding:6px 10px">逆算検証（税込総額）</td><td style="padding:6px 10px;text-align:right">¥{pdf_grand:,}</td><td style="padding:6px 10px;text-align:right">¥{reverse_grand:,}</td><td style="padding:6px 10px;text-align:center;color:{reverse_color};font-weight:600">{reverse_icon}</td></tr>'
+
+                verify_html += '</table>'
+                st.markdown(verify_html, unsafe_allow_html=True)
+
+                # 一致率の算出・表示
+                total_checks = len(_verify_items) + (1 if pdf_grand > 0 and (pdf_parts > 0 or pdf_wages > 0) else 0)
+                passed_checks = sum(1 for _, _, _, ok in _verify_items if ok)
+                if pdf_grand > 0 and (pdf_parts > 0 or pdf_wages > 0) and reverse_ok:
+                    passed_checks += 1
+                match_rate = (passed_checks / total_checks * 100) if total_checks > 0 else 0
+                if _beta_all_ok:
+                    st.markdown(f'<div class="success-box" style="padding:10px 16px;margin:8px 0">✅ <b>ベタ打ち検証: 全項目一致（一致率 {match_rate:.0f}%）</b> — PDF原本とNEO転記内容が完全一致しています。</div>', unsafe_allow_html=True)
+                else:
+                    st.markdown(f'<div class="error-box" style="padding:10px 16px;margin:8px 0">⚠️ <b>ベタ打ち検証: 不一致あり（一致率 {match_rate:.0f}%）</b> — PDF原本との差異を確認してください。基準: 99%以上</div>', unsafe_allow_html=True)
+
+            # ── ベタ打ちモード専用: 部品・工賃区分確認パネル ──────────────────────────
+            _classification_alerts = []
+            _classification_confirmed = True
+            _error_alerts = []
+            if _step3_mode == 'beta':
+                # アイテムが変わった時だけ再計算（session_stateでキャッシュ）
+                _items_hash = hash(str([(it.get('name',''), it.get('parts_amount',0), it.get('wage',0)) for it in edited_items]))
+                if st.session_state.get('_cls_hash') != _items_hash:
+                    st.session_state['_cls_cache'] = check_parts_labor_classification(edited_items)
+                    st.session_state['_cls_hash']  = _items_hash
+                _classification_alerts = st.session_state.get('_cls_cache', [])
+                _error_alerts   = [a for a in _classification_alerts if a['severity'] == 'error']
+                _warning_alerts = [a for a in _classification_alerts if a['severity'] == 'warning']
+
+                if _classification_alerts:
+                    st.markdown(
+                        '<div class="section-title">🔍 部品・工賃区分確認（NEO転記前の必須チェック）</div>',
+                        unsafe_allow_html=True
+                    )
+                    # エラー（要確認）
+                    if _error_alerts:
+                        st.markdown(
+                            f'<div class="error-box" style="padding:10px 16px;margin:6px 0">'
+                            f'🚨 <b>要確認: 部品/工賃の区分に疑わしい行が {len(_error_alerts)} 件あります</b><br>'
+                            f'以下の行を確認し、正しい列に金額が入っているかを確認してください。'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                        for a in _error_alerts:
+                            st.markdown(
+                                f'<div style="background:#fef2f2;border-left:4px solid #dc2626;padding:8px 12px;margin:4px 0;font-size:13px">'
+                                f'🔴 <b>行{a["row_no"]}「{a["name"]}」</b>: '
+                                f'部品¥{a["parts_amount"]:,} / 工賃¥{a["wage"]:,}<br>'
+                                f'⚠️ {a["message"]}'
+                                f'</div>',
+                                unsafe_allow_html=True
+                            )
+                    # 警告（参考情報）
+                    if _warning_alerts:
+                        with st.expander(f"⚠️ 参考警告 ({len(_warning_alerts)} 件) — 要確認の可能性あり", expanded=False):
+                            for a in _warning_alerts:
+                                st.markdown(
+                                    f'<div style="background:#fffbeb;border-left:4px solid #d97706;padding:8px 12px;margin:4px 0;font-size:13px">'
+                                    f'🟡 <b>行{a["row_no"]}「{a["name"]}」</b>: '
+                                    f'部品¥{a["parts_amount"]:,} / 工賃¥{a["wage"]:,}<br>'
+                                    f'{a["message"]}'
+                                    f'</div>',
+                                    unsafe_allow_html=True
+                                )
+
+                    # 確認チェックボックス（エラーがある場合のみ）
+                    if _error_alerts:
+                        _classification_confirmed = st.checkbox(
+                            "⬆️ 上記の部品/工賃区分を確認しました。この内容でNEOファイルに転記します。",
+                            value=False,
+                            key='classification_confirmed'
+                        )
+                        if not _classification_confirmed:
+                            st.info(
+                                "💡 明細を修正するには、上の「✏️ 明細行を修正」エリアで各行の部品金額・工賃を直接編集できます。"
+                                "区分が正しければチェックを入れてNEO生成に進んでください。"
+                            )
+                    else:
+                        _classification_confirmed = True
+                        st.markdown(
+                            '<div class="success-box" style="padding:10px 16px;margin:8px 0">'
+                            '✅ <b>部品・工賃区分チェック: 参考警告のみ</b> — 重大な区分エラーは検出されませんでした。</div>',
+                            unsafe_allow_html=True
+                        )
+                else:
+                    st.markdown(
+                        '<div class="success-box" style="padding:10px 16px;margin:8px 0">'
+                        '✅ <b>部品・工賃区分チェック: 問題なし</b> — 全明細行の区分が正常です。</div>',
+                        unsafe_allow_html=True
+                    )
+
+            # セッションに保存（STEP4で参照）
+            st.session_state['classification_alerts'] = _classification_alerts
+            # classification_confirmed: 別キーで管理（ウィジェットキーとの衝突回避）
+            if not _error_alerts:
+                st.session_state['_cls_confirmed_value'] = _classification_confirmed
+            else:
+                st.session_state['_cls_confirmed_value'] = st.session_state.get('classification_confirmed', False)
+
+            # Addata マスタ差額レポートは除外済み（別途実装予定）
+            discrepancies = []
+            total_diff = 0
+            amount_confirmed = True
+
+            DISCREPANCY_THRESHOLD = 1000
+            if has_discrepancy and (abs(parts_diff) >= DISCREPANCY_THRESHOLD or abs(wage_diff) >= DISCREPANCY_THRESHOLD):
+                st.markdown(
+                    '<div class="mismatch-banner">'
+                    '<div class="mismatch-title">🚨 金額不一致警告</div>'
+                    '<div class="mismatch-body">AI読み取り金額とPDF記載金額に大きな差があります。<br>'
+                    '明細行の内容を確認・修正してから生成してください。</div>'
+                    '</div>',
+                    unsafe_allow_html=True
+                )
+                amount_confirmed = st.checkbox(
+                    "金額の差異を確認しました。このまま生成を続行します。",
+                    value=False,
+                    key='amount_confirmed'
+                )
+            else:
+                amount_confirmed = True
+
+            # ── Total strip ──
+            sub   = calc_parts + calc_wages + sp + st.session_state.get('exp_towing', 0) + st.session_state.get('exp_rental', 0)
+            _is_tax_incl_strip = (estimate_data.get('_is_tax_inclusive', False) if estimate_data else False)
+            if _is_tax_incl_strip:
+                tax   = 0
+                total = sub + st.session_state.get('exp_exempt', 0)
+            else:
+                tax   = round(sub * TAX_RATE)
+                total = sub + tax + st.session_state.get('exp_exempt', 0)
+            st.markdown(f"""
+            <div class="total-strip">
+                <div class="total-item">
+                    <div class="total-label">部品代</div>
+                    <div class="total-value">¥{calc_parts:,}</div>
+                </div>
+                <div class="total-sep">+</div>
+                <div class="total-item">
+                    <div class="total-label">工賃</div>
+                    <div class="total-value">¥{calc_wages:,}</div>
+                </div>
+                <div class="total-sep">+</div>
+                <div class="total-item">
+                    <div class="total-label">{'消費税（税込済）' if _is_tax_incl_strip else '消費税'}</div>
+                    <div class="total-value">{'—' if _is_tax_incl_strip else f'¥{tax:,}'}</div>
+                </div>
+                <div class="total-sep">=</div>
+                <div class="total-item">
+                    <div class="total-label">合計{'（税込）' if not _is_tax_incl_strip else ''}</div>
+                    <div class="total-value-highlight">¥{total:,}</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+          else:
+            amount_confirmed = True
+            st.info("💡 見積書なし — 車両情報のみのNEOファイルを作成します")
+
+        # ── 部品/工賃区分確認チェックの取得（ベタ打ちモード）──────────────────
+        _cls_confirmed   = st.session_state.get('_cls_confirmed_value', True)
+        _cls_alerts      = st.session_state.get('classification_alerts', [])
+        _cls_errors      = [a for a in _cls_alerts if a['severity'] == 'error']
+        # ベタ打ちモード以外は常にOK
+        if _step3_mode != 'beta':
+            _cls_confirmed = True
+
+        # NEO生成ボタン
+        st.markdown("---")
+
+        # 区分エラーがあって未確認の場合、警告を表示（ただし生成はブロックしない）
+        if _cls_errors and not _cls_confirmed and _step3_mode == 'beta':
+            st.markdown(
+                '<div style="background:#fffbeb;border:1px solid #d97706;border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:13px">'
+                f'⚠️ <b>部品・工賃区分に{len(_cls_errors)}件の注意事項があります</b>（上部の「🔍 部品・工賃区分確認」で確認可能）<br>'
+                'そのまま生成することもできます。'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+        bcol1, bcol2 = st.columns(2)
+        with bcol1:
+            if st.button("← ステップ①に戻る", use_container_width=True):
+                st.session_state['step'] = 1
+                st.session_state['vehicle_data']  = None
+                st.session_state['estimate_data'] = None
+                st.rerun()
+        with bcol2:
+            # 金額差異未確認時のみボタンを無効化（分類エラーではブロックしない）
+            gen_disabled = not amount_confirmed
+            if st.button("📦 NEOファイルを生成する →", type="primary", use_container_width=True, disabled=gen_disabled):
+                st.session_state['updated_vehicle'] = updated_vehicle
+                st.session_state['calc_parts']      = calc_parts
+                st.session_state['calc_wages']      = calc_wages
+                st.session_state['pdf_parts']       = pdf_parts if estimate_data else None
+                st.session_state['pdf_wages']       = pdf_wages if estimate_data else None
+                st.session_state['discrepancies']   = discrepancies
+                st.session_state['total_diff']      = total_diff
+                st.session_state['step'] = 4
+                st.rerun()
+            if not amount_confirmed:
+                st.caption("⬆️ 金額差異を確認してチェックを入れてください")
+
+    # =========================================
+    # STEP 4: NEO生成・ダウンロード
+    # =========================================
+    elif current_step == 4:
+        updated_vehicle = st.session_state.get('updated_vehicle', {})
+        estimate_data   = st.session_state.get('estimate_data')
+        calc_parts      = st.session_state.get('calc_parts', 0)
+        calc_wages      = st.session_state.get('calc_wages', 0)
+        pdf_parts       = st.session_state.get('pdf_parts') or 0
+        pdf_wages       = st.session_state.get('pdf_wages') or 0
+        insurance_info  = {
+            'policy_no':        st.session_state.get('policy_no', ''),
+            'contractor_name':  st.session_state.get('contractor_name', ''),
+        }
+        expense_info = {
+            'towing':      st.session_state.get('exp_towing', 0),
+            'rental_car':  st.session_state.get('exp_rental', 0),
+            'tax_exempt':  st.session_state.get('exp_exempt', 0),
+        }
+        items            = []
+        short_parts_wage = 0
+        has_estimate     = False
+        reverse_match    = False
+        if estimate_data and estimate_data.get('items'):
+            items            = estimate_data['items']
+            short_parts_wage = safe_int(estimate_data.get('short_parts_wage', 0))
+            has_estimate     = True
+            reverse_match    = estimate_data.get('_reverse_match', False)
+
+        progress = st.progress(0, text="NEOファイルを生成中...")
+        _neo_wait = st.info("📦 NEOファイルを生成しています。しばらくお待ちください...")
+        try:
+            progress.progress(20, text="📦 テンプレートを読み込み中...")
+            is_tax_inclusive = estimate_data.get('_is_tax_inclusive', False) if estimate_data else False
+            _step4_beta = st.session_state.get('selected_mode', 'db') == 'beta'
+            # カスタムテンプレートNEOが指定されている場合はそちらを使用
+            # session_stateに永続化したバイト列を優先使用（file_uploaderはステップ遷移でクリアされるため）
+            _custom_neo_bytes = st.session_state.get('custom_neo_bytes')
+            if not _custom_neo_bytes:
+                # フォールバック: file_uploaderが同一セッション内でまだ生きている場合
+                _fallback_neo = st.session_state.get('custom_neo_upload')
+                if _fallback_neo:
+                    _custom_neo_bytes = _fallback_neo.read()
+                    _fallback_neo.seek(0)
+            _use_custom_neo   = _custom_neo_bytes is not None
+            _active_template  = _custom_neo_bytes if _use_custom_neo else template_data
+            if _use_custom_neo:
+                _custom_name = st.session_state.get('custom_neo_name', 'カスタムNEO')
+                progress.progress(35, text=f"📁 テンプレートNEO ({_custom_name}) を読み込み中...")
+            progress.progress(50, text="⚙️ 明細データをNEOに書き込み中...")
+            # spec_iter3 課題D (S3-3): 5段ステップを st.status で可視化
+            try:
+                _iter3_status_ctx = st.status("解析中…", expanded=True)
+            except Exception:
+                _iter3_status_ctx = None
+            if _iter3_status_ctx is not None:
+                with _iter3_status_ctx as _iter3_status:
+                    try:
+                        st.write("① 車検証OCR 完了")
+                        st.write("② 見積書データ取り込み 完了")
+                        st.write("③ DB照合（addata）実行中")
+                    except Exception:
+                        pass
+                    try:
+                        _iter3_status.update(label="DB照合中…")
+                    except Exception:
+                        pass
+            # spec_iter4 課題E: OCR完了タイムスタンプ
+            try:
+                import time as _time_iter4b
+                if '_t0_iter4' not in dir():
+                    _t0_iter4 = _time_iter4b.perf_counter()
+                _t_ocr_end_iter4 = _time_iter4b.perf_counter()
+            except Exception:
+                _t_ocr_end_iter4 = None
+            # --- v2-Iter4: PDF→NEO 自動判定パイプライン（モード A/B/C 自動選択） ---
+            try:
+                _use_pipe = st.session_state.get('_use_auto_pipeline', False)
+                _ad_path_pipe = st.session_state.get('_addata_path', r'C:\Addata')
+                if _use_pipe and items and updated_vehicle:
+                    try:
+                        from pdf_to_neo_pipeline import (
+                            classify_pdf_source as _classify,
+                            identify_vehicle_in_addata as _identify,
+                            decide_mode as _decide_mode,
+                        )
+                        _src = _classify(b"", ocr_text=" ".join(str(it.get('parts_name','')) for it in items[:50]))
+                        _ident = _identify(updated_vehicle, _ad_path_pipe)
+                        _mode = _decide_mode(bool(_ident.get('found')), _src)
+                        st.info(f"🚀 自動判定: source={_src} found={_ident.get('found')} → モード**{_mode}** で生成します")
+                    except Exception as _e_pipe:
+                        st.caption(f"自動判定スキップ: {_e_pipe}")
+            except Exception:
+                pass
+
+            # --- Addata DB照合フック（NEO生成前） ---
+            try:
+                _use_ad = st.session_state.get('_use_addata', False)
+                _ad_path = st.session_state.get('_addata_path', r'C:\Addata')
+                if _use_ad and _ADDATA_AVAILABLE and items:
+                    # spec_iter4 課題B: cache_resource 経由で engine を温めておく
+                    try:
+                        get_addata_engine(_ad_path)
+                    except Exception:
+                        pass
+                    items = match_pdf_items_to_addata(items, updated_vehicle or {}, _ad_path)
+                    # --- L1〜L4 件数バッジ表示 (spec_iter2 課題D) ---
+                    try:
+                        from collections import Counter as _Counter
+                        level_counts = _Counter(it.get('match_level', 'NA') for it in items)
+                        st.markdown("##### Addata DB照合結果")
+                        # spec_iter3 課題A (S3-1): カバレッジ% を 5列目で可視化
+                        _total_n = len(items)
+                        _hit_n = sum(1 for _it in items if _it.get('match_level') in ('L1', 'L2'))
+                        _coverage_pct = (_hit_n / _total_n * 100.0) if _total_n else 0.0
+                        _c0, _c1, _c2, _c3, _c4 = st.columns(5)
+                        _c0.metric("DB照合カバレッジ", f"{_coverage_pct:.1f}%",
+                                   help="L1完全一致＋L2強一致の合計÷全件。70%以上が目安。")
+                        _c1.metric("L1 完全一致", level_counts.get('L1', 0))
+                        _c2.metric("L2 強一致",   level_counts.get('L2', 0))
+                        _c3.metric("L3 部分一致", level_counts.get('L3', 0))
+                        _c4.metric("L4 不一致",   level_counts.get('L4', 0))
+                    except Exception:
+                        pass
+                    # --- 価格差±5%超アラート (spec_iter2 課題E) ---
+                    try:
+                        alerts = [it for it in items if it.get('price_alert')]
+                        if alerts:
+                            st.warning(f"DB価格と±5%超の差額がある部品が {len(alerts)} 件あります。確認してください。")
+                            with st.expander("差額アラート詳細", expanded=False):
+                                for it in alerts:
+                                    diff = it.get('price_diff_pct')
+                                    diff_str = f"{diff:+.1f}%" if diff is not None else "?"
+                                    # spec_iter3 課題A / S3-7: 符号方向の文言を明示
+                                    try:
+                                        _pdf_v = int(it.get('unit_price') or 0)
+                                    except Exception:
+                                        _pdf_v = 0
+                                    try:
+                                        _db_v = int(it.get('db_price') or 0)
+                                    except Exception:
+                                        _db_v = 0
+                                    if _pdf_v > _db_v:
+                                        _direction = "PDFが高い"
+                                    elif _pdf_v < _db_v:
+                                        _direction = "PDFが安い"
+                                    else:
+                                        _direction = "同額"
+                                    st.write(f"- {it.get('parts_name', '')} : "
+                                             f"PDF ¥{_pdf_v:,} ／ DB ¥{_db_v:,} ／ {diff_str}（{_direction}）")
+                    except Exception:
+                        pass
+            except Exception as _e_addata:
+                # 照合失敗してもNEO生成は続行
+                try:
+                    st.warning(f"Addata照合をスキップ: {_e_addata}")
+                except Exception:
+                    pass
+            # spec_iter4 課題E: DB照合完了タイムスタンプ
+            try:
+                import time as _time_iter4c
+                _t_db_end_iter4 = _time_iter4c.perf_counter()
+            except Exception:
+                _t_db_end_iter4 = None
+            neo_data, total_parts, total_wages, grand_total = generate_neo_file(
+                _active_template, updated_vehicle, items, short_parts_wage, insurance_info,
+                expenses=expense_info, is_tax_inclusive=is_tax_inclusive, is_beta_mode=_step4_beta,
+                merge_mode=_use_custom_neo
+            )
+            # spec_iter4 課題E (S4-5): NEO生成完了タイムスタンプ + caption表示
+            try:
+                import time as _time_iter4d
+                _t_neo_end_iter4 = _time_iter4d.perf_counter()
+                _t0v = _t0_iter4 if '_t0_iter4' in dir() else _t_neo_end_iter4
+                _t_ocr_v = _t_ocr_end_iter4 if _t_ocr_end_iter4 is not None else _t0v
+                _t_db_v = _t_db_end_iter4 if _t_db_end_iter4 is not None else _t_ocr_v
+                st.caption(
+                    f"⏱ 処理時間: OCR {(_t_ocr_v - _t0v):.1f}s / "
+                    f"DB照合 {(_t_db_v - _t_ocr_v):.1f}s / "
+                    f"NEO生成 {(_t_neo_end_iter4 - _t_db_v):.1f}s / "
+                    f"合計 {(_t_neo_end_iter4 - _t0v):.1f}s"
+                )
+            except Exception:
+                pass
+            # spec_iter4 課題D (S4-4): 解析結果を session_state に永続化
+            try:
+                _sig_save = (
+                    (vehicle_name or '', len(vehicle_bytes or b'')),
+                    (estimate_name or '', len(estimate_bytes or b'')),
+                )
+                st.session_state['analysis_cache'] = {
+                    'sig': _sig_save,
+                    'items': items,
+                    'vehicle_info': updated_vehicle,
+                    'neo_bytes': neo_data,
+                }
+            except Exception:
+                pass
+            progress.progress(85, text="📝 ファイル名を生成中...")
+            filename = generate_filename(
+                updated_vehicle, calc_parts, calc_wages, pdf_parts, pdf_wages,
+                has_estimate, reverse_match, short_parts_wage,
+                is_tax_inclusive=is_tax_inclusive, items_count=len(items)
+            )
+            st.session_state['neo_bytes']    = neo_data
+            st.session_state['neo_filename'] = filename
+            progress.progress(100, text="✅ 生成完了！")
+            # spec_iter3 課題D: ④⑤ ステップ完了表示
+            try:
+                _st2 = st.status("ファイル生成", expanded=False)
+                with _st2 as _s2:
+                    st.write("④ NEOファイル生成 完了")
+                    st.write("⑤ ダウンロード準備 完了")
+                    try:
+                        _s2.update(label="解析完了", state="complete", expanded=False)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # spec_iter3 課題F (S3-6): 完了直後に DL ボタンを目立つ位置で配置
+            try:
+                st.success("✅ NEOファイル生成完了。下のボタンからダウンロードできます。")
+                st.download_button(
+                    label="📥 NEOファイルをダウンロード",
+                    data=neo_data,
+                    file_name=filename,
+                    mime="application/octet-stream",
+                    type="primary",
+                    use_container_width=True,
+                    key="neo_download_main",
+                )
+            except Exception:
+                pass
+            _neo_wait.empty()  # 待機メッセージを消去
+
+            # 不一致チェック（STEP3と同じ判定ロジック）
+            _discrepancies_step4 = []
+            _total_diff_step4 = 0
+            if has_estimate and not reverse_match:
+                sp_val = safe_int(short_parts_wage)
+                is_tax_incl_s4 = estimate_data.get('_is_tax_inclusive', False) if estimate_data else False
+                _tol_s4 = len(items) if is_tax_incl_s4 else 0
+                parts_match_s4 = (calc_parts == pdf_parts) or (calc_parts + sp_val == pdf_parts) or (pdf_parts is not None and abs(calc_parts - pdf_parts) <= _tol_s4) or (pdf_parts is not None and abs(calc_parts + sp_val - pdf_parts) <= _tol_s4)
+                if pdf_parts is not None and pdf_parts > 0 and not parts_match_s4:
+                    _discrepancies_step4.append(f"部品相違（PDF: ¥{pdf_parts:,} / 計算: ¥{calc_parts:,}）")
+                    _total_diff_step4 += calc_parts - pdf_parts
+                wage_match_s4 = (calc_wages == pdf_wages) or (calc_wages + sp_val == pdf_wages) or (pdf_wages is not None and abs(calc_wages - pdf_wages) <= _tol_s4) or (pdf_wages is not None and abs(calc_wages + sp_val - pdf_wages) <= _tol_s4)
+                if pdf_wages is not None and pdf_wages > 0 and not wage_match_s4:
+                    _discrepancies_step4.append(f"工賃相違（PDF: ¥{pdf_wages:,} / 計算: ¥{calc_wages:,}）")
+                    _total_diff_step4 += calc_wages - pdf_wages
+
+            if _discrepancies_step4:
+                diff_abs = abs(_total_diff_step4)
+                st.markdown(f"""
+                <div class="mismatch-banner">
+                    <div class="mismatch-title">⚠️ 金額不一致が検出されました（差額 ▲¥{diff_abs:,}）</div>
+                    <div class="mismatch-body">
+                        元見積の合計額と本システムの算出額が一致しません。<br>
+                        NEOファイルを生成する前に不一致レポートを確認・保存することを推奨します。
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                with st.expander("📄 不一致レポートを確認", expanded=False):
+                    for d_item in _discrepancies_step4:
+                        st.warning(d_item)
+
+            # ── ベタ打ちモード: 部品・工賃区分確認済みサマリー表示 ──
+            if _step4_beta:
+                _cls_alerts_s4 = st.session_state.get('classification_alerts', [])
+                _cls_errors_s4 = [a for a in _cls_alerts_s4 if a['severity'] == 'error']
+                _cls_warnings_s4 = [a for a in _cls_alerts_s4 if a['severity'] == 'warning']
+                if _cls_errors_s4:
+                    st.markdown(
+                        f'<div style="background:#fef9c3;border:1px solid #ca8a04;border-radius:6px;padding:10px 14px;margin:8px 0;font-size:13px">'
+                        f'✅ <b>部品・工賃区分確認済み</b> — {len(_cls_errors_s4)} 件の要確認項目が確認・承認された上でNEOを生成しました。<br>'
+                        + ''.join(f'<div style="margin-top:4px">⚠️ 行{a["row_no"]}「{a["name"]}」: 部品¥{a["parts_amount"]:,} / 工賃¥{a["wage"]:,}</div>' for a in _cls_errors_s4)
+                        + '</div>',
+                        unsafe_allow_html=True
+                    )
+                elif _cls_warnings_s4:
+                    st.markdown(
+                        f'<div style="background:#f0fdf4;border:1px solid #16a34a;border-radius:6px;padding:10px 14px;margin:8px 0;font-size:13px">'
+                        f'✅ <b>部品・工賃区分チェック: 問題なし</b> — 参考警告 {len(_cls_warnings_s4)} 件のみ（重大エラーなし）</div>',
+                        unsafe_allow_html=True
+                    )
+                else:
+                    st.markdown(
+                        '<div style="background:#f0fdf4;border:1px solid #16a34a;border-radius:6px;padding:10px 14px;margin:8px 0;font-size:13px">'
+                        '✅ <b>部品・工賃区分チェック: 問題なし</b></div>',
+                        unsafe_allow_html=True
+                    )
+
+            # ── ベタ打ちモード: PDF原本との差異特定レポート ──
+            if _step4_beta and _discrepancies_step4:
+                st.markdown('<div class="section-title">📋 ベタ打ちモード — 差異特定レポート</div>', unsafe_allow_html=True)
+                st.markdown('金額の不一致箇所を特定するための詳細レポートをPDF形式でダウンロードできます。')
+                # Step4はStep3とは別ブランチのため、wage_match_sp/spをStep4内で再計算する
+                _sp_s4 = safe_int(short_parts_wage)
+                _pdf_wages_s4 = safe_int(pdf_wages or 0)
+                _wage_match_sp_s4 = (_pdf_wages_s4 > 0 and calc_wages + _sp_s4 == _pdf_wages_s4)
+                # ショートパーツはHonda Cars等で工賃列に含まれるため、差異レポートの計算値に加算
+                _calc_wages_report = calc_wages + _sp_s4 if _wage_match_sp_s4 else calc_wages
+                beta_pdf_bytes = generate_beta_discrepancy_report_pdf(estimate_data, calc_parts, _calc_wages_report, pdf_parts or 0, pdf_wages or 0, updated_vehicle)
+                st.download_button(
+                    label="📄 差異レポートをダウンロード(PDF)",
+                    data=beta_pdf_bytes,
+                    file_name=filename.replace('.neo', '_ベタ打ち差異レポート.pdf'),
+                    mime="application/pdf",
+                    use_container_width=True,
+                    type="primary",
+                    key='beta_diff_report_dl'
+                )
+
+            st.markdown('<div class="alert alert-success">✅ NEOファイルの生成が完了しました！コグニセブンで開いて内容を確認してください。</div>', unsafe_allow_html=True)
+
+            # 生成内容サマリー
+            summary_items = [
+                ("ファイル名", f"`{filename}`"),
+                ("ファイルサイズ", f"{len(neo_data):,} bytes"),
+            ]
+            if has_estimate:
+                summary_items += [
+                    ("明細行数", f"{len(items)} 行"),
+                    ("合計金額", f"¥{grand_total:,}（税込）"),
+                ]
+                if reverse_match:
+                    summary_items.append(("金額検証", "✅ 逆算一致"))
+            else:
+                summary_items.append(("内容", "車両情報のみ（明細なし）"))
+            for k, v in summary_items:
+                st.markdown(f"**{k}:** {v}")
+
+            st.markdown("---")
+            dcol1, dcol2 = st.columns(2)
+            with dcol1:
+                st.download_button(
+                    label="📥 NEOファイルをダウンロード",
+                    data=neo_data,
+                    file_name=filename,
+                    mime="application/octet-stream",
+                    type="primary",
+                    use_container_width=True
+                )
+            with dcol2:
+                st.button("📄 差額レポート（Addata連携後に利用可）", disabled=True, use_container_width=True)
+            
+            st.markdown("")
+            if st.button("🔄 新しい見積を作成する", use_container_width=True):
+                for key in [
+                    'step', 'vehicle_data', 'estimate_data', 'neo_bytes', 'neo_filename',
+                    'vehicle_file_bytes', 'vehicle_file_name', 'estimate_file_bytes',
+                    'estimate_file_name', 'updated_vehicle', 'calc_parts', 'calc_wages',
+                    'pdf_parts', 'pdf_wages',
+                    'policy_no', 'contractor_name',
+                    'exp_towing', 'exp_rental', 'exp_exempt',
+                    'custom_neo_bytes', 'custom_neo_name',
+                    'tax_override',
+                    'classification_confirmed', 'classification_alerts',
+                    'discrepancies', 'total_diff',
+                    'amount_confirmed',
+                    '_original_items',
+                    # フィードバック・区分チェックキャッシュ
+                    '_fb_hash', '_fb_cache',
+                    '_cls_hash', '_cls_cache', '_cls_confirmed_value',
+                    # CSV取り込み関連
+                    'csv_mode', 'csv_items', '_csv_paste_saved',
+                    'csv_vehicle_info',
+                    # その他の残留データ
+                    'use_fax_filter', 'use_rasterize', 'use_enhance', 'selected_model',
+                    'selected_mode', 'short_parts_wage',
+                ]:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.session_state['step'] = 1
+                st.rerun()
+        except Exception as e:
+            progress.empty()
+            _neo_wait.empty()
+            st.error(f"⚠️ NEO生成中にエラーが発生しました:\n\n{str(e)}")
+            st.code(traceback.format_exc())
+            if st.button("← ステップ③に戻る"):
+                st.session_state['step'] = 3
+                st.rerun()
+
+
+if __name__ == '__main__':
+    main()
