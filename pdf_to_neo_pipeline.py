@@ -537,6 +537,155 @@ def _final_dedup_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def _enforce_grand_total_match(items: List[Dict[str, Any]],
+                               pdf_grand_total: int,
+                               is_tax_inclusive: bool = True,
+                               tax_rate: float = 0.10,
+                               tolerance: int = 0) -> List[Dict[str, Any]]:
+    """v7.1: pdf_grand_total を真理値として、明細合算が一致するか最終チェック。
+    乖離があれば末尾の調整行(なければ新規)に差分を加える。
+
+    pdf_grand_total が税込なら、税抜合計 = grand_total / 1.1 で逆算。
+    """
+    if not items or pdf_grand_total <= 0:
+        return items
+    out = list(items)
+    target_outtax = pdf_grand_total / (1 + tax_rate) if is_tax_inclusive else pdf_grand_total
+    target_outtax = int(round(target_outtax))
+
+    sum_outtax = 0
+    for it in out:
+        try:
+            pa = it.get("parts_amount") or it.get("amount") or 0
+            if pa:
+                sum_outtax += int(float(pa))
+            else:
+                up = float(it.get("unit_price") or it.get("part_price") or 0)
+                qty = max(int(float(it.get("quantity") or 1)), 1)
+                if up > 0:
+                    sum_outtax += int(up * qty)
+        except Exception:
+            pass
+        try:
+            wg = it.get("wage") or it.get("labor_fee") or 0
+            if wg:
+                sum_outtax += int(float(wg))
+        except Exception:
+            pass
+
+    diff = target_outtax - sum_outtax
+    if abs(diff) <= tolerance:
+        return out
+
+    # 既存の調整行があれば加算、なければ新規作成
+    adj_idx = next((i for i, it in enumerate(out) if it.get("is_adjustment_row")), None)
+    if adj_idx is not None:
+        existing = out[adj_idx]
+        cur_pa = int(float(existing.get("parts_amount") or 0))
+        existing["parts_amount"] = cur_pa + diff
+        existing["amount"] = cur_pa + diff
+        existing["unit_price"] = cur_pa + diff
+        logger.info("[grand_total_match] 調整行更新 +%d (target=%d sum=%d)", diff, target_outtax, sum_outtax)
+    else:
+        out.append({
+            "name": "※金額調整 (PDF総額一致)",
+            "parts_name": "※金額調整",
+            "parts_no": "※金額調整",
+            "part_no": "※金額調整",
+            "quantity": 1,
+            "parts_amount": int(diff),
+            "amount": int(diff),
+            "unit_price": int(diff),
+            "wage": 0,
+            "labor_fee": 0,
+            "category": "",
+            "work_code": "",
+            "index_value": 0.0,
+            "is_adjustment_row": True,
+        })
+        logger.info("[grand_total_match] 調整行新規 %+d (target=%d sum=%d)", diff, target_outtax, sum_outtax)
+    return out
+
+
+def _enforce_total_match(items: List[Dict[str, Any]],
+                         pdf_parts_total: int,
+                         pdf_wage_total: int,
+                         tolerance: int = 0) -> List[Dict[str, Any]]:
+    """v7: PDF表示の部品計/工賃計と明細合算の差分を「※金額調整」行で吸収。
+    ADDATA配備時もベタ打ち時も最終合計を PDF表示金額に完全一致させる。
+
+    入力:
+      pdf_parts_total: PDF表示の部品計 (税抜)
+      pdf_wage_total: PDF表示の工賃計 (税抜)
+      tolerance: ±これ以下の差は無視
+
+    動作:
+      - sum(parts_amount or unit_price*qty) と pdf_parts_total を比較
+      - 差分 > tolerance → 末尾に調整行追加
+        * parts_amount = 部品差分
+        * wage = 工賃差分
+        * parts_no = "※金額調整"
+        * name = "※金額調整 (PDF原本との差分吸収)"
+    """
+    if not items:
+        return items
+    if pdf_parts_total <= 0 and pdf_wage_total <= 0:
+        return items  # PDF総額未取得 → 調整しない
+    out = list(items)
+    # 明細合算
+    sum_parts = 0
+    sum_wage = 0
+    for it in out:
+        try:
+            pa = it.get("parts_amount") or it.get("amount") or 0
+            if pa:
+                sum_parts += int(float(pa))
+            else:
+                up = float(it.get("unit_price") or it.get("part_price") or 0)
+                qty = max(int(float(it.get("quantity") or 1)), 1)
+                if up > 0:
+                    sum_parts += int(up * qty)
+        except Exception:
+            pass
+        try:
+            wg = it.get("wage") or it.get("labor_fee") or 0
+            if wg:
+                sum_wage += int(float(wg))
+        except Exception:
+            pass
+
+    diff_parts = pdf_parts_total - sum_parts if pdf_parts_total else 0
+    diff_wage = pdf_wage_total - sum_wage if pdf_wage_total else 0
+
+    if abs(diff_parts) <= tolerance and abs(diff_wage) <= tolerance:
+        return out  # 既に一致
+
+    if diff_parts == 0 and diff_wage == 0:
+        return out
+
+    # 調整行を追加
+    adj = {
+        "name": "※金額調整 (PDF原本との差分吸収)",
+        "parts_name": "※金額調整",
+        "parts_no": "※金額調整",
+        "part_no": "※金額調整",
+        "quantity": 1,
+        "parts_amount": int(diff_parts),
+        "amount": int(diff_parts),
+        "unit_price": int(diff_parts),
+        "wage": int(diff_wage),
+        "labor_fee": int(diff_wage),
+        "category": "",
+        "work_code": "",
+        "index_value": 0.0,
+        "is_adjustment_row": True,
+    }
+    out.append(adj)
+    logger.info("[total_match] adj parts=%+d wage=%+d (PDF parts=%d wage=%d / 明細 parts=%d wage=%d)",
+                diff_parts, diff_wage, pdf_parts_total, pdf_wage_total, sum_parts, sum_wage)
+    return out
+
+
 def _normalize_items_for_neo(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """OCR items を generate_neo_file 期待スキーマに正規化 (Iter6)
     OCR出力キー: name, part_no, quantity, parts_amount, wage, line_total, work_code, index_value
@@ -1207,6 +1356,24 @@ def process_pdf_to_neo(pdf_path,
 
     vehicle_info = vehicle_info or {}
     items = items or []
+
+    # v7: PDF表示総額と明細合算の差分を「※金額調整」行で吸収 (完全一致保証)
+    if items and out.get("ocr_meta"):
+        try:
+            _meta = out["ocr_meta"]
+            pdf_p = int(_meta.get("pdf_parts_total") or 0)
+            pdf_w = int(_meta.get("pdf_wage_total") or 0)
+            pdf_g = int(_meta.get("pdf_grand_total") or 0)
+            if pdf_p > 0 or pdf_w > 0:
+                items = _enforce_total_match(items, pdf_p, pdf_w, tolerance=0)
+                log.append(f"[total_match] parts={pdf_p} wage={pdf_w} 適用")
+            # v7.1: grand_total で最終保証 (parts+wage の調整で足りない場合の差分)
+            if pdf_g > 0:
+                items = _enforce_grand_total_match(items, pdf_g, is_tax_inclusive=True)
+                log.append(f"[grand_total_match] grand={pdf_g} 適用")
+        except Exception as e:
+            log.append(f"total_match 失敗: {e}")
+
     out["vehicle_info"] = vehicle_info
     out["items"] = items
 
