@@ -20,7 +20,22 @@ import re
 from typing import List, Optional
 
 CACHE_KEY = "_ADDATA_LOCATOR_CACHE"
+ALL_CACHE_KEY = "_ADDATA_LOCATOR_ALL_CACHE"
 _cache: dict = {}
+
+# v6.1: 標準位置リスト (優先度順)
+_STANDARD_PATHS = (
+    r"C:\Addata",
+    r"D:\Addata",
+    r"C:\AdSeven\Addata",                              # コグニセブン同梱 (最優先)
+    r"D:\AdSeven\Addata",
+    r"E:\AdSeven\Addata",
+    r"C:\Program Files (x86)\Audatex\Auda7\Addata",   # インストーラ版
+    r"C:\Program Files\Audatex\Auda7\Addata",
+    r"C:\cogni車種データ\Addata",
+    r"D:\cogni車種データ\Addata",
+    r"E:\cogni車種データ\Addata",
+)
 
 
 def _is_valid_addata(path: str, max_check: int = 3) -> bool:
@@ -148,8 +163,8 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
         _cache[CACHE_KEY] = env_root
         return env_root
 
-    # 2. 標準位置
-    for std in (r"C:\Addata", r"D:\Addata"):
+    # 2. 標準位置 (v6.1: AdSeven含め拡張)
+    for std in _STANDARD_PATHS:
         if _is_valid_addata(std):
             _cache[CACHE_KEY] = std
             return std
@@ -183,6 +198,54 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
 
     _cache[CACHE_KEY] = None
     return None
+
+
+def find_all_addata(force_refresh: bool = False) -> List[str]:
+    """全ADDATA候補を返す (優先度順、重複除去済)。
+    UI でユーザーに選択肢を提示するための補助API。
+    """
+    if not force_refresh and ALL_CACHE_KEY in _cache:
+        return list(_cache[ALL_CACHE_KEY])
+
+    found: List[str] = []
+    seen: set = set()
+
+    def _add(p: Optional[str]):
+        if not p:
+            return
+        n = os.path.normpath(p)
+        if n not in seen and _is_valid_addata(n):
+            seen.add(n)
+            found.append(n)
+
+    # 1. 環境変数
+    _add(os.environ.get("ADDATA_ROOT"))
+
+    # 2. 標準位置 (優先度順)
+    for std in _STANDARD_PATHS:
+        _add(std)
+
+    # 3. OneDrive配下 (並列で全候補回収)
+    try:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        roots = _candidate_onedrive_roots()
+        if roots:
+            with ThreadPoolExecutor(max_workers=min(len(roots), 4)) as ex:
+                futures = {ex.submit(_walk_for_addata, r, 5, 8000): r for r in roots}
+                for fu in as_completed(futures):
+                    try:
+                        _add(fu.result())
+                    except Exception:
+                        pass
+    except Exception:
+        for od in _candidate_onedrive_roots():
+            try:
+                _add(_walk_for_addata(od, max_depth=5, max_dirs=8000))
+            except Exception:
+                pass
+
+    _cache[ALL_CACHE_KEY] = list(found)
+    return found
 
 
 def list_candidate_paths() -> List[str]:

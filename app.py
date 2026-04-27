@@ -4430,16 +4430,28 @@ def main():
             st.sidebar.caption("⚠️ 指定パスが存在しません")
         if st.sidebar.button("🔄 ADDATA再検索", help="OneDriveを再走査"):
             try:
-                from addata_locator import find_addata as _refind
-                _new = _refind(force_refresh=True)
-                if _new:
-                    st.sidebar.success(f"検出: {_new}")
-                    st.session_state['_addata_path_last'] = _new
+                from addata_locator import find_addata as _refind, find_all_addata as _refind_all
+                _all = _refind_all(force_refresh=True)
+                if _all:
+                    st.session_state['_addata_all_candidates'] = _all
+                    st.sidebar.success(f"{len(_all)}件 検出")
+                    st.session_state['_addata_path_last'] = _all[0]
                     st.rerun()
                 else:
                     st.sidebar.warning("見つかりませんでした")
             except Exception as e:
                 st.sidebar.error(f"検索失敗: {e}")
+        # v6.1: 複数候補 → ラジオ選択
+        _candidates = st.session_state.get('_addata_all_candidates', [])
+        if _candidates and len(_candidates) >= 2:
+            with st.sidebar.expander(f"📂 ADDATA候補 ({len(_candidates)}件)", expanded=False):
+                _idx = 0
+                if addata_path in _candidates:
+                    _idx = _candidates.index(addata_path)
+                _sel = st.radio("使用するADDATA", _candidates, index=_idx, key="_ad_radio")
+                if _sel != addata_path:
+                    st.session_state['_addata_path_last'] = _sel
+                    st.rerun()
         st.session_state['_use_addata'] = use_addata
         st.session_state['_addata_path'] = addata_path
         # Iter4 v2 / R2: PDF→NEO 完全自動判定モード（A/B/C 3モード）— デフォルトON
