@@ -4223,11 +4223,14 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded"
     )
-    # v9: frontend-design skill 適用 — Industrial Editorial direction
+    # v10: link block separately to avoid Streamlit Markdown parser breaking the style block
+    st.markdown(
+        '<link rel="preconnect" href="https://fonts.googleapis.com">'
+        '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+        '<link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">',
+        unsafe_allow_html=True,
+    )
     st.markdown("""
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
     <style>
     /* === v9 Design Tokens === */
     :root {
@@ -4253,7 +4256,7 @@ def main():
       background: var(--paper) !important;
       color: var(--ink);
     }
-    /* ブループリントグリッド背景 */
+    /* blueprint grid background */
     .stApp { background-image: var(--grid-pattern); background-size: 32px 32px; }
     h1, h2, h3, .section-title {
       font-family: 'Inter Tight', 'Hiragino Sans', sans-serif !important;
@@ -4262,7 +4265,7 @@ def main():
     }
     code, .mono { font-family: 'JetBrains Mono', monospace; }
 
-    /* 上部の余白を完全に詰める */
+    /* tighten top spacing */
     .block-container { padding-top: 0px !important; margin-top: 0px !important; }
     header[data-testid="stHeader"] { display: none !important; height: 0 !important; }
     #root > div:first-child { padding-top: 0 !important; }
@@ -4270,14 +4273,13 @@ def main():
     .stApp { margin-top: 0 !important; }
     section.main > div { padding-top: 0 !important; }
 
-    /* file_uploader の「Drag and drop」「Limit」テキストを非表示（複数セレクタで対応） */
+    /* hide drag-and-drop / limit captions */
     [data-testid="stFileUploaderDropzoneInstructions"] { display: none !important; }
     [data-testid="stFileUploaderDropzone"] small,
     [data-testid="stFileUploaderDropzone"] span:not(.st-emotion-cache-9ycgxx),
     .uploadedFileName ~ small,
     section[data-testid="stFileUploaderDropzone"] div > small { display: none !important; }
     [data-testid="stFileUploaderDropzone"] { min-height: 56px !important; padding: 8px 12px !important; }
-    /* アイコンとBrowseボタンだけ残す */
     [data-testid="stFileUploaderDropzone"] > div > div:first-child > span { display: none !important; }
     [data-testid="stFileUploaderDropzone"] > div > div:first-child > small { display: none !important; }
 
