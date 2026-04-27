@@ -4716,7 +4716,103 @@ def main():
                 st.caption(f"未選択 → デフォルトテンプレート（{TEMPLATE_FILENAME}）を使用")
 
         # ================================================================
-        # STEP 1-B: Gemini解析 → CSV取り込み（メインフロー）
+        # v8: 見積書PDF直接アップロード → 自動OCR → NEO生成（推奨フロー）
+        # ================================================================
+        st.markdown("---")
+        st.markdown(
+            '<div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:10px;'
+            'padding:14px 18px;font-size:14px;margin-bottom:12px;">'
+            '⚡ <b>かんたんモード（推奨）</b>： 見積書PDFを下にドロップするだけで自動OCR→NEO生成。'
+            'Geminiコピペ作業不要。<br>'
+            '<span style="font-size:12px;color:#555;">'
+            '・PDF総額と完全一致を保証（差分は「※金額調整」行で自動吸収）<br>'
+            '・ADDATA配備時は車種特定→部品名→品番・価格・工賃のフルマッチング<br>'
+            '・並列OCRで4PDF同時 ~5分で処理'
+            '</span>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+        estimate_pdf_files = st.file_uploader(
+            "📄 見積書PDF（直接OCR・複数可）",
+            type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif'],
+            accept_multiple_files=True,
+            key='estimate_pdf_direct',
+            help="見積書PDFをドラッグ＆ドロップ。アップロード後、下の「🚀 直接OCR→NEO生成」ボタンで自動処理開始。"
+        )
+        if estimate_pdf_files:
+            for ef in estimate_pdf_files:
+                st.success(f"✅ {ef.name} ({ef.size:,} bytes)")
+
+            if st.button("🚀 直接OCR→NEO生成", type="primary", key='btn_direct_ocr',
+                          help="Geminiでの解析→ADDATA照合→NEO生成を一括自動実行"):
+                try:
+                    import pdf_to_neo_pipeline as _pipe
+                    from auto_matching import find_addata_dir as _find_dir
+                    addata_root_v8 = st.session_state.get('_addata_path_last') or _find_dir() or r"C:\Addata"
+                    template_path_v8 = TEMPLATE_PATH
+                    if st.session_state.get('custom_neo_bytes'):
+                        import tempfile as _tf
+                        _tmp = _tf.NamedTemporaryFile(suffix='.neo', delete=False)
+                        _tmp.write(st.session_state['custom_neo_bytes'])
+                        _tmp.close()
+                        template_path_v8 = _tmp.name
+
+                    results = []
+                    progress = st.progress(0)
+                    status = st.empty()
+                    for idx, ef in enumerate(estimate_pdf_files):
+                        status.info(f"⏳ {idx+1}/{len(estimate_pdf_files)}: {ef.name} 解析中...")
+                        progress.progress((idx) / max(len(estimate_pdf_files), 1))
+                        ef.seek(0)
+                        pdf_bytes_v8 = ef.read()
+                        try:
+                            r = _pipe.process_pdf_to_neo(
+                                pdf_bytes_v8,
+                                addata_root=addata_root_v8,
+                                template_path=template_path_v8,
+                                skip_ocr=False,
+                            )
+                            results.append((ef.name, r))
+                        except Exception as e:
+                            results.append((ef.name, {"ok": False, "error": str(e)}))
+                    progress.progress(1.0)
+                    status.success(f"✅ {len(results)}件処理完了")
+
+                    # 結果表示
+                    for name, r in results:
+                        with st.expander(f"📄 {name}", expanded=True):
+                            if not r.get("ok"):
+                                st.error(f"❌ 失敗: {r.get('error', '不明')}")
+                                continue
+                            mode = r.get("mode", "?")
+                            items = r.get("items") or []
+                            v = r.get("verify") or {}
+                            vi = r.get("vehicle_info") or {}
+                            c1, c2, c3, c4 = st.columns(4)
+                            c1.metric("モード", mode)
+                            c2.metric("項目数", len(items))
+                            c3.metric("PDF小計", f"{v.get('pdf_total', 0):,}円")
+                            c4.metric("NEO小計", f"{v.get('neo_total', 0):,}円")
+                            if vi.get("car_name"):
+                                st.caption(f"🚗 車名: {vi.get('car_name')} / 車台番号: {vi.get('car_serial_no','-')} / 色: {vi.get('color_code','-')}")
+                            neo_bytes = r.get("neo_bytes")
+                            if neo_bytes:
+                                st.download_button(
+                                    f"📥 {os.path.splitext(name)[0]}.neo をダウンロード",
+                                    data=neo_bytes,
+                                    file_name=os.path.splitext(name)[0] + ".neo",
+                                    mime="application/octet-stream",
+                                    key=f"dl_{name}",
+                                    type="primary",
+                                )
+                except Exception as e:
+                    st.error(f"❌ 処理失敗: {e}")
+                    import traceback as _tb
+                    with st.expander("詳細"):
+                        st.code(_tb.format_exc())
+
+        # ================================================================
+        # STEP 1-B: Gemini解析 → CSV取り込み（旧フロー、互換維持）
         # ================================================================
         st.markdown("---")
         st.markdown(
