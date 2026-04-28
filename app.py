@@ -4975,19 +4975,24 @@ def main():
                 st.caption(f"未選択 → デフォルトテンプレート（{TEMPLATE_FILENAME}）を使用")
 
         # ================================================================
-        # v8: 見積書PDF直接アップロード → 自動OCR → NEO生成（推奨フロー）
+        # v8/v10.2: 見積書PDF直接アップロード → 自動OCR → NEO生成 (Operator Console)
         # ================================================================
         st.markdown("---")
         st.markdown(
-            '<div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:10px;'
-            'padding:14px 18px;font-size:14px;margin-bottom:12px;">'
-            '⚡ <b>かんたんモード（推奨）</b>： 見積書PDFを下にドロップするだけで自動OCR→NEO生成。'
-            'Geminiコピペ作業不要。<br>'
-            '<span style="font-size:12px;color:#555;">'
-            '・PDF総額と完全一致を保証（差分は「※金額調整」行で自動吸収）<br>'
-            '・ADDATA配備時は車種特定→部品名→品番・価格・工賃のフルマッチング<br>'
-            '・並列OCRで4PDF同時 ~5分で処理'
-            '</span>'
+            '<div style="background:#0f172a;color:#fff;border-radius:14px;padding:20px 24px;'
+            'margin-bottom:14px;position:relative;overflow:hidden;'
+            'box-shadow:0 12px 28px -10px rgba(15,23,42,.4);border:1px solid rgba(6,182,212,.25);">'
+            '<div style="position:absolute;top:8px;right:14px;font-family:JetBrains Mono,monospace;'
+            'font-size:9px;letter-spacing:.15em;color:rgba(6,182,212,.6);font-weight:600">'
+            'AUTO MODE / 推奨</div>'
+            '<div style="font-family:Inter Tight,sans-serif;font-size:18px;font-weight:800;'
+            'letter-spacing:-0.01em;">⚡ かんたんモード</div>'
+            '<div style="font-size:13px;color:#cbd5e1;margin-top:4px;line-height:1.6;">'
+            '見積書PDFを下にドロップするだけで自動OCR→NEO生成（Geminiコピペ不要）。'
+            'PDF総額と<b style="color:#fbbf24">完全一致を保証</b>（差分は<code style="color:#06b6d4">※金額調整</code>行で吸収）。'
+            'ADDATA配備時は車種特定→部品名→品番・価格・工賃のフルマッチング。'
+            '並列OCRで4PDF同時 ~5分で処理。'
+            '</div>'
             '</div>',
             unsafe_allow_html=True
         )
