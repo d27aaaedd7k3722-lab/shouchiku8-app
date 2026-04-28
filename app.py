@@ -5052,11 +5052,22 @@ def main():
                             items = r.get("items") or []
                             v = r.get("verify") or {}
                             vi = r.get("vehicle_info") or {}
-                            c1, c2, c3, c4 = st.columns(4)
+                            # v10.3: 完全一致トレース
+                            adj_count = sum(1 for it in items if it.get("is_adjustment_row"))
+                            pdf_t = v.get('pdf_total', 0) or 0
+                            neo_t = v.get('neo_total', 0) or 0
+                            diff = neo_t - pdf_t
+                            c1, c2, c3, c4, c5 = st.columns(5)
                             c1.metric("モード", mode)
-                            c2.metric("項目数", len(items))
-                            c3.metric("PDF小計", f"{v.get('pdf_total', 0):,}円")
-                            c4.metric("NEO小計", f"{v.get('neo_total', 0):,}円")
+                            c2.metric("項目数", len(items),
+                                      delta=f"+{adj_count} 調整行" if adj_count else None,
+                                      delta_color="off")
+                            c3.metric("PDF小計", f"{pdf_t:,}円")
+                            c4.metric("NEO小計", f"{neo_t:,}円",
+                                      delta=f"{diff:+,}円" if diff else "完全一致 ✓",
+                                      delta_color="normal" if diff == 0 else "inverse")
+                            match_pct = v.get('name_match_pct', 0) or 0
+                            c5.metric("名称一致", f"{match_pct}%")
                             if vi.get("car_name"):
                                 st.caption(f"🚗 車名: {vi.get('car_name')} / 車台番号: {vi.get('car_serial_no','-')} / 色: {vi.get('color_code','-')}")
                             neo_bytes = r.get("neo_bytes")
@@ -5070,9 +5081,17 @@ def main():
                                     type="primary",
                                 )
                 except Exception as e:
-                    st.error(f"❌ 処理失敗: {e}")
+                    err_str = str(e)
+                    if "API key" in err_str or "GEMINI" in err_str.upper():
+                        st.error("❌ Gemini API キーエラー\n💡 対処: サイドバーの「APIキー設定」を確認してください")
+                    elif "quota" in err_str.lower() or "429" in err_str:
+                        st.error("❌ Gemini API クォータ超過\n💡 対処: 翌日まで待つか、別のAPIキーに切替えてください")
+                    elif "template" in err_str.lower():
+                        st.error(f"❌ テンプレートNEO読込失敗\n💡 対処: template_toyota.neo が見つかりません: {e}")
+                    else:
+                        st.error(f"❌ 処理失敗: {e}\n💡 対処: 詳細を展開してエラー内容を確認、またはサポートに連絡してください")
                     import traceback as _tb
-                    with st.expander("詳細"):
+                    with st.expander("詳細スタックトレース"):
                         st.code(_tb.format_exc())
 
         # ================================================================

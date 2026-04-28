@@ -8,6 +8,7 @@ sdk_version: "1.45.1"
 python_version: "3.11"
 app_file: app.py
 pinned: false
+short_description: PDF見積→NEO自動生成 (PDF総額完全一致保証・ADDATAフルマッチング)
 ---
 
 # SHOUCHIKU 自動見積システム
