@@ -37,6 +37,19 @@ _STANDARD_PATHS = (
     r"E:\cogni車種データ\Addata",
 )
 
+# v10.4: OneDrive ルート配下の業務典型サブパス（再帰検索より高速で確実な O(1) パス確認）
+# 各 OneDrive ルートに対してこれらを直積展開して _is_valid_addata で検証する。
+_ONEDRIVE_SUBPATHS = (
+    r"【※写真※】 2025\コグニ、アセス　データベース\Addata",
+    r"【※写真※】2025\コグニ、アセス　データベース\Addata",   # スペース無し版
+    r"【※写真※】 2025\コグニ、アセス データベース\Addata",   # 半角スペース版
+    r"コグニ、アセス　データベース\Addata",
+    r"コグニ、アセス データベース\Addata",
+    r"コグニアセスデータベース\Addata",
+    r"Addata",                                                  # OneDrive 直下版
+    r"AdSeven\Addata",
+)
+
 
 def _is_valid_addata(path: str, max_check: int = 3) -> bool:
     """path が ADDATA ルートとして妥当か検証（軽量チェック）"""
@@ -119,14 +132,22 @@ def _candidate_onedrive_roots() -> List[str]:
 
 
 def _walk_for_addata(root: str, max_depth: int = 5,
-                    max_dirs: int = 5000) -> Optional[str]:
-    """root から再帰検索して 'Addata' フォルダかつ妥当判定で見つける。"""
+                    max_dirs: int = 5000,
+                    stats: Optional[dict] = None) -> Optional[str]:
+    """root から再帰検索して 'Addata' フォルダかつ妥当判定で見つける。
+    stats に dict を渡すと {visited:N, hit_path:str|None} が書き戻される。"""
     if not os.path.isdir(root):
         return None
     visited = 0
+    # v10.4: 業務名ヒント。コグニ/アセス/データベース を含むフォルダを優先深掘り
+    _HINT_KEYWORDS = ("コグニ", "アセス", "データベース", "AdSeven", "Adseven", "adseven")
     for cur, dirs, _files in os.walk(root):
         visited += 1
         if visited > max_dirs:
+            if stats is not None:
+                stats["visited"] = visited
+                stats["hit_path"] = None
+                stats["truncated"] = True
             return None
         # 深さ判定
         rel = os.path.relpath(cur, root)
@@ -139,7 +160,34 @@ def _walk_for_addata(root: str, max_depth: int = 5,
             if d.lower() == "addata":
                 cand = os.path.join(cur, d)
                 if _is_valid_addata(cand):
+                    if stats is not None:
+                        stats["visited"] = visited
+                        stats["hit_path"] = cand
                     return cand
+        # v10.4: 業務名ヒント検索（直近サブフォルダに「コグニ」「アセス」等を含む場合は
+        # その配下を即座に深掘りして Addata を探す。子→孫程度の浅い階層想定で計算量小）
+        for d in dirs:
+            if any(kw in d for kw in _HINT_KEYWORDS):
+                hint_root = os.path.join(cur, d)
+                try:
+                    for h_cur, h_dirs, _ in os.walk(hint_root):
+                        # ヒント配下は最大3階層まで
+                        rel_h = os.path.relpath(h_cur, hint_root)
+                        hd = 0 if rel_h == "." else rel_h.count(os.sep) + 1
+                        if hd > 3:
+                            h_dirs[:] = []
+                            continue
+                        for hd_name in h_dirs:
+                            if hd_name.lower() == "addata":
+                                cand = os.path.join(h_cur, hd_name)
+                                if _is_valid_addata(cand):
+                                    if stats is not None:
+                                        stats["visited"] = visited
+                                        stats["hit_path"] = cand
+                                        stats["via_hint"] = d
+                                    return cand
+                except OSError:
+                    continue
         # 不要な深掘り抑制（OneDrive にはユーザーフォルダが多い）
         # node_modules / .git / __pycache__ / cache / temp 等を除外
         dirs[:] = [d for d in dirs
@@ -148,6 +196,9 @@ def _walk_for_addata(root: str, max_depth: int = 5,
                                           "cache", "temp", "tmp", "logs",
                                           "videos", "music", "ピクチャ",
                                           "pictures")]
+    if stats is not None:
+        stats["visited"] = visited
+        stats["hit_path"] = None
     return None
 
 
@@ -169,13 +220,22 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
             _cache[CACHE_KEY] = std
             return std
 
+    # 2b. OneDrive ルート × 業務典型サブパス の直積展開を O(1) 確認 (v10.4)
+    # 再帰検索より速く、ユーザー指定パス「【※写真※】 2025\コグニ、アセス　データベース\Addata」を確実に当てる
+    for od in _candidate_onedrive_roots():
+        for sub in _ONEDRIVE_SUBPATHS:
+            cand = os.path.join(od, sub)
+            if _is_valid_addata(cand):
+                _cache[CACHE_KEY] = cand
+                return cand
+
     # 3. OneDrive配下を並列検索（複数候補を同時走査で最大3倍速）
     try:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         roots = _candidate_onedrive_roots()
         if roots:
             with ThreadPoolExecutor(max_workers=min(len(roots), 4)) as ex:
-                futures = {ex.submit(_walk_for_addata, r, 5, 8000): r for r in roots}
+                futures = {ex.submit(_walk_for_addata, r, 5, 30000): r for r in roots}
                 for fu in as_completed(futures):
                     try:
                         found = fu.result()
@@ -191,7 +251,7 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
     except Exception:
         # フォールバック: 直列
         for od in _candidate_onedrive_roots():
-            found = _walk_for_addata(od, max_depth=5, max_dirs=8000)
+            found = _walk_for_addata(od, max_depth=5, max_dirs=30000)
             if found:
                 _cache[CACHE_KEY] = found
                 return found
@@ -225,13 +285,18 @@ def find_all_addata(force_refresh: bool = False) -> List[str]:
     for std in _STANDARD_PATHS:
         _add(std)
 
+    # 2b. OneDrive ルート × 業務典型サブパス (v10.4)
+    for od in _candidate_onedrive_roots():
+        for sub in _ONEDRIVE_SUBPATHS:
+            _add(os.path.join(od, sub))
+
     # 3. OneDrive配下 (並列で全候補回収)
     try:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         roots = _candidate_onedrive_roots()
         if roots:
             with ThreadPoolExecutor(max_workers=min(len(roots), 4)) as ex:
-                futures = {ex.submit(_walk_for_addata, r, 5, 8000): r for r in roots}
+                futures = {ex.submit(_walk_for_addata, r, 5, 30000): r for r in roots}
                 for fu in as_completed(futures):
                     try:
                         _add(fu.result())
@@ -240,7 +305,7 @@ def find_all_addata(force_refresh: bool = False) -> List[str]:
     except Exception:
         for od in _candidate_onedrive_roots():
             try:
-                _add(_walk_for_addata(od, max_depth=5, max_dirs=8000))
+                _add(_walk_for_addata(od, max_depth=5, max_dirs=30000))
             except Exception:
                 pass
 
@@ -262,13 +327,45 @@ def list_candidate_paths() -> List[str]:
     return out
 
 
+# v10.4: AcesData 並列検出（NEO 生成には不要だが UI 上で「並列にあり」を表示する用途）
+def find_acesdata(force_refresh: bool = False) -> Optional[str]:
+    """ADDATA と並んで「AcesData」フォルダがある場合のパスを返す。なければ None。
+    `find_addata()` で見つけた ADDATA の親フォルダ配下を最初に当たり、
+    なければ OneDrive サブパス候補（_ONEDRIVE_SUBPATHS 由来の親 + AcesData）を確認する。
+    """
+    addata = find_addata(force_refresh=force_refresh)
+    if addata:
+        sibling = os.path.join(os.path.dirname(addata), "AcesData")
+        if os.path.isdir(sibling):
+            return sibling
+    # OneDrive サブパス候補の親に AcesData が並んでいる構造もチェック
+    for od in _candidate_onedrive_roots():
+        for sub in _ONEDRIVE_SUBPATHS:
+            parent = os.path.dirname(os.path.join(od, sub))
+            cand = os.path.join(parent, "AcesData")
+            if os.path.isdir(cand):
+                return cand
+    return None
+
+
 if __name__ == "__main__":
+    import time as _time
     sys.stdout.reconfigure(encoding="utf-8")
-    print("候補:")
+    print("=== ADDATA 自動検出診断 ===")
+    print("候補一覧:")
     for p in list_candidate_paths():
         print(f"  {p}")
     print()
+    t0 = _time.perf_counter()
     found = find_addata()
+    elapsed = _time.perf_counter() - t0
     print(f"検出結果: {found!r}")
+    print(f"検出時間: {elapsed:.2f} 秒")
     if found:
         print(f"_is_valid_addata: {_is_valid_addata(found)}")
+        aces = find_acesdata()
+        print(f"並列 AcesData: {aces!r}")
+    print()
+    print("全候補（find_all_addata）:")
+    for c in find_all_addata():
+        print(f"  - {c}")

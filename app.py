@@ -2037,6 +2037,8 @@ TASK_PROMPTS["shaken_ocr"] = """<task_execution>
 - body_color: 車体の色（記載がなければ""）
 - color_code: カラーコード（記載がなければ""）
 - trim_code: トリムコード（記載がなければ""）
+- body_code: ボディコード（4桁数字、車検証「備考」欄や「ボディタイプ」欄に記載される事が多い、不明なら 0）
+- grade_code: グレードコード（メーカーごとの英数字、不明なら""）
 - car_weight: 車両重量（kg、整数）
 - engine_displacement: 総排気量又は定格出力の数値（cc/L → cc整数に統一。例: 2.49L → 2490）
 - kilometer: 走行距離計表示値（km、整数。備考欄の「走行距離計表示値」から読み取る）
@@ -2074,6 +2076,8 @@ TASK_PROMPTS["shaken_ocr"] = """<task_execution>
   "body_color": "",
   "color_code": "",
   "trim_code": "",
+  "body_code": 0,
+  "grade_code": "",
   "car_weight": 0,
   "engine_displacement": 0,
   "kilometer": 0,
@@ -2110,7 +2114,7 @@ page_type の値: fax_cover / estimate / vehicle / other
 TASK_PROMPTS["estimate_header_totals"] = """<task_execution>
 タスク名: header_total_extraction
 
-合計値・修理工場名・車両情報を抽出します。「ページ小計」は総合計に使用しないでください。
+合計値・修理工場名・車両情報・顧客情報を抽出します。「ページ小計」は総合計に使用しないでください。
 「部品計」「工賃計」の明示的な小計行が存在しない単列金額形式の場合は、部品計・工賃計を 0 とし、総合計のみを抽出してください。
 
 金額探索ルール:
@@ -2119,6 +2123,16 @@ TASK_PROMPTS["estimate_header_totals"] = """<task_execution>
 - 「合計」「総合計」「御見積合計金額」「御見積金額」「見積金額」「請求金額」等 → pdf_grand_total
 - 値引き額 → discount_amount
 - Honda Cars系はページ1上部サマリーボックスの合計値も確認する
+
+顧客情報抽出ルール (v10.4):
+- 「お客様氏名」「使用者氏名」「お名前」「契約者名」「ご依頼主」「氏名」「様」付きの行 → customer_name
+- 「所有者氏名」「ご所有者」「車両所有者」 → owner_name
+- 「受付番号」「受付No」「受付Ｎｏ」「整理番号」「管理番号」「自社No」「事故受付」 → receipt_no
+  （5〜10桁の数字、または「英字+数字」のパターンが多い）
+- 「見積日」「見積書作成日」「日付」「作成日」 → estimate_date（YYYYMMDD 形式）
+- 住所行（〒postal含む） → address
+- 電話番号（XXX-XXXX-XXXX 形式） → phone
+- 抽出が困難な場合は空文字 "" を返し、推測で埋めない
 
 <output_format>
 {
@@ -2131,7 +2145,13 @@ TASK_PROMPTS["estimate_header_totals"] = """<task_execution>
   "pdf_parts_total": 0,
   "pdf_wage_total": 0,
   "discount_amount": 0,
-  "pdf_grand_total": 0
+  "pdf_grand_total": 0,
+  "customer_name": "",
+  "owner_name": "",
+  "receipt_no": "",
+  "estimate_date": "",
+  "address": "",
+  "phone": ""
 }
 </output_format>
 </task_execution>"""
@@ -2491,6 +2511,8 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type):
             "body_color":            {"type": "string"},
             "color_code":            {"type": "string"},
             "trim_code":             {"type": "string"},
+            "body_code":             {"type": "string"},
+            "grade_code":            {"type": "string"},
             "car_weight":            {"type": "string"},
             "engine_displacement":   {"type": "string"},
             "kilometer":             {"type": "string"},
@@ -2545,7 +2567,7 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type):
             result = {}
 
     # 数値フィールドを文字列→数値に変換（response_schema が string 型で返すため）
-    for int_key in ('car_weight', 'engine_displacement', 'kilometer'):
+    for int_key in ('car_weight', 'engine_displacement', 'kilometer', 'body_code'):
         if int_key in result:
             result[int_key] = safe_int(result[int_key])
     if 'confidence' in result:
@@ -4670,10 +4692,20 @@ def main():
             value=_ADDATA_AVAILABLE,
             help="ローカルAddata DBと照合して品番・価格・工数を補完します（C:\\Addata 等）"
         )
-        # v6: OneDrive配下のADDATAを自動検索 (各PCで動的に検出)
+        # v10.5: 起動時に複数候補を自動探索（ボタン押下不要）
+        # OneDrive サブパスを含む候補を優先（業務データ一貫性のため）
         try:
-            from addata_locator import find_addata as _find_ad
-            _auto_ad = _find_ad()
+            from addata_locator import find_addata as _find_ad, find_all_addata as _find_all_ad
+            if '_addata_all_candidates' not in st.session_state:
+                _all_ad_initial = _find_all_ad()
+                # OneDrive サブパスを含む候補を先頭に並び替え
+                if _all_ad_initial:
+                    _od_first = [p for p in _all_ad_initial if 'OneDrive' in p]
+                    _others = [p for p in _all_ad_initial if 'OneDrive' not in p]
+                    _all_ad_initial = _od_first + _others
+                st.session_state['_addata_all_candidates'] = _all_ad_initial
+            _all_ad_cached = st.session_state.get('_addata_all_candidates') or []
+            _auto_ad = _all_ad_cached[0] if _all_ad_cached else _find_ad()
         except Exception:
             _auto_ad = None
         _default_ad = _auto_ad or st.session_state.get('_addata_path_last') or r"C:\Addata"
@@ -4683,10 +4715,25 @@ def main():
             help="自動検索結果を表示。違うパスを指定したい場合は手動入力可。"
         )
         st.session_state['_addata_path_last'] = addata_path
-        if _auto_ad and addata_path == _auto_ad:
-            st.sidebar.caption(f"✅ 自動検出: OneDrive内ADDATA")
+        # v10.4: 4 種類のフィードバックでユーザーが「自分の入力が有効か」を即判定可能に
+        try:
+            from addata_locator import _is_valid_addata as _is_valid
+        except Exception:
+            _is_valid = lambda p: bool(p) and os.path.isdir(p)
+        if not addata_path:
+            st.sidebar.caption("ℹ️ 未入力（ADDATA を使わない場合は OK）")
         elif not os.path.isdir(addata_path):
-            st.sidebar.caption("⚠️ 指定パスが存在しません")
+            st.sidebar.error("⚠️ 指定パスが存在しません。エクスプローラーでフォルダを開きアドレスバーをコピーして貼付してください")
+        elif not _is_valid(addata_path):
+            st.sidebar.warning("⚠️ パスは存在しますが ADDATA 構造（A-Z 子フォルダ + .DB）ではありません")
+        elif _auto_ad and os.path.normpath(addata_path) == os.path.normpath(_auto_ad):
+            try:
+                _label = os.path.basename(os.path.dirname(addata_path)) or os.path.basename(addata_path)
+            except Exception:
+                _label = "OneDrive内ADDATA"
+            st.sidebar.success(f"✅ 自動検出: {_label}")
+        else:
+            st.sidebar.info("✅ 手動指定: 有効な ADDATA")
         if st.sidebar.button("🔄 ADDATA再検索", help="OneDriveを再走査"):
             try:
                 from addata_locator import find_addata as _refind, find_all_addata as _refind_all
@@ -4703,7 +4750,7 @@ def main():
         # v6.1: 複数候補 → ラジオ選択
         _candidates = st.session_state.get('_addata_all_candidates', [])
         if _candidates and len(_candidates) >= 2:
-            with st.sidebar.expander(f"📂 ADDATA候補 ({len(_candidates)}件)", expanded=False):
+            with st.sidebar.expander(f"📂 ADDATA候補 ({len(_candidates)}件)", expanded=True):
                 _idx = 0
                 if addata_path in _candidates:
                     _idx = _candidates.index(addata_path)
@@ -4788,8 +4835,8 @@ def main():
                     )
 
                 st.markdown("---")
-                # 蓄積データ詳細
-                with st.expander("📋 訂正データ詳細", expanded=False):
+                # 蓄積データ詳細（v10.4: ネスト expander 禁則回避のため checkbox トグル化）
+                if st.checkbox("📋 訂正データ詳細を表示", value=False, key="_show_correction_detail"):
                     _all_corr = get_all_pending_corrections()
                     if _all_corr:
                         _corr_rows = []
@@ -4864,10 +4911,10 @@ def main():
                         except Exception as _pe:
                             st.error(f"エラー: {_pe}")
 
-            # 現在適用中のパッチ表示
+            # 現在適用中のパッチ表示（v10.4: ネスト expander 禁則回避のため checkbox トグル化）
             _current_patch = _load_learned_hints("estimate_detail_page")
             if _current_patch:
-                with st.expander("📌 現在適用中のパッチ", expanded=False):
+                if st.checkbox("📌 現在適用中のパッチを表示", value=False, key="_show_active_patch"):
                     st.code(_current_patch, language=None)
 
     # セッション状態初期化
@@ -5046,7 +5093,16 @@ def main():
                     for name, r in results:
                         with st.expander(f"📄 {name}", expanded=True):
                             if not r.get("ok"):
-                                st.error(f"❌ 失敗: {r.get('error', '不明')}")
+                                err = r.get('error', '不明')
+                                st.error(f"❌ 失敗: {err}")
+                                # v10.4: 失敗時のアクション提示
+                                st.caption("💡 対処の目安:")
+                                st.markdown(
+                                    "- **OCR が読めていない場合**: サイドバーの「🎯 精度モード」を ON にして再アップロード\n"
+                                    "- **画像化見積（罫線が複雑）の場合**: 「PDF→画像変換」を ON\n"
+                                    "- **「クォータ超過」エラー**: 翌日まで待機、または別の API キーに切替\n"
+                                    "- **何度も失敗する場合**: PDF を 1〜2 ページずつに分割してアップロード"
+                                )
                                 continue
                             mode = r.get("mode", "?")
                             items = r.get("items") or []
@@ -5071,25 +5127,47 @@ def main():
                             if vi.get("car_name"):
                                 st.caption(f"🚗 車名: {vi.get('car_name')} / 車台番号: {vi.get('car_serial_no','-')} / 色: {vi.get('color_code','-')}")
                             neo_bytes = r.get("neo_bytes")
+                            csv_bytes = r.get("csv_bytes")
+                            dl_cols = st.columns(2 if csv_bytes else 1)
                             if neo_bytes:
-                                st.download_button(
+                                dl_cols[0].download_button(
                                     f"📥 {os.path.splitext(name)[0]}.neo をダウンロード",
                                     data=neo_bytes,
                                     file_name=os.path.splitext(name)[0] + ".neo",
                                     mime="application/octet-stream",
                                     key=f"dl_{name}",
                                     type="primary",
+                                    help="コグニセブンに直接取込めるファイルです",
+                                )
+                            if csv_bytes:
+                                dl_cols[1].download_button(
+                                    f"📋 {os.path.splitext(name)[0]}_明細.csv",
+                                    data=csv_bytes,
+                                    file_name=os.path.splitext(name)[0] + "_明細.csv",
+                                    mime="text/csv",
+                                    key=f"dlcsv_{name}",
+                                    type="secondary",
+                                    help="Excel で開いて明細を確認・修正可。NEO 生成前の可視チェックにも使えます",
                                 )
                 except Exception as e:
                     err_str = str(e)
+                    err_low = err_str.lower()
                     if "API key" in err_str or "GEMINI" in err_str.upper():
                         st.error("❌ Gemini API キーエラー\n💡 対処: サイドバーの「APIキー設定」を確認してください")
-                    elif "quota" in err_str.lower() or "429" in err_str:
+                    elif "quota" in err_low or "429" in err_str:
                         st.error("❌ Gemini API クォータ超過\n💡 対処: 翌日まで待つか、別のAPIキーに切替えてください")
-                    elif "template" in err_str.lower():
+                    elif "template" in err_low:
                         st.error(f"❌ テンプレートNEO読込失敗\n💡 対処: template_toyota.neo が見つかりません: {e}")
+                    elif "deadline" in err_low or "timeout" in err_low:
+                        st.error("⏱️ Gemini API タイムアウト\n💡 対処: PDFのページ数が多すぎる可能性。分割するか、しばらく待って再試行してください")
+                    elif "network" in err_low or "connection" in err_low or "ssl" in err_low:
+                        st.error("🌐 ネットワーク接続エラー\n💡 対処: Wi-Fi 接続を確認してください")
+                    elif "pdf" in err_low and ("corrupt" in err_low or "damaged" in err_low or "invalid" in err_low):
+                        st.error("📄 PDF が破損しています\n💡 対処: 元の PDF を再ダウンロード／再保存してください")
+                    elif "sqlite" in err_low or "database" in err_low:
+                        st.error("💾 NEO テンプレートファイル破損\n💡 対処: template_toyota.neo を再配備してください")
                     else:
-                        st.error(f"❌ 処理失敗: {e}\n💡 対処: 詳細を展開してエラー内容を確認、またはサポートに連絡してください")
+                        st.error("❌ 想定外のエラーです\n💡 対処: 詳細を展開してエラー内容を確認、またはサポートに連絡してください")
                     import traceback as _tb
                     with st.expander("詳細スタックトレース"):
                         st.code(_tb.format_exc())

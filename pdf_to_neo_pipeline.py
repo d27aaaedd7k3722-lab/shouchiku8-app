@@ -1265,6 +1265,8 @@ def process_pdf_to_neo(pdf_path,
                             "engine_model": "engine_model",
                             "trim_code": "trim_code",
                             "grade": "grade",
+                            "grade_code": "grade_code",   # v10.4: ADDATAマッチング補助
+                            "body_code": "body_code",     # v10.4: ADDATAマッチング補助
                             "model_year": "model_year",
                             "mileage": "mileage",
                         }
@@ -1495,10 +1497,77 @@ def process_pdf_to_neo(pdf_path,
             _PIPELINE_CACHE.pop(next(iter(_PIPELINE_CACHE)))
         _PIPELINE_CACHE[cache_key] = {k: v for k, v in out.items()}
 
+    # v10.4: items を CSV bytes 化（NEO 生成に成功している場合のみ。失敗時は付けない）
+    try:
+        if out.get("ok") and out.get("items"):
+            out["csv_bytes"] = items_to_csv_bytes(
+                out.get("items") or [],
+                out.get("vehicle_info") or {},
+                (out.get("vehicle_info") or {}).get("customer_info")
+                if isinstance((out.get("vehicle_info") or {}).get("customer_info"), dict)
+                else None,
+            )
+    except Exception as _csv_e:
+        logger.debug("items_to_csv_bytes failed: %s", _csv_e)
+
     return out
 
 # 後方互換 alias
 run_pipeline = process_pdf_to_neo
+
+
+# v10.4: CSV 中間表現エクスポート
+def items_to_csv_bytes(items: List[Dict[str, Any]],
+                       vehicle_info: Optional[Dict[str, Any]] = None,
+                       customer_info: Optional[Dict[str, Any]] = None) -> bytes:
+    """items list を CSV bytes（UTF-8 BOM 付き、Excel 対応）にエクスポート。
+
+    列構成（NEO 生成前の可視チェック用）:
+      行 / 部品名 / 部品番号(OCR) / DB部品番号 / 数量 / 単価 / DB単価 /
+      部品計 / 工賃 / 作業区分 / 指数 / マッチレベル / マーカー / 備考
+    """
+    import io
+    import csv
+    buf = io.StringIO()
+    buf.write('﻿')  # Excel が UTF-8 を判定する BOM
+    writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
+    if vehicle_info:
+        writer.writerow(["# 車名", vehicle_info.get("car_name", "")])
+        writer.writerow(["# 車台番号", vehicle_info.get("car_serial_no", "")])
+        writer.writerow(["# 型式", vehicle_info.get("car_model", "")])
+        writer.writerow(["# 色", str(vehicle_info.get("color_code", "")) + " " + str(vehicle_info.get("body_color", ""))])
+        writer.writerow(["# グレード", vehicle_info.get("grade", "") or vehicle_info.get("grade_code", "")])
+        writer.writerow(["# ボディコード", str(vehicle_info.get("body_code", 0))])
+    if customer_info:
+        writer.writerow(["# 顧客名", customer_info.get("customer_name", "")])
+        writer.writerow(["# 受付番号", customer_info.get("receipt_no", "")])
+        writer.writerow(["# 修理工場", customer_info.get("repair_shop_name", "")])
+    writer.writerow([])
+    writer.writerow([
+        "行", "部品名", "部品番号(OCR)", "DB部品番号", "数量",
+        "単価", "DB単価", "部品計", "工賃", "作業区分",
+        "指数", "マッチ", "マーカー付", "備考",
+    ])
+    for i, it in enumerate(items, 1):
+        if not isinstance(it, dict):
+            continue
+        writer.writerow([
+            i,
+            it.get("parts_name") or it.get("name", "") or it.get("work_or_part_name", ""),
+            it.get("parts_no") or it.get("part_no", "") or it.get("part_number", ""),
+            it.get("db_parts_no", ""),
+            it.get("quantity", 1),
+            it.get("unit_price") or it.get("part_price", 0),
+            it.get("db_price") or "",
+            it.get("parts_amount") or it.get("amount", 0),
+            it.get("wage") or it.get("labor_fee", 0),
+            it.get("category") or it.get("work_code", ""),
+            it.get("index_value", 0),
+            it.get("match_level", ""),
+            it.get("parts_no_marked", "") or it.get("pno_marker", ""),
+            it.get("match_note", "") or ("※金額調整" if it.get("is_adjustment_row") else ""),
+        ])
+    return buf.getvalue().encode("utf-8")
 
 
 if __name__ == "__main__":
