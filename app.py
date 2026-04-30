@@ -312,12 +312,26 @@ def safe_int(val, default=0):
 
 
 def safe_float(val, default=0.0):
-    """安全な浮動小数変換"""
-    if val is None:
+    """安全な浮動小数変換 (v11.0: 括弧・通貨・全角・単位を吸収)"""
+    if val is None or val == '' or val == '*' or val == '**':
+        return default
+    if isinstance(val, bool):
+        return float(val)
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    if not s:
+        return default
+    s = s.translate(str.maketrans('０１２３４５６７８９．−', '0123456789.-'))
+    is_negative = bool(re.match(r'^[△▲\-]', s))
+    s = re.sub(r'[個本枚セット台式時間円¥￥,，\s]', '', s)
+    s = re.sub(r'[^\d.\-]', '', s)
+    if not s or s in ('-', '.', '-.'):
         return default
     try:
-        return float(val)
-    except (ValueError, TypeError):
+        v = float(s)
+        return -abs(v) if is_negative and v > 0 else v
+    except (ValueError, OverflowError):
         return default
 
 
@@ -589,7 +603,7 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
                 unit_price  = safe_int(item.get('unit_price', 0))
                 parts_total = unit_price * qty
 
-            index_val = float(item.get('index_value', 0.0) or 0.0)
+            index_val = safe_float(item.get('index_value'))
             db_time = round(index_val * 10) if index_val > 0 else -1
 
             wage     = safe_int(item.get('wage', 0))
@@ -1917,21 +1931,10 @@ def generate_beta_discrepancy_report_pdf(estimate_data, calc_parts, calc_wages, 
     for i, it in enumerate(items):
         name = it.get('name', '')
         method = it.get('method', '')
-        # quantity might be float in some edges
-        try:
-            qty = int(float(it.get('quantity', 1)))
-        except (ValueError, TypeError):
-            qty = 1
-
-        try:
-            p_amt = int(float(it.get('parts_amount', 0)))
-        except (ValueError, TypeError):
-            p_amt = safe_int(it.get('_original_parts_amount', 0))
-
-        try:
-            w_amt = int(float(it.get('wage', 0)))
-        except (ValueError, TypeError):
-            w_amt = 0
+        # quantity might be float in some edges (v11.0: safe_int で括弧書き対策)
+        qty = max(safe_int(it.get('quantity'), 1), 1)
+        p_amt = safe_int(it.get('parts_amount')) or safe_int(it.get('_original_parts_amount'))
+        w_amt = safe_int(it.get('wage'))
 
         table_data.append([
             str(i + 1), name, method, str(qty), f"¥{p_amt:,}", f"¥{w_amt:,}"
@@ -4686,6 +4689,32 @@ def main():
             help="APIで利用可能なモデルを自動検出。3.1 Pro=最高精度、2.5 Flash=高速・コスパ良好"
         )
         st.markdown("---")
+
+        # v11.0: 簡単モード切替（デフォルトON、非エンジニア向け）
+        if '_v11_use_simple' not in st.session_state:
+            st.session_state['_v11_use_simple'] = True
+        st.markdown('### 🎯 表示モード')
+        _v11_simple = st.checkbox(
+            '簡単モード（おすすめ）',
+            value=st.session_state['_v11_use_simple'],
+            key='_v11_simple_checkbox',
+            help='ON: PDFを投げ込むだけ / OFF: 細かい設定ができる詳細モード'
+        )
+        st.session_state['_v11_use_simple'] = _v11_simple
+        st.markdown("---")
+
+    # v11.0: 簡単モードならシンプル UI を描画して早期 return
+    if st.session_state.get('_v11_use_simple', True):
+        try:
+            import simple_mode_v11
+            simple_mode_v11.render(api_key, model_name=selected_model)
+        except Exception as _v11_e:
+            st.error(f'簡単モード初期化失敗: {_v11_e}\n\n左サイドバーの「簡単モード」を OFF にして詳細モードでお試し下さい。')
+            import traceback
+            st.code(traceback.format_exc())
+        return
+
+    with st.sidebar:
         st.header("🗂️ Addata DB照合")
         use_addata = st.sidebar.checkbox(
             "Addata DB照合を使う",

@@ -40,6 +40,64 @@ _PIPELINE_CACHE: Dict[str, Dict[str, Any]] = {}
 _PIPELINE_CACHE_MAX = 32
 
 
+# ============================================================
+# v11.0 Phase A-1/A-2: 安全な数値変換ヘルパー
+# OCR 由来の括弧書き「(02)」「△500」「￥1,200」「2台」等を吸収して
+# float / int クラッシュを根絶する（BUG-1 (02) 問題の対策）
+# ============================================================
+def _to_int(val, default: int = 0) -> int:
+    """安全な int 変換。括弧・通貨記号・全角・単位・会計表記を吸収。"""
+    if val is None or val == '' or val == '*' or val == '**':
+        return default
+    if isinstance(val, bool):
+        return int(val)
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        try:
+            return int(round(val))
+        except (ValueError, OverflowError):
+            return default
+    s = str(val).strip()
+    if not s:
+        return default
+    s = s.translate(str.maketrans('０１２３４５６７８９．−', '0123456789.-'))
+    is_negative = bool(re.match(r'^[△▲\-]', s))
+    s = re.sub(r'[個本枚セット台式時間円¥￥,，\s]', '', s)
+    s = re.sub(r'[^\d.\-]', '', s)
+    if not s or s in ('-', '.', '-.'):
+        return default
+    try:
+        v = int(round(float(s)))
+        return -abs(v) if is_negative and v > 0 else v
+    except (ValueError, OverflowError):
+        return default
+
+
+def _to_float(val, default: float = 0.0) -> float:
+    """安全な float 変換。括弧・通貨記号・全角・単位を吸収。"""
+    if val is None or val == '' or val == '*' or val == '**':
+        return default
+    if isinstance(val, bool):
+        return float(val)
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    if not s:
+        return default
+    s = s.translate(str.maketrans('０１２３４５６７８９．−', '0123456789.-'))
+    is_negative = bool(re.match(r'^[△▲\-]', s))
+    s = re.sub(r'[個本枚セット台式時間円¥￥,，\s]', '', s)
+    s = re.sub(r'[^\d.\-]', '', s)
+    if not s or s in ('-', '.', '-.'):
+        return default
+    try:
+        v = float(s)
+        return -abs(v) if is_negative and v > 0 else v
+    except (ValueError, OverflowError):
+        return default
+
+
 def _pdf_md5(b: bytes) -> str:
     import hashlib
     return hashlib.md5(b).hexdigest() if b else ""
@@ -523,8 +581,8 @@ def _final_dedup_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
         try:
             nm = str(it.get("name") or it.get("parts_name") or "").strip().lower()
-            pa = int(float(it.get("parts_amount") or it.get("part_price") or 0))
-            wg = int(float(it.get("wage") or it.get("labor_fee") or 0))
+            pa = _to_int(it.get("parts_amount") or it.get("part_price"))
+            wg = _to_int(it.get("wage") or it.get("labor_fee"))
             ix = str(it.get("index_value") or "").strip()
             key = (nm, pa, wg, ix)
             if nm and key in seen:
@@ -558,10 +616,10 @@ def _enforce_grand_total_match(items: List[Dict[str, Any]],
         try:
             pa = it.get("parts_amount") or it.get("amount") or 0
             if pa:
-                sum_outtax += int(float(pa))
+                sum_outtax += _to_int(pa)
             else:
-                up = float(it.get("unit_price") or it.get("part_price") or 0)
-                qty = max(int(float(it.get("quantity") or 1)), 1)
+                up = _to_float(it.get("unit_price") or it.get("part_price"))
+                qty = max(_to_int(it.get("quantity"), 1), 1)
                 if up > 0:
                     sum_outtax += int(up * qty)
         except Exception:
@@ -569,7 +627,7 @@ def _enforce_grand_total_match(items: List[Dict[str, Any]],
         try:
             wg = it.get("wage") or it.get("labor_fee") or 0
             if wg:
-                sum_outtax += int(float(wg))
+                sum_outtax += _to_int(wg)
         except Exception:
             pass
 
@@ -581,7 +639,7 @@ def _enforce_grand_total_match(items: List[Dict[str, Any]],
     adj_idx = next((i for i, it in enumerate(out) if it.get("is_adjustment_row")), None)
     if adj_idx is not None:
         existing = out[adj_idx]
-        cur_pa = int(float(existing.get("parts_amount") or 0))
+        cur_pa = _to_int(existing.get("parts_amount"))
         existing["parts_amount"] = cur_pa + diff
         existing["amount"] = cur_pa + diff
         existing["unit_price"] = cur_pa + diff
@@ -639,10 +697,10 @@ def _enforce_total_match(items: List[Dict[str, Any]],
         try:
             pa = it.get("parts_amount") or it.get("amount") or 0
             if pa:
-                sum_parts += int(float(pa))
+                sum_parts += _to_int(pa)
             else:
-                up = float(it.get("unit_price") or it.get("part_price") or 0)
-                qty = max(int(float(it.get("quantity") or 1)), 1)
+                up = _to_float(it.get("unit_price") or it.get("part_price"))
+                qty = max(_to_int(it.get("quantity"), 1), 1)
                 if up > 0:
                     sum_parts += int(up * qty)
         except Exception:
@@ -650,7 +708,7 @@ def _enforce_total_match(items: List[Dict[str, Any]],
         try:
             wg = it.get("wage") or it.get("labor_fee") or 0
             if wg:
-                sum_wage += int(float(wg))
+                sum_wage += _to_int(wg)
         except Exception:
             pass
 
@@ -704,30 +762,24 @@ def _normalize_items_for_neo(items: List[Dict[str, Any]]) -> List[Dict[str, Any]
         # v4: app.generate_neo_file は part_no を読むため、parts_no を part_no にもコピー
         if nit.get("parts_no") and not nit.get("part_no"):
             nit["part_no"] = nit["parts_no"]
-        # 数量
-        try:
-            qty = nit.get("quantity")
-            qty_i = int(float(qty)) if qty not in (None, "", 0) else 1
-            if qty_i < 1:
-                qty_i = 1
-        except (TypeError, ValueError):
-            qty_i = 1
+        # 数量 (v11.0: _to_int で括弧書き対策)
+        qty_i = max(_to_int(nit.get("quantity"), 1), 1)
         nit["quantity"] = qty_i
         # 単価: unit_price 未設定なら parts_amount/qty で算出
         if not nit.get("unit_price"):
-            try:
-                pa = float(nit.get("parts_amount") or 0)
-                if pa > 0 and qty_i > 0:
-                    nit["unit_price"] = int(round(pa / qty_i))
-                else:
-                    nit["unit_price"] = int(float(nit.get("part_price") or 0))
-            except (TypeError, ValueError):
-                nit["unit_price"] = 0
+            pa = _to_float(nit.get("parts_amount"))
+            if pa > 0 and qty_i > 0:
+                nit["unit_price"] = int(round(pa / qty_i))
+            else:
+                nit["unit_price"] = _to_int(nit.get("part_price"))
         # 工賃
-        try:
-            nit["wage"] = int(float(nit.get("wage") or nit.get("labor_fee") or 0))
-        except (TypeError, ValueError):
-            nit["wage"] = 0
+        nit["wage"] = _to_int(nit.get("wage") or nit.get("labor_fee"))
+        # parts_amount / index_value も安全変換
+        if "parts_amount" in nit:
+            nit["parts_amount"] = _to_int(nit.get("parts_amount"))
+        if "index_value" in nit:
+            iv = _to_float(nit.get("index_value"))
+            nit["index_value"] = iv
         # カテゴリ（取替/脱着/修理）
         if not nit.get("category"):
             nit["category"] = nit.get("work_code") or ""
@@ -895,8 +947,8 @@ def build_neo_mode_b(items: List[Dict[str, Any]],
                     it.setdefault("orig_parts_no", it.get("parts_no", ""))
                     it["parts_no"] = db_pno
                 try:
-                    db_p = float(it.get("db_price") or 0)
-                    up = float(it.get("unit_price") or 0)
+                    db_p = _to_float(it.get("db_price"))
+                    up = _to_float(it.get("unit_price"))
                     if db_p > 0 and up > 0 and abs(db_p - up) >= 1:
                         it["parts_no"] = _decorate_part_no(it.get("parts_no"), _PRICE_MISMATCH_MARK)
                         it["price_mismatch"] = True
@@ -984,13 +1036,20 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]]) -> Dic
         "mismatches": [],
     }
     try:
-        # PDF total 計算
+        # PDF total 計算 (v11.0 Phase A-3: parts_amount + wage を直接合計。
+        # 旧 unit_price*qty 方式は本アプリ items 仕様と不整合だった BUG-2 修正)
         pdf_total = 0
         for it in (items or []):
             try:
-                up = float(it.get("unit_price") or it.get("part_price") or 0)
-                qty = float(it.get("quantity") or 1)
-                pdf_total += up * qty
+                pa = _to_int(it.get("parts_amount") or it.get("amount") or it.get("part_price"))
+                wg = _to_int(it.get("wage") or it.get("labor_fee"))
+                if pa or wg:
+                    pdf_total += pa + wg
+                else:
+                    # フォールバック: 旧来の unit_price * quantity
+                    up = _to_float(it.get("unit_price"))
+                    qty = max(_to_int(it.get("quantity"), 1), 1)
+                    pdf_total += int(up * qty)
             except (TypeError, ValueError):
                 pass
         res["pdf_total"] = pdf_total
@@ -1036,15 +1095,15 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]]) -> Dic
             neo_count = len(rows)
             neo_total = 0
             for r in rows:
-                # PartsPriceInTax/OutTax のうち利用可能な値で総額算出
+                # PartsPriceInTax/OutTax のうち利用可能な値で総額算出 (v11.0: _to_float で安全化)
                 try:
-                    in_tax = float(r[4] or 0)
-                    out_tax = float(r[3] or 0)
+                    in_tax = _to_float(r[4])
+                    out_tax = _to_float(r[3])
                     val = in_tax if in_tax > 0 else out_tax
                     if val <= 0:
                         # 単価×数量で代替
-                        up = float(r[2] or r[1] or 0)
-                        qty = float(r[5] or 1)
+                        up = _to_float(r[2]) or _to_float(r[1])
+                        qty = max(_to_int(r[5], 1), 1)
                         val = up * qty
                     neo_total += val
                 except (TypeError, ValueError):
@@ -1324,9 +1383,9 @@ def process_pdf_to_neo(pdf_path,
                     # Iter8: 金額誤差自動リカバリ
                     # OCR出力の合計と PDF表示総合計が ±5%超ずれてたら rasterize=ON で再OCR
                     try:
-                        pdf_total = float(ocr_meta_first.get("grand_total") or
-                                         ocr_meta_first.get("pdf_total") or 0)
-                        items_sum = sum(float(it.get("line_total") or 0) for it in items)
+                        pdf_total = _to_float(ocr_meta_first.get("grand_total") or
+                                              ocr_meta_first.get("pdf_total"))
+                        items_sum = sum(_to_float(it.get("line_total")) for it in items)
                         diff_ratio = abs(items_sum - pdf_total) / pdf_total if pdf_total > 0 else 0
                         if diff_ratio > 0.05 and not skip_ocr:
                             log.append(f"⚠ 金額差{diff_ratio:.1%} → rasterize=ON で再OCR試行")
@@ -1334,7 +1393,7 @@ def process_pdf_to_neo(pdf_path,
                                                     use_rasterize=True)
                             if isinstance(res2, dict) and "items" in res2:
                                 items2 = res2.get("items", [])
-                                items2_sum = sum(float(it.get("line_total") or 0) for it in items2)
+                                items2_sum = sum(_to_float(it.get("line_total")) for it in items2)
                                 diff2 = abs(items2_sum - pdf_total) / pdf_total if pdf_total > 0 else 1
                                 if diff2 < diff_ratio:
                                     log.append(f"✅ 再OCR採用 ({diff2:.1%} < {diff_ratio:.1%})")
@@ -1363,9 +1422,18 @@ def process_pdf_to_neo(pdf_path,
     if items and out.get("ocr_meta"):
         try:
             _meta = out["ocr_meta"]
-            pdf_p = int(_meta.get("pdf_parts_total") or 0)
-            pdf_w = int(_meta.get("pdf_wage_total") or 0)
-            pdf_g = int(_meta.get("pdf_grand_total") or 0)
+            pdf_p = _to_int(_meta.get("pdf_parts_total"))
+            pdf_w = _to_int(_meta.get("pdf_wage_total"))
+            pdf_g = _to_int(_meta.get("pdf_grand_total"))
+            # v11.0 Phase A-4: header OCR で pdf_wage_total=0 だが items に工賃 > 0 がある場合、
+            # items 側の合計を採用 (BUG-3: 工賃計 0 OCR ミス対策)
+            try:
+                items_wage_sum = sum(_to_int(it.get("wage") or it.get("labor_fee")) for it in items)
+                if pdf_w == 0 and items_wage_sum > 1000:
+                    log.append(f"[A-4] header工賃計=0 だが items合計={items_wage_sum} → items側採用")
+                    pdf_w = items_wage_sum
+            except Exception:
+                pass
             if pdf_p > 0 or pdf_w > 0:
                 items = _enforce_total_match(items, pdf_p, pdf_w, tolerance=0)
                 log.append(f"[total_match] parts={pdf_p} wage={pdf_w} 適用")
@@ -1373,6 +1441,21 @@ def process_pdf_to_neo(pdf_path,
             if pdf_g > 0:
                 items = _enforce_grand_total_match(items, pdf_g, is_tax_inclusive=True)
                 log.append(f"[grand_total_match] grand={pdf_g} 適用")
+            # v11.0 Phase A-4 v2: pdf_grand_total すら 0 のとき、items 合計を grand とみなして調整
+            elif pdf_g == 0 and items:
+                try:
+                    items_total = sum(
+                        _to_int(it.get("parts_amount") or it.get("amount") or it.get("part_price"))
+                        + _to_int(it.get("wage") or it.get("labor_fee"))
+                        for it in items
+                    )
+                    if items_total > 0:
+                        log.append(f"[A-4] header総額未取得 → items合計={items_total} を grand_total として登録")
+                        # _meta に書き戻し（後段が利用するため）
+                        if isinstance(_meta, dict):
+                            _meta["pdf_grand_total"] = items_total
+                except Exception:
+                    pass
         except Exception as e:
             log.append(f"total_match 失敗: {e}")
 

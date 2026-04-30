@@ -1606,28 +1606,26 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
         "調整": 2, "点検": 2,
     }
 
+    # v11.0: pipeline の _to_int/_to_float ヘルパーを利用 (括弧書き等の OCR 異常吸収)
+    try:
+        from pdf_to_neo_pipeline import _to_int as _ti, _to_float as _tf
+    except Exception:
+        def _ti(v, d=0):
+            try: return int(round(float(re.sub(r'[^\d.\-]', '', str(v)))))
+            except: return d
+        def _tf(v, d=0.0):
+            try: return float(re.sub(r'[^\d.\-]', '', str(v)))
+            except: return d
     for it in out:
         name = (it.get("parts_name") or it.get("name") or "").strip()
         ocr_pno = str(it.get("parts_no") or it.get("part_no") or "").strip()
-        # OCR価格・数量
-        try:
-            unit_price = float(it.get("unit_price") or 0)
-        except (TypeError, ValueError):
-            unit_price = 0.0
-        try:
-            amount = float(it.get("parts_amount") or it.get("amount") or 0)
-        except (TypeError, ValueError):
-            amount = 0.0
-        try:
-            qty = max(int(float(it.get("quantity") or 1)), 1)
-        except (TypeError, ValueError):
-            qty = 1
+        # OCR価格・数量 (v11.0: 安全変換)
+        unit_price = _tf(it.get("unit_price"))
+        amount = _tf(it.get("parts_amount") or it.get("amount"))
+        qty = max(_ti(it.get("quantity"), 1), 1)
         if unit_price <= 0 and amount > 0:
             unit_price = amount / qty
-        try:
-            target_time = float(it.get("index_value") or 0)
-        except (TypeError, ValueError):
-            target_time = 0.0
+        target_time = _tf(it.get("index_value"))
         action = (it.get("category") or it.get("work_code") or "").strip()
         disposal = _disposal_map.get(action)
 
