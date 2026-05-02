@@ -1521,13 +1521,20 @@ def process_pdf_to_neo(pdf_path,
 
         # v13 Step C: ADDATA folder 構造から MakerCode/CarCode を抽出して vehicle_info に流す
         # (path 分解で確実に取れる Audatex 内部コード Mapping → NEO Car テーブル UPDATE 用)
-        if ident_vc and isinstance(vehicle_info, dict):
+        # v12 修正: Layer 3 (TOYOTA_GENERIC) フォールバック時は伝搬しない。
+        # 合成コード "TOYOTA_GENERIC" が NEO 固定長フィールドで "TOY" に切り詰められ、
+        # コグニ7 が「該当の車種が収録されておりません [車種コード: TOY]」と拒否するため。
+        _is_template_fallback = (ident_layer == 3) or (ident.get("is_template") is True) \
+                                 or (str(ident_vc or '').upper().startswith("TOYOTA_GENERIC"))
+        if ident_vc and isinstance(vehicle_info, dict) and not _is_template_fallback:
             vc = str(ident_vc).strip()
             if len(vc) >= 1:
                 vehicle_info.setdefault("maker_code", vc[0])
             if len(vc) >= 2:
                 vehicle_info.setdefault("car_code", vc)
             log.append(f"[Step C] MakerCode={vehicle_info.get('maker_code')} CarCode={vehicle_info.get('car_code')}")
+        elif _is_template_fallback:
+            log.append(f"[Step C skip] Layer3 template fallback ({ident_vc!r}) → maker_code/car_code は template の値を維持")
 
         # v12 Phase B/C 連動: NEO 生成前に _full_addata_match を呼んで items に
         # match_level / db_parts_no / addata_matched を付与する（メトリクス & CSV 用）。

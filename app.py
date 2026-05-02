@@ -1051,12 +1051,25 @@ def update_em_db(db_bytes, cust, insurance_info, estimated_date, is_tax_inclusiv
         # v13 Step C: ADDATA 由来の MakerCode/CarCode/FormCode/FVAName/BodyCode/GradeCode/
         # YearCode/FinishCode を追加。template Z10 のままで N1=22% に張りついていた問題を改善。
         car_cols = {row[1] for row in cur.execute("PRAGMA table_info(Car)").fetchall()}
+        # v12 修正: 合成コード "TOYOTA_GENERIC" 等が CarCode に流入すると NEO 固定長
+        # フィールドで "TOY" に切り詰められ、コグニ7 が拒否するため、保護する。
+        _maker_code = safe_str(cust.get('maker_code', ''))
+        _car_code   = safe_str(cust.get('car_code', ''))
+        _SYNTHETIC_CODES = ('TOYOTA_GENERIC', 'HONDA_GENERIC', 'NISSAN_GENERIC',
+                            'MAZDA_GENERIC', 'SUBARU_GENERIC', 'SUZUKI_GENERIC',
+                            'DAIHATSU_GENERIC', 'MITSUBISHI_GENERIC')
+        if _car_code.upper() in _SYNTHETIC_CODES or len(_car_code) > 8:
+            import sys as _sys
+            print(f"[update_ansmb] WARNING: 合成/異常な car_code='{_car_code}' を CarCode 書込から除外", file=_sys.stderr)
+            _car_code = ''
+            # maker_code も合成由来なら除外（'T' 等の単一文字は維持してもNEOで通らない）
+            _maker_code = ''
         car_update = [
             ('CarName', car_name), ('CarNameByUser', car_name),
             ('ColorCode', color_code), ('ColorName', body_color),
             ('TrimCode', trim_code),
-            ('MakerCode',    safe_str(cust.get('maker_code', ''))),
-            ('CarCode',      safe_str(cust.get('car_code', ''))),
+            ('MakerCode',    _maker_code),
+            ('CarCode',      _car_code),
             ('CarFormCode',  safe_str(cust.get('car_form_code', ''))),
             ('FormCode1',    safe_str(cust.get('form_code_1', ''))),
             ('FormCode2',    safe_str(cust.get('form_code_2', ''))),
