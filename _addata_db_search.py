@@ -896,6 +896,242 @@ class AddataSearchEngine:
 
         return output_path
 
+    # ================================================================
+    # v13+ 拡張: KATB010.DB / KA06_ALL.DB 連携 (Phase 2)
+    # ================================================================
+    # KATB010.DB レコード長 = 42 bytes (XOR 0xFF 復号後)
+    # フォーマット: '02' + MakerCode(A〜J) + cp932 メーカー名 (空白パディング) + CRLF
+    # 観測 (2026-05-01 phase0_db_dump.py):
+    #   02A 三菱 / 02B ダイハツ / 02C スバル / 02D ホンダ / 02E いすゞ
+    #   02F マツダ / 02G 日産 / 02H スズキ / 02I トヨタ / 02J フォルクスワーゲン
+    _KATB010_REC_LEN = 42
+
+    def _load_katb010(self) -> dict:
+        """KATB010.DB → MakerCode (A〜J) ⇄ メーカー名 双方向辞書を返す。"""
+        cache_key = '_katb010'
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        path = os.path.join(self.root, 'COM', 'KATB010.DB')
+        out: dict = {}
+        if not os.path.exists(path):
+            self._cache[cache_key] = out
+            return out
+        try:
+            with open(path, 'rb') as f:
+                raw = f.read()
+            dec = bytes(b ^ 0xFF for b in raw)
+            text = dec.decode('cp932', errors='replace')
+            for line in text.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
+                line = line.rstrip()
+                if len(line) < 4 or not line.startswith('02'):
+                    continue
+                code = line[2:3]
+                name = line[3:].strip()
+                if code and name:
+                    out[code] = name
+                    out[name] = code
+        except Exception:
+            pass
+        self._cache[cache_key] = out
+        return out
+
+    def get_maker_code(self, vehicle_code: str) -> str:
+        """vehicle_code (3-byte 例: C10/W53/J55) の先頭 1 文字 (MakerCode A〜J) を返す。"""
+        if not vehicle_code:
+            return ''
+        vc = str(vehicle_code).strip().upper()
+        return vc[0] if vc else ''
+
+    def get_maker_name(self, vehicle_code_or_makercode: str) -> str:
+        """vehicle_code (例: 'C10') または MakerCode (例: 'C') から日本語メーカー名を返す。"""
+        s = str(vehicle_code_or_makercode or '').strip().upper()
+        if not s:
+            return ''
+        return self._load_katb010().get(s[0], '')
+
+    def lookup_by_chassis_full(self, reg_date: str = '', model_designation: str = '',
+                               category_number: str = '') -> Optional[dict]:
+        """Layer 1: KA06_ALL.DB を初度登録 + 型式指定 + 類別区分 で完全一致検索。
+
+        引数:
+          reg_date: 'YYYYMM' / 'YYYYMMDD' / 'YYYYMM00' いずれも受理 (先頭 6 桁を使用)
+          model_designation: 型式指定番号 (例: '19557')
+          category_number:   類別区分番号 (例: '0172')
+
+        戻り値: {'vehicle_code', 'reg_yyyymm', 'cat_padded', 'desig_padded',
+                 'line', 'match_layer'} or None
+        """
+        ka06 = os.path.join(self.root, 'COM', 'KA06_ALL.DB')
+        if not os.path.exists(ka06):
+            return None
+        md = str(model_designation or '').strip()
+        cn = str(category_number or '').strip()
+        if not md or not cn:
+            return None
+        padded_desig = md.zfill(5)
+        padded_cat = cn.zfill(4)
+        reg_yyyymm = ''
+        if reg_date:
+            digits = ''.join(ch for ch in str(reg_date) if ch.isdigit())
+            if len(digits) >= 6:
+                reg_yyyymm = digits[:6]
+        cache_key = '_ka06_lines'
+        if cache_key in self._cache:
+            lines = self._cache[cache_key]
+        else:
+            try:
+                with open(ka06, 'rb') as f:
+                    raw = f.read()
+                text = bytes(b ^ 0xFF for b in raw).decode('cp932', errors='replace')
+                lines = [l for l in text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+                         if l.startswith('06')]
+            except Exception:
+                lines = []
+            self._cache[cache_key] = lines
+        best = None
+        for line in lines:
+            if padded_desig not in line:
+                continue
+            if padded_cat not in line:
+                continue
+            vc = line[2:5].strip()
+            if not vc:
+                continue
+            rec = {
+                'vehicle_code': vc,
+                'reg_yyyymm': reg_yyyymm,
+                'line': line,
+                'cat_padded': padded_cat,
+                'desig_padded': padded_desig,
+                'match_layer': 1,
+            }
+            if reg_yyyymm and reg_yyyymm in line:
+                return rec
+            if best is None:
+                best = rec
+        return best
+
+    def lookup_by_serial_no(self, serial_no: str) -> Optional[dict]:
+        """Layer 3: 車台番号 prefix 逆引き。"""
+        if not serial_no:
+            return None
+        s = str(serial_no).strip().upper()
+        head = s.split('-')[0]
+        if not head:
+            return None
+        for n in (3, 4, 5):
+            cand = head[:n]
+            if not cand:
+                continue
+            if len(cand) >= 3 and cand[0].isalpha():
+                vc = cand[:3]
+                folder = self._vehicle_folder(vc)
+                if os.path.isdir(folder):
+                    return {
+                        'vehicle_code': vc,
+                        'serial_head': head,
+                        'match_layer': 3,
+                    }
+        return None
+
+    def get_vehicle_meta(self, vehicle_code: str, body_code: int = 0,
+                         grade_code: str = '') -> dict:
+        """vehicle_code に紐づくメタ情報を集約して返す。"""
+        meta: dict = {'vehicle_code': vehicle_code}
+        if not vehicle_code:
+            return meta
+        meta['maker_code'] = self.get_maker_code(vehicle_code)
+        meta['maker_name'] = self.get_maker_name(vehicle_code)
+        for suf in ('11.DB', '83.DB', '12.DB', '15.DB', '09.DB'):
+            meta[f'has_{suf[:2]}db'] = bool(self._find_db(vehicle_code, suf))
+        if body_code and grade_code:
+            try:
+                meta['grade_option_code'] = self.get_grade_option_code(
+                    vehicle_code, body_code, grade_code)
+            except Exception:
+                meta['grade_option_code'] = ''
+            try:
+                meta['grade_section'] = self.get_grade_section(
+                    vehicle_code, body_code, grade_code)
+            except Exception:
+                meta['grade_section'] = ''
+        return meta
+
+    def identify_vehicle_3layer(self, vehicle_data: dict) -> dict:
+        """3 階層フォールバック車種特定の統合 API。"""
+        if not isinstance(vehicle_data, dict):
+            vehicle_data = {}
+        md = str(vehicle_data.get('car_model_designation') or
+                 vehicle_data.get('model_designation') or '').strip()
+        cn = str(vehicle_data.get('car_category_number') or
+                 vehicle_data.get('category_number') or '').strip()
+        rd = str(vehicle_data.get('car_reg_date') or
+                 vehicle_data.get('first_reg_date') or
+                 vehicle_data.get('reg_date') or '').strip()
+        sn = str(vehicle_data.get('car_serial_no') or
+                 vehicle_data.get('serial_no') or '').strip()
+
+        rec = self.lookup_by_chassis_full(rd, md, cn)
+        if rec and rec.get('vehicle_code'):
+            vc = rec['vehicle_code']
+            return {
+                'found': True,
+                'vehicle_code': vc,
+                'match_layer': 1,
+                'method': 'layer1_full',
+                'maker_code': self.get_maker_code(vc),
+                'maker_name': self.get_maker_name(vc),
+                'reason': f'KA06 3キー一致 desig={md} cat={cn} reg={rd}',
+            }
+
+        try:
+            from auto_matching import AddataEngine  # type: ignore
+            eng = AddataEngine(self.root)
+            mc = str(vehicle_data.get('car_model') or
+                     vehicle_data.get('model_code') or '').strip()
+            mk = str(vehicle_data.get('maker') or
+                     vehicle_data.get('car_maker') or '').strip()
+            cnm = str(vehicle_data.get('car_name') or '').strip()
+            veh, _err = eng.identify_vehicle(md, cn, mc,
+                                             reg_date=rd, maker=mk, car_name=cnm)
+            if veh and veh.get('match_layer') == 2 and veh.get('vehicle_code'):
+                vc = veh['vehicle_code']
+                return {
+                    'found': True,
+                    'vehicle_code': vc,
+                    'match_layer': 2,
+                    'method': 'layer2_attr',
+                    'maker_code': self.get_maker_code(vc),
+                    'maker_name': self.get_maker_name(vc),
+                    'reason': 'AddataEngine fuzzy 一致',
+                }
+        except Exception:
+            pass
+
+        if sn:
+            rec = self.lookup_by_serial_no(sn)
+            if rec and rec.get('vehicle_code'):
+                vc = rec['vehicle_code']
+                return {
+                    'found': True,
+                    'vehicle_code': vc,
+                    'match_layer': 3,
+                    'method': 'layer3_serial',
+                    'maker_code': self.get_maker_code(vc),
+                    'maker_name': self.get_maker_name(vc),
+                    'reason': f'serial_no={sn} prefix 一致',
+                }
+
+        return {
+            'found': False,
+            'vehicle_code': None,
+            'match_layer': 4,
+            'method': 'no_db',
+            'maker_code': '',
+            'maker_name': '',
+            'reason': f'全層未ヒット desig={md} cat={cn} reg={rd} serial={sn}',
+        }
+
 
 # ============================================================
 # CLI実行

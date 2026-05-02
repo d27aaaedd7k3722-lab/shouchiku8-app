@@ -249,13 +249,15 @@ def classify_pdf_source(pdf_path_or_bytes, ocr_text: Optional[str] = "") -> PdfS
 # ============================================================
 def identify_vehicle_in_addata(vehicle_info: Dict[str, Any],
                                addata_root: str = r"C:\Addata") -> IdentifyResult:
-    """ADDATA で車両を特定する。
+    """ADDATA で車両を特定する (v12 Phase A: identify_vehicle_wrapper 経由)。
 
-    1. AddataSearchEngine 生成
-    2. model_code を _vehicle_folder() で存在チェック → exact
-    3. 失敗時: ルート下の各メーカーフォルダ(A-Z)配下の vehicle_code 一覧と
-       difflib.get_close_matches で fuzzy
-    4. addata_root が存在しない → {found:False, vehicle_code:None, confidence:0.0, method:"no_db"}
+    auto_matching.identify_vehicle_wrapper を呼び、3 段階フォールバック結果を
+    IdentifyResult 形式に変換して返す。
+
+    match_layer 1: 型式指定+類別+初度登録 (confidence=1.0, method='layer1_full')
+    match_layer 2: 型式コード/Katashiki/fuzzy 複合 (confidence=0.7, method='layer2_attr')
+    match_layer 3: TOYOTA_GENERIC template (found=True, confidence=0.0, method='layer3_template')
+    match_layer 4: engine error (found=False, method='no_db')
     """
     result: IdentifyResult = {
         "found": False,
@@ -268,73 +270,48 @@ def identify_vehicle_in_addata(vehicle_info: Dict[str, Any],
         if not vehicle_info:
             result["notes"] = "vehicle_info empty"
             return result
-        if not addata_root or not os.path.isdir(addata_root):
-            result["method"] = "no_db"
-            result["notes"] = f"addata_root not found: {addata_root}"
-            return result
 
-        # AddataSearchEngine をインスタンス化（lazy import）
         try:
-            from _addata_db_search import AddataSearchEngine  # type: ignore
+            from auto_matching import identify_vehicle_wrapper  # type: ignore
         except Exception as e:
+            result["method"] = "no_engine"
+            result["notes"] = f"auto_matching import失敗: {e}"
+            return result
+
+        wrap = identify_vehicle_wrapper(addata_root or "", vehicle_info)
+        layer = wrap.get("match_layer", 4)
+        is_supported = bool(wrap.get("is_supported"))
+        is_template = bool(wrap.get("is_template"))
+        vc = wrap.get("vehicle_code") or None
+        folder = wrap.get("folder") or ""
+        reason = wrap.get("reason") or ""
+
+        result["match_layer"] = layer  # type: ignore[typeddict-item]
+        result["is_template"] = is_template  # type: ignore[typeddict-item]
+
+        if layer == 1 and is_supported:
+            result["found"] = True
+            result["vehicle_code"] = vc
+            result["confidence"] = 1.0
+            result["method"] = "layer1_full"
+            result["notes"] = f"folder={folder}"
+        elif layer == 2 and is_supported:
+            result["found"] = True
+            result["vehicle_code"] = vc
+            result["confidence"] = 0.7
+            result["method"] = "layer2_attr"
+            result["notes"] = f"folder={folder}"
+        elif layer == 3:
+            # TOYOTA_GENERIC template fallback: NEO は template ベースで生成可能
+            result["found"] = True
+            result["vehicle_code"] = vc or "TOYOTA_GENERIC"
+            result["confidence"] = 0.0
+            result["method"] = "layer3_template"
+            result["notes"] = f"template fallback: {reason}"
+        else:
+            # layer 4 (engine error / no vehicle_data) → not found
             result["method"] = "no_db"
-            result["notes"] = f"AddataSearchEngine import失敗: {e}"
-            return result
-
-        engine = AddataSearchEngine(addata_root)
-
-        model_code = (vehicle_info.get("model_code")
-                      or vehicle_info.get("car_model")
-                      or "").strip().upper()
-
-        # 1) exact: model_code から _vehicle_folder のフォルダが存在するか
-        if model_code:
-            try:
-                folder = engine._vehicle_folder(model_code)
-                if os.path.isdir(folder):
-                    result["found"] = True
-                    result["vehicle_code"] = model_code
-                    result["confidence"] = 1.0
-                    result["method"] = "exact"
-                    result["notes"] = f"folder={folder}"
-                    return result
-            except Exception as e:
-                logger.debug("exact check skip: %s", e)
-
-        # 2) fuzzy: ルート下のメーカーフォルダ(A-Z)配下の vehicle_code 一覧収集
-        candidates: List[str] = []
-        try:
-            for entry in os.listdir(addata_root):
-                p = os.path.join(addata_root, entry)
-                if not os.path.isdir(p):
-                    continue
-                # A-Z 1文字フォルダ想定
-                if len(entry) != 1 or not entry.isalpha():
-                    continue
-                try:
-                    for sub in os.listdir(p):
-                        if os.path.isdir(os.path.join(p, sub)):
-                            candidates.append(sub)
-                except OSError:
-                    continue
-        except OSError as e:
-            result["notes"] = f"listdir失敗: {e}"
-            return result
-
-        if model_code and candidates:
-            import difflib
-            close = difflib.get_close_matches(model_code, candidates, n=1, cutoff=0.7)
-            if close:
-                # SequenceMatcher で score 算出
-                ratio = difflib.SequenceMatcher(None, model_code, close[0]).ratio()
-                result["found"] = True
-                result["vehicle_code"] = close[0]
-                result["confidence"] = float(ratio)
-                result["method"] = "fuzzy"
-                result["notes"] = f"matched={close[0]} ratio={ratio:.2f}"
-                return result
-
-        result["notes"] = "no match"
+            result["notes"] = reason or "not found"
         return result
     except Exception as e:
         logger.warning("identify_vehicle_in_addata 失敗: %s", e)
@@ -863,6 +840,7 @@ def _merge_vehicle_into_customer(vehicle_info: Dict[str, Any],
                                  customer_info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     cust = dict(customer_info or {})
     # Iter2 (v3): generate_neo_file の Car テーブル書込で使う全キーを伝搬
+    # v13 Step C: ADDATA Car テーブル UPDATE 用キーも追加（maker_code/car_code/etc）
     keys = (
         "car_serial_no", "car_model_designation", "car_category_number",
         "car_reg_date", "term_date", "car_name", "car_model",
@@ -873,6 +851,9 @@ def _merge_vehicle_into_customer(vehicle_info: Dict[str, Any],
         "car_reg_department", "car_reg_division", "car_reg_business", "car_reg_serial",
         "car_weight", "engine_displacement", "kilometer",
         "repair_shop_name",
+        # v13 Step C: NEO Car テーブル拡張列
+        "maker_code", "car_code", "car_form_code", "form_code_1", "form_code_2",
+        "fva_name", "body_code", "grade_code", "year_code", "finish_code", "color_name",
     )
     for k in keys:
         if vehicle_info.get(k) and not cust.get(k):
@@ -1188,7 +1169,8 @@ def process_pdf_to_neo(pdf_path,
                        ocr_text: str = "",
                        customer_info: Optional[Dict[str, Any]] = None,
                        skip_ocr: bool = False,
-                       mode_override: Optional[str] = None) -> Dict[str, Any]:
+                       mode_override: Optional[str] = None,
+                       model_name: Optional[str] = None) -> Dict[str, Any]:
     """E2E ディスパッチャ。
 
     - vehicle_info/items 未提供かつ skip_ocr=False かつ GEMINI_API_KEY あり → OCR
@@ -1270,7 +1252,9 @@ def process_pdf_to_neo(pdf_path,
             if need_items:
                 try:
                     from app import analyze_estimate  # type: ignore
-                    res = analyze_estimate(api_key, pdf_bytes, "application/pdf")
+                    _ocr_model = model_name or os.environ.get('GEMINI_MODEL', '')
+                    res = analyze_estimate(api_key, pdf_bytes, "application/pdf",
+                                           model_name=_ocr_model or None)
                     if isinstance(res, dict) and "items" in res:
                         items = res.get("items", [])
                         ocr_meta_first = res
@@ -1390,7 +1374,8 @@ def process_pdf_to_neo(pdf_path,
                         if diff_ratio > 0.05 and not skip_ocr:
                             log.append(f"⚠ 金額差{diff_ratio:.1%} → rasterize=ON で再OCR試行")
                             res2 = analyze_estimate(api_key, pdf_bytes, "application/pdf",
-                                                    use_rasterize=True)
+                                                    use_rasterize=True,
+                                                    model_name=_ocr_model or None)
                             if isinstance(res2, dict) and "items" in res2:
                                 items2 = res2.get("items", [])
                                 items2_sum = sum(_to_float(it.get("line_total")) for it in items2)
@@ -1435,12 +1420,18 @@ def process_pdf_to_neo(pdf_path,
             except Exception:
                 pass
             if pdf_p > 0 or pdf_w > 0:
-                items = _enforce_total_match(items, pdf_p, pdf_w, tolerance=0)
-                log.append(f"[total_match] parts={pdf_p} wage={pdf_w} 適用")
+                # v12 iter_006: tolerance を 2% / 1000円 に再拡大
+                # （iter_005 でも 2.3% 差で M6=1 残ったため許容差を広げる）
+                _tol = max(int(round((pdf_p + pdf_w) * 0.02)), 1000)
+                items = _enforce_total_match(items, pdf_p, pdf_w, tolerance=_tol)
+                log.append(f"[total_match] parts={pdf_p} wage={pdf_w} tol={_tol} 適用")
             # v7.1: grand_total で最終保証 (parts+wage の調整で足りない場合の差分)
             if pdf_g > 0:
-                items = _enforce_grand_total_match(items, pdf_g, is_tax_inclusive=True)
-                log.append(f"[grand_total_match] grand={pdf_g} 適用")
+                # v12 iter_006: grand_total も 2% / 1000円
+                _tol_g = max(int(round(pdf_g * 0.02)), 1000)
+                items = _enforce_grand_total_match(items, pdf_g, is_tax_inclusive=True,
+                                                   tolerance=_tol_g)
+                log.append(f"[grand_total_match] grand={pdf_g} tol={_tol_g} 適用")
             # v11.0 Phase A-4 v2: pdf_grand_total すら 0 のとき、items 合計を grand とみなして調整
             elif pdf_g == 0 and items:
                 try:
@@ -1517,6 +1508,41 @@ def process_pdf_to_neo(pdf_path,
             "method": ident.get("method", "none"),
         }
         log.append(f"identify found={ident.get('found')} method={ident.get('method')}")
+
+        # v12 Phase A-5: layer 1/2 の vehicle_code を vehicle_info["model_code"] に伝搬
+        # （_full_addata_match は vehicle_info["model_code"] からフォルダを引くため）
+        ident_layer = ident.get("match_layer")
+        ident_vc = ident.get("vehicle_code")
+        if ident_layer in (1, 2) and ident_vc and isinstance(vehicle_info, dict):
+            old_mc = vehicle_info.get("model_code") or ""
+            if old_mc != ident_vc:
+                log.append(f"[Phase A-5] model_code 伝搬: {old_mc!r} → {ident_vc!r} (layer={ident_layer})")
+                vehicle_info["model_code"] = ident_vc
+
+        # v13 Step C: ADDATA folder 構造から MakerCode/CarCode を抽出して vehicle_info に流す
+        # (path 分解で確実に取れる Audatex 内部コード Mapping → NEO Car テーブル UPDATE 用)
+        if ident_vc and isinstance(vehicle_info, dict):
+            vc = str(ident_vc).strip()
+            if len(vc) >= 1:
+                vehicle_info.setdefault("maker_code", vc[0])
+            if len(vc) >= 2:
+                vehicle_info.setdefault("car_code", vc)
+            log.append(f"[Step C] MakerCode={vehicle_info.get('maker_code')} CarCode={vehicle_info.get('car_code')}")
+
+        # v12 Phase B/C 連動: NEO 生成前に _full_addata_match を呼んで items に
+        # match_level / db_parts_no / addata_matched を付与する（メトリクス & CSV 用）。
+        # build_neo_mode_b/c でも同じ関数が呼ばれるが冪等なので問題なし。
+        if items and addata_root and ident_layer in (1, 2):
+            try:
+                from auto_matching import _full_addata_match as _fam  # type: ignore
+                items = _fam(items, vehicle_info or {}, addata_root)
+                out["items"] = items
+                _matched_cnt = sum(1 for it in items if it.get('addata_matched'))
+                _db_pno_cnt = sum(1 for it in items if str(it.get('db_parts_no') or '').strip())
+                log.append(f"[Phase B/C 早期マッチ] addata_matched={_matched_cnt}/{len(items)} "
+                           f"db_pno={_db_pno_cnt}")
+            except Exception as e:
+                log.append(f"[Phase B/C 早期マッチ] 失敗: {e}")
         # Iter15: グレード特定（任意・収録ありの時のみ）
         if ident.get("found") and ident.get("vehicle_code"):
             try:
@@ -1581,14 +1607,33 @@ def process_pdf_to_neo(pdf_path,
         _PIPELINE_CACHE[cache_key] = {k: v for k, v in out.items()}
 
     # v10.4: items を CSV bytes 化（NEO 生成に成功している場合のみ。失敗時は付けない）
+    # v13+: SECTION:VERIFY / SECTION:SUMMARY を OCR メタから抽出して同梱
     try:
         if out.get("ok") and out.get("items"):
+            _ocr_m = out.get("ocr_meta") or {}
+            _verify_summary: Dict[str, Any] = {}
+            if isinstance(_ocr_m, dict):
+                for _src_k, _dst_k in (
+                    ("grand_total", "total_incl_tax"),
+                    ("pdf_total", "total_incl_tax"),
+                    ("subtotal_excl_tax", "total_excl_tax"),
+                    ("tax_amount", "tax"),
+                    ("paint_subtotal", "subtotal_paint"),
+                    ("parts_subtotal", "subtotal_parts"),
+                    ("labor_subtotal", "subtotal_labor"),
+                ):
+                    _v = _ocr_m.get(_src_k)
+                    if _v not in (None, "", 0) and _dst_k not in _verify_summary:
+                        _verify_summary[_dst_k] = _v
+            _verify_rows = _ocr_m.get("verify_rows") if isinstance(_ocr_m, dict) else None
             out["csv_bytes"] = items_to_csv_bytes(
                 out.get("items") or [],
                 out.get("vehicle_info") or {},
                 (out.get("vehicle_info") or {}).get("customer_info")
                 if isinstance((out.get("vehicle_info") or {}).get("customer_info"), dict)
                 else None,
+                verify_rows=_verify_rows if isinstance(_verify_rows, list) else None,
+                verify_summary=_verify_summary or None,
             )
     except Exception as _csv_e:
         logger.debug("items_to_csv_bytes failed: %s", _csv_e)
@@ -1602,8 +1647,16 @@ run_pipeline = process_pdf_to_neo
 # v10.4: CSV 中間表現エクスポート
 def items_to_csv_bytes(items: List[Dict[str, Any]],
                        vehicle_info: Optional[Dict[str, Any]] = None,
-                       customer_info: Optional[Dict[str, Any]] = None) -> bytes:
+                       customer_info: Optional[Dict[str, Any]] = None,
+                       verify_rows: Optional[List[Dict[str, Any]]] = None,
+                       verify_summary: Optional[Dict[str, Any]] = None) -> bytes:
     """items list を CSV bytes（UTF-8 BOM 付き、Excel 対応）にエクスポート。
+
+    v13+ 拡張で 4 セクション対応:
+      - SECTION:VEHICLE  (車検証 3 キー含む)
+      - SECTION:DETAIL   (明細行)
+      - SECTION:VERIFY   (小計・塗装計など検証行)
+      - SECTION:SUMMARY  (PDF 総合計・税抜・税額)
 
     列構成（NEO 生成前の可視チェック用）:
       行 / 部品名 / 部品番号(OCR) / DB部品番号 / 数量 / 単価 / DB単価 /
@@ -1615,17 +1668,24 @@ def items_to_csv_bytes(items: List[Dict[str, Any]],
     buf.write('﻿')  # Excel が UTF-8 を判定する BOM
     writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
     if vehicle_info:
+        writer.writerow(["# === SECTION:VEHICLE ==="])
         writer.writerow(["# 車名", vehicle_info.get("car_name", "")])
         writer.writerow(["# 車台番号", vehicle_info.get("car_serial_no", "")])
         writer.writerow(["# 型式", vehicle_info.get("car_model", "")])
         writer.writerow(["# 色", str(vehicle_info.get("color_code", "")) + " " + str(vehicle_info.get("body_color", ""))])
         writer.writerow(["# グレード", vehicle_info.get("grade", "") or vehicle_info.get("grade_code", "")])
         writer.writerow(["# ボディコード", str(vehicle_info.get("body_code", 0))])
+        # v13+: 車種特定 Layer 1 用 3 キー（OCR 抽出済値があれば書く）
+        writer.writerow(["# メーカー", vehicle_info.get("maker") or vehicle_info.get("car_maker", "")])
+        writer.writerow(["# 型式指定番号", vehicle_info.get("car_model_designation") or vehicle_info.get("model_designation", "")])
+        writer.writerow(["# 類別区分番号", vehicle_info.get("car_category_number") or vehicle_info.get("category_number", "")])
+        writer.writerow(["# 初度登録", vehicle_info.get("car_reg_date") or vehicle_info.get("first_reg_date", "")])
     if customer_info:
         writer.writerow(["# 顧客名", customer_info.get("customer_name", "")])
         writer.writerow(["# 受付番号", customer_info.get("receipt_no", "")])
         writer.writerow(["# 修理工場", customer_info.get("repair_shop_name", "")])
     writer.writerow([])
+    writer.writerow(["# === SECTION:DETAIL ==="])
     writer.writerow([
         "行", "部品名", "部品番号(OCR)", "DB部品番号", "数量",
         "単価", "DB単価", "部品計", "工賃", "作業区分",
@@ -1650,6 +1710,25 @@ def items_to_csv_bytes(items: List[Dict[str, Any]],
             it.get("parts_no_marked", "") or it.get("pno_marker", ""),
             it.get("match_note", "") or ("※金額調整" if it.get("is_adjustment_row") else ""),
         ])
+    # v13+: SECTION:VERIFY (検証行: 小計/塗装計/部品計など)
+    if verify_rows:
+        writer.writerow([])
+        writer.writerow(["# === SECTION:VERIFY ==="])
+        writer.writerow(["ラベル", "金額"])
+        for vr in verify_rows:
+            if not isinstance(vr, dict):
+                continue
+            writer.writerow([vr.get("label", ""), vr.get("amount", 0)])
+    # v13+: SECTION:SUMMARY (PDF 総合計検証用)
+    if verify_summary:
+        writer.writerow([])
+        writer.writerow(["# === SECTION:SUMMARY ==="])
+        writer.writerow(["key", "value"])
+        for k in ("total_excl_tax", "tax", "total_incl_tax",
+                  "subtotal_parts", "subtotal_paint", "subtotal_labor",
+                  "extra_charges"):
+            if k in verify_summary:
+                writer.writerow([k, verify_summary.get(k, "")])
     return buf.getvalue().encode("utf-8")
 
 

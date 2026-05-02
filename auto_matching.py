@@ -201,16 +201,49 @@ class AddataEngine:
         if not os.path.exists(filepath): return b''
         with open(filepath, 'rb') as f: return f.read()
 
-    # --- 車種特定 ---
-    def identify_vehicle(self, model_desig, cat_num, model_code=''):
+    # --- 車種特定 (v12 Phase A: 3段階完全実装) ---
+    def identify_vehicle(self, model_desig, cat_num, model_code='',
+                         reg_date='', maker='', car_name=''):
+        """3 段階フォールバック車種特定。
+
+        Layer 1: 型式指定 + 類別区分 + 初度登録（reg_date）の複合キー
+        Layer 2: 型式コード直接検索 / Katashiki.DB / fuzzy 複合属性検索
+        Layer 3: TOYOTA_GENERIC 明示フォールバック（is_template=True）
+
+        戻り値: ({'vehicle_code', 'folder', 'match_layer', [is_template, reason]}, err_or_None)
+        """
+        # Phase A-2: ADDATA ルート不在 → 即 layer 3 フォールバック（KA06 ロード回避）
+        if not self.root or not os.path.isdir(self.root):
+            return ({'vehicle_code': 'TOYOTA_GENERIC',
+                     'folder': '<template>',
+                     'match_layer': 3,
+                     'is_template': True,
+                     'reason': 'addata_root not found'}, None)
+
         ka06 = os.path.join(self.root, 'COM', 'KA06_ALL.DB')
         if not os.path.exists(ka06):
-            return None, "KA06_ALL.DB not found"
+            return ({'vehicle_code': 'TOYOTA_GENERIC',
+                     'folder': '<template>',
+                     'match_layer': 3,
+                     'is_template': True,
+                     'reason': 'KA06_ALL.DB not found'}, None)
+
         text = self.xor_decode(ka06)
         lines = [l for l in text.replace('\r\n', '\n').replace('\r', '\n').split('\n') if l.strip()]
-        padded_desig = model_desig.zfill(5)
-        padded_cat = cat_num.zfill(4)
+        md = str(model_desig or '').strip()
+        cn = str(cat_num or '').strip()
+        padded_desig = md.zfill(5)
+        padded_cat = cn.zfill(4)
         desig60 = '60' + padded_desig
+
+        # Phase A-1: reg_date を YYYYMM へ正規化（layer 1 の追加キー）
+        reg_yyyymm = ''
+        if reg_date:
+            digits = re.sub(r'[^\d]', '', str(reg_date))
+            if len(digits) >= 6:
+                reg_yyyymm = digits[:6]
+            elif len(digits) >= 4:
+                reg_yyyymm = digits[:4]
 
         def try_resolve(v_code, layer):
             if not v_code: return None
@@ -219,14 +252,22 @@ class AddataEngine:
                 return {'vehicle_code': v_code, 'folder': folder, 'match_layer': layer}
             return None
 
-        # 第1層: 型式指定+類別区分
-        if model_desig and cat_num:
+        # Phase A-1: 第1層 — 型式指定 + 類別区分 (+ 初度登録優先)
+        if md and cn:
             if len(lines) > 1:
+                best = None
                 for line in lines:
                     if not line.startswith('06'): continue
                     if padded_cat in line and (padded_desig in line or desig60 in line):
                         r = try_resolve(line[2:5].strip(), 1)
-                        if r: return r, None
+                        if not r: continue
+                        # reg_date が一致するレコードを最優先
+                        if reg_yyyymm and reg_yyyymm in line:
+                            return r, None
+                        if best is None:
+                            best = r
+                if best:
+                    return best, None
             else:
                 # 固定長レコード（改行なし）
                 for term in [desig60, padded_desig]:
@@ -245,7 +286,7 @@ class AddataEngine:
                                     if r: return r, None
                         pos = idx + 1
 
-        # 第2層: 型式コード
+        # 第2層: 型式コード（既存 fast path、後方互換維持）
         if model_code:
             mk = model_code.split('-')[-1][:5].upper()
             for line in lines:
@@ -254,7 +295,7 @@ class AddataEngine:
                     r = try_resolve(line[2:5].strip(), 2)
                     if r: return r, None
 
-        # 第2.5層: Katashiki.DB
+        # 第2.5層: Katashiki.DB（既存）
         if model_code:
             kat = os.path.join(self.root, 'COM', 'Katashiki.DB')
             if os.path.exists(kat):
@@ -269,7 +310,71 @@ class AddataEngine:
                                     if r: return r, None
                 except Exception: pass
 
-        return None, f"車種特定失敗: 型式指定={model_desig}, 類別={cat_num}, 型式={model_code}"
+        # Phase A-3: 第2.7層 — メーカー + 車名 + 型式 + 年式 の fuzzy 複合検索
+        if maker or car_name or model_code:
+            r = self._fuzzy_lookup_by_attributes(
+                lines, maker=maker, car_name=car_name,
+                model_code=model_code, reg_yyyymm=reg_yyyymm,
+                try_resolve=try_resolve,
+            )
+            if r:
+                return r, None
+
+        # Phase A-4: 第3層 — TOYOTA_GENERIC 明示フォールバック
+        return ({'vehicle_code': 'TOYOTA_GENERIC',
+                 'folder': '<template>',
+                 'match_layer': 3,
+                 'is_template': True,
+                 'reason': f"全層未ヒット: 型式指定={md}, 類別={cn}, "
+                           f"型式={model_code}, 初度登録={reg_date}, "
+                           f"メーカー={maker}, 車名={car_name}"}, None)
+
+    def _fuzzy_lookup_by_attributes(self, lines, maker='', car_name='',
+                                    model_code='', reg_yyyymm='',
+                                    try_resolve=None):
+        """KA06 lines を走査し、maker/car_name/model_code/reg_yyyymm の
+        部分一致＋類似度合計で top1 を返す（layer 2）。
+        """
+        if not lines or try_resolve is None:
+            return None
+        import difflib
+
+        tokens = []
+        if maker:
+            m = str(maker).strip().upper()
+            if m: tokens.append(m)
+        if car_name:
+            c = str(car_name).strip().upper()
+            if c: tokens.append(c)
+        if model_code:
+            mc = str(model_code).split('-')[-1].upper()
+            if mc: tokens.append(mc)
+        if reg_yyyymm:
+            tokens.append(reg_yyyymm[:4])
+        if not tokens:
+            return None
+
+        best_score = 0.0
+        best_vc = None
+        for line in lines:
+            if not line.startswith('06'): continue
+            line_up = line.upper()
+            score = 0.0
+            for t in tokens:
+                if t in line_up:
+                    score += 1.0
+                else:
+                    sm = difflib.SequenceMatcher(None, t, line_up).ratio()
+                    score += sm * 0.5
+            if score > best_score:
+                best_score = score
+                best_vc = line[2:5].strip()
+
+        # 閾値: tokens の半数以上に相当する一致が必要
+        min_required = max(1.0, len(tokens) * 0.5)
+        if best_score >= min_required and best_vc:
+            return try_resolve(best_vc, 2)
+        return None
 
     # --- 部品マスタ (*12.DB) ---
     def load_parts_master(self, folder):
@@ -1566,17 +1671,106 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
         return out
 
     # 名称→マスタ entries の dict (v5-Iter3-4: 名称正規化 + キャッシュ)
+    # v12 Phase B-1: 部品名正規化強化（Fr/Rr 統一、長音吸収、濁点ゆれ、同義語辞書）
     import difflib
+
+    # 小書き仮名 → 大書き仮名（OCR で ッ↔ツ, ェ↔エ 揺れ吸収用）
+    _KANA_SMALL_TO_LARGE = str.maketrans({
+        'ァ': 'ア', 'ィ': 'イ', 'ゥ': 'ウ', 'ェ': 'エ', 'ォ': 'オ',
+        'ャ': 'ヤ', 'ュ': 'ユ', 'ョ': 'ヨ', 'ッ': 'ツ', 'ヮ': 'ワ',
+    })
+
+    # 同義語マップ（長い key 優先で順次置換）
+    # v12 Phase B-1 v2: HONDA 表記（リヤー/フロアー/長音）と TOYOTA 表記（リヤ/フロア）統一を追加
+    _SYN_MAP = {
+        # バンパ系
+        'フロントバンパー': 'FRBUMPER', 'フロントバンパ': 'FRBUMPER',
+        'リヤバンパー': 'RRBUMPER', 'リアバンパー': 'RRBUMPER',
+        'リヤーバンパー': 'RRBUMPER', 'リヤーパンバー': 'RRBUMPER',
+        'リヤバンパ': 'RRBUMPER', 'リアバンパ': 'RRBUMPER',
+        'Frバンパー': 'FRBUMPER', 'Frバンパ': 'FRBUMPER',
+        'FRバンパ': 'FRBUMPER',
+        'Rrバンパー': 'RRBUMPER', 'Rrバンパ': 'RRBUMPER',
+        'RRバンパ': 'RRBUMPER',
+        'バンパー': 'BUMPER', 'バンパ': 'BUMPER',
+        # フェンダ系
+        'フロントフェンダー': 'FRFENDER', 'フロントフェンダ': 'FRFENDER',
+        'Frフェンダ': 'FRFENDER', 'Frフエンダ': 'FRFENDER',
+        'リヤフェンダー': 'RRFENDER', 'リアフェンダー': 'RRFENDER',
+        'リヤーフェンダー': 'RRFENDER',
+        'Rrフェンダ': 'RRFENDER', 'Rrフエンダ': 'RRFENDER',
+        'フェンダー': 'FENDER', 'フエンダ': 'FENDER', 'フェンダ': 'FENDER',
+        # ランプ系
+        'ヘッドランプ': 'HEADLAMP', 'ヘッドライト': 'HEADLAMP',
+        'ヘツドランプ': 'HEADLAMP', 'ヘツドライト': 'HEADLAMP',
+        'テールランプ': 'TAILLAMP', 'テールライト': 'TAILLAMP',
+        'テイルランプ': 'TAILLAMP',
+        'フォグランプ': 'FOGLAMP', 'フォグライト': 'FOGLAMP',
+        'フオグランプ': 'FOGLAMP',
+        # ボンネット・グリル
+        'ボンネット': 'HOOD', 'フード': 'HOOD',
+        'ラジエータグリル': 'RADGRILLE', 'ラジエタグリル': 'RADGRILLE',
+        # ドア・ミラー
+        'フロントドア': 'FRDOOR', 'リヤドア': 'RRDOOR',
+        'リアドア': 'RRDOOR', 'リヤードア': 'RRDOOR',
+        'Frドア': 'FRDOOR', 'Rrドア': 'RRDOOR',
+        'ドアミラー': 'DOORMIRROR', 'サイドミラー': 'DOORMIRROR',
+        # HONDA 長音表記揺れ統一
+        'リヤー': 'リヤ', 'リアー': 'リヤ',
+        'フロアー': 'フロア',
+        'コーナーサブ': 'コーナサブ',
+        'シリンダー': 'シリンダ',
+        'モールデイング': 'モールディング',
+        'ガーニツシュ': 'ガーニッシュ',
+        'クツション': 'クッション', 'クツシヨン': 'クッション',
+        # v12 iter_006: HONDA OCR ゆれ追加（バツ→バッ、ヘツ→ヘッ等）
+        'バツク': 'バック', 'バツクボード': 'バックボード',
+        'パツド': 'パッド', 'パツチ': 'パッチ',
+        'ヘツドレスト': 'ヘッドレスト',
+        'エアーコンデイシヨナー': 'エアコンディショナー',
+        'コンデイシヨナー': 'コンディショナー',
+        'コーンビ': 'コンビ', 'コンヒ': 'コンビ',
+        'シーロムン': 'シートベルト', 'シーロベルト': 'シートベルト',
+        'バネル': 'パネル', 'バネルCOMP': 'パネルCOMP',
+        'バネルセット': 'パネルセット',
+        'リャー': 'リヤ',
+        'バルブ': 'バルブ', 'バイブ': 'バルブ',
+        'フューエル': 'フユーエル',
+        'フイラー': 'フィラー',
+        'ベッドCOMPL': 'パッドCOMP',
+        'ブレート': 'プレート',
+        'ブラグ': 'プラグ',
+        'クオーター': 'クォーター', 'クオータービラー': 'クォーターピラー',
+        'ピラー': 'ピラー',
+        # ASSY/COMP 等の符号統一（後段の記号削除で更にクリーンに）
+        'ASSY.': 'ASSY', 'ASSY、': 'ASSY', 'ASSY,': 'ASSY',
+        'COMP.': 'COMP', 'COMPL.': 'COMP', 'COMPL、': 'COMP',
+        'COMPL ': 'COMP', 'COMP,': 'COMP', 'COMP、': 'COMP',
+        # 接頭辞
+        'Fr': 'FR', 'Rr': 'RR',
+    }
+    _SYN_KEYS_BY_LEN = sorted(_SYN_MAP.keys(), key=len, reverse=True)
 
     def _norm_name(n: str) -> str:
         if not n: return ""
         n = str(n).strip()
+        # 半角カナ → 全角カナ
         try:
             import jaconv
             n = jaconv.h2z(n, kana=True, ascii=False, digit=False)
         except Exception:
             pass
-        for ch in (" ", "　", "・", "．", ".", ",", "（", "）", "(", ")"):
+        # 左右接頭辞除去（語頭の「左 」「右 」「左」「右」）
+        n = re.sub(r'^[左右]\s*', '', n)
+        # 同義語マップ適用（長い key 優先）
+        for k in _SYN_KEYS_BY_LEN:
+            if k in n:
+                n = n.replace(k, _SYN_MAP[k])
+        # 小書きカナ → 大書きカナ（OCR ゆれ吸収）
+        n = n.translate(_KANA_SMALL_TO_LARGE)
+        # 記号・空白・長音・ハイフン除去
+        for ch in (" ", "　", "・", "．", ".", ",", "（", "）", "(", ")",
+                   "ー", "-", "〃", "/", "/", "\\", "．"):
             n = n.replace(ch, "")
         return n.upper()
 
@@ -1643,28 +1837,39 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
             continue
 
         # v5-Iter5: 高速ショートカット: OCR品番が DB pno_index にあれば即マッチ
+        # v12 Phase B-2: マッチ段階を name_match_stage に記録
+        name_match_stage = ""
         ocr_pno_norm = _normalize_pno(ocr_pno)
         if ocr_pno_norm and len(ocr_pno_norm) >= 6:
+            cand = None
             for nm, m in name_to_entry.items():
                 m_pno = _normalize_pno(m.get("parts_no") or "")
                 if m_pno == ocr_pno_norm:
-                    # 直接マッチ
                     cand = [nm]
+                    name_match_stage = "pno_exact"
                     break
-            else:
+            if not cand:
                 cand = difflib.get_close_matches(name, master_names, n=1, cutoff=0.85)
+                if cand: name_match_stage = "name_0.85"
         else:
             cand = difflib.get_close_matches(name, master_names, n=1, cutoff=0.85)
+            if cand: name_match_stage = "name_0.85"
         if not cand:
-            # 正規化マッチ
+            # 正規化マッチ (Phase B-1 強化辞書経由)
             nn = _norm_name(name)
             if nn:
-                cand_n = difflib.get_close_matches(nn, master_names_norm, n=1, cutoff=0.7)
-                if cand_n:
-                    cand = [norm_to_orig[cand_n[0]]]
+                # 段階的緩和: 0.85 → 0.7 → 0.6 → 0.5 (iter_006 追加)
+                for cutoff, stage in [(0.85, "norm_0.85"), (0.7, "norm_0.70"),
+                                      (0.6, "norm_0.60"), (0.5, "norm_0.50")]:
+                    cand_n = difflib.get_close_matches(nn, master_names_norm, n=1, cutoff=cutoff)
+                    if cand_n:
+                        cand = [norm_to_orig[cand_n[0]]]
+                        name_match_stage = stage
+                        break
         if not cand:
             # 緩いマッチ (最終フォールバック)
             cand = difflib.get_close_matches(name, master_names, n=1, cutoff=0.55)
+            if cand: name_match_stage = "name_0.55"
         if not cand:
             it["db_price"] = None
             it["db_parts_no"] = ""
@@ -1732,13 +1937,29 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
         else:
             marked = primary_pno
 
+        # v13 Step B: ADDATA マスタの正式部品名（半角カナ）を取得
+        db_name = (entry.get("name") or "").strip()
+
         it["db_price"] = int(db_price) if db_price else None
         it["db_parts_no"] = db_pno
+        it["db_parts_name"] = db_name
         it["db_work_index"] = db_widx
         it["db_disposal_code"] = db_disp
         it["match_level"] = level
-        it["match_note"] = note or f"{level} ref_no={ref_no}"
+        # v12 Phase B-2: name_match_stage を note に記録
+        _stage_suffix = f" stage={name_match_stage}" if name_match_stage else ""
+        it["match_note"] = note + _stage_suffix if note else f"{level} ref_no={ref_no}{_stage_suffix}"
         it["parts_no_marked"] = marked
+        # v12 Phase C-1: addata_matched フラグ
+        it["addata_matched"] = level in ("L1", "L2", "L3")
+        # v13 Step B (iter_006/007): ADDATA 由来の name 上書きは N4 を逆に悪化させたためロールバック。
+        # ADDATA マスタの全角カナ表記が正解 NEO の半角カナと記号差で乖離するケースが多く、
+        # OCR の半角カナ寄りの値の方が一致しやすい。db_parts_name は参照用に保存のみ。
+
+    # v12 Phase C-1: 早期 return 経路（マスタ取得失敗・車種フォルダ不在等）にも
+    # addata_matched=False を一律付与（呼び出し側の安全のため）
+    for it in out:
+        it.setdefault("addata_matched", it.get("match_level") in ("L1", "L2", "L3"))
 
     return out
 
@@ -1764,22 +1985,38 @@ def find_ka06_path(addata_base):
 
 
 def identify_vehicle_wrapper(addata_base, vehicle_data):
-    """app.py 用 identify_vehicle 実体。AddataEngine.identify_vehicle を呼ぶ。"""
-    if not addata_base or not vehicle_data:
-        return {'match_layer': 4, 'is_supported': False, 'reason': 'no addata or vehicle data'}
+    """app.py / pipeline 用 identify_vehicle 実体。AddataEngine.identify_vehicle を呼ぶ。
+
+    v12 Phase A-5: vehicle_data から reg_date / maker / car_name も渡す。
+    layer 3 (TOYOTA_GENERIC) が返ると is_supported=True / is_template=True。
+    """
+    if not vehicle_data:
+        vehicle_data = {}
     try:
-        eng = AddataEngine(addata_base)
-        md = str(vehicle_data.get('model_designation', '') or '').strip()
-        cn = str(vehicle_data.get('category_number', '') or '').strip()
-        mc = str(vehicle_data.get('model_code', '') or '').strip()
-        veh, err = eng.identify_vehicle(md, cn, mc)
+        # addata_base 不在でも AddataEngine 内で layer 3 へ落ちる
+        eng = AddataEngine(addata_base or '')
+        md = str(vehicle_data.get('model_designation') or
+                 vehicle_data.get('car_model_designation') or '').strip()
+        cn = str(vehicle_data.get('category_number') or
+                 vehicle_data.get('car_category_number') or '').strip()
+        mc = str(vehicle_data.get('model_code') or
+                 vehicle_data.get('car_model') or '').strip()
+        rd = str(vehicle_data.get('reg_date') or
+                 vehicle_data.get('car_reg_date') or
+                 vehicle_data.get('first_reg_date') or '').strip()
+        mk = str(vehicle_data.get('maker') or
+                 vehicle_data.get('car_maker') or '').strip()
+        cnm = str(vehicle_data.get('car_name') or '').strip()
+        veh, err = eng.identify_vehicle(md, cn, mc,
+                                        reg_date=rd, maker=mk, car_name=cnm)
         if veh:
             return {
                 'match_layer': veh.get('match_layer', 3),
                 'is_supported': True,
+                'is_template': bool(veh.get('is_template')),
                 'vehicle_code': veh.get('vehicle_code'),
                 'folder': veh.get('folder'),
-                'reason': 'ok',
+                'reason': veh.get('reason') or 'ok',
             }
         return {'match_layer': 4, 'is_supported': False, 'reason': err or 'not found'}
     except Exception as e:

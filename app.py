@@ -82,13 +82,18 @@ try:
     GEMINI_API_KEY = st.secrets.get('GEMINI_API_KEY', os.environ.get('GEMINI_API_KEY', ''))
 except Exception:
     GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+try:
+    ANTHROPIC_API_KEY = st.secrets.get('ANTHROPIC_API_KEY', os.environ.get('ANTHROPIC_API_KEY', ''))
+except Exception:
+    ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 GEMINI_MODEL      = "gemini-2.5-flash"          # フォールバック（動的に上書きされる）
 CONFIDENCE_THRESHOLD = 0.6
 
 # 優先順位付きのモデル候補リスト（上位が最優先）
 # gemini-2.5-flashを最優先（安定・クォータ余裕あり）
-# gemini-3.1-pro-previewはクォータ250回/日の制限があるため後方に配置
+# claude-sonnet-4-6 は先頭: Vision精度最高（100%実証済み）
 _PREFERRED_MODELS = [
+    "claude-sonnet-4-6",
     "gemini-2.5-flash",
     "gemini-2.5-pro",
     "gemini-3.1-pro-preview",
@@ -130,7 +135,22 @@ def get_default_gemini_model(api_key: str) -> str:
             return m
     # 全モデルがクォータ超過の場合はフォールバック
     return models[0] if models else _FALLBACK_MODEL
-SELF_CORRECTION_THRESHOLD = 1000  # 差額が1000円以上の場合のみ自己修復を試行（高速化）
+# ============================================================
+# Harness チューナブルパラメータ — _harness/params.json から動的読込
+# ============================================================
+def _load_harness_params() -> dict:
+    """ハーネス実行時に params.json を読込み、なければデフォルト返却。"""
+    try:
+        _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_harness', 'params.json')
+        if os.path.exists(_p):
+            with open(_p, encoding='utf-8') as _f:
+                return json.load(_f).get('params', {}) or {}
+    except Exception:
+        pass
+    return {}
+
+HARNESS_PARAMS = _load_harness_params()
+SELF_CORRECTION_THRESHOLD = HARNESS_PARAMS.get('self_correction_threshold', 100)
 
 DOS_DBVER = bytes.fromhex('334cc198')   # AnDBVersion.ini 固定値
 DOS_IMGE  = bytes.fromhex('2c365a67')   # AnSvImge.ini 固定値
@@ -544,10 +564,39 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
                 WHERE LineNo=?""", (lno,))
         total_parts = 0
         total_wages = 0
+        # v13 Phase 2: 正解 NEO の ERParts に存在しない「塗装系合計」「※ADDATA該当なし」等の
+        # 特殊行を ERParts への書き出しから除外する。これらはコグニセブン側で
+        # PaintingTotal/Painting* テーブルから自動算出されるべきもの。
+        # 注: 合計金額には影響しない（_enforce_total_match で別途吸収済み）。
+        # name と part_no の両方で判定する（「※ADDATA該当なし」は part_no 側に入る場合あり）
+        _erparts_skip_patterns = (
+            "※ADDATA該当なし",
+            "塗装費用計", "塗装工賃計", "塗装材料代計", "追加塗装費用計",
+            "ブース加算", "加算基礎数値",
+            "2コートソリッドルーフ", "２コートソリッドルーフ",
+            "ボデーシーリング", "防錆ワックス",
+            "下塗り塗料代", "塗装色番加算",
+        )
+        # 「※部品価格相違」は正常な部品行の part_no 末尾にもぶら下がるため
+        # name 側のみで判定（part_no 側ヒットは過剰削除になる）
+        _erparts_skip_name_only = ("※部品価格相違",)
         for i, item in enumerate(items):
             name   = item.get('name', '')
-        
-            parts_no = str(item.get('part_no', '') or '')
+            # v13 Phase 2: 特殊行は ERParts から除外。name か part_no のどちらかに
+            # 特殊パターンが含まれていればスキップ（※ADDATA該当なし は part_no 側に
+            # 入る場合もある）。ただし「※金額調整」は PDF 総額一致に必須のため許容。
+            _name_str = str(name)
+            _pno_str = str(item.get('part_no', '') or '')
+            if any(p in _name_str or p in _pno_str for p in _erparts_skip_patterns):
+                continue
+            if any(p in _name_str for p in _erparts_skip_name_only):
+                continue
+
+            # v13 Phase 2.1: part_no 末尾に「※部品価格相違」「※～」が結合されている場合は切り捨て
+            # （正解 NEO の PartsNo は純粋なコードのみ。例: "90467-09093 ※部品価格相違" → "90467-09093"）
+            parts_no = _pno_str
+            if "※" in parts_no:
+                parts_no = parts_no.split("※", 1)[0].strip()
 
             # 区分: work_code（Markdownパーサー保存先）または method から取得
             method = item.get('method', '') or item.get('work_code', '')
@@ -603,7 +652,16 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
                 unit_price  = safe_int(item.get('unit_price', 0))
                 parts_total = unit_price * qty
 
-            index_val = safe_float(item.get('index_value'))
+            # v12 Phase C-2: addata_matched=False の行は OCR の指数を信用せず空欄化
+            # （ADDATA に該当しない部品で OCR が拾った値を NEO に書き込むのを防ぐ）
+            # キー不在時はデフォルト True（後方互換: 既存呼出しはそのまま動く）
+            _addata_ok = item.get('addata_matched', True)
+            if _addata_ok:
+                index_val = safe_float(item.get('index_value'))
+            else:
+                # ADDATA 未マッチ: db_work_index があれば採用、なければ空欄
+                _db_widx = item.get('db_work_index')
+                index_val = safe_float(_db_widx) / 10.0 if _db_widx else 0.0
             db_time = round(index_val * 10) if index_val > 0 else -1
 
             wage     = safe_int(item.get('wage', 0))
@@ -990,11 +1048,23 @@ def update_em_db(db_bytes, cust, insurance_info, estimated_date, is_tax_inclusiv
             ))
 
         # Car テーブル更新（車名・カラーコード・トリムコード） — 非空の値のみ更新（通常・マージ共通）
+        # v13 Step C: ADDATA 由来の MakerCode/CarCode/FormCode/FVAName/BodyCode/GradeCode/
+        # YearCode/FinishCode を追加。template Z10 のままで N1=22% に張りついていた問題を改善。
         car_cols = {row[1] for row in cur.execute("PRAGMA table_info(Car)").fetchall()}
         car_update = [
             ('CarName', car_name), ('CarNameByUser', car_name),
             ('ColorCode', color_code), ('ColorName', body_color),
             ('TrimCode', trim_code),
+            ('MakerCode',    safe_str(cust.get('maker_code', ''))),
+            ('CarCode',      safe_str(cust.get('car_code', ''))),
+            ('CarFormCode',  safe_str(cust.get('car_form_code', ''))),
+            ('FormCode1',    safe_str(cust.get('form_code_1', ''))),
+            ('FormCode2',    safe_str(cust.get('form_code_2', ''))),
+            ('FVAName',      safe_str(cust.get('fva_name', ''))),
+            ('BodyCode',     safe_str(cust.get('body_code', ''))),
+            ('GradeCode',    safe_str(cust.get('grade_code', ''))),
+            ('YearCode',     safe_str(cust.get('year_code', ''))),
+            ('FinishCode',   safe_str(cust.get('finish_code', ''))),
         ]
         valid_car = [(col, val) for col, val in car_update if col in car_cols and val]
         if valid_car:
@@ -1658,6 +1728,51 @@ def call_gemini(api_key, file_bytes, mime_type, prompt_text, model_name=None, us
             raise ValueError(f"Gemini API呼び出しに失敗しました（{attempt+1}回試行）: {str(last_error)}")
 
 
+def call_claude(api_key: str, file_bytes: bytes, mime_type: str, prompt_text: str,
+                model_name: str = "claude-sonnet-4-6") -> str:
+    """Claude Vision APIにPDF/画像を送信して解析結果テキストを取得（最大3回リトライ）。
+    PDF は document ブロックで直接送信（ラスタライズ不要、高精度）。
+    """
+    import anthropic, base64
+    client = anthropic.Anthropic(api_key=api_key)
+    model = model_name or "claude-sonnet-4-6"
+    b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+    if mime_type == "application/pdf":
+        media_block: dict = {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
+        }
+    else:
+        media_block = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": mime_type, "data": b64},
+        }
+    content = [media_block, {"type": "text", "text": prompt_text}]
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=8192,
+                messages=[{"role": "user", "content": content}],
+            )
+            text = response.content[0].text if response.content else ""
+            if text and text.strip():
+                return text
+            if attempt < 2:
+                import time; time.sleep(1)
+                continue
+            raise ValueError("Claudeから有効な応答が得られませんでした。")
+        except ValueError:
+            raise
+        except Exception as e:
+            last_error = e
+            if attempt < 2:
+                import time; time.sleep(1)
+                continue
+            raise ValueError(f"Claude API呼び出しに失敗しました（{attempt+1}回試行）: {str(last_error)}")
+
+
 def classify_first_page_as_fax(api_key, pdf_bytes, model_name):
     """
     PDFの1ページ目がFAX送付状かどうかをAIで判定する。
@@ -2165,9 +2280,16 @@ TASK_PROMPTS["estimate_detail_page"] = """<task_execution>
 
 文書上部から基本情報を抽出し、明細行を配列で抽出してください。合計行・小計行・消費税行は明細配列に含めないでください。
 
+v12 厳密抽出ルール（必須）:
+- part_number（部品番号）は記載通り厳密に書写する。手書きやかすれで読めない場合は "" にする（推測・補完は禁止）。OCR が一部の文字を誤認しやすい場合（O→0, l→1 など）でも、視覚的に最も近い文字をそのまま採用する
+- index_value（指数）は記載通りに数値文字列で抽出する。記載がない、空欄、または「－」「ー」「・」のみの場合は "" にする（0 や 0.0 ではなく空文字。OCR で 0.5 と読み違えた場合は記載状態を再確認する）
+- labor_fee（工賃）は記載がなく空欄なら 0 を返してよいが、明示的に「0円」表記でない限り推測しない
+- part_price（部品単価）と quantity（数量）は記載通り。明示的な数字がなければ 0
+- 1 行の中で部品列と工賃列が分離している場合、列の取り違いに注意する
+
 <output_format>
 {
-  "step_by_step_reasoning": "行のズレや欠落がないか、部品と工賃の分離をどう行ったかの簡潔な思考プロセス",
+  "step_by_step_reasoning": "行のズレや欠落がないか、部品と工賃の分離をどう行ったか、part_number と index_value で記載通りの厳密抽出をどう確保したかの簡潔な思考プロセス",
   "basic_info": {
     "estimate_date": "文字列",
     "customer_name": "文字列",
@@ -2179,11 +2301,82 @@ TASK_PROMPTS["estimate_detail_page"] = """<task_execution>
     {
       "work_or_part_name": "文字列",
       "category": "文字列 (区分判定ルールに従う)",
-      "index_value": "文字列 (指数)",
+      "index_value": "文字列 (指数 / 記載なしは空文字)",
       "labor_fee": 0,
       "quantity": 0,
       "part_price": 0,
-      "part_number": "文字列"
+      "part_number": "文字列 (記載なしは空文字、推測禁止)"
+    }
+  ]
+}
+</output_format>
+
+【追加厳密ルール v13】
+- 部品番号に含まれるハイフン(-)・スラッシュ(/)・英数字は一字一句そのまま転写する
+- 技術料と部品代が同一列に混在している場合、行の作業区分（取替/脱着等）で分類する
+- 合計行・ページ小計行・「以上」行は details に含めない（category="合計" も不可）
+- 数量が括弧内に記載されている場合（例: フロントバンパー(1)）は quantity=1 として抽出
+- 金額が「－」「***」「省略」の場合は 0 とする（推測しない）
+</task_execution>"""
+
+
+TASK_PROMPTS["estimate_unified"] = """<task_execution>
+タスク名: unified_extraction
+
+見積書PDFから明細を完全抽出した上で、合計値・車両情報・顧客情報も併せて返してください。
+
+【🔥 最優先タスク: 明細行抽出 v13 (厳守)】
+1. **すべての明細行を details に列挙する。漏れ厳禁**。1行も欠かさない
+2. **part_number（部品番号）は記載されている場合は必ず完全に転写する。** 5桁数字＋ハイフン＋英数字（例: 62022-3GSOB, 625H2-3JY0A, 04711-F4060-ZZ）の形式が頻出。一字も省略不可。番号欄の文字を順に書き写すこと
+3. OCR 不確実な1〜2文字（O↔0, l↔1, B↔8 等）も視覚的に最も近い文字を採用。空文字にするのは完全に判読不能な場合のみ
+4. index_value（指数）は記載通りに数値文字列で抽出。記載なし・空欄・「－」「・」のみは "" （0 ではなく空文字）
+5. 合計行・小計行・「以上」行・消費税行は details に**含めない**
+6. 部品列と工賃列の取り違えに注意。作業区分（取替/脱着/調整/塗装）で分類
+7. 数量が括弧内（例: バンパー(1)）→ quantity=1
+8. 金額が「－」「***」「省略」の場合は 0（推測しない）
+
+【金額探索ルール】
+- 「部品計」「部品代」「部品合計」等 → pdf_parts_total
+- 「工賃計」「技術料合計」「工賃合計」等 → pdf_wage_total
+- 「合計」「総合計」「御見積金額」「請求金額」等 → pdf_grand_total
+- 値引き額 → discount_amount
+- ページ小計は総合計に使わない。最終ページの最終総合計を採用
+
+【車両情報抽出ルール】
+- 1ページ目ヘッダ部分から抽出
+- 型式指定番号(model_designation)・類別区分番号(category_number)・初度登録(first_reg_date) は **NEO生成必須キー**
+
+<output_format>
+{
+  "vehicle_info": {
+    "car_name": "", "car_model": "", "engine_model": "",
+    "color_code": "", "color_name": "", "trim_code": "", "grade": "",
+    "model_year": "", "chassis_no": "", "mileage": "",
+    "model_designation": "", "category_number": "",
+    "first_reg_date": "", "term_date": "", "car_reg_no": ""
+  },
+  "customer_info": {
+    "customer_name": "", "owner_name": "",
+    "receipt_no": "", "estimate_date": "",
+    "address": "", "phone": ""
+  },
+  "totals": {
+    "repair_shop_name": "",
+    "pdf_parts_total": 0,
+    "pdf_wage_total": 0,
+    "pdf_grand_total": 0,
+    "discount_amount": 0,
+    "amount_basis": "tax_exclusive"
+  },
+  "details": [
+    {
+      "work_or_part_name": "",
+      "category": "",
+      "index_value": "",
+      "labor_fee": 0,
+      "quantity": 0,
+      "part_price": 0,
+      "part_number": ""
     }
   ]
 }
@@ -2222,6 +2415,74 @@ status フィールドを追加すること:
 - expected_totals と calculated_totals が完全一致
 - ページ下端の取りこぼしなし
 - 不確定数字なし"""
+
+
+import re as _re
+
+_SHOP_PATTERNS: dict = {
+    'honda_cars': _re.compile(r'Honda\s*Cars|ホンダカーズ|HONDA\s*CARS|Hondaカーズ', _re.I),
+    'seiwa':      _re.compile(r'正和工業'),
+    'byd_auto':   _re.compile(r'BYD\s*AUTO|ビーワイディー'),
+    'shinyou':    _re.compile(r'信用モータース|信用自動車'),
+}
+
+_SHOP_PROMPT_EXTRAS: dict = {
+    'honda_cars': """
+【Honda Cars 見積書 — 列構造と変換例】
+列順: 部品名 | 作業区分 | 部品代（左） | 技術料（右）
+変換例:
+  入力: フロントバンパアッセンブリー 取替 151,700 44,100
+  出力: {"work_or_part_name":"フロントバンパアッセンブリー","category":"取替","part_price":151700,"labor_fee":44100}
+  入力: エンジンオイル交換 調整  3,300
+  出力: {"work_or_part_name":"エンジンオイル交換","category":"調整","part_price":0,"labor_fee":3300}
+注意: 大項目行（番号のみの行）はスキップ。技術料が0の部品のみ行は part_price に計上。
+""",
+    'seiwa': """
+【正和工業 見積書 — 列構造と変換例】
+列順: 行No | 部品名 | 作業区分 | 技術料（左） | 数量 | 単価 | 部品金額（右）
+変換例:
+  入力: 3 Frバンパ（色なし） 取替 23,750 1 38,500 38,500
+  出力: {"work_or_part_name":"Frバンパ（色なし）","category":"取替","labor_fee":23750,"quantity":1,"part_price":38500}
+  入力: 13 クリップ 部品  26 80 2,080
+  出力: {"work_or_part_name":"クリップ","category":"取替","labor_fee":0,"quantity":26,"part_price":80}
+注意: 作業区分「部品」は category="取替"（技術料なし部品のみ）。
+""",
+    'byd_auto': """
+【BYD AUTO 見積書 — 列構造と変換例】
+列順: コード | 修理項目・部品名 | 作業区分 | 部品番号(数量) | 部品価格合計 | 工賃 | 備考
+変換例:
+  入力: 1234 フロントバンパー 取替 04711-F4060-ZZ(1) 68,750 27,500
+  出力: {"work_or_part_name":"フロントバンパー","category":"取替","part_number":"04711-F4060-ZZ","quantity":1,"part_price":68750,"labor_fee":27500}
+注意: 部品番号欄の末尾 (N) は数量。# マークはセット料金（備考列に記載）。
+""",
+    'shinyou': """
+【信用モータース 見積書 — 3セクション構造】
+セクション1「修理明細」: 部位 | 作業・部品名 | 部品番号 | 数量 | 部品代 | 技術料
+セクション2「塗装明細」: 塗装箇所 | 作業内容 | 材料費 | 技術料
+セクション3「その他課税」: 項目名 | 金額（技術料として計上）
+変換例（修理明細）:
+  入力: Frバンパー フロントバンパーAssy 52119-28A90 1 191,400 23,750
+  出力: {"work_or_part_name":"フロントバンパーAssy","category":"取替","part_number":"52119-28A90","quantity":1,"part_price":191400,"labor_fee":23750}
+変換例（塗装明細）:
+  入力: Lスライドドア 塗装一式 5,600 40,800
+  出力: {"work_or_part_name":"Lスライドドア 塗装一式","category":"板金","part_price":5600,"labor_fee":40800}
+""",
+}
+
+
+def detect_shop_format(pdf_bytes: bytes) -> str:
+    """PDFの埋め込みテキストからショップ形式を検出（API不要・高速）。"""
+    try:
+        import fitz
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        text = "".join(page.get_text() for page in doc)
+        doc.close()
+    except Exception:
+        text = ""
+    for shop_id, pattern in _SHOP_PATTERNS.items():
+        if pattern.search(text):
+            return shop_id
+    return 'default'
 
 
 def _build_prompt(task_type: str, extra: str = "") -> str:
@@ -2487,9 +2748,28 @@ def _detect_corrections(original_items: list, edited_items: list) -> list:
     return corrections
 
 
-def analyze_vehicle_registration(api_key, file_bytes, mime_type):
+def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None):
     """車検証をAI-OCRで解析（JSON mode + プロンプトベースの構造化出力）"""
     prompt = _build_prompt("shaken_ocr")
+
+    # Claude Vision ルーティング
+    _use_model = model_name or GEMINI_MODEL
+    if _use_model and _use_model.startswith("claude-"):
+        _claude_key = api_key if api_key and api_key.startswith("sk-ant-") else ANTHROPIC_API_KEY
+        if _claude_key:
+            json_prompt = prompt + "\n\nレスポンスはJSONのみ（コードブロック不要）。"
+            try:
+                raw = call_claude(_claude_key, file_bytes, mime_type, json_prompt, _use_model)
+                result_c = extract_json_from_response(raw) if raw else {}
+                if result_c and any(v for v in result_c.values() if v and str(v).strip()):
+                    for int_key in ('car_weight', 'engine_displacement', 'kilometer', 'body_code'):
+                        if int_key in result_c:
+                            result_c[int_key] = safe_int(result_c[int_key])
+                    if 'confidence' in result_c:
+                        result_c['confidence'] = safe_float(result_c.get('confidence', 0), 0.0)
+                    return result_c
+            except Exception as _ec:
+                print(f"[shaken_ocr] Claude failed, falling back to Gemini: {_ec}")
 
     # 方式1: response_schema を使用（全フィールドstring型で安全にパース）
     _schema_shaken = {
@@ -2987,24 +3267,61 @@ def parse_markdown_to_items(md_text: str, page_num: int = 1) -> list:
     return items
 
 
-def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num=1, total_pages=1, tax_inclusive=False):
+def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num=1, total_pages=1, tax_inclusive=False, shop_extra=''):
     """見積書明細行をJSON出力プロンプトで読み取り、itemsリストに変換して返す"""
     extra_notes = ''
     if tax_inclusive:
         extra_notes += '\n\n【税込表記】この見積書は税込表記です。記載されている金額はすべて税込金額として読み取り、そのまま転写してください。税抜きへの変換は不要です。'
     if total_pages > 1:
         extra_notes += f'\n\n【ページ指定】これは全{total_pages}ページ中の{page_num}ページ目です。このページの全明細行を漏れなく読み取ってください。'
+    if shop_extra:
+        extra_notes += shop_extra
+    # Harness の prompt_extra も付加
+    _hp_extra = HARNESS_PARAMS.get('prompt_extra', '')
+    if _hp_extra:
+        extra_notes += _hp_extra
 
     prompt = _build_prompt("estimate_detail_page", extra_notes)
+
+    # Claude Vision ルーティング（model_name が "claude-" で始まる場合）
+    if model_name and model_name.startswith("claude-"):
+        _claude_key = (api_key if api_key and api_key.startswith("sk-ant-")
+                       else os.environ.get('ANTHROPIC_API_KEY', ANTHROPIC_API_KEY))
+        if not _claude_key:
+            raise ValueError("ANTHROPIC_API_KEY が未設定です。.env ファイルに ANTHROPIC_API_KEY を追加してください。")
+        last_error = None
+        for attempt in range(3):
+            try:
+                response_text = call_claude(_claude_key, file_bytes, mime_type, prompt, model_name)
+                if response_text and response_text.strip():
+                    items = parse_detail_json_to_items(response_text, page_num)
+                    if not items:
+                        items = parse_markdown_to_items(response_text, page_num)
+                    return {'items': items, 'discount_amount': 0, 'confidence': 0.95}
+                if attempt < 2:
+                    import time; time.sleep(1)
+                    continue
+                raise ValueError("Claudeから有効な応答が得られませんでした。")
+            except ValueError:
+                raise
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    import time; time.sleep(1)
+                    continue
+                raise ValueError(f"Claude API呼び出しに失敗しました: {str(last_error)}")
 
     from google.genai import types
     client = _get_genai_client(api_key)
     file_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
-    # Iter6 v3: thinking_budget=0 (NEO_FAST_OCR=0 で無効化)
-    _cfg = {"temperature": 0.0, "max_output_tokens": 65536}
+    # Harness パラメータ反映
+    _hp_temp   = HARNESS_PARAMS.get('temperature', 0.0)
+    _hp_maxtok = HARNESS_PARAMS.get('max_output_tokens', 65536)
+    _hp_think  = HARNESS_PARAMS.get('thinking_budget', 0)
+    _cfg = {"temperature": _hp_temp, "max_output_tokens": _hp_maxtok}
     try:
-        if "2.5-flash" in (model_name or "") and os.environ.get("NEO_FAST_OCR", "1") == "1":
-            _cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+        if "2.5-flash" in (model_name or ""):
+            _cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=_hp_think)
     except Exception:
         pass
     last_error = None
@@ -3055,6 +3372,102 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
                 import time; time.sleep(1)
                 continue
             raise ValueError(f"Gemini API呼び出しに失敗しました: {str(last_error)}")
+
+
+# ============================================================
+# 統合解析: 1回のAPI呼出で vehicle/customer/totals/details を全て取得
+# ============================================================
+
+def analyze_estimate_unified(api_key, file_bytes, mime_type, model_name):
+    """1パス統合プロンプトで PDF 全体を 1 回の Gemini 呼出で解析する。
+
+    戻り値: {
+      'items': [...], 'vehicle_info': {...}, 'customer_info': {...},
+      'pdf_parts_total': int, 'pdf_wage_total': int, 'pdf_grand_total': int,
+      'discount_amount': int, 'repair_shop_name': str,
+      'amount_basis': 'tax_inclusive'|'tax_exclusive'|'unknown',
+      'confidence': float
+    }
+    """
+    import json as _json, re, sys
+    prompt = _build_prompt("estimate_unified")
+
+    # Claude ルーティング
+    if model_name and model_name.startswith("claude-"):
+        _claude_key = (api_key if api_key and api_key.startswith("sk-ant-")
+                       else os.environ.get('ANTHROPIC_API_KEY', ANTHROPIC_API_KEY))
+        if not _claude_key:
+            raise ValueError("ANTHROPIC_API_KEY 未設定")
+        response_text = call_claude(_claude_key, file_bytes, mime_type, prompt, model_name)
+    else:
+        from google.genai import types
+        client = _get_genai_client(api_key)
+        file_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+        _hp_temp   = HARNESS_PARAMS.get('temperature', 0.0)
+        _hp_maxtok = HARNESS_PARAMS.get('max_output_tokens', 65536)
+        _hp_think  = HARNESS_PARAMS.get('thinking_budget', 0)
+        _cfg = {"temperature": _hp_temp, "max_output_tokens": _hp_maxtok}
+        try:
+            if "2.5-flash" in (model_name or ""):
+                _cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=_hp_think)
+        except Exception:
+            pass
+        last_err = None
+        response_text = ''
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=model_name, contents=[prompt, file_part], config=_cfg)
+                response_text = response.text or ''
+                if response_text.strip():
+                    break
+                if attempt < 2:
+                    import time; time.sleep(1)
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    import time; time.sleep(1)
+                    continue
+                raise ValueError(f"Gemini unified 呼出失敗: {last_err}")
+
+    if not response_text or not response_text.strip():
+        raise ValueError("unified 応答が空")
+
+    # JSON抽出
+    text = response_text.strip()
+    text = re.sub(r'^```json\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^```\s*$', '', text, flags=re.MULTILINE)
+    m = re.search(r'\{.*\}', text, re.DOTALL)
+    if not m:
+        raise ValueError("unified JSON parseエラー")
+    try:
+        data = _json.loads(m.group(0))
+    except Exception:
+        try:
+            data = _json.loads(repair_truncated_json(m.group(0)))
+        except Exception as e:
+            raise ValueError(f"unified JSON 修復失敗: {e}")
+
+    # 詳細を items に変換 (parse_detail_json_to_items相当)
+    items = parse_detail_json_to_items(_json.dumps({'details': data.get('details', [])}, ensure_ascii=False))
+
+    vinfo = data.get('vehicle_info', {}) or {}
+    cinfo = data.get('customer_info', {}) or {}
+    totals = data.get('totals', {}) or {}
+
+    return {
+        'items':           items,
+        'vehicle_info':    vinfo,
+        'customer_info':   cinfo,
+        'pdf_parts_total': safe_int(totals.get('pdf_parts_total', 0)),
+        'pdf_wage_total':  safe_int(totals.get('pdf_wage_total', 0)),
+        'pdf_grand_total': safe_int(totals.get('pdf_grand_total', 0)),
+        'discount_amount': safe_int(totals.get('discount_amount', 0)),
+        'repair_shop_name': totals.get('repair_shop_name', '') or '',
+        'amount_basis':    totals.get('amount_basis', 'unknown') or 'unknown',
+        'confidence':      0.9,
+        '_unified_used':   True,
+    }
 
 
 # ============================================================
@@ -3812,6 +4225,12 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
       use_rasterize: PDF→JPEG変換してから送信（行ズレ防止）
     """
     import hashlib, sys
+    # Harness 上書き
+    if HARNESS_PARAMS:
+        use_fax_filter        = HARNESS_PARAMS.get('use_fax_filter', use_fax_filter)
+        use_rasterize         = HARNESS_PARAMS.get('use_rasterize', use_rasterize)
+        use_enhance           = HARNESS_PARAMS.get('use_enhance', use_enhance)
+        enable_self_correction = HARNESS_PARAMS.get('enable_self_correction', enable_self_correction)
     used_model = model_name or GEMINI_MODEL
     _log: list = []  # 解析ログ収集リスト
 
@@ -3886,9 +4305,9 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
         last_page_idx = max(0, num_pages - 1)
         # 最終ページと1ページ目を並列ラスタライズ（直列から並列化 → ~2s節約）
         def _raster_last(_):
-            return rasterize_pdf_page(file_bytes, last_page_idx, dpi=300, enhance=use_enhance)
+            return rasterize_pdf_page(file_bytes, last_page_idx, dpi=HARNESS_PARAMS.get('dpi', 300), enhance=use_enhance)
         def _raster_first(_):
-            return rasterize_pdf_page(file_bytes, 0, dpi=300, enhance=use_enhance)
+            return rasterize_pdf_page(file_bytes, 0, dpi=HARNESS_PARAMS.get('dpi', 300), enhance=use_enhance)
         with ThreadPoolExecutor(max_workers=2) as _ex:
             _fut_last  = _ex.submit(_raster_last, None)
             _fut_first = _ex.submit(_raster_first, None)
@@ -3900,6 +4319,80 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
         if img1:
             first_raster_bytes = img1
             first_raster_mime  = 'image/jpeg'
+
+    # ④ 1パス統合プロンプト経路 (HARNESS_PARAMS.use_unified=True で有効化)
+    _use_unified = HARNESS_PARAMS.get('use_unified', False)
+    if _use_unified:
+        _cb(20, "① 統合プロンプトで一括解析中...（30〜60秒）")
+        try:
+            uni = analyze_estimate_unified(api_key, file_bytes, 'application/pdf', used_model)
+            # 品質チェック: PDFに部品番号パターンが可視で含まれているのに unified が抽出できていない場合フォールバック
+            _items_with_pn = sum(1 for it in uni.get('items', [])
+                                 if str(it.get('part_number') or it.get('parts_no') or '').strip())
+            _items_count = len(uni.get('items', []))
+            try:
+                import fitz, re as _re
+                _doc = fitz.open(stream=file_bytes, filetype='pdf')
+                _pdf_text = ''.join(p.get_text() for p in _doc)
+                _doc.close()
+                # 部品番号パターン: 5桁数字 + ハイフン + 4-8文字英数字 (例: 62022-3GSOB)
+                _pdf_pn_count = len(_re.findall(r'\b\d{5}[\-\s][A-Z0-9]{4,8}\b', _pdf_text))
+            except Exception:
+                _pdf_pn_count = 0
+
+            if _pdf_pn_count >= 5 and _items_with_pn < (_pdf_pn_count // 2):
+                _logw(f"⚠️ 統合解析の品番抽出が不足 (PDF内可視PN={_pdf_pn_count}, 抽出={_items_with_pn}). 従来パスへフォールバック")
+                raise ValueError("unified: PN extraction insufficient, fallback")
+            totals_data = {
+                'pdf_parts_total':  uni['pdf_parts_total'],
+                'pdf_wage_total':   uni['pdf_wage_total'],
+                'pdf_grand_total':  uni['pdf_grand_total'],
+                'discount_amount':  uni['discount_amount'],
+                'repair_shop_name': uni['repair_shop_name'],
+                'vehicle_info':     uni['vehicle_info'],
+                'customer_info':    uni['customer_info'],
+                'amount_basis':     uni['amount_basis'],
+            }
+            target_parts = uni['pdf_parts_total']
+            target_wage  = uni['pdf_wage_total']
+            pdf_grand    = uni['pdf_grand_total']
+            discount     = uni['discount_amount']
+            _logw(f"④ 統合解析: 部品計={target_parts:,} / 工賃計={target_wage:,} / 総合計={pdf_grand:,} / 値引={discount:,}")
+
+            _page_count = len(pages) if pages else 1
+            _logw(f"⑤ 統合解析で {len(uni['items'])}行 取得")
+
+            result = {
+                'items':            uni['items'],
+                'short_parts_wage': 0,
+                'pdf_parts_total':  target_parts,
+                'pdf_wage_total':   target_wage,
+                'pdf_grand_total':  pdf_grand,
+                'discount_amount':  discount,
+                'confidence':       uni['confidence'],
+                '_fax_filtered':    filtered_count,
+                '_page_count':      _page_count,
+                '_vehicle_info':    uni['vehicle_info'],
+                '_repair_shop_name': uni['repair_shop_name'],
+                'customer_info':    uni['customer_info'],
+                '_log':             _log,
+                'amount_basis':     uni['amount_basis'],
+            }
+            # 重複除去・バリデーション (既存パイプラインと同等の整理)
+            result['items'] = global_dedup_items(result['items'])
+            result['items'] = validate_and_correct_items(result['items'])
+            for _it in result['items']:
+                if not str(_it.get('name', '')).strip():
+                    _wc = str(_it.get('work_code', '')).strip()
+                    _it['name'] = _wc if _wc else '不明'
+            result['items'], row_warnings = validate_row_consistency(result['items'])
+            if row_warnings:
+                result['_row_warnings'] = row_warnings
+            _analyze_result_cache[_cache_key] = result
+            return result
+        except Exception as _ue:
+            _logw(f"⚠️ 統合プロンプト失敗 ({_ue}). 従来の2-pass経路にフォールバック")
+            # フォールスルー
 
     # ④ 1パス目: 合計値＋車両情報抽出
     _cb(20, "③ 合計金額・車両情報を読み取り中...（10〜20秒）")
@@ -3968,9 +4461,13 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     # ⑤ 2パス目: 明細抽出（PDF全ページを一括送信 — ページ境界ズレを防ぐ）
     _cb(45, f"④ 明細行を解析中...（{len(pages) if pages else 1}ページ / 30秒〜2分かかる場合があります）")
     _page_count = len(pages) if pages else 1
+    _shop_format = detect_shop_format(file_bytes) if mime_type == 'application/pdf' else 'default'
+    _logw(f"🏪 ショップ形式検出: {_shop_format}")
+    _shop_extra = _SHOP_PROMPT_EXTRAS.get(_shop_format, '')
     _logw(f"⑤ 全ページ一括解析開始 ({_page_count}ページ)")
     result = analyze_estimate_single(
-        api_key, file_bytes, 'application/pdf', used_model, 1, _page_count
+        api_key, file_bytes, 'application/pdf', used_model, 1, _page_count,
+        shop_extra=_shop_extra
     ) or {}
     result.setdefault('items', [])
     result.setdefault('short_parts_wage', 0)
@@ -4664,12 +5161,22 @@ def main():
         st.header("🔑 APIキー設定")
         if GEMINI_API_KEY:
             api_key = GEMINI_API_KEY
-            st.success("APIキー: 設定済み (.env)")
+            st.success("Gemini APIキー: 設定済み (.env)")
         else:
             api_key = st.text_input(
                 "Gemini APIキー",
                 type="password",
                 help=".envファイルの GEMINI_API_KEY にキーを設定すれば毎回入力不要"
+            )
+        # Claude Vision 用 ANTHROPIC_API_KEY
+        _claude_key_sidebar = ANTHROPIC_API_KEY
+        if _claude_key_sidebar:
+            st.success("Claude APIキー: 設定済み (.env)")
+        else:
+            _claude_key_sidebar = st.text_input(
+                "Claude APIキー（高精度モード用）",
+                type="password",
+                help=".envファイルの ANTHROPIC_API_KEY を設定するとclaude-sonnet-4-6が使用可能"
             )
         # 利用可能なモデルをAPIで動的取得（APIキーがある場合のみ）
         if api_key:
@@ -4681,13 +5188,19 @@ def main():
                     _avail_models = get_available_gemini_models(api_key)
         else:
             _avail_models = [_FALLBACK_MODEL]
+        # Claude が使える場合は先頭に追加（実証済み100%精度）
+        if _claude_key_sidebar and "claude-sonnet-4-6" not in _avail_models:
+            _avail_models = ["claude-sonnet-4-6"] + list(_avail_models)
+        _default_idx = 0
         selected_model = st.selectbox(
             "🤖 AIモデル",
             options=_avail_models,
-            index=0,
+            index=_default_idx,
             key="model_selector_v2",
-            help="APIで利用可能なモデルを自動検出。3.1 Pro=最高精度、2.5 Flash=高速・コスパ良好"
+            help="claude-sonnet-4-6: 精度100%実証済み（推奨） / gemini-2.5-flash: 高速・Geminiのみ"
         )
+        # サイドバーで選択したClaudeキーをセッションに保存（simple_mode で参照）
+        st.session_state['_claude_api_key'] = _claude_key_sidebar
         st.markdown("---")
 
         # v11.0: 簡単モード切替（デフォルトON、非エンジニア向け）

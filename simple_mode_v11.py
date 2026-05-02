@@ -83,10 +83,16 @@ def _show_error(exc: Exception):
 
 
 def _process_with_progress(estimate_bytes: bytes, vehicle_bytes, original_neo_bytes,
-                            api_key: str, model_name: str = 'gemini-2.5-flash') -> dict:
+                            api_key: str, model_name: str = 'gemini-2.5-flash',
+                            claude_api_key: str = '') -> dict:
     """pipeline を呼びつつ進捗を表示。Returns: {ok, neo_bytes, csv_bytes, summary_text, ...}"""
     progress = st.progress(0, text='準備中...')
     log_area = st.empty()
+
+    # Claude モデルの場合は ANTHROPIC_API_KEY を環境変数にセット
+    _is_claude = model_name and model_name.startswith("claude-")
+    if _is_claude and claude_api_key:
+        os.environ['ANTHROPIC_API_KEY'] = claude_api_key
 
     import tempfile
     with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tf:
@@ -105,8 +111,9 @@ def _process_with_progress(estimate_bytes: bytes, vehicle_bytes, original_neo_by
                 tf.write(original_neo_bytes); template = tf.name
             progress.progress(20, text='② 原本 NEO を反映準備...')
 
-        progress.progress(30, text='③ AI で OCR 解析中... (30秒〜2分)')
-        log_area.caption('Gemini AI で見積内容を読取り中...')
+        _engine_label = 'Claude Vision' if _is_claude else 'Gemini AI'
+        progress.progress(30, text=f'③ AI で OCR 解析中... ({_engine_label})')
+        log_area.caption(f'{_engine_label} で見積内容を読取り中...')
         import pdf_to_neo_pipeline as P
         os.environ['GEMINI_MODEL'] = model_name
         vehicle_info = None
@@ -114,7 +121,10 @@ def _process_with_progress(estimate_bytes: bytes, vehicle_bytes, original_neo_by
             try:
                 from app import analyze_vehicle_registration
                 progress.progress(40, text='④ 車検証 PDF も並行解析中...')
-                vehicle_info = analyze_vehicle_registration(api_key, vehicle_bytes, 'application/pdf')
+                vehicle_info = analyze_vehicle_registration(
+                    claude_api_key if _is_claude else api_key,
+                    vehicle_bytes, 'application/pdf', model_name=model_name
+                )
                 if not isinstance(vehicle_info, dict):
                     vehicle_info = None
             except Exception as _ve:
@@ -128,6 +138,7 @@ def _process_with_progress(estimate_bytes: bytes, vehicle_bytes, original_neo_by
         }
         if vehicle_info:
             kwargs['vehicle_info'] = vehicle_info
+        kwargs['model_name'] = model_name
         result = P.process_pdf_to_neo(est_path, **kwargs)
         progress.progress(90, text='⑥ NEO ファイルを書き出し中...')
 
@@ -245,6 +256,7 @@ def render(api_key: str, model_name: str = 'gemini-2.5-flash'):
                 result = _process_with_progress(
                     est_bytes, veh_bytes, tpl_bytes,
                     api_key=api_key, model_name=model_name,
+                    claude_api_key=st.session_state.get('_claude_api_key', ''),
                 )
                 elapsed = time.time() - t0
             st.session_state['_v11_last_result'] = result

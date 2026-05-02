@@ -5,11 +5,36 @@
 # Claude Code / harness 作業フォルダ
 .claude/
 .cache/
+.venv_local/
 _harness_run_*/
+_harness/
+_harness_v2/
+_verify_*/
 _archive/
 _開発資料/
 テスト要/
 サンプル見積PDF/
+
+# 検証用 PDF→CSV リファレンスデータ (顧客情報含むため除外)
+pdf_to_csv_esquire.py
+pdf_to_csv_estimate.py
+pdf_to_csv_jimny.py
+pdf_to_csv_nbox.py
+csv_verify.py
+csv_to_neo.py
+pdf_to_csv.py
+pdf_to_csv_to_neo_cli.py
+benchmark_csv.py
+phase2_benchmark.py
+*.csv
+*.neo
+
+# 引き継ぎ書（顧客情報含む）
+引き継ぎ書_*.md
+現状サマリ_*.md
+新PC_セットアップ手順.md
+docker-compose.yml
+.env.example
 
 # 大型ドキュメント
 *.docx
@@ -25,6 +50,7 @@ Cloud_Run*.md
 操作マニュアル.md
 社内共有マニュアル.txt
 社内デプロイガイド.docx
+PDF→NEOマニュアル.md
 "PDF→NEOマニュアル.md"
 
 # Local-only スクリプト
