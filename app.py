@@ -62,6 +62,12 @@ TEMPLATE_FILENAME = "template_toyota.neo"
 TEMPLATE_PATH     = os.path.join(SCRIPT_DIR, TEMPLATE_FILENAME)
 ANALYSIS_LOG_PATH = os.path.join(SCRIPT_DIR, "analysis.log")
 TAX_RATE          = 0.10
+# ヘッダXML <CarRegistedDateEra> の元号コード。
+# 【実機確認が必要】この対応は日本のシステムで一般的な並び順によるもので、
+# コグニセブンの実機で確認できていない。テンプレート原本は初度登録が
+# 空欄のまま 4 を持っているだけで、根拠にならなかった。
+# 誤っていた場合はここだけ直せば済むように1か所にまとめている。
+_ERA_CODE = {'明治': '1', '大正': '2', '昭和': '3', '平成': '4', '令和': '5'}
 # Streamlit Cloud の st.secrets にも対応（ローカルは .env を使用）
 try:
     GEMINI_API_KEY = st.secrets.get('GEMINI_API_KEY', os.environ.get('GEMINI_API_KEY', ''))
@@ -577,6 +583,13 @@ def safe_str(val, default=''):
     if val is None:
         return default
     return str(val)
+
+
+def read_xml_tag(text, tag_name):
+    """XMLタグの現在値を読む。マージモードで「書き込み後の実効値」を
+    知りたいときに使う（テンプレートに残る値も含めて突き合わせるため）。"""
+    m = re.search(rf'<{re.escape(tag_name)}>([^<]*)</{re.escape(tag_name)}>', text)
+    return m.group(1) if m else ''
 
 
 def replace_xml_tag(text, tag_name, value):
@@ -1755,10 +1768,28 @@ def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mo
         # 初度登録が2通り入る（DB側は Customer.CarRegDate に8桁で入っている）。
         tag_values['CarRegistedDateYear']  = reg_era_year
         tag_values['CarRegistedDateMonth'] = reg_month
+        # 元号コードも一緒に書く。年月だけ入れて元号コードを
+        # テンプレートの値のまま残すと、「元号は平成・年は令和の年」という
+        # 組み合わせになり、令和6年が平成6年（1994年）として読まれる。
+        tag_values['CarRegistedDateEra'] = _ERA_CODE.get(reg_era, '')
     else:
         tag_values['CarRegistedDate']      = ''
         tag_values['CarRegistedDateYear']  = ''
         tag_values['CarRegistedDateMonth'] = ''
+        tag_values['CarRegistedDateEra']   = ''
+    # CarNo（連結された登録番号）は、分解4欄とマージ判定の粒度が違う。
+    # 4欄はタグ単位で「空ならテンプレートの値を残す」のに、CarNo は
+    # 今回の入力だけから合成していたため、1欄でも空だと
+    # 「品川あ１２３４」のように桁の抜けた、存在しない登録番号になり、
+    # 同じ .neo の中で分解4欄と食い違っていた。
+    # 書き込み後に実際に入る4欄の値から合成し直す。
+    if merge_mode:
+        _eff = []
+        for _tag, _val in (('CarNoArea', car_dept), ('CarNoClass', car_div),
+                           ('CarNoKana', car_biz), ('CarNoSeries', car_serial)):
+            _eff.append(_val if _val else read_xml_tag(text, _tag))
+        tag_values['CarNo'] = ''.join(_eff)
+
     for tag_name, value in tag_values.items():
         if merge_mode and not value:
             continue  # マージモード: 空値はスキップ（テンプレートの既存値を保持）
@@ -1789,7 +1820,12 @@ def update_imge_ini(orig_bytes, cust, insurance_info=None, merge_mode=False):
         'AcceptNo':        cp932_trim((insurance_info or {}).get('accept_no', ''), 37),
         # 8桁固定の欄。未入力は純正テンプレートと同じ 00000000 にする
         # （空文字だと DB の Insurance.AccidentDate='00000000' と食い違う）
-        'AccidentDate':    _normalize_date8((insurance_info or {}).get('accident_date', '')) or '00000000',
+        # 未入力を '00000000' に既定化するのは非マージモードのときだけ。
+        # マージモードでも真の値になってしまうと下の空値スキップに
+        # 引っかからず、DB・ヘッダXMLには前案件の事故日が残るのに
+        # ここだけ 00000000 に潰れ、同じ .neo で事故日が2通りになる。
+        'AccidentDate':    (_normalize_date8((insurance_info or {}).get('accident_date', ''))
+                            or ('' if merge_mode else '00000000')),
     }
     for key, value in ini_values.items():
         if merge_mode and not value:
@@ -4902,6 +4938,9 @@ def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=
             # 見積書の明細が税込表記かどうか。画面で利用者が指定する。
             # 決め打ちにすると、税込表記の見積で総額が消費税ぶん膨らむ。
             is_tax_inclusive=bool(is_tax_inclusive),
+            # 利用者が過去の .neo をテンプレートに指定したときだけマージモード。
+            # 画面の主経路（ステップ④）と同じ扱いに揃える。
+            merge_mode=bool(template_bytes),
         )
         if not isinstance(result, dict):
             return {'ok': False, 'error': 'PDF→NEO変換が想定外の値を返しました'}
@@ -6297,24 +6336,6 @@ def main():
             with col5:
                 v_regdate = st.text_input("初度登録年月 (YYYYMM00)", value=safe_str(vehicle_data.get('car_reg_date', '')), key='v_regdate')
 
-            # 列幅を超えた分は無言で切り捨てられ、画面には全文が残るため
-            # ユーザーは気づけない。実際に切られる項目だけを知らせる。
-            for _lbl, _val, _w in (
-                ('使用者名',   v_customer, _CUST_WIDTH['UserName']),
-                ('所有者名',   v_owner,    _CUST_WIDTH['OwnerName']),
-                ('郵便番号',   v_postal,   _CUST_WIDTH['PostalNo']),
-                ('市区町村',   v_muni,     _CUST_WIDTH['Municipality']),
-                ('その他住所', v_addr,     _CUST_WIDTH['AddressOther1']),
-                ('車台番号',   v_csn,      _CUST_WIDTH['CarSerialNo']),
-                ('車名',       v_carname,  _CAR_WIDTH['CarName']),
-            ):
-                _cut = cp932_trim(_val, _w)
-                if _val and _cut != safe_str(_val):
-                    st.warning(
-                        f"⚠️ {_lbl}はコグニセブンの列幅（{_w}バイト＝全角{_w // 2}文字）を"
-                        f"超えています。NEOには「{_cut}」までしか入りません。"
-                        "短い表記に直してください。")
-
             # 読み取れない日付は黙って捨てられる（または和暦の組み立てで
             # 落ちる）ので、事故日と同じように画面で知らせる。
             for _lbl, _val, _norm, _hint in (
@@ -6350,6 +6371,38 @@ def main():
                 v_weight    = st.number_input("車両重量 (kg)",  value=safe_int(vehicle_data.get('car_weight', 0)),          min_value=0, step=10, key='v_weight')
             with dc6:
                 v_displace  = st.number_input("排気量 (cc)",    value=safe_int(vehicle_data.get('engine_displacement', 0)), min_value=0, step=100, key='v_displace')
+
+            # 列幅を超えた分は無言で切り捨てられ、画面には全文が残るため
+            # ユーザーは気づけない。実際に切られる項目だけを知らせる。
+            # 以前は7項目しか見ておらず、車体の色（30バイト）のように
+            # メーカー純正色名だとほぼ必ず切れる欄が対象外だった。
+            # 塗色名が途中で切れると塗装の色種別の根拠が読めなくなる。
+            # 切り詰められる欄はすべて挙げる。
+            for _lbl, _val, _w in (
+                ('使用者名',       v_customer,   _CUST_WIDTH['UserName']),
+                ('所有者名',       v_owner,      _CUST_WIDTH['OwnerName']),
+                ('郵便番号',       v_postal,     _CUST_WIDTH['PostalNo']),
+                ('都道府県',       v_pref,       _CUST_WIDTH['Prefecture']),
+                ('市区町村',       v_muni,       _CUST_WIDTH['Municipality']),
+                ('その他住所',     v_addr,       _CUST_WIDTH['AddressOther1']),
+                ('登録番号 地名',   v_dept,       _CUST_WIDTH['CarRegNoDepartment']),
+                ('登録番号 分類番号', v_div,      _CUST_WIDTH['CarRegNoDivision']),
+                ('登録番号 かな',   v_biz,        _CUST_WIDTH['CarRegNoBusiness']),
+                ('登録番号 一連番号', v_serial,   _CUST_WIDTH['CarRegNoSerial']),
+                ('車台番号',       v_csn,        _CUST_WIDTH['CarSerialNo']),
+                ('型式指定番号',    v_modeldesig, _CUST_WIDTH['CarMouldNo']),
+                ('類別区分番号',    v_catnum,     _CUST_WIDTH['CarKindNo']),
+                ('車名',           v_carname,    _CAR_WIDTH['CarName']),
+                ('車体の色',       v_color,      _CAR_WIDTH['ColorName']),
+                ('カラーコード',    v_colorcode,  _CAR_WIDTH['ColorCode']),
+                ('トリムコード',    v_trimcode,   _CAR_WIDTH['TrimCode']),
+            ):
+                _cut = cp932_trim(_val, _w)
+                if _val and _cut != safe_str(_val):
+                    st.warning(
+                        f"⚠️ {_lbl}はコグニセブンの列幅（{_w}バイト＝全角{_w // 2}文字）を"
+                        f"超えています。NEOには「{_cut}」までしか入りません。"
+                        "短い表記に直してください。")
 
         # 入力途中の内容を毎回保存しておく。ステップ①に戻ると
         # vehicle_data が捨てられるため、保存しないと入力が全て消える。

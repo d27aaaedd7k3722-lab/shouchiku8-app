@@ -922,7 +922,8 @@ def _call_generate_neo(template_bytes: bytes,
                        customer_info: Dict[str, Any],
                        items: List[Dict[str, Any]],
                        is_beta_mode: bool = False,
-                       is_tax_inclusive: bool = False) -> bytes:
+                       is_tax_inclusive: bool = False,
+                       merge_mode: bool = False) -> bytes:
     """app.generate_neo_file の薄ラッパ。lazy import + items正規化(Iter6)"""
     try:
         from app import generate_neo_file  # type: ignore
@@ -944,7 +945,11 @@ def _call_generate_neo(template_bytes: bytes,
         # モードA(ベタ打ち)ではDB照合していないので、未マッチを表す ※ を
         # 品名に付けてはいけない（付けると全品名が ※ 付きで出荷される）
         is_beta_mode=is_beta_mode,
-        merge_mode=False,
+        # 利用者が過去の .neo をテンプレートに指定したときは、画面の主経路と
+        # 同じくマージモードにする。決め打ちで False にしていたため、この経路
+        # だけ前案件の車の色・カラーコード・受付番号・アジャスター名が
+        # DB側に残り、しかも同じ .neo のヘッダXML側は空という食い違いが出ていた。
+        merge_mode=merge_mode,
     )
     return neo_bytes
 
@@ -1039,13 +1044,15 @@ def build_neo_mode_a(items: List[Dict[str, Any]],
                      vehicle_info: Dict[str, Any],
                      template_path: Optional[str] = None,
                      customer_info: Optional[Dict[str, Any]] = None,
-                     is_tax_inclusive: bool = False) -> bytes:
+                     is_tax_inclusive: bool = False,
+                     merge_mode: bool = False) -> bytes:
     """モードA: ベタ打ち (収録外)。OCR項目をそのまま転写。"""
     tpl = _load_template_bytes(template_path)
     cust = _merge_vehicle_into_customer(vehicle_info or {}, customer_info)
     # ベタ打ち: DB照合していないため ※（DB未マッチ印）を付けない
     return _call_generate_neo(tpl, cust, items or [], is_beta_mode=True,
-                              is_tax_inclusive=is_tax_inclusive)
+                              is_tax_inclusive=is_tax_inclusive,
+                              merge_mode=merge_mode)
 
 
 def build_neo_mode_b(items: List[Dict[str, Any]],
@@ -1053,7 +1060,8 @@ def build_neo_mode_b(items: List[Dict[str, Any]],
                      template_path: Optional[str] = None,
                      addata_root: str = r"C:\Addata",
                      customer_info: Optional[Dict[str, Any]] = None,
-                     is_tax_inclusive: bool = False) -> bytes:
+                     is_tax_inclusive: bool = False,
+                     merge_mode: bool = False) -> bytes:
     """モードB: 完全複製 (cogni判定)。価格不一致マーカー付与。"""
     matched = items or []
     # Iter13: 品番空 → DB逆引き補完
@@ -1115,7 +1123,8 @@ def build_neo_mode_b(items: List[Dict[str, Any]],
     tpl = _load_template_bytes(template_path)
     cust = _merge_vehicle_into_customer(vehicle_info or {}, customer_info)
     return _call_generate_neo(tpl, cust, matched,
-                              is_tax_inclusive=is_tax_inclusive)
+                              is_tax_inclusive=is_tax_inclusive,
+                              merge_mode=merge_mode)
 
 
 def build_neo_mode_c(items: List[Dict[str, Any]],
@@ -1123,7 +1132,8 @@ def build_neo_mode_c(items: List[Dict[str, Any]],
                      template_path: Optional[str] = None,
                      addata_root: str = r"C:\Addata",
                      customer_info: Optional[Dict[str, Any]] = None,
-                     is_tax_inclusive: bool = False) -> bytes:
+                     is_tax_inclusive: bool = False,
+                     merge_mode: bool = False) -> bytes:
     """モードC: あいまい複製。L4 or db_parts_no 空 → ※ADDATA該当なし マーカー。"""
     matched = items or []
     vcode = (vehicle_info or {}).get("model_code") or (vehicle_info or {}).get("vehicle_code")
@@ -1163,7 +1173,8 @@ def build_neo_mode_c(items: List[Dict[str, Any]],
         tpl = _load_template_bytes(template_path)
         cust = _merge_vehicle_into_customer(vehicle_info or {}, customer_info)
         return _call_generate_neo(tpl, cust, matched,
-                              is_tax_inclusive=is_tax_inclusive)
+                              is_tax_inclusive=is_tax_inclusive,
+                              merge_mode=merge_mode)
     try:
         from auto_matching import match_pdf_items_to_addata  # type: ignore
         matched = match_pdf_items_to_addata(matched, vehicle_info or {}, addata_root)
@@ -1182,7 +1193,8 @@ def build_neo_mode_c(items: List[Dict[str, Any]],
     tpl = _load_template_bytes(template_path)
     cust = _merge_vehicle_into_customer(vehicle_info or {}, customer_info)
     return _call_generate_neo(tpl, cust, matched,
-                              is_tax_inclusive=is_tax_inclusive)
+                              is_tax_inclusive=is_tax_inclusive,
+                              merge_mode=merge_mode)
 
 
 # ============================================================
@@ -1467,7 +1479,8 @@ def process_pdf_to_neo(pdf_path,
                        model_name: Optional[str] = None,
                        api_key: Optional[str] = None,
                        cache_scope: str = "",
-                       is_tax_inclusive: bool = False) -> Dict[str, Any]:
+                       is_tax_inclusive: bool = False,
+                       merge_mode: bool = False) -> Dict[str, Any]:
     """E2E ディスパッチャ。
 
     - vehicle_info/items 未提供かつ skip_ocr=False かつ GEMINI_API_KEY あり → OCR
@@ -1524,6 +1537,9 @@ def process_pdf_to_neo(pdf_path,
             # 税区分は出力を変えるのでキーに含める。含めないと、税区分を
             # 選び直して生成し直しても前回の .neo がそのまま返る。
             str(bool(is_tax_inclusive)),
+            # マージモードは生成物を変える。キーに入れないと、同じPDFを
+            # テンプレート指定あり／なしで通したとき前の結果が返る。
+            str(bool(merge_mode)),
             _pdf_md5((ocr_text or "").encode("utf-8", "ignore")),
         ])
         if cache_key in _PIPELINE_CACHE:
@@ -2116,13 +2132,16 @@ def process_pdf_to_neo(pdf_path,
     try:
         if mode == "A":
             neo = build_neo_mode_a(items, vehicle_info, template_path, customer_info,
-                                   is_tax_inclusive=is_tax_inclusive)
+                                   is_tax_inclusive=is_tax_inclusive,
+                                   merge_mode=merge_mode)
         elif mode == "B":
             neo = build_neo_mode_b(items, vehicle_info, template_path, addata_root, customer_info,
-                                   is_tax_inclusive=is_tax_inclusive)
+                                   is_tax_inclusive=is_tax_inclusive,
+                                   merge_mode=merge_mode)
         else:
             neo = build_neo_mode_c(items, vehicle_info, template_path, addata_root, customer_info,
-                                   is_tax_inclusive=is_tax_inclusive)
+                                   is_tax_inclusive=is_tax_inclusive,
+                                   merge_mode=merge_mode)
         out["neo_bytes"] = neo
         log.append(f"NEO生成成功 size={len(neo) if neo else 0}")
         # verify
