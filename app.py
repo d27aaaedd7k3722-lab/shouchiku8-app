@@ -1308,7 +1308,9 @@ def generate_annote(items):
         ln_str = f'{line_no:08d}'
         for j, c in enumerate(ln_str):
             line[j] = ord(c)
-        name_bytes = name.encode('cp932', errors='replace')[:30]
+        # バイト数で単純に切ると2バイト文字の途中で割れ、末尾に
+        # 復号できない片割れが残る。文字境界で切り詰める。
+        name_bytes = cp932_trim(name, 30).encode('cp932', errors='replace')
         for j, b in enumerate(name_bytes):
             line[14 + j] = b
         qty_str = f'{min(qty, 99):02d}'
@@ -2548,7 +2550,7 @@ _COLUMN_ALIASES = {
     'name':         ('品名', '部品名', '品目', '名称', '摘要', '作業内容'),
     'work_code':    ('区分', '作業区分'),
     'quantity':     ('数量', '個数'),
-    'parts_amount': ('部品金額', '部品代', '部品価格', '部品単価'),
+    'parts_amount': ('部品金額', '部品代', '部品価格', '部品単価', '部品油脂'),
     'wage':         ('工賃', '技術料', '作業工賃'),
     'part_no':      ('部品コード', '部品番号', '品番'),
     'index_value':  ('工数', '指数'),
@@ -2563,7 +2565,9 @@ def _build_column_map(header_row) -> dict:
     # 空白は詰めるだけにし、括弧書きの注記だけを落とす。
     cells = []
     for c in header_row:
-        c = re.sub(r'[\s\u3000]', '', str(c or ''))
+        c = re.sub(r'[\s\u3000・、，]', '', str(c or ''))
+        # 括弧書きの注記だけを落とす。閉じ括弧が無い場合は以降を捨てる。
+        c = re.sub(r'[（(\[【][^）)\]】]*[）)\]】]', '', c)
         c = re.sub(r'[（(\[【].*$', '', c)
         cells.append(c)
     colmap = {}
@@ -2690,18 +2694,32 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
         )
         return has_name and has_amount
 
-    # 見出しは「明細が始まる前」にしか存在しない。表の途中に現れる
-    # 「品名,…」は2枚目のページ見出しなので、そこで区切ると
-    # それより上の明細が丸ごと捨てられてしまう。
+    def _is_detail_start(r):
+        """見出しの探索を打ち切るべき「本物の明細行」か。
+
+        「見積番号,12345」のようなメタ情報行や、表の上に置かれた
+        「御見積金額,,,203170,」で打ち切ると見出しを見失い、全列が
+        ずれたうえ合計行が明細として二重計上されてしまう。
+        """
+        if not _looks_like_data(r):
+            return False
+        cells = [str(c or '').strip() for c in r]
+        if sum(1 for c in cells if c) < 3:
+            return False          # 2セルだけの行はメタ情報
+        return not _is_total_row_name(cells[0])
+
+    # 見出しは表の先頭付近にしかない。8行より下にある「品名,…」は
+    # 2ページ目のページ見出しなので見出しとして採らない
+    # （採ると、それより上の明細が丸ごと捨てられてしまう）。
+    _HEADER_SCAN = 8
     header_idx = 0
-    for i, row in enumerate(rows):
-        if _looks_like_data(row):
+    for i, row in enumerate(rows[:_HEADER_SCAN]):
+        if _is_detail_start(row):
             break
         if row and '品名' in (row[0] or ''):
             header_idx = i + 1
             break
-        # 推測によるヘッダ判定は先頭行だけに限る。
-        if i == 0 and _looks_like_header(row):
+        if _looks_like_header(row):
             header_idx = i + 1
             break
 
@@ -2709,10 +2727,15 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
     # 付いただけで全列が1つずれ、部品代が工賃に化けてしまう。
     _colmap = _build_column_map(rows[header_idx - 1]) if header_idx > 0 else {}
 
+    _claimed = set(_colmap.values())
+
     def _cell(row, key, pos):
-        # 見出しを認識できた場合、その見出しに無い項目まで位置で埋めると
-        # 別の列（品名など）を拾ってしまう。認識できた時は空を返す。
-        idx = _colmap.get(key, None if _colmap else pos)
+        # 見出しに無い項目は位置で補う。「部品、油脂」「金額（部品）」の
+        # ように別名表に無い列名だと、補わなければ部品代が全額消える。
+        # ただし他のキーが既に確保した列（品名・区分など）は横取りしない。
+        idx = _colmap.get(key)
+        if idx is None:
+            idx = pos if (pos is not None and pos not in _claimed) else None
         return row[idx].strip() if idx is not None and 0 <= idx < len(row) else ''
 
     row_idx = 0
@@ -2722,6 +2745,11 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
         # 列数が足りない場合は右側を空文字で補完
         while len(row) < 6:
             row.append('')
+
+        # 2ページ目以降で繰り返される見出し行が、品名「品名」の
+        # 0円明細としてNEOに書き込まれるのを防ぐ
+        if _looks_like_header(row) or (row[0] or '').strip() == '品名':
+            continue
 
         name      = _cell(row, 'name', 0)
         category  = _cell(row, 'work_code', 1)
