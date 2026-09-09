@@ -2528,6 +2528,66 @@ def analyze_estimate_totals(api_key, file_bytes, mime_type, model_name):
     return None
 
 
+# 明細ではなく集計を表す語（これで「終わる」品名は明細として扱わない）
+_TOTAL_SUFFIXES = ('合計', '小計', '総額', '総計', '消費税', '税額')
+# 単独で使われた場合だけ集計とみなす語
+_TOTAL_EXACT = ('内税', '外税', '請求', 'ご請求', '税', '計')
+
+
+# CSVの見出し名 → 内部キー
+_COLUMN_ALIASES = {
+    'name':         ('品名', '品目', '部品名', '名称', '摘要', '作業内容', '内容'),
+    'work_code':    ('区分', '作業区分', '作業'),
+    'quantity':     ('数量', '個数', '数'),
+    'parts_amount': ('部品金額', '部品代', '部品価格', '部品'),
+    'wage':         ('工賃', '技術料', '作業工賃'),
+    'part_no':      ('部品コード', '部品番号', '品番', 'コード'),
+    'index_value':  ('工数', '指数'),
+}
+
+
+def _build_column_map(header_row) -> dict:
+    """見出し行から「内部キー → 列位置」を作る。判別できない場合は空dict。"""
+    if not header_row:
+        return {}
+    cells = [re.sub(r'[\s\u3000（(].*$', '', str(c or '').strip()) for c in header_row]
+    colmap = {}
+    for key, aliases in _COLUMN_ALIASES.items():
+        for i, c in enumerate(cells):
+            if not c or i in colmap.values():
+                continue
+            if c in aliases:
+                colmap[key] = i
+                break
+    # 品名の列が見つからないなら、この見出しは当てにならないので位置決め打ちに戻す
+    if 'name' not in colmap:
+        return {}
+    return colmap
+
+
+def _is_total_row_name(name: str) -> bool:
+    """品名が集計行のものか判定する。
+
+    見積書の合計欄は「合計」「小計(税抜)」「税込合計」「合計金額」
+    「【合計】」「小計①」「合　計　金　額」など表記が揺れる。
+    空白・括弧・丸数字・通貨記号を落としたうえで、末尾が集計語かで判断する。
+    「合計表示灯」「総額メーター」「温度計」のような部品名は末尾が
+    集計語ではないので残る。
+    """
+    nm = re.sub(r'[\s\u3000【】\[\]「」『』¥￥:：･・]', '', str(name or ''))
+    nm = re.sub(r'[（(].*?[）)]', '', nm)          # 括弧書きを除去
+    nm = re.sub(r'[0-9０-９①-⑳%％]+$', '', nm)     # 末尾の番号・率を除去
+    if not nm:
+        return False
+    if nm in _TOTAL_EXACT or nm.endswith(_TOTAL_SUFFIXES):
+        return True
+    # 「合計金額」「小計額」のように集計語の後ろに金額表現が付く形
+    nm2 = re.sub(r'(金額|額|金|計)$', '', nm)
+    if nm2 and nm2 != nm and (nm2 in _TOTAL_EXACT or nm2.endswith(_TOTAL_SUFFIXES)):
+        return True
+    return False
+
+
 def parse_csv_to_items(csv_text: str, return_notes: bool = False):
     """Claude.ai / Gemini.ai 等から出力されたCSVテキストをitemsリストに変換する。
     期待フォーマット（ヘッダあり）:
@@ -2540,8 +2600,10 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
 
     # BOM除去・改行正規化
     text = csv_text.strip().lstrip('\ufeff').replace('\r\n', '\n').replace('\r', '\n')
-    # AIの回答をそのまま貼り付けたときに付いてくるコードフェンスを外す
-    text = '\n'.join(l for l in text.split('\n') if not l.strip().startswith('```'))
+    # AIの回答をそのまま貼り付けたときの前後のコードフェンスだけを外す。
+    # 全行から除去すると、引用符で囲まれた複数行フィールドを壊してしまう。
+    text = re.sub(r'^[^\n]*```[a-zA-Z]*\n', '', text)
+    text = re.sub(r'\n```[^\n]*$', '', text)
     items = []
     try:
         reader = _csv.reader(_io.StringIO(text))
@@ -2555,8 +2617,9 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
     # ヘッダ行を特定する。「品名」が無くてもヘッダらしい行なら読み飛ばす。
     # 以前は先頭セルに「品名」が無いとヘッダ行をそのまま明細として
     # 取り込み、「品目」のような別表記で先頭行がゴミ明細になっていた。
-    _HEADER_WORDS = ('品名', '品目', '部品名', '名称', '区分', '数量', '金額',
-                     '部品金額', '工賃', '部品コード', '部品番号', '工数')
+    _HEADER_WORDS = ('品名', '品目', '部品名', '名称', '摘要', '区分', '作業内容',
+                     '数量', '個数', '数', '単価', '金額', '部品金額', '工賃',
+                     '部品コード', '部品番号', '工数', '番号', '備考', '単位')
 
     def _looks_like_header(r):
         if not r:
@@ -2570,14 +2633,25 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
                 return False
         return sum(1 for c in cells if any(w in c for w in _HEADER_WORDS)) >= 2
 
+    # 「品名」見出しは何行目にあっても拾う。一方、見出しらしさによる推測は
+    # 先頭数行に限る。表の途中の小見出し（「工賃」など）をヘッダと誤認すると、
+    # それより前の明細が全部捨てられてしまう。
     header_idx = 0
     for i, row in enumerate(rows):
         if row and '品名' in (row[0] or ''):
             header_idx = i + 1
             break
-        if _looks_like_header(row):
+        if i < 5 and _looks_like_header(row):
             header_idx = i + 1
             break
+
+    # 見出し行があれば列名で対応付ける。位置決め打ちだと、先頭に「No」列が
+    # 付いただけで全列が1つずれ、部品代が工賃に化けてしまう。
+    _colmap = _build_column_map(rows[header_idx - 1]) if header_idx > 0 else {}
+
+    def _cell(row, key, pos):
+        idx = _colmap.get(key, pos)
+        return row[idx].strip() if idx is not None and 0 <= idx < len(row) else ''
 
     row_idx = 0
     for row in rows[header_idx:]:
@@ -2587,29 +2661,28 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
         while len(row) < 6:
             row.append('')
 
-        name      = row[0].strip()
-        category  = row[1].strip() if len(row) > 1 else ''
-        qty       = safe_int(row[2].strip(), 1) if len(row) > 2 else 1
-        parts_amt = safe_int(row[3].strip()) if len(row) > 3 else 0
-        wage_amt  = safe_int(row[4].strip()) if len(row) > 4 else 0
-        part_no   = row[5].strip() if len(row) > 5 else ''
+        name      = _cell(row, 'name', 0)
+        category  = _cell(row, 'work_code', 1)
+        qty       = safe_int(_cell(row, 'quantity', 2), 1)
+        parts_amt = safe_int(_cell(row, 'parts_amount', 3))
+        wage_amt  = safe_int(_cell(row, 'wage', 4))
+        part_no   = _cell(row, 'part_no', 5)
 
         if not name:
             continue
         # アプリ自身のプロンプトが末尾に付ける差異メモは明細ではない
-        if re.fullmatch(r'(部品|工賃)相違[\d,，]*円?', name.strip()):
+        if re.match(r'^(部品|工賃)相違', name.strip()) and parts_amt == 0 and wage_amt == 0:
             _trailer_notes.append(','.join(c.strip() for c in row if c.strip()))
             continue
         # 集計行の除外。
-        # 「合計」「小計(税抜)」のように集計語で始まり、そこで終わるか
-        # 括弧書きが続くだけの行は、金額があっても明細ではないので必ず落とす。
-        # 一方「合計表示灯」「特別値引」のような正当な品名は残す。
-        # （以前は品名の部分一致だったため正当な明細まで消え、
-        #   その後の緩和では逆に合計行が明細に混ざって総額が膨らんでいた）
-        _nm = re.sub(r'[\s\u3000]', '', name)
-        if re.match(r'^(合計|小計|総額|総計|消費税|税額|内税|外税)([（(].*)?$', _nm):
+        # 「合計」「小計(税抜)」「税込合計」「合計金額」「【合計】」「小計①」など、
+        # 装飾を取り除くと集計語で終わる行は、金額があっても明細ではない。
+        # 一方「合計表示灯」「総額メーター」「温度計」のような正当な品名は
+        # 集計語で終わらないので残る。
+        if _is_total_row_name(name):
             continue
         # 「値引」単独で金額が無い行だけ落とす（金額のある値引きは明細として残す）
+        _nm = re.sub(r'[\s\u3000]', '', name)
         if _nm in ('値引', '値引き') and parts_amt == 0 and wage_amt == 0:
             continue
         if qty < 1:
@@ -4463,6 +4536,9 @@ def main():
                     f"✅ 解析完了 — {len(_p2n_items)}行 ／ "
                     f"部品 ¥{_p2n_parts:,} ／ 工賃 ¥{_p2n_wage:,}"
                 )
+                # 車検証OCRの失敗など、成功扱いでも伝えるべき警告がある
+                for _w in (_p2n_res.get('warnings') or [])[:5]:
+                    st.warning(f"⚠️ {_w}")
                 _p2n_v = _p2n_res.get('verify') or {}
                 if _p2n_v.get('count_match') and _p2n_v.get('total_match'):
                     st.caption("🔍 検証OK: 生成NEOの明細件数と部品金額（税抜）がPDFと一致しました。")
@@ -5302,6 +5378,8 @@ def main():
                 exp_tow = st.session_state.get('exp_towing', 0)
                 exp_ren = st.session_state.get('exp_rental', 0)
                 exp_exm = st.session_state.get('exp_exempt', 0)
+                # ショートパーツを合計に含める（0のままだと画面だけ少なくなる）
+                sp = safe_int((estimate_data or {}).get('short_parts_wage', 0)) or sp
                 sub = calc_parts + calc_wages + sp + exp_tow + exp_ren
                 if is_tax_incl_s3:
                     # 税込モード: 明細金額は既に税込。ただし費用欄は「税抜」で
@@ -5588,6 +5666,10 @@ def main():
                 amount_confirmed = True
 
             # ── Total strip ──
+            # sp は初期化のまま0で使われていたため、画面の合計だけ
+            # ショートパーツぶん少なく表示されていた（short_parts_wage の
+            # 定義はこの後なので estimate_data から直接読む）
+            sp = safe_int((estimate_data or {}).get('short_parts_wage', 0)) or sp
             _exp_tow_s4 = st.session_state.get('exp_towing', 0)
             _exp_ren_s4 = st.session_state.get('exp_rental', 0)
             sub   = calc_parts + calc_wages + sp + _exp_tow_s4 + _exp_ren_s4

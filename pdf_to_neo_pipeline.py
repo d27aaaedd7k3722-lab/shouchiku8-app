@@ -1437,6 +1437,7 @@ def process_pdf_to_neo(pdf_path,
                         # 失敗を空の車両情報として扱うと、中身の無いNEOが
                         # 「生成成功」としてキャッシュまでされてしまう
                         vehicle_info = {}
+                        out["ocr_incomplete"] = True
                         warnings.append(f"車検証OCR失敗: {vi['_error']}")
                         log.append(f"OCR vehicle_info 失敗: {vi['_error']}")
                     elif isinstance(vi, dict):
@@ -1834,7 +1835,9 @@ def process_pdf_to_neo(pdf_path,
         out["ok"] = False
 
     # Iter9: 成功結果をキャッシュ
-    if cache_key and out.get("ok") and out.get("neo_bytes"):
+    # OCRが途中で失敗した結果をキャッシュすると、クォータ回復後に
+    # 同じPDFを処理しても中身の欠けたNEOが返り続ける。
+    if cache_key and out.get("ok") and out.get("neo_bytes") and not out.get("ocr_incomplete"):
         if len(_PIPELINE_CACHE) >= _PIPELINE_CACHE_MAX:
             _PIPELINE_CACHE.pop(next(iter(_PIPELINE_CACHE)))
         _PIPELINE_CACHE[cache_key] = copy.deepcopy(out)
