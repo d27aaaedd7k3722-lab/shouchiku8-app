@@ -1151,7 +1151,9 @@ def _find_erparts_blob(files: Dict[str, bytes]) -> Optional[bytes]:
 
 def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                            pdf_parts_total: Optional[int] = None,
-                           pdf_wage_total: Optional[int] = None) -> Dict[str, Any]:
+                           pdf_wage_total: Optional[int] = None,
+                           is_tax_inclusive: bool = False,
+                           tax_rate: float = 0.10) -> Dict[str, Any]:
     """生成したNEOの明細を、見積書PDFの金額と突き合わせる。
 
     pdf_parts_total / pdf_wage_total には、見積書に「印字されている」合計
@@ -1202,6 +1204,12 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
             res["total_source"] = "items_sum"
         if pdf_wage_total_arg is not None and _to_int(pdf_wage_total_arg) > 0:
             pdf_wage_total = _to_int(pdf_wage_total_arg)
+        # NEO の ERParts は常に税抜。見積書が税込表記なら、比較する前に
+        # PDF 側を税抜へ換算する。換算しないと税込を選ぶたびに必ず
+        # 「差異あり」と警告が出て、正しい .neo を疑わせてしまう。
+        if is_tax_inclusive:
+            pdf_parts_total = int(round(pdf_parts_total / (1 + tax_rate)))
+            pdf_wage_total  = int(round(pdf_wage_total / (1 + tax_rate)))
         pdf_total = pdf_parts_total + pdf_wage_total
         res["pdf_parts_total"] = pdf_parts_total
         res["pdf_wage_total"] = pdf_wage_total
@@ -1309,7 +1317,10 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
             res["neo_count"] = neo_count
             res["neo_total"] = neo_total
             res["count_match"] = (neo_count == res["pdf_count"])
-            res["total_match"] = abs(neo_total - pdf_parts_total) < 1.0
+            # 税込は行ごとに税抜を逆算するため数円ずれる。行数ぶんの
+            # 許容を持たせないと、正しい .neo でも不一致と判定される。
+            _tol = max(1.0, float(len(items or []))) if is_tax_inclusive else 1.0
+            res["total_match"] = abs(neo_total - pdf_parts_total) < _tol
             if not res["count_match"]:
                 res["mismatches"].append(
                     {"type": "count", "neo": neo_count, "pdf": res["pdf_count"]}
@@ -1848,7 +1859,8 @@ def process_pdf_to_neo(pdf_path,
         try:
             v = verify_neo_against_pdf(neo, items,
                                        pdf_parts_total=hdr_parts_total or None,
-                                       pdf_wage_total=hdr_wage_total or None)
+                                       pdf_wage_total=hdr_wage_total or None,
+                                       is_tax_inclusive=is_tax_inclusive)
             out["verify"] = v
             log.append(f"verify ok={v.get('ok')} count={v.get('count_match')} total={v.get('total_match')}")
         except Exception as e:

@@ -2202,7 +2202,10 @@ def _sweep_stale_addata_dirs():
     import glob as _glob, shutil as _sh, time as _t
     try:
         base = os.path.realpath(tempfile.gettempdir())
-        keep = os.path.realpath(st.session_state.get(_ADDATA_UPLOAD_BASE_KEY) or '\0')
+        # 使用中の展開先。os.path.realpath('\0') は全バージョンで例外に
+        # なるため、番兵文字列を渡してはいけない（関数ごと死ぬ）。
+        _keep_src = st.session_state.get(_ADDATA_UPLOAD_BASE_KEY)
+        keep = os.path.realpath(_keep_src) if _keep_src else None
         now = _t.time()
         for d in _glob.glob(os.path.join(base, 'addata_*')):
             rd = os.path.realpath(d)
@@ -2236,6 +2239,12 @@ def find_addata_dir():
     try:
         up = st.session_state.get(_ADDATA_UPLOAD_KEY)
         if up and _addata_is_valid(up):
+            # 使用中であることを更新時刻で示す。展開したきりだと、
+            # 長時間開いている別セッションの Addata を掃除で消してしまう。
+            try:
+                os.utime(st.session_state.get(_ADDATA_UPLOAD_BASE_KEY) or up, None)
+            except OSError:
+                pass
             return up
     except Exception:
         pass
@@ -6722,6 +6731,11 @@ def main():
                     'exp_towing', 'exp_rental', 'exp_exempt',
                     'custom_neo_bytes', 'custom_neo_name',
                     'tax_override',
+                    # PDF側の税区分と、その引き継ぎ用の一時キー。消し忘れると
+                    # 次の見積で意図しない税区分が復活し、税抜の見積が
+                    # 税込として処理される。
+                    '_tax_carry_pending', 'pdf_tax_override',
+                    'pdf2neo_tax_inclusive', 'csv_tax_radio', 'pdf_tax_radio',
                     'classification_confirmed', 'classification_alerts',
                     'discrepancies', 'total_diff',
                     'amount_confirmed',
