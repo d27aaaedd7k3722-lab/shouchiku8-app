@@ -1747,12 +1747,41 @@ def process_pdf_to_neo(pdf_path,
             # そのとき部品計・工賃計と合わないのは、小計に含まれない行
             # （レッカー代・諸経費・値引き）が明細にあるからで、行を足す理由にならない。
             # 足すと部品計と工賃計の間で金額が動き、原本と違う小計になる。
+            #
+            # 総合計の税区分は、まず「明細合算とは独立した証拠」で決める。
+            # 明細合算に近いほうを採る方式にすると、明細を総合計の約9%
+            # 読み落としたときに、その不足額が消費税額に化けて
+            # 「総合計は税込・明細は正しい」と誤判定される。すると
+            # 部品計/工賃計の調整・総合計の調整・ずれ警告が同時に外れ、
+            # 1行足りない見積が「検証OK・警告なし」で出てしまう。
+            # 印字された 部品計＋工賃計−値引 は明細の読み落としに影響されない
+            # ので、それが取れているときはそちらで決める。
+            # 小計行が無い単列金額形式のときだけ明細合算に頼る。
+            _grand_is_intax = not is_tax_inclusive
             _grand_ok = False
             if pdf_g > 0:
                 _s0 = _sum_items_outtax(items)
                 _tol0 = max(int(round(pdf_g * 0.02)), 1000)
-                _grand_ok = (abs(pdf_g - _s0) <= _tol0
-                             or abs(int(round(pdf_g / 1.10)) - _s0) <= _tol0)
+                _disc0 = _to_int(_meta.get("discount_amount"))
+                _pw_net = pdf_p + pdf_w - _disc0
+                _decided = False
+                if _pw_net > 0:
+                    _e = max(int(_pw_net * 0.01), 100)
+                    if abs(pdf_g - _pw_net) <= _e:
+                        _grand_is_intax, _decided = False, True
+                    elif abs(pdf_g - int(round(_pw_net * 1.10))) <= _e:
+                        _grand_is_intax, _decided = True, True
+                if not _decided:
+                    _grand_is_intax = (abs(int(round(pdf_g / 1.10)) - _s0)
+                                       < abs(pdf_g - _s0))
+                log.append(f"[grand_total_match] 総合計{pdf_g}の税区分: "
+                           f"{'税込' if _grand_is_intax else '税抜'}"
+                           f"（{'小計から判定' if _decided else '明細合算から判定'}"
+                           f" 部品計+工賃計-値引={_pw_net}）")
+                # 一致判定は、選んだ1つの解釈だけで行う。両方の解釈のどちらかが
+                # 当たれば一致、とすると上記の読み落としを見逃す。
+                _target0 = int(round(pdf_g / 1.10)) if _grand_is_intax else pdf_g
+                _grand_ok = abs(_target0 - _s0) <= _tol0
                 if _grand_ok:
                     log.append(f"[total_match] 総合計{pdf_g}と明細合算{_s0}が一致 → "
                                f"部品計/工賃計との差は小計対象外の行によるものとみなし調整しない")
@@ -1769,25 +1798,20 @@ def process_pdf_to_neo(pdf_path,
                 # この引数は「PDFの総額を明細の基準に換算するか」を意味する。
                 # 明細が税抜なら総額(税込)を1.1で割って合わせる。
                 # 明細が税込なら総額と同じ基準なので換算しない。
-                # 印字された総合計が税込か税抜かは、表記の選択だけでは決まらない。
-                # 「税抜表記＝総合計は税込」と決め打つと、合計欄が税抜の見積で
-                # 明細が完全に正しくても約9%の減額調整行が入る。逆も同じ。
-                # 両方の解釈を明細合算と突き合わせ、近いほうを採る。
+                # 税区分は上（_enforce_total_match の手前）で決めた _grand_is_intax
+                # を使う。ここで明細合算から決め直すと、読み落としが消費税に
+                # 化けて調整行の目標値が読み落とし後の合算そのものになる。
                 _sum_now = _sum_items_outtax(items)
-                _d_same = abs(pdf_g - _sum_now)
-                _d_intax = abs(int(round(pdf_g / 1.10)) - _sum_now)
-                _grand_is_intax = _d_intax < _d_same
-                log.append(f"[grand_total_match] 総合計{pdf_g}の税区分判定: "
-                           f"そのまま差={_d_same} / 税込とみなす差={_d_intax} → "
-                           f"{'税込' if _grand_is_intax else '税抜'}")
-                # どちらの解釈でも許容差に収まらない差は、税区分の問題ではなく
-                # 本当の読み落としか誤読。ここで行を捏造すると、原本に無い行が
-                # 入った見積を「合計は合っている」という理由で出してしまう。
-                # 協定見積は行と金額が原本と一致していることが条件なので、
-                # 差が大きいときは調整行を作らず警告だけにする。
-                if min(_d_same, _d_intax) > max(_tol_g * 5, int(pdf_g * 0.10)):
+                _target_now = (int(round(pdf_g / 1.10)) if _grand_is_intax else pdf_g)
+                _d_now = abs(_target_now - _sum_now)
+                # 許容差に収まらない差は、税区分の問題ではなく本当の読み落としか
+                # 誤読。ここで行を捏造すると、原本に無い行が入った見積を
+                # 「合計は合っている」という理由で出してしまう。協定見積は行と
+                # 金額が原本と一致していることが条件なので、差が大きいときは
+                # 調整行を作らず警告だけにする。
+                if _d_now > max(_tol_g * 5, int(pdf_g * 0.10)):
                     log.append(f"[grand_total_match] 差が大きすぎるため調整行は作らない "
-                               f"(最小差={min(_d_same, _d_intax)})")
+                               f"(差={_d_now})")
                     warnings.append(
                         f"見積書に印字された総額（{int(pdf_g):,}円）と、読み取った明細の"
                         f"合算（{int(_sum_now):,}円）の差が大きすぎます。"
@@ -1853,10 +1877,16 @@ def process_pdf_to_neo(pdf_path,
                 _resid_p = pdf_p - _sum_p if pdf_p > 0 else 0
                 _resid_w = pdf_w - _sum_w if pdf_w > 0 else 0
                 out["total_residual"] = {"parts": _resid_p, "wage": _resid_w}
-                # 総合計が明細合算と一致しているなら、この差は小計対象外の行
-                # （レッカー代・諸経費）で説明がつく。毎回出す警告にすると
-                # 本物の読み落としの警告が埋もれるので、そのときは出さない。
-                if (_resid_p or _resid_w) and not _grand_ok:
+                # 残差の向きで意味が変わる。
+                #   負（明細のほうが多い）… レッカー代・諸経費など小計に
+                #     含まれない行が明細にあるだけで、説明がつく。総合計が
+                #     合っているならこれは正常なので警告しない。毎回出すと
+                #     本物の読み落としの警告が埋もれる。
+                #   正（明細のほうが少ない）… 行が足りない。許容差内で調整行が
+                #     作られなかった場合、これが唯一の手がかりになるので、
+                #     総合計が合っていても必ず知らせる。
+                _resid_shortfall = (_resid_p > 0 or _resid_w > 0)
+                if (_resid_p or _resid_w) and (_resid_shortfall or not _grand_ok):
                     warnings.append(
                         f"見積書の合計と明細の合計に差が残っています"
                         f"（部品 {_resid_p:+,}円 / 工賃 {_resid_w:+,}円）。明細を確認してください。"

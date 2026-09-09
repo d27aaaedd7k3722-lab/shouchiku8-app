@@ -4571,7 +4571,15 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
         # Geminiのstated totalsが明細合算と大きくずれているか（10%超）
         _cv_p_wrong = abs(_cv_calc_p - _cv_p_stated) / max(_cv_calc_p, 1) > 0.10
         _cv_w_wrong = abs(_cv_calc_w + _cv_sp - _cv_w_stated) / max(_cv_calc_w + _cv_sp, 1) > 0.10
-        if _cv_match_grand and (_cv_p_wrong or _cv_w_wrong):
+        # 印字された部品計＋工賃計が総合計と辻褄が合っている（税抜・税込の
+        # どちらの解釈でも可）なら、小計のほうが正しく、足りないのは明細。
+        # そこで小計を明細合算で上書きすると、行が落ちている唯一の証拠を
+        # 消してしまい、1行少ない見積が無警告で出る。上書きしない。
+        _cv_pw_stated = _cv_p_stated + _cv_w_stated
+        _cv_pw_ok = (abs(_cv_pw_stated - _cv_grand) <= max(int(_cv_grand * 0.01), 100)
+                     or abs(int(round(_cv_pw_stated * 1.10)) - _cv_grand)
+                     <= max(int(_cv_grand * 0.01), 100))
+        if _cv_match_grand and (_cv_p_wrong or _cv_w_wrong) and not _cv_pw_ok:
             import sys as _sys_cv
             print(f"[INFO] cross-validation: Gemini stated totals誤り検出 → 明細合算値で上書き", file=_sys_cv.stderr)
             print(f"  Gemini: 部品={_cv_p_stated:,}, 工賃={_cv_w_stated:,}", file=_sys_cv.stderr)
