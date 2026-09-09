@@ -4239,7 +4239,8 @@ def _session_cache_scope() -> str:
         return _uuid.uuid4().hex
 
 
-def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=None):
+def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=None,
+                           is_tax_inclusive=False):
     """見積書PDFから直接NEOファイルを生成する。
 
     pdf_to_neo_pipeline.process_pdf_to_neo をStreamlitから安全に呼ぶための薄いラッパ。
@@ -4282,6 +4283,9 @@ def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=
             model_name=model_name or None,
             api_key=api_key or None,
             cache_scope=_session_cache_scope(),
+            # 見積書の明細が税込表記かどうか。画面で利用者が指定する。
+            # 決め打ちにすると、税込表記の見積で総額が消費税ぶん膨らむ。
+            is_tax_inclusive=bool(is_tax_inclusive),
         )
         if not isinstance(result, dict):
             return {'ok': False, 'error': 'PDF→NEO変換が想定外の値を返しました'}
@@ -4930,6 +4934,22 @@ def main():
             "見積書PDFをそのままアップロードすると、AI-OCRで明細を読み取り、"
             "NEOファイルまで一気に生成します。Geminiへのコピペは不要です。"
         )
+        _pdf_tax_options = ['税抜き（外税）', '税込み（内税）']
+        _saved_pdf_tax = st.session_state.get('pdf_tax_override',
+                                              st.session_state.get('tax_override', '税抜き（外税）'))
+        _pdf_tax_idx = 1 if ('内税' in str(_saved_pdf_tax) or '税込' in str(_saved_pdf_tax)) else 0
+        _pdf_tax_sel = st.radio(
+            "💴 添付する見積書の金額表記",
+            options=_pdf_tax_options,
+            index=_pdf_tax_idx,
+            horizontal=True,
+            key='pdf_tax_radio',
+            help="明細の金額が税込みで書かれている見積書は「税込み（内税）」を選んでください。"
+                 "取り違えると、NEOの合計が消費税ぶん（10%）ずれます。",
+        )
+        st.session_state['pdf_tax_override'] = _pdf_tax_sel
+        _pdf_is_tax_incl = ('内税' in _pdf_tax_sel or '税込' in _pdf_tax_sel)
+
         _p2n_file = st.file_uploader(
             "見積書PDF",
             type=['pdf'],
@@ -4953,7 +4973,9 @@ def main():
                         api_key,
                         model_name=selected_model,
                         template_bytes=st.session_state.get('custom_neo_bytes'),
+                        is_tax_inclusive=_pdf_is_tax_incl,
                     )
+                st.session_state['pdf2neo_tax_inclusive'] = _pdf_is_tax_incl
                 st.rerun()
 
         _p2n_res = st.session_state.get('pdf2neo_result')
@@ -5014,6 +5036,14 @@ def main():
                                                 use_container_width=True):
                         st.session_state['csv_items'] = _p2n_items
                         st.session_state['csv_mode']  = True
+                        # PDF側で選んだ税区分をプレビュー側にも引き継ぐ。
+                        # 引き継がないと、下流はCSV側のラジオを見るため
+                        # 税区分が食い違い、合計が10%ずれる。
+                        _carry = ('税込み（内税）'
+                                  if st.session_state.get('pdf2neo_tax_inclusive')
+                                  else '税抜き（外税）')
+                        st.session_state['tax_override'] = _carry
+                        st.session_state['csv_tax_radio'] = _carry
                         st.session_state['pdf2neo_vehicle_info'] = _p2n_res.get('vehicle_info') or {}
                         st.session_state['vehicle_file_bytes']  = None
                         st.session_state['vehicle_file_name']   = None
