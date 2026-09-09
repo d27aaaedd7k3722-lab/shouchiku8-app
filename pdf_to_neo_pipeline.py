@@ -1413,6 +1413,9 @@ def process_pdf_to_neo(pdf_path,
             _pdf_md5(pdf_bytes),
             str(mode_override), str(addata_root),
             str(template_path), str(model_name),
+            # 税区分は出力を変えるのでキーに含める。含めないと、税区分を
+            # 選び直して生成し直しても前回の .neo がそのまま返る。
+            str(bool(is_tax_inclusive)),
             _pdf_md5((ocr_text or "").encode("utf-8", "ignore")),
         ])
         if cache_key in _PIPELINE_CACHE:

@@ -2080,6 +2080,35 @@ def extract_addata_zip(zip_bytes: bytes, dest_dir: str) -> tuple:
     return (None, 'Addataの構造（A〜Zの1文字フォルダ／車種コード／*.DB）が見つかりません')
 
 
+# 展開先を掃除するまでの猶予。これより古いものは他セッションの
+# 置き土産とみなして回収する。
+_ADDATA_TMP_TTL_SEC = 6 * 3600
+
+
+def _sweep_stale_addata_dirs():
+    """古い Addata 展開先を回収する。
+
+    Streamlit にはセッション終了フックが無く、解除せずにタブを閉じられると
+    展開先が残り続ける。Addata は大きいので、放置するとディスクが尽きて
+    アプリごと止まる。自分が作った形（一時ディレクトリ直下の addata_*）で、
+    かつ十分に古いものだけを消す。
+    """
+    import glob as _glob, shutil as _sh, time as _t
+    try:
+        base = os.path.realpath(tempfile.gettempdir())
+        keep = os.path.realpath(st.session_state.get(_ADDATA_UPLOAD_BASE_KEY) or '\0')
+        now = _t.time()
+        for d in _glob.glob(os.path.join(base, 'addata_*')):
+            rd = os.path.realpath(d)
+            if (os.path.dirname(rd) == base
+                    and os.path.basename(rd).startswith('addata_')
+                    and os.path.isdir(rd) and rd != keep
+                    and now - os.path.getmtime(rd) > _ADDATA_TMP_TTL_SEC):
+                _sh.rmtree(rd, ignore_errors=True)
+    except Exception:
+        pass
+
+
 def _discard_uploaded_addata():
     """アップロードされた Addata の展開先を消し、セッションから外す。
 
@@ -4603,7 +4632,8 @@ def main():
                 "Addata の ZIP",
                 type=['zip'],
                 key='addata_zip_upload',
-                help="展開後 2GB まで。セッション内でのみ保持し、他の利用者からは見えません。",
+                help="アップロードできるZIPは200MBまでです。"
+                     "セッション内でのみ保持し、他の利用者からは見えません。",
             )
             # 同じファイルで再実行するたびに展開し直さないよう、
             # 何を展開済みかを名前とサイズで覚えておく。別のZIPが
@@ -4613,6 +4643,7 @@ def main():
             if _zip_id and st.session_state.get('_addata_zip_id') != _zip_id:
                 _discard_uploaded_addata()
                 with st.spinner("Addataを展開しています…"):
+                    _sweep_stale_addata_dirs()
                     _dest = tempfile.mkdtemp(prefix='addata_')
                     try:
                         _root, _why = extract_addata_zip(_addata_zip.getvalue(), _dest)
@@ -4915,6 +4946,12 @@ def main():
 
         # 税区分選択
         _tax_options = ['税抜き（外税）', '税込み（内税）']
+        # PDF側から引き継いだ税区分を、ウィジェットを描画する前に反映する。
+        # 描画後に代入すると Streamlit が例外を投げる。
+        _pending_tax = st.session_state.pop('_tax_carry_pending', None)
+        if _pending_tax:
+            st.session_state['tax_override'] = _pending_tax
+            st.session_state['csv_tax_radio'] = _pending_tax
         _saved_tax_override = st.session_state.get('tax_override', '税抜き（外税）')
         _tax_default_idx = 1 if '内税' in str(_saved_tax_override) or '税込' in str(_saved_tax_override) else 0
         _tax_sel = st.radio(
@@ -5119,7 +5156,11 @@ def main():
                                   if st.session_state.get('pdf2neo_tax_inclusive')
                                   else '税抜き（外税）')
                         st.session_state['tax_override'] = _carry
-                        st.session_state['csv_tax_radio'] = _carry
+                        # ここで csv_tax_radio に直接代入すると、同じ実行の前半で
+                        # 既に描画済みのウィジェットへの代入となり Streamlit が
+                        # 例外を投げ、取り込みが中断してしまう。次の実行の
+                        # 描画前に反映させるため、一時キーに預けておく。
+                        st.session_state['_tax_carry_pending'] = _carry
                         st.session_state['pdf2neo_vehicle_info'] = _p2n_res.get('vehicle_info') or {}
                         st.session_state['vehicle_file_bytes']  = None
                         st.session_state['vehicle_file_name']   = None
@@ -5370,10 +5411,18 @@ def main():
                     veh_match_result = identify_vehicle(addata_dir, vehicle_data)
                     estimate_data['_veh_match_result'] = veh_match_result
 
-                    if veh_match_result.get('is_supported'):
-                        a_folder = veh_match_result.get('addata_folder')
+                    # is_template（TOYOTA_GENERIC 代用）は実車種が当たって
+                    # いないので照合しない。PDF→NEO 側の decide_mode_from_identify
+                    # がモードAへ落とすのと揃える。
+                    if (veh_match_result.get('is_supported')
+                            and not veh_match_result.get('is_template')):
                         if 'items' in estimate_data and estimate_data['items']:
-                            matched_items, has_rev = match_parts_with_addata(estimate_data['items'], a_folder)
+                            # 渡すのは車種フォルダではなく Addata ルート。
+                            # 車両情報も渡さないと照合側が車種を引けない。
+                            # （以前は存在しないキー addata_folder を読んでおり、
+                            #   常に None になって照合が一度も動いていなかった）
+                            matched_items, has_rev = match_parts_with_addata(
+                                estimate_data['items'], addata_dir, vehicle_data)
                             estimate_data['items'] = matched_items
                             estimate_data['_reverse_match'] = has_rev
                 elif _current_mode == 'beta':
