@@ -1580,7 +1580,12 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
         ('ColorCode', color_code), ('ColorName', body_color),
         ('TrimCode', trim_code),
     ]
-    valid_car = [(col, val) for col, val in car_update if col in car_cols and val]
+    # 非マージモードでは空欄でも書いてテンプレートの値を消す。
+    # ここだけ「非空のみ」だったため、前案件の車の色・カラーコードが
+    # DBに残る一方でヘッダXMLには空が書かれ、同じ .neo の中で食い違っていた。
+    # 塗色は塗装工賃の根拠になるので、別の車の色が残るのは危険。
+    valid_car = [(col, val) for col, val in car_update
+                 if col in car_cols and (val or not merge_mode)]
     if valid_car:
         set_clause = ', '.join(f'{col}=?' for col, _ in valid_car)
         values = [val for _, val in valid_car]
@@ -1607,9 +1612,13 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
     # Insurance テーブル: 入力があった項目だけ書き込む。
     # 空欄で既存値を消すと、テンプレート由来の工場情報などが失われるため。
     _ins_updates, _ins_values = [], []
+    # 非マージモードでは、空欄でも書いてテンプレートの値を消す。
+    # Customer は非マージなら全上書きなのに、ここだけ「非空のみ」だったため、
+    # 前案件のアジャスター名がDBに残る一方でヘッダXMLには空が書かれ、
+    # 同じ .neo の中で食い違っていた。
     for _col, _val in (('PolicyNo', policy_no), ('ContractorName', contractor),
                        ('AgencyName', agency_name), ('AdjusterName', adjuster_name)):
-        if _val:
+        if _val or not merge_mode:
             _ins_updates.append(f'{_col}=?')
             _ins_values.append(_val)
     if repair_days > 0:
@@ -1627,11 +1636,12 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
         cur.execute(f"UPDATE Insurance SET {', '.join(_ins_updates)}", _ins_values)
 
     # FileInfo テーブル: 受付番号・入出庫日・備考
+    # 非マージモードでは空欄でも書く（Insurance と同じ理由）。
     _fi_updates, _fi_values = [], []
-    if accept_no:
+    if accept_no or not merge_mode:
         _fi_updates.append('AcceptNo=?')
         _fi_values.append(accept_no)
-    if note1:
+    if note1 or not merge_mode:
         _fi_updates.append('Note1=?')
         _fi_values.append(note1)
     for _prefix, _date in (('GarageIn', garage_in), ('GarageOut', garage_out)):
@@ -1647,7 +1657,11 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
     # 使うと、前案件の見積ID・案件番号・協定額が新しい見積に同居する。
     # 保険会社への提出物としては危険なので、案件固有の欄だけ初期化する。
     # 工場区分・保険会社区分など工場固有の設定は残す（消すと毎回入れ直しになる）。
-    if not merge_mode:
+    # 見積ID・案件番号・協定額は案件そのものを識別する値で、テンプレートに
+    # 何を使おうと引き継いではいけない。マージモードを除外していたため、
+    # 過去の .neo をテンプレートにすると前案件の協定額が新しい見積に
+    # 同居していた。アプリにこれらの入力欄は無く、利用者は消せない。
+    if True:
         try:
             cur.execute("""UPDATE Statistics SET
                 EstimationId='', ProjectNo='', ProjectCompletedFlag='',
@@ -4938,9 +4952,12 @@ def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=
             # 見積書の明細が税込表記かどうか。画面で利用者が指定する。
             # 決め打ちにすると、税込表記の見積で総額が消費税ぶん膨らむ。
             is_tax_inclusive=bool(is_tax_inclusive),
-            # 利用者が過去の .neo をテンプレートに指定したときだけマージモード。
-            # 画面の主経路（ステップ④）と同じ扱いに揃える。
-            merge_mode=bool(template_bytes),
+            # この経路には車両情報の入力欄が無く、利用者が上書きする手段が
+            # ない。マージモードにすると前案件の登録番号・使用者名・事故日が
+            # そのまま残り、別の車の見積になってしまうので使わない。
+            # DBとヘッダXMLの食い違いは、非マージモードで Car/Insurance/
+            # FileInfo も Customer と同じく全上書きにすることで解消している。
+            merge_mode=False,
         )
         if not isinstance(result, dict):
             return {'ok': False, 'error': 'PDF→NEO変換が想定外の値を返しました'}

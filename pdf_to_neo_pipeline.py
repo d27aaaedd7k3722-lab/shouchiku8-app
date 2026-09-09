@@ -1811,10 +1811,26 @@ def process_pdf_to_neo(pdf_path,
                 # 値引きは、ヘッダの値と明細の値引き行の合計の大きいほうを採る。
                 # ヘッダ側を読み落としたときに 0 のまま使うと、下の残差判定が
                 # 「小計のほうが総合計より大きい」と見て税区分を取り違える。
+                # ただし明細の値引き行で補ってよいのは、印字された小計が
+                # 値引き「前」（グロス）のときだけ。値引き後の小計を印字する
+                # 帳票で二重に引くと _pw_net が値引き額ぶん小さくなり、
+                # 値引きが総額の8〜9%のとき _pw_net×1.1 が税抜の総合計に
+                # 重なって、税抜を税込と取り違える（総額が9.09%減り、
+                # 原本に無い調整行が1本入る）。
                 _disc_rows = sum(abs(_to_int(it.get("wage", 0)))
                                  + abs(_to_int(it.get("parts_amount", 0)))
                                  for it in (items or []) if _is_discount_row(it))
-                _disc0 = max(_to_int(_meta.get("discount_amount")), _disc_rows)
+                _disc0 = _to_int(_meta.get("discount_amount"))
+                if _disc_rows > 0:
+                    _pw_raw = pdf_p + pdf_w
+                    _sub_tol = max(int(_pw_raw * 0.01), 100)
+                    _gross = _sum_items_outtax(items, skip_discount=True)
+                    _net = _sum_items_outtax(items)
+                    # 小計が値引き前の合算と一致し、値引き後の合算とは
+                    # 一致しないときだけ「グロス」と判断する。
+                    if (abs(_pw_raw - _gross) <= _sub_tol
+                            and abs(_pw_raw - _net) > _sub_tol):
+                        _disc0 = max(_disc0, _disc_rows)
                 _pw_net = pdf_p + pdf_w - _disc0
                 _decided = False
                 if _pw_net > 0:
@@ -2007,9 +2023,12 @@ def process_pdf_to_neo(pdf_path,
                 # 行ごとの丸めで印字小計が明細合算より数円大きくなるのは普通に
                 # 起きる。下限を置かないと、1行も落としていない見積で毎回
                 # 警告が出て、本物の読み落としの警告が埋もれる。
-                # 丸め差は行あたり高々1円。総額の0.1%を下限にすると、
-                # 60万円の見積で600円のクリップ1行が無警告で消える。
-                _resid_floor = max(len(items or []), 100)
+                # 丸め差は行あたり高々1円。総額の0.1%を下限にすると
+                # 60万円の見積で600円のクリップ1行が無警告で消え、
+                # 行数を下限にすると250行の見積で210円の1行が消える。
+                # 控えめなほうを採る。
+                _resid_floor = max(min(len(items or []),
+                                       int((pdf_p + pdf_w) * 0.001)), 100)
                 _resid_shortfall = (_resid_p > _resid_floor or _resid_w > _resid_floor)
                 if (_resid_p or _resid_w) and (_resid_shortfall or not _grand_ok):
                     warnings.append(
