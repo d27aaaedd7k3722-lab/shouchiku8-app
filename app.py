@@ -46,6 +46,7 @@ import datetime
 import json
 import io
 import re
+import unicodedata
 import traceback
 import pandas as pd
 import threading
@@ -455,6 +456,16 @@ def _xml_escape(value) -> str:
             .replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
 
 
+def _strip_control_chars(value) -> str:
+    """改行・タブ・NUL などの制御文字を空白1つに潰す。
+
+    NEO の内部ファイルには142バイト固定長のレコードがあり、
+    制御文字が入ると行構造そのものが壊れる。
+    """
+    s = re.sub(r'[\x00-\x1f\x7f]', ' ', str(value or ''))
+    return re.sub(r'[ \t]+', ' ', s).strip()
+
+
 def cp932_trim(value, max_bytes: int) -> str:
     """コグニセブンの列幅（CP932のバイト数）に収まるよう切り詰める。
 
@@ -721,10 +732,10 @@ def extract_files(full_raw, entries):
 def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclusive=False, is_beta_mode=False):
     """ERParts/Expense/Total を更新（値引き行の負工賃も対応）
     expenses: {
-        'towing': レッカー費用,              # LineNo=1
-        'rental_car': 代車費用,              # LineNo=2
+        'towing': レッカー費用,              # LineNo=5「レッカー代１」
+        'rental_car': 代車費用,              # LineNo=7「写真代他」（専用行が無いため）
         'short_parts': ショートパーツ,       # LineNo=4（short_parts_wageと同義）
-        'tax_exempt': 非課税費用,            # LineNo=5（消費税なし）
+        'tax_exempt': 非課税費用,            # LineNo=8「その他控除」（消費税なし）
     }
     is_tax_inclusive: True の場合、items の金額は税込値として扱い、
                      OutTax/InTax/Tax を正しく逆算する。
@@ -777,12 +788,43 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         MaterialTotalEtceteraOutTax=0, MaterialTotalEtceteraInTax=0, MaterialTotalEtceteraTax=0,
         MaterialTotalOutTax=0, MaterialTotalInTax=0, MaterialTotalTax=0, MaterialTotalbyManual='',
         TotalOutTax=0, TotalInTax=0, TotalTax=0""")
+    # 明細に紐づくテーブルは、前案件の .neo をテンプレートにしたときに
+    # 残ると別案件の塗装工賃・損害コメント・リサイクル部品が混入する。
+    # ERParts と同じタイミングで必ず消す。
+    for _t in ('DamageParts', 'DamageBlock', 'DamageComment', 'DamageImage',
+               'RCParts', 'RCLinkParts', 'RWLinkParts', 'EPCLinkParts', 'Frame'):
+        try:
+            cur.execute(f'DELETE FROM {_t}')
+        except sqlite3.Error:
+            pass   # テンプレートに無いテーブルは無視する
+    # 1行固定の塗装テーブルは、PaintingOther と同じくブランク(-1)へ戻す。
+    # 列構成がテンプレートによって違うので、時間・工賃・材料の列を
+    # 名前で拾って一括で戻す。
+    for _t in ('PaintingBumper', 'PaintingFrame', 'PaintingEtcetera'):
+        try:
+            _cols = [c[1] for c in cur.execute(f'PRAGMA table_info({_t})').fetchall()]
+        except sqlite3.Error:
+            continue
+        if not _cols:
+            continue
+        _blank = [c for c in _cols
+                  if ('Time' in c or 'Wage' in c or 'Material' in c or 'Total' in c)]
+        _zero  = [c for c in _cols if 'Disposal' in c]
+        _sets  = [f'{c}=-1' for c in _blank] + [f'{c}=0' for c in _zero]
+        if _sets:
+            try:
+                cur.execute(f"UPDATE {_t} SET {', '.join(_sets)}")
+            except sqlite3.Error:
+                pass
+
     # 全Expense行をクリア（LineNo=1〜8: 文字書き/内張り/配線/ショートパーツ/レッカー代１/レッカー代２/写真代他/その他控除）
     for lno in (1, 2, 3, 4, 5, 6, 7, 8):
         cur.execute("""UPDATE Expense SET
-            WageEnabled=0, WageOutTax=0, WageInTax=0, WageTax=0
+            OutTaxFlag=0, WageEnabled=0, WageOutTax=0, WageInTax=0, WageTax=0,
+            Comment=''
             WHERE LineNo=?""", (lno,))
     total_parts = 0
+    annote_rows = []
     # 税込モードの丸め調整用
     total_parts_intax = 0
     total_wages_intax = 0
@@ -815,6 +857,11 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         
         # 区分: work_code（Markdownパーサー保存先）または method から取得
         method = item.get('method', '') or item.get('work_code', '')
+        # 明細もコグニセブンの宣言列幅（CP932バイト）に収める。
+        # 顧客欄と同じ理由で、ここで守らないと桁あふれした値が入る。
+        # 「フロントバンパーカバーASSY」程度の普通の部品名で超える。
+        name     = cp932_trim(name, _ERPARTS_WIDTH['PartsName'])
+        parts_no = cp932_trim(parts_no, _ERPARTS_WIDTH['PartsNo'])
 
         # 品名から作業種別を自動推定（区分が空白の場合）
         if not method:
@@ -905,15 +952,32 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         # 部品金額がある行のみ数量を設定。脱着など部品なし行は -1（空白）
         db_qty = qty if parts_total != 0 else -1
         # ── Addata マスタ照合結果から PartsCode / PartsCodeSub / DisposalCode を設定 ──
+        # 区分の判定は切り詰める前の文字列で行う。先に8バイトへ切ると
+        # 「ｱｯｾﾝﾌﾞﾘ取替」から「取替」が落ちて区分不明になる。
+        _method_full = method
+        method = cp932_trim(method, _ERPARTS_WIDTH['DisposalName'])
         _disposal_map = {
-            '取替': 1, '交換': 1, '取換': 1,
+            '取替': 1, '交換': 1, '取換': 1, '取り替え': 1, '取替え': 1,
             '脱着': 2, '取外': 2, '取付': 2, '組付': 2, '脱外': 2,
             '修理': 3, '補修': 3, '分解': 3, '修正': 3, '調整': 3,
             '光軸': 3, 'フィッティング': 3, 'コーディング': 3, '穴あけ': 3,
             'シーリング': 3, '点検': 3, '消去': 3, '設定': 3,
             '鈑金': 4, '板金': 4, '塗装': 4, 'ペイント': 4, 'ワックス': 4, '加算': 4, 'ブース': 4,
         }
-        disposal_code = _disposal_map.get(method, -1)
+        # 区分は完全一致だけで引くと、末尾に空白が付いただけ、
+        # 「脱着（左）」のように補足が付いただけで -1（区分不明）になる。
+        # 記号や括弧書きを落として正規化し、それでも決まらなければ
+        # 部分一致に落とす。CSV取込では区分欄が埋まっているのが普通なので、
+        # ここで取りこぼすと全行が区分不明になる。
+        _m_key = unicodedata.normalize('NFKC', str(_method_full or ''))
+        _m_key = re.sub(r'[（(\[【][^）)\]】]*[）)\]】]?', '', _m_key)
+        _m_key = re.sub(r'[\s\u3000※*・/／,、]', '', _m_key).strip()
+        disposal_code = _disposal_map.get(_m_key, -1)
+        if disposal_code == -1 and _m_key:
+            for _kw, _cd in _disposal_map.items():
+                if _kw in _m_key:
+                    disposal_code = _cd
+                    break
         parts_code = item.get('_master_section_code', '')  # 部品コード大区分（例: '01'）
         _branch_raw = item.get('_master_branch_code', '')  # 枝番（例: '00101', '001AA'）
         # PartsCodeSub は SQLite integer 型。数値変換できる枝番のみ整数で保存
@@ -953,9 +1017,11 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             ?, '',
             ?, ?, ?,
             -1, -1, -1,
-            NULL, NULL, NULL,
+            -- 空欄は -1。NULL や 0 にすると帳票に「0」と表示され、
+            -- 標準部品価格ゼロ・標準指数ゼロの見積として読まれてしまう。
+            -1, -1, -1,
             '*',
-            -1, 0,
+            -1, -1,
             ?, ?, ?,
             -1, -1, -1,
             '*', ?,
@@ -981,6 +1047,10 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             db_wage_total, db_wage_intax, db_wage_tax,
             db_qty
         ))
+        # AnNote.ini は ERParts と同じ値でなければならない。生の items から
+        # 別に組み立てると、マスタ名への置換・「※」付与・数量ブランクが
+        # 反映されず、同じ行なのに品名と数量が2通り存在することになる。
+        annote_rows.append({'line_no': line_no, 'name': name, 'qty': db_qty})
     # ── 税込/税抜に応じた費用計算ヘルパー ──
     def _calc_tax(amount, inclusive=False):
         """金額から OutTax, InTax, Tax を計算"""
@@ -1006,25 +1076,34 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
         WHERE LineNo=4""", (1 if sp_wage > 0 else 0, sp_out, sp_intax, sp_tax))
 
-    # LineNo=1: レッカー費用（課税）
+    # Expense の行名は NameFix=1 の固定名で、コグニセブンはその名前のまま
+    # 表示する。以前はレッカーを LineNo=1（文字書き費用）、代車を
+    # LineNo=2（内張り費用）、非課税を LineNo=5（レッカー代１）に
+    # 書き込んでいたため、金額は合っていても費目名が全部別物だった。
+
+    # LineNo=5: レッカー代１（課税）
     towing = safe_int(expenses.get('towing', 0))
     tow_out, tow_intax, tow_tax = _calc_tax(towing, False)
     cur.execute("""UPDATE Expense SET
         WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
-        WHERE LineNo=1""", (1 if towing > 0 else 0, tow_out, tow_intax, tow_tax))
+        WHERE LineNo=5""", (1 if towing > 0 else 0, tow_out, tow_intax, tow_tax))
 
-    # LineNo=2: 代車費用（課税）
+    # LineNo=7: 写真代他（課税）。テンプレートに代車専用の行が無いため、
+    # 汎用の「その他課税費用」行に入れ、Comment に費目を書き添える。
     rental_car = safe_int(expenses.get('rental_car', 0))
     rent_out, rent_intax, rent_tax = _calc_tax(rental_car, False)
     cur.execute("""UPDATE Expense SET
-        WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
-        WHERE LineNo=2""", (1 if rental_car > 0 else 0, rent_out, rent_intax, rent_tax))
+        WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?, Comment=?
+        WHERE LineNo=7""", (1 if rental_car > 0 else 0, rent_out, rent_intax, rent_tax,
+                            cp932_trim('代車費用', 30) if rental_car > 0 else ''))
 
-    # LineNo=5: 非課税費用（消費税なし）
+    # LineNo=8: その他控除（非課税）。OutTaxFlag で非課税であることを示す。
     tax_exempt = safe_int(expenses.get('tax_exempt', 0))
     cur.execute("""UPDATE Expense SET
-        WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
-        WHERE LineNo=5""", (1 if tax_exempt > 0 else 0, tax_exempt, tax_exempt, 0))
+        OutTaxFlag=?, WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?, Comment=?
+        WHERE LineNo=8""", (1 if tax_exempt > 0 else 0, 1 if tax_exempt > 0 else 0,
+                            tax_exempt, tax_exempt, 0,
+                            cp932_trim('非課税費用', 30) if tax_exempt > 0 else ''))
 
     # ── 税込モードの丸め調整 ──
     # 行ごとの逆算をそのまま足すと、見積書の税込総額と生成NEOの合計が
@@ -1103,6 +1182,16 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         hy_WageTaxTotalOutTax=?,
         hy_WageTaxTotalInTax=?,
         hy_WageTaxTotalTax=?,
+        hy_PartsNoTaxTotalOutTax=?,
+        hy_PartsNoTaxTotalInTax=?,
+        hy_PartsNoTaxTotalTax=?,
+        hy_WageNoTaxTotalOutTax=?,
+        hy_WageNoTaxTotalInTax=?,
+        hy_WageNoTaxTotalTax=?,
+        hy_Wrecker1OutTax=?,
+        hy_Wrecker1InTax=?,
+        hy_Wrecker1Tax=?,
+        hy_Wrecker1TaxFlag=?,
         tx_TotalOutTax=?,
         tx_TotalInTax=?,
         SubTotal=?,
@@ -1111,6 +1200,12 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         total_parts, total_parts + parts_tax_total, parts_tax_total,
         total_wages, total_wages + wages_tax_total, wages_tax_total,
         taxable_expenses, taxable_expenses + jpy_round(taxable_expenses * TAX_RATE) if taxable_expenses > 0 else 0, jpy_round(taxable_expenses * TAX_RATE) if taxable_expenses > 0 else 0,
+        # 非課税ぶんは工賃側の非課税欄に計上する。どの内訳にも入れないと
+        # 小計＋消費税が合計に届かず、帳票の検算が合わなくなる。
+        0, 0, 0,
+        tax_exempt, tax_exempt, 0,
+        # レッカーは専用欄にも入れる
+        tow_out, tow_intax, tow_tax, (1 if towing > 0 else 0),
         tax_total,   tax_total,
         sub_total,   grand_total
     ))
@@ -1118,7 +1213,7 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
     conn.close()
     with open(_tmp_db_path, 'rb') as f:
         result = f.read()
-    return result, total_parts, total_wages, grand_total
+    return result, total_parts, total_wages, grand_total, annote_rows
 
 
 # ============================================================
@@ -1144,6 +1239,9 @@ def update_em_db(db_bytes, cust, insurance_info, estimated_date, is_tax_inclusiv
         except OSError:
             pass
 
+
+# AnSMB.txt の ERParts の宣言列幅（CP932バイト数）
+_ERPARTS_WIDTH = {'DisposalName': 8, 'PartsName': 24, 'PartsNo': 18}
 
 # AnSvEm0001Ex.db の宣言列幅（CP932バイト数）
 _CUST_WIDTH = {
@@ -1479,16 +1577,22 @@ def update_imge_ini(orig_bytes, cust, insurance_info=None, merge_mode=False):
 # 内部ファイル更新: AnNote.ini（明細簡易表現）
 # ============================================================
 
-def generate_annote(items):
-    """142B固定長 × 行数 の AnNote.ini を生成"""
-    if not items:
+def generate_annote(rows):
+    """142B固定長 × 行数 の AnNote.ini を生成
+
+    rows は _update_ansmb_impl が ERParts に実際に書いた値
+    （line_no / name / qty）。生の items から組み直すと、
+    マスタ名への置換や「※」付与、数量ブランクが反映されず、
+    同じ行なのに DB と AnNote で品名・数量が食い違う。
+    """
+    if not rows:
         return b''
     lines = []
-    for i, item in enumerate(items):
-        name    = item.get('name', '')
-        qty     = safe_int(item.get('quantity', 1), 1)
-        rec_no  = i + 1
-        line_no = rec_no * 10
+    for row in rows:
+        name    = row.get('name', '')
+        _q      = safe_int(row.get('qty', 1), 1)
+        qty     = _q if _q > 0 else 1     # -1（ブランク）は表示上1として扱う
+        line_no = row.get('line_no', 0)
         line    = bytearray(142)
         for j in range(142):
             line[j] = 0x20
@@ -1497,7 +1601,9 @@ def generate_annote(items):
             line[j] = ord(c)
         # バイト数で単純に切ると2バイト文字の途中で割れ、末尾に
         # 復号できない片割れが残る。文字境界で切り詰める。
-        name_bytes = cp932_trim(name, 30).encode('cp932', errors='replace')
+        # 改行やタブが混ざると142B固定長レコードが行単位で割れる。
+        # 見積書の部品名が2行に折り返された表をCSV化すると普通に起きる。
+        name_bytes = cp932_trim(_strip_control_chars(name), 30).encode('cp932', errors='replace')
         for j, b in enumerate(name_bytes):
             line[14 + j] = b
         qty_str = f'{min(qty, 99):02d}'
@@ -1589,11 +1695,11 @@ def generate_neo_file(template_data, customer_info, items, short_parts_wage, ins
     files        = extract_files(full_raw, entries)
     estimated_date = datetime.datetime.now().strftime('%Y%m%d')
     normalized_items = items or []
-    files['AnSMB.txt'], total_parts, total_wages, grand_total = update_ansmb(
+    files['AnSMB.txt'], total_parts, total_wages, grand_total, _annote_rows = update_ansmb(
         files['AnSMB.txt'], normalized_items, short_parts_wage,
         expenses=expenses, is_tax_inclusive=is_tax_inclusive, is_beta_mode=is_beta_mode
     )
-    files['AnNote.ini']       = generate_annote(normalized_items)
+    files['AnNote.ini']       = generate_annote(_annote_rows)
     files['AnSvEm0001Ex.db']  = update_em_db(
         files['AnSvEm0001Ex.db'], customer_info, insurance_info, estimated_date,
         is_tax_inclusive=is_tax_inclusive, merge_mode=merge_mode
@@ -3184,10 +3290,10 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
         items.append({
             'page':         1,
             'row_type':     'detail',
-            'name':         to_halfwidth_katakana(name),
+            'name':         _strip_control_chars(to_halfwidth_katakana(name)),
             'description':  '',
-            'work_code':    category,
-            'method':       category,
+            'work_code':    _strip_control_chars(category),
+            'method':       _strip_control_chars(category),
             'part_no':      part_no,
             'quantity':     qty,
             'parts_amount': parts_amt,
