@@ -1,17 +1,19 @@
+# 注意: ホスト固有のバインド設定（server.port / server.address / browser.serverAddress）は
+# ここに書かない。Streamlit Community Cloud はポートをプラットフォーム側で割り当てるため、
+# config.toml で固定するとアプリが起動できず「Oh no. Error running app.」になる。
+# Cloud Run / Docker では start.py が --server.address と --server.port を
+# コマンドライン引数で明示的に渡しており、そちらが config.toml より優先される。
+
 [server]
+headless = true
 enableXsrfProtection = false
 enableCORS = false
-headless = true
-address = "0.0.0.0"
-# Cloud Run: PORT環境変数で上書き（start.pyで制御）
-port = 8080
-# WebSocket接続を安定させる設定
 maxUploadSize = 200
+# WebSocket接続を安定させる設定
 enableWebsocketCompression = false
 
 [browser]
 gatherUsageStats = false
-serverAddress = "0.0.0.0"
 
 [runner]
 # 長時間処理中もWebSocket接続を維持
