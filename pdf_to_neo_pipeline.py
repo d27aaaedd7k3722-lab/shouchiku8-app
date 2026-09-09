@@ -29,13 +29,14 @@ logger = logging.getLogger(__name__)
 def _pdfium_lock():
     """pdfium はスレッドセーフでないため、app 側と同じロックで直列化する。
 
-    複数スレッドから同時に触るとCヒープが壊れてプロセスごと落ちるため、
-    app.py が持つロックを共有する。取得できない場合はこのモジュール専用の
-    ロックを使う（少なくとも自分同士の同時実行は防げる）。
+    複数スレッドから同時に触るとCヒープが壊れてプロセスごと落ちる。
+    `streamlit run app.py` では app.py は __main__ として動くため
+    `from app import ...` は app.py を二重読み込みして別のロックを返す。
+    ロックだけを置いた専用モジュールを介して確実に共有する。
     """
     try:
-        from app import _PDFIUM_LOCK  # type: ignore
-        return _PDFIUM_LOCK
+        from _pdfium_lock_mod import PDFIUM_LOCK
+        return PDFIUM_LOCK
     except Exception:
         global _LOCAL_PDFIUM_LOCK
         if _LOCAL_PDFIUM_LOCK is None:

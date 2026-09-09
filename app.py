@@ -316,16 +316,50 @@ def datetime_to_dos(dt):
     return struct.pack('<HH', dos_date, dos_time)
 
 
+def _normalize_ym8(raw) -> str:
+    """初度登録年月を YYYYMM00 に正規化する。
+
+    YYYYMM / YYYYMMDD / 「2019/03/01」のような区切り付きを受ける。
+    読み取れない場合は空文字を返す。
+    """
+    s = re.sub(r'[^\d]', '', str(raw or ''))
+    if len(s) == 6:
+        s += '00'
+    if len(s) != 8:
+        return ''
+    try:
+        y, m = int(s[:4]), int(s[4:6])
+    except ValueError:
+        return ''
+    if not (1926 <= y <= 2999) or not (1 <= m <= 12):
+        return ''
+    if s[6:8] == '00':
+        return s
+    return s if _normalize_date8(s) else ''
+
+
 def get_era_info(date_str):
-    """YYYYMMDD文字列 → (和暦名, 和暦年4桁ゼロ埋め)"""
+    """YYYYMMDD文字列 → (和暦名, 和暦年4桁ゼロ埋め)
+
+    年だけで分岐すると改元日をまたぐ月が必ず狂う。
+    平成31年3月登録（2019年1〜4月）の車は実際に多く、
+    年だけ見ると令和1年3月になってしまう。
+    """
     if not date_str or len(date_str) < 4 or date_str == '00000000':
         return '令和', '0000'
-    year = int(date_str[:4])
-    if year >= 2019:
+    try:
+        year  = int(date_str[:4])
+        month = int(date_str[4:6]) if len(date_str) >= 6 else 0
+        day   = int(date_str[6:8]) if len(date_str) >= 8 else 0
+    except ValueError:
+        return '令和', '0000'
+    # 初度登録年月は YYYYMM00 で日が無い。その場合は月初とみなす。
+    ymd = (year, month or 1, day or 1)
+    if ymd >= (2019, 5, 1):
         return '令和', f'{year - 2018:04d}'
-    elif year >= 1989:
+    if ymd >= (1989, 1, 8):
         return '平成', f'{year - 1988:04d}'
-    elif year >= 1926:
+    if ymd >= (1926, 12, 25):
         return '昭和', f'{year - 1925:04d}'
     return '令和', '0000'
 
@@ -1031,36 +1065,53 @@ def update_em_db(db_bytes, cust, insurance_info, estimated_date, is_tax_inclusiv
             pass
 
 
+# AnSvEm0001Ex.db の宣言列幅（CP932バイト数）
+_CUST_WIDTH = {
+    'Name1': 30, 'UserName': 20, 'OwnerName': 20, 'PostalNo': 10,
+    'Prefecture': 8, 'Municipality': 30, 'AddressOther1': 30,
+    'CarRegNoDepartment': 8, 'CarRegNoDivision': 6, 'CarRegNoBusiness': 4,
+    'CarRegNoSerial': 10, 'CarSerialNo': 41, 'CarMouldNo': 5, 'CarKindNo': 4,
+}
+_CAR_WIDTH = {
+    'CarName': 50, 'CarNameByUser': 50, 'ColorCode': 12,
+    'ColorName': 30, 'TrimCode': 6,
+}
+
+
 def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
                        is_tax_inclusive, merge_mode):
     conn = sqlite3.connect(_tmp_db_path)
     cur  = conn.cursor()
-    customer_name = safe_str(cust.get('customer_name', ''))
-    owner_name    = safe_str(cust.get('owner_name', ''))
-    postal_no     = safe_str(cust.get('postal_no', ''))
-    prefecture    = safe_str(cust.get('prefecture', ''))
-    municipality  = safe_str(cust.get('municipality', ''))
-    address_other = safe_str(cust.get('address_other', ''))
-    car_dept      = safe_str(cust.get('car_reg_department', ''))
-    car_div       = safe_str(cust.get('car_reg_division', ''))
-    car_biz       = safe_str(cust.get('car_reg_business', ''))
-    car_serial    = safe_str(cust.get('car_reg_serial', ''))
-    car_serial_no = safe_str(cust.get('car_serial_no', ''))
-    car_name       = safe_str(cust.get('car_name', ''))
+    # コグニセブンの列幅（CP932バイト数）に合わせて切り詰める。
+    # SQLite は TEXT(n) を強制しないため、ここで守らないと桁あふれした値が
+    # そのまま入る。Name1 と UserName は宣言幅が違うので別々に切る。
+    customer_name = cp932_trim(cust.get('customer_name', ''), _CUST_WIDTH['Name1'])
+    user_name     = cp932_trim(cust.get('customer_name', ''), _CUST_WIDTH['UserName'])
+    owner_name    = cp932_trim(cust.get('owner_name', ''), _CUST_WIDTH['OwnerName'])
+    postal_no     = cp932_trim(cust.get('postal_no', ''), _CUST_WIDTH['PostalNo'])
+    prefecture    = cp932_trim(cust.get('prefecture', ''), _CUST_WIDTH['Prefecture'])
+    municipality  = cp932_trim(cust.get('municipality', ''), _CUST_WIDTH['Municipality'])
+    address_other = cp932_trim(cust.get('address_other', ''), _CUST_WIDTH['AddressOther1'])
+    car_dept      = cp932_trim(cust.get('car_reg_department', ''), _CUST_WIDTH['CarRegNoDepartment'])
+    car_div       = cp932_trim(cust.get('car_reg_division', ''), _CUST_WIDTH['CarRegNoDivision'])
+    car_biz       = cp932_trim(cust.get('car_reg_business', ''), _CUST_WIDTH['CarRegNoBusiness'])
+    car_serial    = cp932_trim(cust.get('car_reg_serial', ''), _CUST_WIDTH['CarRegNoSerial'])
+    car_serial_no = cp932_trim(cust.get('car_serial_no', ''), _CUST_WIDTH['CarSerialNo'])
+    car_name       = cp932_trim(cust.get('car_name', ''), _CAR_WIDTH['CarName'])
     car_model      = safe_str(cust.get('car_model', ''))
     engine_model   = safe_str(cust.get('engine_model', ''))
-    body_color     = safe_str(cust.get('body_color', ''))
-    color_code     = safe_str(cust.get('color_code', ''))
-    trim_code      = safe_str(cust.get('trim_code', ''))
+    body_color     = cp932_trim(cust.get('body_color', ''), _CAR_WIDTH['ColorName'])
+    color_code     = cp932_trim(cust.get('color_code', ''), _CAR_WIDTH['ColorCode'])
+    trim_code      = cp932_trim(cust.get('trim_code', ''), _CAR_WIDTH['TrimCode'])
     car_weight     = safe_int(cust.get('car_weight', 0))
     displacement   = safe_int(cust.get('engine_displacement', 0))
-    model_desig    = safe_str(cust.get('car_model_designation', ''))
-    category_num   = safe_str(cust.get('car_category_number', ''))
+    model_desig    = cp932_trim(cust.get('car_model_designation', ''), _CUST_WIDTH['CarMouldNo'])
+    category_num   = cp932_trim(cust.get('car_category_number', ''), _CUST_WIDTH['CarKindNo'])
     kilometer      = safe_int(cust.get('kilometer', -1), -1)
-    term_date      = safe_str(cust.get('term_date', '00000000'))
-    car_reg_date   = safe_str(cust.get('car_reg_date', '00000000'))
-    if not term_date    or len(term_date) < 8:    term_date    = '00000000'
-    if not car_reg_date or len(car_reg_date) < 8: car_reg_date = '00000000'
+    # 「2026/03/01」のような区切り付きをそのまま通すと、和暦の組み立てで
+    # int('/0') となり NEO 生成が丸ごと失敗する。必ず正規化してから使う。
+    term_date      = _normalize_date8(cust.get('term_date', '')) or '00000000'
+    car_reg_date   = _normalize_ym8(cust.get('car_reg_date', '')) or '00000000'
     term_era, term_era_year = get_era_info(term_date)
     reg_era,  reg_era_year  = get_era_info(car_reg_date)
 
@@ -1069,7 +1120,7 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
         _cust_updates = []
         _cust_values  = []
         _field_map = [
-            ('Name1', customer_name), ('UserName', customer_name), ('OwnerName', owner_name),
+            ('Name1', customer_name), ('UserName', user_name), ('OwnerName', owner_name),
             # 住所欄も書き込む（画面に入力欄があるのに反映されないと分かりにくいため）
             ('PostalNo', postal_no), ('Prefecture', prefecture),
             ('Municipality', municipality), ('AddressOther1', address_other),
@@ -1105,7 +1156,7 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
             CarRegDate=?, CarRegEra=?, CarRegEraYear=?,
             Kilometer=?
         ''', (
-            customer_name, customer_name, owner_name,
+            customer_name, user_name, owner_name,
             postal_no, prefecture, municipality, address_other,
             car_dept, car_div, car_biz, car_serial,
             car_serial_no, model_desig, category_num,
@@ -1202,7 +1253,7 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
 # 内部ファイル更新: AnSvMail.ini（XML）
 # ============================================================
 
-def update_mail_ini(orig_bytes, cust, grand_total, merge_mode=False):
+def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mode=False):
     """Shift_JIS XMLの顧客・車両情報を更新
     merge_mode=True の場合、非空の値のみ上書きする。
     """
@@ -1217,8 +1268,11 @@ def update_mail_ini(orig_bytes, cust, grand_total, merge_mode=False):
     car_name      = safe_str(cust.get('car_name', ''))
     car_serial_no = safe_str(cust.get('car_serial_no', ''))
     kilometer     = safe_str(cust.get('kilometer', ''))
-    car_reg_date  = safe_str(cust.get('car_reg_date', ''))
-    term_date     = safe_str(cust.get('term_date', ''))
+    # DB側と同じ正規化を通す。ここだけ生の値を使うと、同じNEOの中で
+    # DBとヘッダXMLが食い違ったり int('/0') で落ちたりする。
+    car_reg_date  = _normalize_ym8(cust.get('car_reg_date', ''))
+    term_date     = _normalize_date8(cust.get('term_date', ''))
+    ins = insurance_info or {}
     tag_values = {
         'CustomerName1': customer_name,
         'OwnerName':     owner_name,
@@ -1234,6 +1288,18 @@ def update_mail_ini(orig_bytes, cust, grand_total, merge_mode=False):
         'Total':         grand_total,
         # 作成日を更新しないと、どの見積にもテンプレート作成時の日付が残る
         'CreatedDate':   datetime.datetime.now().strftime('%Y/%m/%d'),
+        # 事故・保険情報。DBに書くのと同じ値をヘッダXMLにも書かないと、
+        # 過去のNEOをテンプレートに使ったとき前の案件の値が残ってしまう。
+        'AcceptNo':      cp932_trim(ins.get('accept_no', ''), 37),
+        'AccidentDate':  _normalize_date8(ins.get('accident_date', '')),
+        'AdjusterName':  cp932_trim(ins.get('adjuster_name', ''), 20),
+        'Note1':         cp932_trim(
+            re.sub(r'\s+', ' ', safe_str(ins.get('note1', ''))).strip(), 40),
+        'GarageInDate':  _normalize_date8(ins.get('garage_in_date', '')),
+        'GarageOutDate': _normalize_date8(ins.get('garage_out_date', '')),
+        'CarMouldNo':    safe_str(cust.get('car_model_designation', '')),
+        'CarKindNo':     safe_str(cust.get('car_category_number', '')),
+        'ColorCode':     safe_str(cust.get('color_code', '')),
     }
     if term_date and term_date != '00000000':
         term_era, term_era_year = get_era_info(term_date)
@@ -1268,7 +1334,7 @@ def update_mail_ini(orig_bytes, cust, grand_total, merge_mode=False):
 # 内部ファイル更新: AnSvImge.ini（INI）
 # ============================================================
 
-def update_imge_ini(orig_bytes, cust, merge_mode=False):
+def update_imge_ini(orig_bytes, cust, insurance_info=None, merge_mode=False):
     """INIファイルの顧客・車両情報を更新
     merge_mode=True の場合、非空の値のみ上書きする。
     """
@@ -1280,6 +1346,9 @@ def update_imge_ini(orig_bytes, cust, merge_mode=False):
         'CarNoBusiness':   safe_str(cust.get('car_reg_business', '')),
         'CarNoSerial':     safe_str(cust.get('car_reg_serial', '')),
         'CarName':         safe_str(cust.get('car_name', '')),
+        # 事故情報。書かないとテンプレート再利用時に前の案件の値が残る。
+        'AcceptNo':        cp932_trim((insurance_info or {}).get('accept_no', ''), 37),
+        'AccidentDate':    _normalize_date8((insurance_info or {}).get('accident_date', '')),
     }
     for key, value in ini_values.items():
         if merge_mode and not value:
@@ -1411,8 +1480,10 @@ def generate_neo_file(template_data, customer_info, items, short_parts_wage, ins
         files['AnSvEm0001Ex.db'], customer_info, insurance_info, estimated_date,
         is_tax_inclusive=is_tax_inclusive, merge_mode=merge_mode
     )
-    files['AnSvMail.ini'] = update_mail_ini(files['AnSvMail.ini'], customer_info, grand_total, merge_mode=merge_mode)
-    files['AnSvImge.ini'] = update_imge_ini(files['AnSvImge.ini'], customer_info, merge_mode=merge_mode)
+    files['AnSvMail.ini'] = update_mail_ini(files['AnSvMail.ini'], customer_info, grand_total,
+                                            insurance_info=insurance_info, merge_mode=merge_mode)
+    files['AnSvImge.ini'] = update_imge_ini(files['AnSvImge.ini'], customer_info,
+                                            insurance_info=insurance_info, merge_mode=merge_mode)
     neo_data = repack_neo(template_data, files, mgmt, entries)
     return neo_data, total_parts, total_wages, grand_total
 
@@ -1447,8 +1518,10 @@ def enhance_image_for_ocr(image_bytes):
         return image_bytes
 
 
-# pdfium(pypdfium2) はスレッドセーフでないため、呼び出しを直列化する
-_PDFIUM_LOCK = threading.Lock()
+# pdfium(pypdfium2) はスレッドセーフでないため、呼び出しを直列化する。
+# `streamlit run app.py` では app.py は __main__ なので、pipeline 側の
+# `from app import ...` は別インスタンスを掴んでしまう。専用モジュールに置く。
+from _pdfium_lock_mod import PDFIUM_LOCK as _PDFIUM_LOCK
 # ラスタライズ時の総画素数上限（約40メガピクセル）。A3@300dpi でも約17Mpxなので余裕がある。
 MAX_RASTER_PIXELS = 40_000_000
 
@@ -5226,6 +5299,17 @@ def main():
                 v_term    = st.text_input("有効期限 (YYYYMMDD)",   value=safe_str(vehicle_data.get('term_date', '')),    key='v_term')
             with col5:
                 v_regdate = st.text_input("初度登録年月 (YYYYMM00)", value=safe_str(vehicle_data.get('car_reg_date', '')), key='v_regdate')
+
+            # 読み取れない日付は黙って捨てられる（または和暦の組み立てで
+            # 落ちる）ので、事故日と同じように画面で知らせる。
+            for _lbl, _val, _norm, _hint in (
+                ('有効期限', v_term, _normalize_date8, 'YYYYMMDD（例: 20280315）'),
+                ('初度登録年月', v_regdate, _normalize_ym8, 'YYYYMM00（例: 20190300）'),
+            ):
+                if _val and not _norm(_val):
+                    st.warning(f"⚠️ {_lbl}「{_val}」は日付として読み取れません。"
+                               f"{_hint} の形式で入力してください。"
+                               "このままでは NEO に書き込まれません。")
 
             # 車両詳細情報
             st.markdown('<div class="section-title" style="margin-top:16px">🔧 車両詳細</div>', unsafe_allow_html=True)
