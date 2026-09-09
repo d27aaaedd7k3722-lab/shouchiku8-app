@@ -822,17 +822,41 @@ class FuzzyMatcher:
         n = n.translate(cls._S2L)
         return n
 
+    @staticmethod
+    def _split_side_impl(n):
+        """左右の表記を取り除き、(本体, 'L'|'R'|'') を返す。
+
+        以前は PDF 名の先頭から「左/右」を落とすだけで、落とした側を
+        どこにも使っておらず、マスタ名の左右は落としてもいなかった。
+        そのため「右フロントドアパネル」と「左フロントドアパネル」が
+        どちらも同じ本体名になり、マスタの並び順で先に来たほうが
+        無条件に選ばれていた（しかも完全一致扱いなので ※ も価格警告も出ない）。
+        _norm_name（v4側）は同じ問題を先に解決済みなので、その規則に揃える。
+        """
+        side = ''
+        m = re.match(r'^\s*(左|右)\s*', n)
+        if m:
+            side = 'L' if m.group(1) == '左' else 'R'
+            n = n[m.end():]
+        if re.search(r'[（(\[]?\s*(左|Ｌ|LH|L)\s*[)）\]]?\s*$', n):
+            side = 'L'
+        elif re.search(r'[（(\[]?\s*(右|Ｒ|RH|R)\s*[)）\]]?\s*$', n):
+            side = 'R'
+        n = re.sub(r'[（(\[]?\s*(左|右|Ｌ|Ｒ|LH|RH)\s*[)）\]]?\s*$', '', n)
+        return n, side
+
     @classmethod
     def match(cls, pdf_name, master_parts, pdf_price=0):
         norm_t = cls.normalize(pdf_name)
         if not norm_t: return None, 99, False
 
-        # 方向プレフィックス除去（左/右を記録）
-        side = ''
-        for pfx in ['左RR', '右RR', '左', '右', 'LH', 'RH']:
+        # 左右を本体名から分離して記録する（マスタ側も同じ処理をする）
+        norm_t, side_t = cls._split_side_impl(norm_t)
+        for pfx in ['左RR', '右RR', 'LH', 'RH']:
             if norm_t.startswith(pfx):
                 norm_t = norm_t[len(pfx):]
-                side = pfx
+                if not side_t:
+                    side_t = 'L' if pfx in ('左RR', 'LH') else 'R'
                 break
         # Rr→R, Fr→F  (PDF表記のRrをマスタのRに合わせる)
         if norm_t.startswith('RR'): norm_t = 'R' + norm_t[2:]
@@ -846,10 +870,15 @@ class FuzzyMatcher:
         for mp in master_parts:
             nm = cls.normalize(mp['name'])
             if not nm: continue
+            nm, side_m = cls._split_side_impl(nm)
+            if not nm: continue
+            # 左右が食い違う候補は、F/R 違いと同じ重さで遠ざける。
+            # ここを 0 にすると左の部品が右の行に完全一致として当たる。
+            side_penalty = 10 if (side_t and side_m and side_t != side_m) else 0
 
             # 完全一致
             if norm_t == nm:
-                candidates.append((mp, 0, 0))
+                candidates.append((mp, 0 + side_penalty, 0))
                 continue
             # 方向分離
             dir_m = nm[0] if nm and nm[0] in 'FR' else ''
@@ -859,17 +888,17 @@ class FuzzyMatcher:
             dir_penalty = 10 if (dir_t and dir_m and dir_t != dir_m) else 0
 
             if core_t == core_m and len(core_t) >= 4:
-                candidates.append((mp, 1 + dir_penalty, 0))
+                candidates.append((mp, 1 + dir_penalty + side_penalty, 0))
                 continue
             if core_t in core_m or core_m in core_t:
                 min_len = min(len(core_t), len(core_m))
                 if min_len >= 4:
-                    candidates.append((mp, 2 + dir_penalty, abs(len(core_t) - len(core_m))))
+                    candidates.append((mp, 2 + dir_penalty + side_penalty, abs(len(core_t) - len(core_m))))
                     continue
             # Levenshtein
             d = lev_distance(core_t, core_m)
             if len(core_m) > 0 and d / max(len(core_t), len(core_m)) < 0.4:
-                candidates.append((mp, 3 + dir_penalty, d))
+                candidates.append((mp, 3 + dir_penalty + side_penalty, d))
 
         if not candidates:
             return None, 99, False
@@ -1514,14 +1543,19 @@ def _decorate_pno_v4(pno: str, mark: str, max_bytes: int = ERPARTS_PARTS_NO_BYTE
     tag = _PNO_MARK_SHORT.get(mark, "※")
     if not pno:
         return tag
-    if tag in pno or mark in pno:
+    if "※" in pno or mark in pno:
         return pno  # 二重付与防止
-    cand = f"{pno} {tag}"
-    try:
-        if len(cand.encode("cp932", "replace")) <= max_bytes:
-            return cand
-    except Exception:
-        pass
+    # 収まらないときに印ごと捨てると、価格相違やADDATA該当なしが
+    # 何の表示も無いまま協定に出る。ホンダの品番（71501-T5A-J00ZZ＝15バイト）
+    # は「 ※価」の4バイトを足すと必ず溢れるので、これが常態だった。
+    # 詰め方を段階的に緩めて、最後は1文字の「※」だけでも残す。
+    # 印の種類は呼び出し側が警告に出すので、ここでは「要確認」だけ伝われば足りる。
+    for cand in (f"{pno} {tag}", f"{pno}{tag}", f"{pno}※"):
+        try:
+            if len(cand.encode("cp932", "replace")) <= max_bytes:
+                return cand
+        except Exception:
+            pass
     return pno
 
 
@@ -2120,6 +2154,10 @@ def identify_vehicle_wrapper(addata_base, vehicle_data):
                 'vehicle_code': veh.get('vehicle_code'),
                 'folder': veh.get('folder'),
                 'reason': veh.get('reason') or 'ok',
+                # 候補が複数残ったことを呼び出し側に伝える。載せないと
+                # 「先頭候補で確定」が「一致」と同じ顔で下流に流れ、
+                # 別型式の部品マスタで照合したことに誰も気づけない。
+                'ambiguous': veh.get('ambiguous') or [],
             }
         return {'match_layer': 4, 'is_supported': False, 'reason': err or 'not found'}
     except Exception as e:

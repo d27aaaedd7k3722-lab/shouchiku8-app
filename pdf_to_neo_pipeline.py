@@ -355,6 +355,16 @@ def identify_vehicle_in_addata(vehicle_info: Dict[str, Any],
             result["confidence"] = 0.7
             result["method"] = "layer2_attr"
             result["notes"] = f"folder={folder}"
+            # 候補が割れたまま先頭を採ったケース。reason を捨てると
+            # 画面には「連携成功」としか出ず、別型式のマスタで照合した
+            # ことが利用者に伝わらない。
+            _amb = wrap.get("ambiguous") or []
+            if _amb:
+                result["ambiguous"] = list(_amb)
+                result["confidence"] = 0.4
+                result["notes"] = (f"候補が{len(_amb)}件に割れています"
+                                   f"({'/'.join(map(str, _amb))}): "
+                                   f"{reason}")
         elif layer == 3:
             # TOYOTA_GENERIC template fallback: NEO は template ベースで生成可能
             result["found"] = True
@@ -1060,11 +1070,21 @@ def build_neo_mode_b(items: List[Dict[str, Any]],
             if mk is not None:
                 it["parts_no"] = mk
                 it["part_no"] = mk  # v4: app.generate_neo_file 互換
-            # v5-Iter6: DB WI を index_value に反映 (DB値があれば優先)
+            # ADDATAの指数で見積の工数を上書きしない。工賃は見積の値のまま
+            # 書かれるので、上書きすると「工数はADDATA・工賃は見積」という
+            # 行ができ、工数×レバーレートが工賃と合わなくなる。協定の場で
+            # 説明できない見積になるうえ、元見積と同じ内容という条件も崩れる。
+            # ADDATA側の値は db_work_index として保持し、食い違う行は知らせる。
             db_wi = it.get("db_work_index")
             if db_wi and isinstance(db_wi, (int, float)) and db_wi > 0:
                 try:
-                    it["index_value"] = round(float(db_wi) / 100.0, 2)
+                    _pdf_idx = _to_float(it.get("index_value"))
+                    _db_idx = round(float(db_wi) / 100.0, 2)
+                    if _pdf_idx <= 0:
+                        # 見積側に工数が無い行だけ、ADDATAの指数で補う
+                        it["index_value"] = _db_idx
+                    elif abs(_pdf_idx - _db_idx) > 0.005:
+                        it["index_mismatch"] = (_pdf_idx, _db_idx)
                 except Exception:
                     pass
         v4_done = True
@@ -1118,11 +1138,21 @@ def build_neo_mode_c(items: List[Dict[str, Any]],
             if mk is not None:
                 it["parts_no"] = mk
                 it["part_no"] = mk  # v4: app.generate_neo_file 互換
-            # v5-Iter6: DB WI を index_value に反映 (DB値があれば優先)
+            # ADDATAの指数で見積の工数を上書きしない。工賃は見積の値のまま
+            # 書かれるので、上書きすると「工数はADDATA・工賃は見積」という
+            # 行ができ、工数×レバーレートが工賃と合わなくなる。協定の場で
+            # 説明できない見積になるうえ、元見積と同じ内容という条件も崩れる。
+            # ADDATA側の値は db_work_index として保持し、食い違う行は知らせる。
             db_wi = it.get("db_work_index")
             if db_wi and isinstance(db_wi, (int, float)) and db_wi > 0:
                 try:
-                    it["index_value"] = round(float(db_wi) / 100.0, 2)
+                    _pdf_idx = _to_float(it.get("index_value"))
+                    _db_idx = round(float(db_wi) / 100.0, 2)
+                    if _pdf_idx <= 0:
+                        # 見積側に工数が無い行だけ、ADDATAの指数で補う
+                        it["index_value"] = _db_idx
+                    elif abs(_pdf_idx - _db_idx) > 0.005:
+                        it["index_mismatch"] = (_pdf_idx, _db_idx)
                 except Exception:
                     pass
         v4_done = True
@@ -1893,6 +1923,21 @@ def process_pdf_to_neo(pdf_path,
                     if _pct > 0.05:
                         # 読み落としが大きい結果はキャッシュに残さない
                         out["ocr_incomplete"] = True
+            except Exception:
+                pass
+            # ADDATAの指数と見積の工数が食い違う行は、指数を上書きせずに
+            # 見積の値を残している。黙って通すと利用者が食い違いに
+            # 気づけないので知らせる。
+            try:
+                _im = [it for it in (items or []) if it.get("index_mismatch")]
+                if _im:
+                    _ex = _im[0]
+                    _p, _d = _ex["index_mismatch"]
+                    warnings.append(
+                        f"ADDATAの指数と見積の工数が食い違う行が{len(_im)}件あります"
+                        f"（例:「{_ex.get('name') or _ex.get('parts_name') or ''}」"
+                        f" 見積 {_p} / ADDATA {_d}）。"
+                        "見積の工数をそのまま採用しています。")
             except Exception:
                 pass
             # 許容差(2%または1000円)の範囲内は調整行を作らないため、

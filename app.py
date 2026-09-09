@@ -5995,7 +5995,19 @@ def main():
                     info_msgs.append("✏️ ベタ打ちモード: PDF見積の全明細をそのままNEOファイルに転記します（DB照合なし）")
                 elif estimate_data.get('_veh_match_result', {}).get('is_supported'):
                     v_res = estimate_data['_veh_match_result']
-                    info_msgs.append(f"🚙 Addata マスタ連携成功: レイヤー{v_res['match_layer']} 一致 (車種コード: {v_res.get('vehicle_code')})")
+                    _amb = v_res.get('ambiguous') or []
+                    if _amb:
+                        # 候補が割れたまま先頭を採っている。「連携成功」とだけ
+                        # 出すと、別型式のマスタで照合したことが伝わらない。
+                        info_msgs.append(
+                            f"⚠️ Addata 車種が{len(_amb)}件の候補に割れています"
+                            f"（{' / '.join(map(str, _amb))}）。"
+                            f"いまは {v_res.get('vehicle_code')} で照合しています。"
+                            "初度登録年月を入力すると絞り込めます。"
+                            "部品コード・品番が別型式のものになっていないか、"
+                            "生成前にプレビューでご確認ください。")
+                    else:
+                        info_msgs.append(f"🚙 Addata マスタ連携成功: レイヤー{v_res['match_layer']} 一致 (車種コード: {v_res.get('vehicle_code')})")
                 else:
                     info_msgs.append("⚠️ Addata マスタ連携: 該当車種が見つかりませんでした (手動入力モード)")
                     # フォールバック処理 (Geminiで車種名とエンジン型式を推測)
@@ -6828,6 +6840,13 @@ def main():
                 is_reverse = item.get('_reverse_match', False)
                 qty = item.get('quantity', 1)
 
+                # マスタ単価が取れていない行は比較できない。
+                # '_master_price' はリポジトリ内のどこからも実値が入らないため、
+                # この条件を外すと全部品行が「差額あり」として並び、
+                # 「総額変動 -（部品総額）」という嘘の合計が出ていた。
+                # 常時100%誤報だと、本物の価格相違に気づけなくなる。
+                if master_price <= 0:
+                    continue
                 # Check discrepancy if NOT reverse matched
                 if not is_reverse and ocr_price > 0 and (m_level >= 4 or m_level == 0 or ocr_price != master_price):
                     d = (master_price - ocr_price) * qty
