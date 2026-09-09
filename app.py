@@ -1385,11 +1385,16 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
     # total_parts / total_wages は既に税抜値（is_tax_inclusive時は逆算済み）
     taxable_expenses = sp_out + tow_out + rent_out
     sub_total         = total_parts + total_wages + taxable_expenses
-    tax_total         = jpy_round(sub_total * TAX_RATE)
-    grand_total       = sub_total + tax_total + tax_exempt  # 非課税は税計算後に加算
     parts_tax_total   = jpy_round(total_parts * TAX_RATE)
     wages_tax_total   = jpy_round(total_wages * TAX_RATE)
     sp_tax_total      = jpy_round(sp_out * TAX_RATE)
+    # 消費税は、内訳の各欄（部品計・工賃計・諸経費計）と同じ刻みで丸めて足す。
+    # 以前は小計をまとめて1回で丸めていたため、内訳の税額欄の合計と
+    # tx_Total が一致せず、同じ .neo の中で内訳と総額が1円食い違っていた。
+    # 画面も内訳と同じ刻みで出しているので、画面とファイルも1円ずれていた。
+    expenses_tax_total = jpy_round(taxable_expenses * TAX_RATE)
+    tax_total         = parts_tax_total + wages_tax_total + expenses_tax_total
+    grand_total       = sub_total + tax_total + tax_exempt  # 非課税は税計算後に加算
     cur.execute("""UPDATE Total SET
         ms_PartsTotalOutTax=?,
         ms_PartsTotalInTax=?,
@@ -1435,7 +1440,9 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
     """, (
         total_parts, total_parts + parts_tax_total, parts_tax_total,
         total_wages, total_wages + wages_tax_total, wages_tax_total,
-        taxable_expenses, taxable_expenses + jpy_round(taxable_expenses * TAX_RATE) if taxable_expenses > 0 else 0, jpy_round(taxable_expenses * TAX_RATE) if taxable_expenses > 0 else 0,
+        taxable_expenses,
+        taxable_expenses + expenses_tax_total if taxable_expenses > 0 else 0,
+        expenses_tax_total if taxable_expenses > 0 else 0,
         # 非課税ぶんは工賃側の非課税欄に計上する。どの内訳にも入れないと
         # 小計＋消費税が合計に届かず、帳票の検算が合わなくなる。
         0, 0, 0,
@@ -4964,7 +4971,7 @@ def _session_cache_scope() -> str:
 
 
 def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=None,
-                           is_tax_inclusive=False):
+                           is_tax_inclusive=False, expenses=None):
     """見積書PDFから直接NEOファイルを生成する。
 
     pdf_to_neo_pipeline.process_pdf_to_neo をStreamlitから安全に呼ぶための薄いラッパ。
@@ -5016,6 +5023,9 @@ def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=
             # DBとヘッダXMLの食い違いは、非マージモードで Car/Insurance/
             # FileInfo も Customer と同じく全上書きにすることで解消している。
             merge_mode=False,
+            # サイドバーの費用欄。渡さないと、この経路で作った .neo に
+            # レッカー代・代車費用・非課税費用が1円も入らない。
+            expenses=expenses or None,
         )
         if not isinstance(result, dict):
             return {'ok': False, 'error': 'PDF→NEO変換が想定外の値を返しました'}
@@ -5727,6 +5737,11 @@ def main():
                         model_name=selected_model,
                         template_bytes=st.session_state.get('custom_neo_bytes'),
                         is_tax_inclusive=_pdf_is_tax_incl,
+                        expenses={
+                            'towing':     st.session_state.get('exp_towing', 0),
+                            'rental_car': st.session_state.get('exp_rental', 0),
+                            'tax_exempt': st.session_state.get('exp_exempt', 0),
+                        },
                     )
                 st.session_state['pdf2neo_tax_inclusive'] = _pdf_is_tax_incl
                 st.rerun()
