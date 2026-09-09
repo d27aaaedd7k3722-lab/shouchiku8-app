@@ -37,6 +37,7 @@ load_dotenv()
 
 import streamlit as st
 import struct
+import uuid as _uuid
 import zlib
 import sqlite3
 import tempfile
@@ -315,16 +316,50 @@ def datetime_to_dos(dt):
     return struct.pack('<HH', dos_date, dos_time)
 
 
+def _normalize_ym8(raw) -> str:
+    """初度登録年月を YYYYMM00 に正規化する。
+
+    YYYYMM / YYYYMMDD / 「2019/03/01」のような区切り付きを受ける。
+    読み取れない場合は空文字を返す。
+    """
+    s = re.sub(r'[^\d]', '', str(raw or ''))
+    if len(s) == 6:
+        s += '00'
+    if len(s) != 8:
+        return ''
+    try:
+        y, m = int(s[:4]), int(s[4:6])
+    except ValueError:
+        return ''
+    if not (1926 <= y <= 2999) or not (1 <= m <= 12):
+        return ''
+    if s[6:8] == '00':
+        return s
+    return s if _normalize_date8(s) else ''
+
+
 def get_era_info(date_str):
-    """YYYYMMDD文字列 → (和暦名, 和暦年4桁ゼロ埋め)"""
+    """YYYYMMDD文字列 → (和暦名, 和暦年4桁ゼロ埋め)
+
+    年だけで分岐すると改元日をまたぐ月が必ず狂う。
+    平成31年3月登録（2019年1〜4月）の車は実際に多く、
+    年だけ見ると令和1年3月になってしまう。
+    """
     if not date_str or len(date_str) < 4 or date_str == '00000000':
         return '令和', '0000'
-    year = int(date_str[:4])
-    if year >= 2019:
+    try:
+        year  = int(date_str[:4])
+        month = int(date_str[4:6]) if len(date_str) >= 6 else 0
+        day   = int(date_str[6:8]) if len(date_str) >= 8 else 0
+    except ValueError:
+        return '令和', '0000'
+    # 初度登録年月は YYYYMM00 で日が無い。その場合は月初とみなす。
+    ymd = (year, month or 1, day or 1)
+    if ymd >= (2019, 5, 1):
         return '令和', f'{year - 2018:04d}'
-    elif year >= 1989:
+    if ymd >= (1989, 1, 8):
         return '平成', f'{year - 1988:04d}'
-    elif year >= 1926:
+    if ymd >= (1926, 12, 25):
         return '昭和', f'{year - 1925:04d}'
     return '令和', '0000'
 
@@ -420,6 +455,59 @@ def _xml_escape(value) -> str:
             .replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
 
 
+def cp932_trim(value, max_bytes: int) -> str:
+    """コグニセブンの列幅（CP932のバイト数）に収まるよう切り詰める。
+
+    日本語は1文字2バイトなので、文字数で切ると宣言幅の2倍入ってしまう。
+    多バイト文字の途中で切れないよう、デコードできる位置まで戻す。
+    """
+    s = str(value if value is not None else '')
+    if not s:
+        return ''
+    b = s.encode('cp932', 'replace')[:max_bytes]
+    while b:
+        try:
+            return b.decode('cp932')
+        except UnicodeDecodeError:
+            b = b[:-1]
+    return ''
+
+
+def jpy_round(value) -> int:
+    """日本の商習慣どおり四捨五入して整数の円にする。
+
+    Python の round() は偶数丸め（round(10.5)==10）なので、
+    消費税の計算に使うと約20件に1件、1円少なくなる。
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+    try:
+        return int(Decimal(str(value)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+    except Exception:
+        try:
+            return int(round(float(value)))
+        except (TypeError, ValueError):
+            return 0
+
+
+def _normalize_date8(raw) -> str:
+    """日付入力を YYYYMMDD の8桁に正規化する。解釈できなければ空文字。
+
+    「2026/09/01」「2026-09-01」「20260901」いずれも受け付ける。
+    妥当でない日付（13月など）は書き込まない。
+    """
+    s = re.sub(r'[^\d]', '', str(raw or ''))
+    if len(s) != 8:
+        return ''
+    try:
+        d = datetime.datetime.strptime(s, '%Y%m%d')
+    except ValueError:
+        return ''
+    # 昭和より前は和暦に変換できず、日付だけ入って元号が空になるため受け付けない
+    if d.year < 1926:
+        return ''
+    return s
+
+
 def _normalize_number_text(raw):
     """金額・数量の文字列を符号付きの数値文字列に正規化する。解釈不能なら None。
 
@@ -482,7 +570,10 @@ def replace_xml_tag(text, tag_name, value):
     """XMLタグの中身を現在値に関係なく置換"""
     pattern = rf'<{re.escape(tag_name)}>[^<]*</{re.escape(tag_name)}>'
     replacement = f'<{tag_name}>{value}</{tag_name}>'
-    result = re.sub(pattern, replacement, text)
+    # 置換文字列を生で渡すと、値の中の「\1」が後方参照として解釈されて
+    # 落ちる。JIS配列の ¥ キーは U+005C を送るので、備考に「¥1,200」と
+    # 打っただけで NEO 生成が失敗していた。lambda で解釈を止める。
+    result = re.sub(pattern, lambda _m: replacement, text)
     # 空タグ形式も対応
     empty_pattern = rf'<{re.escape(tag_name)}/>'
     result = result.replace(empty_pattern, replacement)
@@ -492,8 +583,9 @@ def replace_xml_tag(text, tag_name, value):
 def replace_ini_value(text, key, value):
     """INIキー値を確実に更新"""
     pattern = rf'^({re.escape(key)}\s*=).*$'
-    replacement = rf'\g<1>{value}'
-    return re.sub(pattern, replacement, text, flags=re.MULTILINE)
+    # 上と同じ理由で、値をそのまま置換文字列にしない
+    return re.sub(pattern, lambda m: m.group(1) + str(value), text,
+                  flags=re.MULTILINE)
 
 
 # ============================================================
@@ -761,13 +853,13 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         if is_tax_inclusive:
             # 税込: 金額は既に税込値 → OutTax=税抜逆算, InTax=そのまま, Tax=差額
             if parts_total != 0:
-                parts_outtax = round(parts_total / (1 + TAX_RATE))
+                parts_outtax = jpy_round(parts_total / (1 + TAX_RATE))
                 parts_intax  = parts_total
                 parts_tax    = parts_total - parts_outtax
             else:
                 parts_outtax = 0; parts_intax = 0; parts_tax = 0
             if wage_total != 0:
-                wage_outtax  = round(abs(wage_total) / (1 + TAX_RATE))
+                wage_outtax  = jpy_round(abs(wage_total) / (1 + TAX_RATE))
                 if wage_total < 0:
                     wage_outtax = -wage_outtax
                 wage_intax   = wage_total
@@ -777,10 +869,10 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         else:
             # 税抜: 従来通り
             parts_outtax = parts_total
-            parts_tax    = round(parts_total * TAX_RATE) if parts_total != 0 else 0
+            parts_tax    = jpy_round(parts_total * TAX_RATE) if parts_total != 0 else 0
             parts_intax  = parts_total + parts_tax if parts_total != 0 else 0
             wage_outtax  = wage_total
-            wage_tax_abs = round(abs(wage_total) * TAX_RATE) if wage_total != 0 else 0
+            wage_tax_abs = jpy_round(abs(wage_total) * TAX_RATE) if wage_total != 0 else 0
             wage_tax     = wage_tax_abs if wage_total >= 0 else -wage_tax_abs
             wage_intax   = wage_total + wage_tax if wage_total != 0 else 0
         total_parts += parts_outtax
@@ -877,33 +969,35 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         if amount == 0:
             return 0, 0, 0
         if inclusive:
-            outtax = round(amount / (1 + TAX_RATE))
+            outtax = jpy_round(amount / (1 + TAX_RATE))
             intax  = amount
             tax    = amount - outtax
         else:
             outtax = amount
-            tax    = round(amount * TAX_RATE)
+            tax    = jpy_round(amount * TAX_RATE)
             intax  = amount + tax
         return outtax, intax, tax
 
     # ── Expense各行を更新 ──
     # LineNo=4: ショートパーツ
     sp_wage = safe_int(short_parts_wage)
-    sp_out, sp_intax, sp_tax = _calc_tax(sp_wage, is_tax_inclusive)
+    # サイドバーの費用欄は「（税抜）」と明示しているため、明細の税区分に
+    # かかわらず常に税抜として扱う。以前は税込モードで9.1%目減りしていた。
+    sp_out, sp_intax, sp_tax = _calc_tax(sp_wage, False)
     cur.execute("""UPDATE Expense SET
         WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
         WHERE LineNo=4""", (1 if sp_wage > 0 else 0, sp_out, sp_intax, sp_tax))
 
     # LineNo=1: レッカー費用（課税）
     towing = safe_int(expenses.get('towing', 0))
-    tow_out, tow_intax, tow_tax = _calc_tax(towing, is_tax_inclusive)
+    tow_out, tow_intax, tow_tax = _calc_tax(towing, False)
     cur.execute("""UPDATE Expense SET
         WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
         WHERE LineNo=1""", (1 if towing > 0 else 0, tow_out, tow_intax, tow_tax))
 
     # LineNo=2: 代車費用（課税）
     rental_car = safe_int(expenses.get('rental_car', 0))
-    rent_out, rent_intax, rent_tax = _calc_tax(rental_car, is_tax_inclusive)
+    rent_out, rent_intax, rent_tax = _calc_tax(rental_car, False)
     cur.execute("""UPDATE Expense SET
         WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
         WHERE LineNo=2""", (1 if rental_car > 0 else 0, rent_out, rent_intax, rent_tax))
@@ -918,11 +1012,11 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
     # total_parts / total_wages は既に税抜値（is_tax_inclusive時は逆算済み）
     taxable_expenses = sp_out + tow_out + rent_out
     sub_total         = total_parts + total_wages + taxable_expenses
-    tax_total         = round(sub_total * TAX_RATE)
+    tax_total         = jpy_round(sub_total * TAX_RATE)
     grand_total       = sub_total + tax_total + tax_exempt  # 非課税は税計算後に加算
-    parts_tax_total   = round(total_parts * TAX_RATE)
-    wages_tax_total   = round(total_wages * TAX_RATE)
-    sp_tax_total      = round(sp_out * TAX_RATE)
+    parts_tax_total   = jpy_round(total_parts * TAX_RATE)
+    wages_tax_total   = jpy_round(total_wages * TAX_RATE)
+    sp_tax_total      = jpy_round(sp_out * TAX_RATE)
     cur.execute("""UPDATE Total SET
         ms_PartsTotalOutTax=?,
         ms_PartsTotalInTax=?,
@@ -940,7 +1034,7 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
     """, (
         total_parts, total_parts + parts_tax_total, parts_tax_total,
         total_wages, total_wages + wages_tax_total, wages_tax_total,
-        taxable_expenses, taxable_expenses + round(taxable_expenses * TAX_RATE) if taxable_expenses > 0 else 0, round(taxable_expenses * TAX_RATE) if taxable_expenses > 0 else 0,
+        taxable_expenses, taxable_expenses + jpy_round(taxable_expenses * TAX_RATE) if taxable_expenses > 0 else 0, jpy_round(taxable_expenses * TAX_RATE) if taxable_expenses > 0 else 0,
         tax_total,   tax_total,
         sub_total,   grand_total
     ))
@@ -975,36 +1069,83 @@ def update_em_db(db_bytes, cust, insurance_info, estimated_date, is_tax_inclusiv
             pass
 
 
+# AnSvEm0001Ex.db の宣言列幅（CP932バイト数）
+_CUST_WIDTH = {
+    'Name1': 30, 'UserName': 20, 'OwnerName': 20, 'PostalNo': 10,
+    'Prefecture': 8, 'Municipality': 30, 'AddressOther1': 30,
+    'CarRegNoDepartment': 8, 'CarRegNoDivision': 6, 'CarRegNoBusiness': 4,
+    'CarRegNoSerial': 10, 'CarSerialNo': 41, 'CarMouldNo': 5, 'CarKindNo': 4,
+}
+_CAR_WIDTH = {
+    'CarName': 50, 'CarNameByUser': 50, 'ColorCode': 12,
+    'ColorName': 30, 'TrimCode': 6,
+}
+
+
+def _trimmed_cust_values(cust: dict) -> dict:
+    """DB・ヘッダXML・INI で同じ値を書くための、列幅で切り詰め済みの束。
+
+    片側だけ切り詰めると、1つの .neo の中で使用者名や車名が
+    2種類存在する状態になってしまう。
+    """
+    cust = cust or {}
+    return {
+        'customer_name': cp932_trim(cust.get('customer_name', ''), _CUST_WIDTH['Name1']),
+        'user_name':     cp932_trim(cust.get('customer_name', ''), _CUST_WIDTH['UserName']),
+        'owner_name':    cp932_trim(cust.get('owner_name', ''),    _CUST_WIDTH['OwnerName']),
+        'postal_no':     cp932_trim(cust.get('postal_no', ''),     _CUST_WIDTH['PostalNo']),
+        'prefecture':    cp932_trim(cust.get('prefecture', ''),    _CUST_WIDTH['Prefecture']),
+        'municipality':  cp932_trim(cust.get('municipality', ''),  _CUST_WIDTH['Municipality']),
+        'address_other': cp932_trim(cust.get('address_other', ''), _CUST_WIDTH['AddressOther1']),
+        'car_dept':      cp932_trim(cust.get('car_reg_department', ''), _CUST_WIDTH['CarRegNoDepartment']),
+        'car_div':       cp932_trim(cust.get('car_reg_division', ''),   _CUST_WIDTH['CarRegNoDivision']),
+        'car_biz':       cp932_trim(cust.get('car_reg_business', ''),   _CUST_WIDTH['CarRegNoBusiness']),
+        'car_serial':    cp932_trim(cust.get('car_reg_serial', ''),     _CUST_WIDTH['CarRegNoSerial']),
+        'car_serial_no': cp932_trim(cust.get('car_serial_no', ''),      _CUST_WIDTH['CarSerialNo']),
+        'model_desig':   cp932_trim(cust.get('car_model_designation', ''), _CUST_WIDTH['CarMouldNo']),
+        'category_num':  cp932_trim(cust.get('car_category_number', ''),   _CUST_WIDTH['CarKindNo']),
+        'car_name':      cp932_trim(cust.get('car_name', ''),      _CAR_WIDTH['CarName']),
+        'body_color':    cp932_trim(cust.get('body_color', ''),    _CAR_WIDTH['ColorName']),
+        'color_code':    cp932_trim(cust.get('color_code', ''),    _CAR_WIDTH['ColorCode']),
+        'trim_code':     cp932_trim(cust.get('trim_code', ''),     _CAR_WIDTH['TrimCode']),
+    }
+
+
 def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
                        is_tax_inclusive, merge_mode):
     conn = sqlite3.connect(_tmp_db_path)
     cur  = conn.cursor()
-    customer_name = safe_str(cust.get('customer_name', ''))
-    owner_name    = safe_str(cust.get('owner_name', ''))
-    postal_no     = safe_str(cust.get('postal_no', ''))
-    prefecture    = safe_str(cust.get('prefecture', ''))
-    municipality  = safe_str(cust.get('municipality', ''))
-    address_other = safe_str(cust.get('address_other', ''))
-    car_dept      = safe_str(cust.get('car_reg_department', ''))
-    car_div       = safe_str(cust.get('car_reg_division', ''))
-    car_biz       = safe_str(cust.get('car_reg_business', ''))
-    car_serial    = safe_str(cust.get('car_reg_serial', ''))
-    car_serial_no = safe_str(cust.get('car_serial_no', ''))
-    car_name       = safe_str(cust.get('car_name', ''))
+    # コグニセブンの列幅（CP932バイト数）に合わせて切り詰める。
+    # SQLite は TEXT(n) を強制しないため、ここで守らないと桁あふれした値が
+    # そのまま入る。同じ束をヘッダXML・INIでも使い、表記を一致させる。
+    _t = _trimmed_cust_values(cust)
+    customer_name = _t['customer_name']
+    user_name     = _t['user_name']
+    owner_name    = _t['owner_name']
+    postal_no     = _t['postal_no']
+    prefecture    = _t['prefecture']
+    municipality  = _t['municipality']
+    address_other = _t['address_other']
+    car_dept      = _t['car_dept']
+    car_div       = _t['car_div']
+    car_biz       = _t['car_biz']
+    car_serial    = _t['car_serial']
+    car_serial_no = _t['car_serial_no']
+    car_name       = _t['car_name']
     car_model      = safe_str(cust.get('car_model', ''))
     engine_model   = safe_str(cust.get('engine_model', ''))
-    body_color     = safe_str(cust.get('body_color', ''))
-    color_code     = safe_str(cust.get('color_code', ''))
-    trim_code      = safe_str(cust.get('trim_code', ''))
+    body_color     = _t['body_color']
+    color_code     = _t['color_code']
+    trim_code      = _t['trim_code']
     car_weight     = safe_int(cust.get('car_weight', 0))
     displacement   = safe_int(cust.get('engine_displacement', 0))
-    model_desig    = safe_str(cust.get('car_model_designation', ''))
-    category_num   = safe_str(cust.get('car_category_number', ''))
+    model_desig    = _t['model_desig']
+    category_num   = _t['category_num']
     kilometer      = safe_int(cust.get('kilometer', -1), -1)
-    term_date      = safe_str(cust.get('term_date', '00000000'))
-    car_reg_date   = safe_str(cust.get('car_reg_date', '00000000'))
-    if not term_date    or len(term_date) < 8:    term_date    = '00000000'
-    if not car_reg_date or len(car_reg_date) < 8: car_reg_date = '00000000'
+    # 「2026/03/01」のような区切り付きをそのまま通すと、和暦の組み立てで
+    # int('/0') となり NEO 生成が丸ごと失敗する。必ず正規化してから使う。
+    term_date      = _normalize_date8(cust.get('term_date', '')) or '00000000'
+    car_reg_date   = _normalize_ym8(cust.get('car_reg_date', '')) or '00000000'
     term_era, term_era_year = get_era_info(term_date)
     reg_era,  reg_era_year  = get_era_info(car_reg_date)
 
@@ -1013,8 +1154,10 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
         _cust_updates = []
         _cust_values  = []
         _field_map = [
-            ('Name1', customer_name), ('UserName', customer_name), ('OwnerName', owner_name),
-            # 住所欄はNEOに記載不要のため除外（PostalNo/Prefecture/Municipality/AddressOther1は書き込まない）
+            ('Name1', customer_name), ('UserName', user_name), ('OwnerName', owner_name),
+            # 住所欄も書き込む（画面に入力欄があるのに反映されないと分かりにくいため）
+            ('PostalNo', postal_no), ('Prefecture', prefecture),
+            ('Municipality', municipality), ('AddressOther1', address_other),
             ('CarRegNoDepartment', car_dept), ('CarRegNoDivision', car_div),
             ('CarRegNoBusiness', car_biz), ('CarRegNoSerial', car_serial),
             ('CarSerialNo', car_serial_no), ('CarMouldNo', model_desig), ('CarKindNo', category_num),
@@ -1036,9 +1179,10 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
         if _cust_updates:
             cur.execute(f"UPDATE Customer SET {', '.join(_cust_updates)}", _cust_values)
     else:
-        # 通常モード: 全フィールドを上書き（住所欄はNEO不要のため除外）
+        # 通常モード: 全フィールドを上書き
         cur.execute('''UPDATE Customer SET
             Name1=?, UserName=?, OwnerName=?,
+            PostalNo=?, Prefecture=?, Municipality=?, AddressOther1=?,
             CarRegNoDepartment=?, CarRegNoDivision=?,
             CarRegNoBusiness=?, CarRegNoSerial=?,
             CarSerialNo=?, CarMouldNo=?, CarKindNo=?,
@@ -1046,7 +1190,8 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
             CarRegDate=?, CarRegEra=?, CarRegEraYear=?,
             Kilometer=?
         ''', (
-            customer_name, customer_name, owner_name,
+            customer_name, user_name, owner_name,
+            postal_no, prefecture, municipality, address_other,
             car_dept, car_div, car_biz, car_serial,
             car_serial_no, model_desig, category_num,
             term_date, term_era, term_era_year,
@@ -1070,25 +1215,58 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
     cur.execute('''UPDATE FileInfo SET
         EstimatedDate=?, EstimatedEra=?, EstimatedEraYear=?
     ''', (estimated_date, est_era, est_era_year))
-    policy_no  = safe_str(insurance_info.get('policy_no', ''))
-    contractor = safe_str(insurance_info.get('contractor_name', ''))
-    if merge_mode:
-        # マージモード: 非空の保険情報のみ上書き
-        _ins_updates = []
-        _ins_values  = []
-        if policy_no:
-            _ins_updates.append('PolicyNo=?')
-            _ins_values.append(policy_no)
-        if contractor:
-            _ins_updates.append('ContractorName=?')
-            _ins_values.append(contractor)
-        if _ins_updates:
-            cur.execute(f"UPDATE Insurance SET {', '.join(_ins_updates)}", _ins_values)
-    else:
-        cur.execute('''UPDATE Insurance SET
-            PolicyNo=?, ContractorName=?,
-            AccidentDate='00000000', AccidentEra='令和'
-        ''', (policy_no, contractor))
+    # コグニセブンの列幅に合わせて切り詰める。SQLite は TEXT(n) を強制しないため
+    # ここで守らないと、桁あふれした値がそのまま入る。
+    policy_no     = cp932_trim(insurance_info.get('policy_no', ''), 20)
+    contractor    = cp932_trim(insurance_info.get('contractor_name', ''), 20)
+    agency_name   = cp932_trim(insurance_info.get('agency_name', ''), 20)
+    adjuster_name = cp932_trim(insurance_info.get('adjuster_name', ''), 20)
+    accept_no     = cp932_trim(insurance_info.get('accept_no', ''), 37)
+    accident_date = _normalize_date8(insurance_info.get('accident_date', ''))
+    garage_in     = _normalize_date8(insurance_info.get('garage_in_date', ''))
+    garage_out    = _normalize_date8(insurance_info.get('garage_out_date', ''))
+    repair_days   = safe_int(insurance_info.get('repair_days', 0))
+    # 備考は改行を含むと固定長レコードが崩れるため1行に潰す
+    note1         = cp932_trim(
+        re.sub(r'\s+', ' ', safe_str(insurance_info.get('note1', ''))).strip(), 40)
+
+    # Insurance テーブル: 入力があった項目だけ書き込む。
+    # 空欄で既存値を消すと、テンプレート由来の工場情報などが失われるため。
+    _ins_updates, _ins_values = [], []
+    for _col, _val in (('PolicyNo', policy_no), ('ContractorName', contractor),
+                       ('AgencyName', agency_name), ('AdjusterName', adjuster_name)):
+        if _val:
+            _ins_updates.append(f'{_col}=?')
+            _ins_values.append(_val)
+    if repair_days > 0:
+        _ins_updates.append('RepairDays=?')
+        _ins_values.append(repair_days)
+    if accident_date:
+        _acc_era, _acc_era_year = get_era_info(accident_date)
+        _ins_updates += ['AccidentDate=?', 'AccidentEra=?', 'AccidentEraYear=?']
+        _ins_values  += [accident_date, _acc_era, _acc_era_year]
+    elif not merge_mode:
+        # 新規作成時は事故日を未入力状態で初期化する（和暦の年も併せて消す）
+        _ins_updates += ['AccidentDate=?', 'AccidentEra=?', 'AccidentEraYear=?']
+        _ins_values  += ['00000000', '令和', '0000']
+    if _ins_updates:
+        cur.execute(f"UPDATE Insurance SET {', '.join(_ins_updates)}", _ins_values)
+
+    # FileInfo テーブル: 受付番号・入出庫日・備考
+    _fi_updates, _fi_values = [], []
+    if accept_no:
+        _fi_updates.append('AcceptNo=?')
+        _fi_values.append(accept_no)
+    if note1:
+        _fi_updates.append('Note1=?')
+        _fi_values.append(note1)
+    for _prefix, _date in (('GarageIn', garage_in), ('GarageOut', garage_out)):
+        if _date:
+            _era, _era_year = get_era_info(_date)
+            _fi_updates += [f'{_prefix}Date=?', f'{_prefix}Era=?', f'{_prefix}EraYear=?']
+            _fi_values  += [_date, _era, _era_year]
+    if _fi_updates:
+        cur.execute(f"UPDATE FileInfo SET {', '.join(_fi_updates)}", _fi_values)
     conn.commit()
 
     # TaxKindFlag 更新 (1=内税, 0=外税)
@@ -1109,27 +1287,34 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
 # 内部ファイル更新: AnSvMail.ini（XML）
 # ============================================================
 
-def update_mail_ini(orig_bytes, cust, grand_total, merge_mode=False):
+def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mode=False):
     """Shift_JIS XMLの顧客・車両情報を更新
     merge_mode=True の場合、非空の値のみ上書きする。
     """
     text         = orig_bytes.decode('cp932', errors='replace')
-    customer_name = safe_str(cust.get('customer_name', ''))
-    owner_name    = safe_str(cust.get('owner_name', ''))
-    car_dept      = safe_str(cust.get('car_reg_department', ''))
-    car_div       = safe_str(cust.get('car_reg_division', ''))
-    car_biz       = safe_str(cust.get('car_reg_business', ''))
-    car_serial    = safe_str(cust.get('car_reg_serial', ''))
+    # DB と同じ切り詰め済みの値を使う。片側だけ切ると、1つの .neo の中で
+    # 使用者名や車名が2種類存在する状態になる。
+    _t = _trimmed_cust_values(cust)
+    customer_name = _t['customer_name']
+    user_name     = _t['user_name']
+    owner_name    = _t['owner_name']
+    car_dept      = _t['car_dept']
+    car_div       = _t['car_div']
+    car_biz       = _t['car_biz']
+    car_serial    = _t['car_serial']
     car_no_full   = f'{car_dept}{car_div}{car_biz}{car_serial}'
-    car_name      = safe_str(cust.get('car_name', ''))
-    car_serial_no = safe_str(cust.get('car_serial_no', ''))
+    car_name      = _t['car_name']
+    car_serial_no = _t['car_serial_no']
     kilometer     = safe_str(cust.get('kilometer', ''))
-    car_reg_date  = safe_str(cust.get('car_reg_date', ''))
-    term_date     = safe_str(cust.get('term_date', ''))
+    # DB側と同じ正規化を通す。ここだけ生の値を使うと、同じNEOの中で
+    # DBとヘッダXMLが食い違ったり int('/0') で落ちたりする。
+    car_reg_date  = _normalize_ym8(cust.get('car_reg_date', ''))
+    term_date     = _normalize_date8(cust.get('term_date', ''))
+    ins = insurance_info or {}
     tag_values = {
         'CustomerName1': customer_name,
         'OwnerName':     owner_name,
-        'UserName':      customer_name,
+        'UserName':      user_name,
         'CarNo':         car_no_full,
         'CarName':       car_name,
         'CarSerialNo':   car_serial_no,
@@ -1139,6 +1324,20 @@ def update_mail_ini(orig_bytes, cust, grand_total, merge_mode=False):
         'CarNoKana':     car_biz,
         'CarNoSeries':   car_serial,
         'Total':         grand_total,
+        # 作成日を更新しないと、どの見積にもテンプレート作成時の日付が残る
+        'CreatedDate':   datetime.datetime.now().strftime('%Y/%m/%d'),
+        # 事故・保険情報。DBに書くのと同じ値をヘッダXMLにも書かないと、
+        # 過去のNEOをテンプレートに使ったとき前の案件の値が残ってしまう。
+        'AcceptNo':      cp932_trim(ins.get('accept_no', ''), 37),
+        'AccidentDate':  _normalize_date8(ins.get('accident_date', '')),
+        'AdjusterName':  cp932_trim(ins.get('adjuster_name', ''), 20),
+        'Note1':         cp932_trim(
+            re.sub(r'\s+', ' ', safe_str(ins.get('note1', ''))).strip(), 40),
+        'GarageInDate':  _normalize_date8(ins.get('garage_in_date', '')),
+        'GarageOutDate': _normalize_date8(ins.get('garage_out_date', '')),
+        'CarMouldNo':    _t['model_desig'],
+        'CarKindNo':     _t['category_num'],
+        'ColorCode':     _t['color_code'],
     }
     if term_date and term_date != '00000000':
         term_era, term_era_year = get_era_info(term_date)
@@ -1164,7 +1363,8 @@ def update_mail_ini(orig_bytes, cust, grand_total, merge_mode=False):
     for tag_name, value in tag_values.items():
         if merge_mode and not value:
             continue  # マージモード: 空値はスキップ（テンプレートの既存値を保持）
-        text = replace_xml_tag(text, tag_name, value)
+        # 値に & や < が入るとXMLが壊れるためエスケープする（法人名の「＆」等）
+        text = replace_xml_tag(text, tag_name, _xml_escape(value))
     return text.encode('cp932', errors='replace')
 
 
@@ -1172,18 +1372,25 @@ def update_mail_ini(orig_bytes, cust, grand_total, merge_mode=False):
 # 内部ファイル更新: AnSvImge.ini（INI）
 # ============================================================
 
-def update_imge_ini(orig_bytes, cust, merge_mode=False):
+def update_imge_ini(orig_bytes, cust, insurance_info=None, merge_mode=False):
     """INIファイルの顧客・車両情報を更新
     merge_mode=True の場合、非空の値のみ上書きする。
     """
     text      = orig_bytes.decode('cp932', errors='replace')
+    # DB・ヘッダXML と同じ切り詰め済みの値を使う
+    _t = _trimmed_cust_values(cust)
     ini_values = {
-        'CustomerName':    safe_str(cust.get('customer_name', '')),
-        'CarNoDepartment': safe_str(cust.get('car_reg_department', '')),
-        'CarNoDivision':   safe_str(cust.get('car_reg_division', '')),
-        'CarNoBusiness':   safe_str(cust.get('car_reg_business', '')),
-        'CarNoSerial':     safe_str(cust.get('car_reg_serial', '')),
-        'CarName':         safe_str(cust.get('car_name', '')),
+        'CustomerName':    _t['customer_name'],
+        'CarNoDepartment': _t['car_dept'],
+        'CarNoDivision':   _t['car_div'],
+        'CarNoBusiness':   _t['car_biz'],
+        'CarNoSerial':     _t['car_serial'],
+        'CarName':         _t['car_name'],
+        # 事故情報。書かないとテンプレート再利用時に前の案件の値が残る。
+        'AcceptNo':        cp932_trim((insurance_info or {}).get('accept_no', ''), 37),
+        # 8桁固定の欄。未入力は純正テンプレートと同じ 00000000 にする
+        # （空文字だと DB の Insurance.AccidentDate='00000000' と食い違う）
+        'AccidentDate':    _normalize_date8((insurance_info or {}).get('accident_date', '')) or '00000000',
     }
     for key, value in ini_values.items():
         if merge_mode and not value:
@@ -1212,7 +1419,9 @@ def generate_annote(items):
         ln_str = f'{line_no:08d}'
         for j, c in enumerate(ln_str):
             line[j] = ord(c)
-        name_bytes = name.encode('cp932', errors='replace')[:30]
+        # バイト数で単純に切ると2バイト文字の途中で割れ、末尾に
+        # 復号できない片割れが残る。文字境界で切り詰める。
+        name_bytes = cp932_trim(name, 30).encode('cp932', errors='replace')
         for j, b in enumerate(name_bytes):
             line[14 + j] = b
         qty_str = f'{min(qty, 99):02d}'
@@ -1313,8 +1522,10 @@ def generate_neo_file(template_data, customer_info, items, short_parts_wage, ins
         files['AnSvEm0001Ex.db'], customer_info, insurance_info, estimated_date,
         is_tax_inclusive=is_tax_inclusive, merge_mode=merge_mode
     )
-    files['AnSvMail.ini'] = update_mail_ini(files['AnSvMail.ini'], customer_info, grand_total, merge_mode=merge_mode)
-    files['AnSvImge.ini'] = update_imge_ini(files['AnSvImge.ini'], customer_info, merge_mode=merge_mode)
+    files['AnSvMail.ini'] = update_mail_ini(files['AnSvMail.ini'], customer_info, grand_total,
+                                            insurance_info=insurance_info, merge_mode=merge_mode)
+    files['AnSvImge.ini'] = update_imge_ini(files['AnSvImge.ini'], customer_info,
+                                            insurance_info=insurance_info, merge_mode=merge_mode)
     neo_data = repack_neo(template_data, files, mgmt, entries)
     return neo_data, total_parts, total_wages, grand_total
 
@@ -1349,8 +1560,10 @@ def enhance_image_for_ocr(image_bytes):
         return image_bytes
 
 
-# pdfium(pypdfium2) はスレッドセーフでないため、呼び出しを直列化する
-_PDFIUM_LOCK = threading.Lock()
+# pdfium(pypdfium2) はスレッドセーフでないため、呼び出しを直列化する。
+# `streamlit run app.py` では app.py は __main__ なので、pipeline 側の
+# `from app import ...` は別インスタンスを掴んでしまう。専用モジュールに置く。
+from _pdfium_lock_mod import PDFIUM_LOCK as _PDFIUM_LOCK
 # ラスタライズ時の総画素数上限（約40メガピクセル）。A3@300dpi でも約17Mpxなので余裕がある。
 MAX_RASTER_PIXELS = 40_000_000
 
@@ -1418,87 +1631,28 @@ def rasterize_pdf_page(pdf_bytes, page_index, dpi=200, enhance=False):
         result = enhance_image_for_ocr(result)
 
     return result
-
-
-def detect_table_region(image_bytes):
-    """
-    画像から明細テーブル領域を検出し、クロップされた画像バイトと位置比率を返す。
-    OpenCV が利用可能な場合は水平線検出を使用。
-    フォールバック: ヒューリスティック（上12%・下90%）。
-    戻り値: (cropped_bytes, top_ratio, bottom_ratio)
-    """
-    # ── OpenCV による水平線ベース検出 ─────────────────────────
     try:
-        import cv2
-        import numpy as np
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        img_cv = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-        if img_cv is not None:
-            h, w = img_cv.shape
-            _, thresh = cv2.threshold(img_cv, 200, 255, cv2.THRESH_BINARY_INV)
-            horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, w // 5), 1))
-            horiz = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horiz_kernel, iterations=2)
-            coords = cv2.findNonZero(horiz)
-            if coords is not None and len(coords) > 4:
-                ys = coords[:, 0, 1]
-                top_y = max(0, int(np.min(ys)) - 15)
-                bot_y = min(h, int(np.max(ys)) + 15)
-                top_ratio = top_y / h
-                bot_ratio = bot_y / h
-                if bot_ratio - top_ratio >= 0.3:
-                    from PIL import Image
-                    pil = Image.open(io.BytesIO(image_bytes))
-                    cropped = pil.crop((0, top_y, pil.width, bot_y))
-                    buf = io.BytesIO()
-                    cropped.save(buf, format='JPEG', quality=93)
-                    return buf.getvalue(), top_ratio, bot_ratio
-    except ImportError:
-        pass
-    except Exception:
-        pass
-
-    # ── フォールバック: ヒューリスティック ──────────────────────
-    try:
-        from PIL import Image
-        pil = Image.open(io.BytesIO(image_bytes))
-        h = pil.height
-        top_y = int(h * 0.12)
-        bot_y = int(h * 0.90)
-        cropped = pil.crop((0, top_y, pil.width, bot_y))
+        from pypdf import PdfReader, PdfWriter
+        reader       = PdfReader(io.BytesIO(pdf_bytes))
+        needs_rotation = False
+        for page in reader.pages:
+            box = page.mediabox
+            if float(box.width) > float(box.height) * 1.2:
+                needs_rotation = True
+                break
+        if not needs_rotation:
+            return pdf_bytes
+        writer = PdfWriter()
+        for page in reader.pages:
+            box = page.mediabox
+            if float(box.width) > float(box.height) * 1.2:
+                page.rotate(270)
+            writer.add_page(page)
         buf = io.BytesIO()
-        cropped.save(buf, format='JPEG', quality=93)
-        return buf.getvalue(), 0.12, 0.90
+        writer.write(buf)
+        return buf.getvalue()
     except Exception:
-        return image_bytes, 0.0, 1.0
-
-
-def split_into_vertical_chunks(image_bytes, n_chunks=3, overlap_ratio=0.08):
-    """
-    画像を縦方向に n_chunks 分割（オーバーラップあり）。
-    戻り値: List of (chunk_bytes, y_start_ratio, y_end_ratio)
-    ※ y比率はクロップ画像に対する 0-1 の値
-    """
-    try:
-        from PIL import Image
-        pil = Image.open(io.BytesIO(image_bytes))
-        w, h = pil.width, pil.height
-        if h < 200:
-            return [(image_bytes, 0.0, 1.0)]
-        chunk_h = h // n_chunks
-        overlap_px = max(10, int(h * overlap_ratio))
-        chunks = []
-        for i in range(n_chunks):
-            y_start = max(0, i * chunk_h - (overlap_px if i > 0 else 0))
-            y_end   = min(h, (i + 1) * chunk_h + (overlap_px if i < n_chunks - 1 else 0))
-            if y_end <= y_start:
-                continue
-            chunk = pil.crop((0, y_start, w, y_end))
-            buf = io.BytesIO()
-            chunk.save(buf, format='JPEG', quality=93)
-            chunks.append((buf.getvalue(), y_start / h, y_end / h))
-        return chunks if chunks else [(image_bytes, 0.0, 1.0)]
-    except Exception:
-        return [(image_bytes, 0.0, 1.0)]
+        return pdf_bytes
 
 
 def try_fix_landscape_pdf(pdf_bytes):
@@ -2301,368 +2455,10 @@ status フィールドを追加すること:
 
 
 def _build_prompt(task_type: str, extra: str = "") -> str:
-    """CORE_PROMPT + TASK_PROMPTS[task_type] + learned_hints + extra を結合して返す"""
+    """CORE_PROMPT + TASK_PROMPTS[task_type] + extra を結合して返す"""
     task_part = TASK_PROMPTS.get(task_type, "")
-    learned   = _load_learned_hints(task_type)
-    parts = [CORE_PROMPT, task_part, learned, extra]
+    parts = [CORE_PROMPT, task_part, extra]
     return "\n\n".join(p for p in parts if p)
-
-
-# ============================================================
-# フィードバック学習DB
-# ============================================================
-import uuid as _uuid
-
-_FEEDBACK_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feedback.db")
-
-# エラー種別の日本語ラベル
-FEEDBACK_ERROR_TYPES = {
-    "column_swap":    "部品↔工賃の取り違え",
-    "missed_row":     "行の見落とし",
-    "amount_misread": "金額の読み取りミス",
-    "wrong_category": "分類誤り（合計行混入等）",
-    "name_error":     "品名の誤読",
-    "quantity_error": "数量の誤読",
-    "extra_row":      "不要な行が追加されている",
-    "other":          "その他",
-}
-
-# 積算しきい値（この件数を超えたらマスタ統合を推奨）
-FEEDBACK_MERGE_THRESHOLD = 5
-
-
-_FEEDBACK_EXPECTED_COLUMNS = {
-    'corrections': {
-        'id': 'TEXT', 'timestamp': 'TEXT', 'document_type': 'TEXT',
-        'error_type': 'TEXT', 'row_index': 'INTEGER',
-        'orig_name': 'TEXT', 'orig_parts': 'INTEGER', 'orig_wage': 'INTEGER',
-        'corr_name': 'TEXT', 'corr_parts': 'INTEGER', 'corr_wage': 'INTEGER',
-        'user_comment': 'TEXT', 'page_context': 'TEXT', 'status': 'TEXT',
-    },
-}
-
-
-def _migrate_feedback_db(conn):
-    """既存DBに不足している列を足す。
-
-    以前のバージョンで作られたDBがあると CREATE TABLE IF NOT EXISTS は
-    何もしないため、列が足りないまま INSERT が例外になり、記録ボタンを
-    押した瞬間に画面が落ちていた。
-    """
-    cur = conn.cursor()
-    for table, columns in _FEEDBACK_EXPECTED_COLUMNS.items():
-        try:
-            existing = {r[1] for r in cur.execute(f"PRAGMA table_info({table})")}
-        except sqlite3.Error:
-            continue
-        if not existing:
-            continue
-        for col, col_type in columns.items():
-            if col not in existing:
-                try:
-                    cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
-                    print(f"[feedback.db] 列を追加しました: {table}.{col}")
-                except sqlite3.Error as e:
-                    print(f"[feedback.db] 列追加に失敗: {table}.{col}: {e}")
-    conn.commit()
-
-
-def _get_feedback_db():
-    """フィードバックDB接続を返す（テーブルが存在しない場合は作成）"""
-    conn = sqlite3.connect(_FEEDBACK_DB_PATH)
-    cur  = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS corrections (
-            id            TEXT PRIMARY KEY,
-            timestamp     TEXT NOT NULL,
-            document_type TEXT,
-            error_type    TEXT,
-            row_index     INTEGER,
-            orig_name     TEXT,
-            orig_parts    INTEGER,
-            orig_wage     INTEGER,
-            corr_name     TEXT,
-            corr_parts    INTEGER,
-            corr_wage     INTEGER,
-            user_comment  TEXT,
-            page_context  TEXT,
-            status        TEXT DEFAULT 'pending'
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS prompt_patches (
-            id          TEXT PRIMARY KEY,
-            task_type   TEXT NOT NULL,
-            patch_text  TEXT NOT NULL,
-            created_at  TEXT NOT NULL,
-            is_active   INTEGER DEFAULT 1
-        )
-    """)
-    conn.commit()
-    _migrate_feedback_db(conn)
-    return conn
-
-
-def record_correction(corrections: list, user_comment: str, document_type: str = "不明"):
-    """
-    明細の訂正データをDBに記録する。
-    corrections: [{"row_index": int, "error_type": str, "original": dict, "corrected": dict}]
-    """
-    if not corrections:
-        return
-    conn = _get_feedback_db()
-    cur  = conn.cursor()
-    ts   = datetime.datetime.now().isoformat()
-    for c in corrections:
-        orig = c.get("original", {})
-        corr = c.get("corrected", {})
-        cur.execute("""
-            INSERT INTO corrections
-            (id, timestamp, document_type, error_type, row_index,
-             orig_name, orig_parts, orig_wage,
-             corr_name, corr_parts, corr_wage,
-             user_comment, page_context, status)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            str(_uuid.uuid4()), ts, document_type,
-            c.get("error_type", "other"),
-            c.get("row_index", 0),
-            str(orig.get("name", "")),
-            safe_int(orig.get("parts_amount", 0)),
-            safe_int(orig.get("wage", 0)),
-            str(corr.get("name", "")),
-            safe_int(corr.get("parts_amount", 0)),
-            safe_int(corr.get("wage", 0)),
-            user_comment,
-            c.get("page_context", ""),
-            "pending",
-        ))
-    conn.commit()
-    conn.close()
-
-
-def get_error_summary():
-    """エラー種別ごとの件数・代表例をまとめて返す"""
-    try:
-        conn = _get_feedback_db()
-        cur  = conn.cursor()
-        cur.execute("""
-            SELECT error_type, COUNT(*) as cnt,
-                   GROUP_CONCAT(orig_name, '|') as names
-            FROM corrections
-            WHERE status = 'pending'
-            GROUP BY error_type
-            ORDER BY cnt DESC
-        """)
-        rows = cur.fetchall()
-        conn.close()
-        result = []
-        for r in rows:
-            names = list(set((r[2] or "").split("|")))[:5]
-            result.append({
-                "error_type": r[0],
-                "label": FEEDBACK_ERROR_TYPES.get(r[0], r[0]),
-                "count": r[1],
-                "sample_names": [n for n in names if n],
-            })
-        return result
-    except Exception:
-        return []
-
-
-def get_all_pending_corrections():
-    """未統合の全訂正レコードを返す"""
-    try:
-        conn = _get_feedback_db()
-        cur  = conn.cursor()
-        cur.execute("""
-            SELECT id, timestamp, document_type, error_type,
-                   orig_name, orig_parts, orig_wage,
-                   corr_name, corr_parts, corr_wage,
-                   user_comment
-            FROM corrections
-            WHERE status = 'pending'
-            ORDER BY timestamp DESC
-        """)
-        rows = cur.fetchall()
-        conn.close()
-        cols = ["id","timestamp","document_type","error_type",
-                "orig_name","orig_parts","orig_wage",
-                "corr_name","corr_parts","corr_wage","user_comment"]
-        return [dict(zip(cols, r)) for r in rows]
-    except Exception:
-        return []
-
-
-def generate_and_save_patch(patch_text: str, task_type: str = "estimate_detail_page"):
-    """
-    生成されたプロンプトパッチをDBに保存し、既存のアクティブパッチを無効化する。
-    """
-    conn = _get_feedback_db()
-    cur  = conn.cursor()
-    # 既存アクティブパッチを無効化
-    cur.execute("UPDATE prompt_patches SET is_active = 0 WHERE task_type = ?", (task_type,))
-    # 新パッチを挿入
-    cur.execute("""
-        INSERT INTO prompt_patches (id, task_type, patch_text, created_at, is_active)
-        VALUES (?,?,?,?,1)
-    """, (str(_uuid.uuid4()), task_type, patch_text,
-          datetime.datetime.now().isoformat()))
-    # 統合済みの pending レコードを merged に更新
-    cur.execute("UPDATE corrections SET status = 'merged' WHERE status = 'pending'")
-    conn.commit()
-    conn.close()
-
-
-def _load_learned_hints(task_type: str = "estimate_detail_page") -> str:
-    """
-    現在アクティブなプロンプトパッチを返す。なければ空文字列。
-    _build_prompt() から呼ばれる。
-    """
-    try:
-        conn = _get_feedback_db()
-        cur  = conn.cursor()
-        cur.execute("""
-            SELECT patch_text FROM prompt_patches
-            WHERE task_type = ? AND is_active = 1
-            ORDER BY created_at DESC LIMIT 1
-        """, (task_type,))
-        row = cur.fetchone()
-        conn.close()
-        return row[0] if row else ""
-    except Exception:
-        return ""
-
-
-def _classify_correction(orig: dict, corr: dict) -> str:
-    """1行の修正内容からエラー種別を推定する。
-
-    部品↔工賃の取り違え（column_swap）は、部品金額と工賃が実際に入れ替わって
-    いる時だけとする。単なる金額の直しをこれに分類すると、自動生成される
-    学習パッチが「工賃列の金額を部品として扱え」という誤った指示になり、
-    次回以降の解析で金額が失われる。
-    """
-    orig_p = safe_int(orig.get("parts_amount", 0))
-    orig_w = safe_int(orig.get("wage", 0))
-    corr_p = safe_int(corr.get("parts_amount", 0))
-    corr_w = safe_int(corr.get("wage", 0))
-    orig_n = str(orig.get("name", ""))
-    corr_n = str(corr.get("name", ""))
-    orig_q = safe_int(orig.get("quantity", 1), 1)
-    corr_q = safe_int(corr.get("quantity", 1), 1)
-
-    amount_changed = (orig_p != corr_p) or (orig_w != corr_w)
-    name_changed = orig_n != corr_n
-
-    # 部品と工賃がそのまま入れ替わっている場合のみ取り違え
-    if amount_changed and orig_p == corr_w and orig_w == corr_p and (orig_p or orig_w):
-        return "column_swap"
-    if name_changed and not amount_changed:
-        return "name_error"
-    if amount_changed and not name_changed:
-        return "amount_misread"
-    if amount_changed and name_changed:
-        # 品名も金額も変わっている＝行そのものの読み違え
-        return "amount_misread"
-    if orig_q != corr_q:
-        return "quantity_error"
-    return "other"
-
-
-def _row_identity(item: dict) -> str:
-    """行の同一性を判定するためのキー（品番があれば品番、無ければ品名）"""
-    pno = str(item.get("part_no", "") or item.get("parts_no", "") or "").strip()
-    if pno:
-        return "P:" + pno.lower()
-    return "N:" + to_halfwidth_katakana(str(item.get("name", "") or "")).strip().lower()
-
-
-def _detect_corrections(original_items: list, edited_items: list) -> list:
-    """
-    AIが出力したオリジナル明細とユーザー編集後を比較し、差分リストを返す。
-    Returns: [{"row_index", "error_type", "original", "corrected", "page_context"}]
-
-    行は位置ではなく内容（品番・品名）で対応付ける。位置で突き合わせると、
-    途中に1行挿入しただけで以降の全行が「別の行に化けた」と誤検出され、
-    その誤りがそのまま学習データに記録されてしまう。
-    """
-    import difflib as _difflib
-
-    corrections = []
-    orig_keys = [_row_identity(it) for it in (original_items or [])]
-    edit_keys = [_row_identity(it) for it in (edited_items or [])]
-    matcher = _difflib.SequenceMatcher(a=orig_keys, b=edit_keys, autojunk=False)
-
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
-            for off in range(i2 - i1):
-                orig = original_items[i1 + off]
-                corr = edited_items[j1 + off]
-                etype = _classify_correction(orig, corr)
-                if etype == "other" and \
-                        safe_int(orig.get("parts_amount", 0)) == safe_int(corr.get("parts_amount", 0)) and \
-                        safe_int(orig.get("wage", 0)) == safe_int(corr.get("wage", 0)) and \
-                        str(orig.get("name", "")) == str(corr.get("name", "")):
-                    continue  # 変更なし
-                corrections.append({
-                    "row_index":    j1 + off + 1,
-                    "error_type":   etype,
-                    "original":     orig,
-                    "corrected":    corr,
-                    "page_context": f"{j1 + off + 1}行目: {orig.get('name', '')}",
-                })
-        elif tag == "replace":
-            # 置き換え：対応が取れる分だけ突き合わせ、余りは追加/削除として扱う
-            common = min(i2 - i1, j2 - j1)
-            for off in range(common):
-                orig = original_items[i1 + off]
-                corr = edited_items[j1 + off]
-                corrections.append({
-                    "row_index":    j1 + off + 1,
-                    "error_type":   _classify_correction(orig, corr),
-                    "original":     orig,
-                    "corrected":    corr,
-                    "page_context": f"{j1 + off + 1}行目: {orig.get('name', '')}",
-                })
-            for off in range(common, j2 - j1):
-                corr = edited_items[j1 + off]
-                corrections.append({
-                    "row_index":    j1 + off + 1,
-                    "error_type":   "missed_row",
-                    "original":     {},
-                    "corrected":    corr,
-                    "page_context": f"{j1 + off + 1}行目（追加）",
-                })
-            for off in range(common, i2 - i1):
-                orig = original_items[i1 + off]
-                corrections.append({
-                    "row_index":    i1 + off + 1,
-                    "error_type":   "extra_row",
-                    "original":     orig,
-                    "corrected":    {},
-                    "page_context": f"{i1 + off + 1}行目（削除）",
-                })
-        elif tag == "insert":
-            for off in range(j2 - j1):
-                corr = edited_items[j1 + off]
-                corrections.append({
-                    "row_index":    j1 + off + 1,
-                    "error_type":   "missed_row",
-                    "original":     {},
-                    "corrected":    corr,
-                    "page_context": f"{j1 + off + 1}行目（追加）",
-                })
-        elif tag == "delete":
-            for off in range(i2 - i1):
-                orig = original_items[i1 + off]
-                corrections.append({
-                    "row_index":    i1 + off + 1,
-                    "error_type":   "extra_row",
-                    "original":     orig,
-                    "corrected":    {},
-                    "page_context": f"{i1 + off + 1}行目（削除）",
-                })
-    return corrections
 
 
 def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None):
@@ -2714,6 +2510,10 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
     }
     result = {}
     _method_used = ""
+    _last_error = None
+    if not api_key:
+        # キーが無ければ呼ぶ前に失敗を返す（黙って空の車両情報を返さない）
+        return {'_error': 'Gemini APIキーが設定されていません'}
     try:
         from google.genai import types
         client = _get_genai_client(api_key)
@@ -2738,6 +2538,7 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
     except Exception as e:
         print(f"[shaken_ocr] response_schema failed: {e}")
         _method_used = "fallback"
+        _last_error = e
 
     # 方式1で空結果 → 方式2: シンプルなJSON modeにフォールバック
     if not result or not any(v for v in result.values() if v and str(v).strip()):
@@ -2755,6 +2556,18 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
         except Exception as e2:
             print(f"[shaken_ocr] json_mode fallback also failed: {e2}")
             result = {}
+            _last_error = e2
+
+    # 2方式とも空 → 失敗として理由を返す。空dictを返すと呼び出し側が
+    # 「読み取れたが全項目が空」と区別できず、車両情報なしのNEOが
+    # 黙って作られてしまう。
+    if not result or not any(v for v in result.values() if v and str(v).strip()):
+        _msg = str(_last_error) if _last_error else '車検証のページを判別できませんでした'
+        if '429' in _msg or 'RESOURCE_EXHAUSTED' in _msg:
+            _msg = 'Gemini APIのクォータが上限に達しました'
+        elif 'API key not valid' in _msg or 'API_KEY_INVALID' in _msg:
+            _msg = 'Gemini APIキーが正しくありません'
+        return {'_error': _msg}
 
     # 数値フィールドを文字列→数値に変換（response_schema が string 型で返すため）
     for int_key in ('car_weight', 'engine_displacement', 'kilometer'):
@@ -2832,7 +2645,94 @@ def analyze_estimate_totals(api_key, file_bytes, mime_type, model_name):
     return None
 
 
-def parse_csv_to_items(csv_text: str) -> list:
+# 明細ではなく集計を表す語（これで「終わる」品名は明細として扱わない）
+_TOTAL_SUFFIXES = ('合計', '小計', '総額', '総計', '消費税', '税額')
+# 単独で使われた場合だけ集計とみなす語
+# （「税」は入れない。「税金」「重量税」のような正当な明細まで消えるため）
+_TOTAL_EXACT = ('内税', '外税', '請求', 'ご請求', '計', '以上', '総合計', '税込', '税抜')
+# 「部品計」「工賃計」のように、この語に「計」が続く形も集計行
+_TOTAL_PREFIXES_FOR_KEI = (
+    '部品', '部品代', '工賃', '技術料', '諸費用', '費用', '材料', '塗装',
+    '作業', '整備', '修理', '合計', '小計', '値引', 'その他',
+    '課税', '非課税', '税込', '税抜',
+)
+
+
+# CSVの見出し名 → 内部キー
+# 見出し名 → 内部キー。曖昧な短い別名は最後に置き、具体的な名前を優先する。
+# 「部品」だけの列は品番のことも金額のこともあるため候補に入れない。
+_COLUMN_ALIASES = {
+    'name':         ('品名', '部品名', '品目', '名称', '摘要', '作業内容'),
+    'work_code':    ('区分', '作業区分'),
+    'quantity':     ('数量', '個数'),
+    'parts_amount': ('部品金額', '部品代', '部品価格', '部品単価', '部品油脂'),
+    'wage':         ('工賃', '技術料', '作業工賃'),
+    'part_no':      ('部品コード', '部品番号', '品番'),
+    'index_value':  ('工数', '指数'),
+}
+
+
+def _build_column_map(header_row) -> dict:
+    """見出し行から「内部キー → 列位置」を作る。判別できない場合は空dict。"""
+    if not header_row:
+        return {}
+    # 空白で切り捨てると「部品 コード」が「部品」になり、品番列を見失う。
+    # 空白は詰めるだけにし、括弧書きの注記だけを落とす。
+    cells = []
+    for c in header_row:
+        c = re.sub(r'[\s\u3000・、，]', '', str(c or ''))
+        # 括弧書きの注記だけを落とす。閉じ括弧が無い場合は以降を捨てる。
+        c = re.sub(r'[（(\[【][^）)\]】]*[）)\]】]', '', c)
+        c = re.sub(r'[（(\[【].*$', '', c)
+        cells.append(c)
+    colmap = {}
+    # 別名を外側で回し、具体的な名前から順に列を確保する。
+    # 列を外側で回すと「部品 コード」→「部品」のような弱い一致が
+    # 先に金額列を奪い、部品代が全部0になる。
+    for key, aliases in _COLUMN_ALIASES.items():
+        for alias in aliases:
+            for i, c in enumerate(cells):
+                if c == alias and i not in colmap.values():
+                    colmap[key] = i
+                    break
+            if key in colmap:
+                break
+    # 品名の列が見つからないなら、この見出しは当てにならないので位置決め打ちに戻す
+    if 'name' not in colmap:
+        return {}
+    return colmap
+
+
+def _is_total_row_name(name: str) -> bool:
+    """品名が集計行のものか判定する。
+
+    見積書の合計欄は「合計」「小計(税抜)」「税込合計」「合計金額」
+    「【合計】」「小計①」「合　計　金　額」など表記が揺れる。
+    空白・括弧・丸数字・通貨記号を落としたうえで、末尾が集計語かで判断する。
+    「合計表示灯」「総額メーター」「温度計」のような部品名は末尾が
+    集計語ではないので残る。
+    """
+    nm = re.sub(r'[\s\u3000【】\[\]「」『』¥￥:：･・]', '', str(name or ''))
+    nm = re.sub(r'[（(].*?[）)]', '', nm)          # 括弧書きを除去
+    nm = re.sub(r'[0-9０-９①-⑳%％]+$', '', nm)     # 末尾の番号・率を除去
+    nm = nm.replace('御', 'ご')                     # 御請求額 → ご請求額
+    if not nm:
+        return False
+    if re.fullmatch(r'(?i)(sub)?total', nm):        # 英語表記の合計欄
+        return True
+    if nm in _TOTAL_EXACT or nm.endswith(_TOTAL_SUFFIXES):
+        return True
+    # 「部品計」「工賃計」「諸費用計」のように、集計対象＋「計」の形
+    if nm.endswith('計') and nm[:-1] in _TOTAL_PREFIXES_FOR_KEI:
+        return True
+    # 「合計金額」「ご請求額」のように集計語の後ろに金額表現が付く形
+    nm2 = re.sub(r'(金額|額|計)$', '', nm)
+    if nm2 and nm2 != nm and (nm2 in _TOTAL_EXACT or nm2.endswith(_TOTAL_SUFFIXES)):
+        return True
+    return False
+
+
+def parse_csv_to_items(csv_text: str, return_notes: bool = False):
     """Claude.ai / Gemini.ai 等から出力されたCSVテキストをitemsリストに変換する。
     期待フォーマット（ヘッダあり）:
         品名,区分,数量,部品金額,工賃,部品コード
@@ -2840,24 +2740,118 @@ def parse_csv_to_items(csv_text: str) -> list:
     import csv as _csv
     import io as _io
 
+    _trailer_notes: list = []
+
     # BOM除去・改行正規化
     text = csv_text.strip().lstrip('\ufeff').replace('\r\n', '\n').replace('\r', '\n')
+    # AIの回答をそのまま貼り付けたときの前後のコードフェンスだけを外す。
+    # 全行から除去すると、引用符で囲まれた複数行フィールドを壊してしまう。
+    text = re.sub(r'^[^\n]*```[a-zA-Z]*\n', '', text)
+    text = re.sub(r'\n```[^\n]*$', '', text)
+    # フェンスの後ろに説明文が続くと閉じフェンスが行の途中に残り、
+    # 「```」だけの行が金額0円の明細として取り込まれてしまう。
+    # 行全体がフェンスだけの行に限って落とす（引用中の本文は壊さない）。
+    text = '\n'.join(l for l in text.split('\n')
+                     if not re.fullmatch(r'\s*```[a-zA-Z]*\s*', l))
     items = []
     try:
         reader = _csv.reader(_io.StringIO(text))
         rows = list(reader)
     except Exception:
-        return items
+        return (items, _trailer_notes) if return_notes else items
 
     if not rows:
-        return items
+        return (items, _trailer_notes) if return_notes else items
 
-    # ヘッダ行を特定（"品名" を含む行を探す）
+    # ヘッダ行を特定する。「品名」が無くてもヘッダらしい行なら読み飛ばす。
+    # 以前は先頭セルに「品名」が無いとヘッダ行をそのまま明細として
+    # 取り込み、「品目」のような別表記で先頭行がゴミ明細になっていた。
+    _HEADER_WORDS = ('品名', '品目', '部品名', '名称', '摘要', '区分', '作業内容',
+                     '数量', '個数', '数', '単価', '金額', '部品金額', '工賃',
+                     '部品コード', '部品番号', '工数', '番号', '備考', '単位')
+
+    def _norm_header_cell(c):
+        # 「部品金額（税抜）」「数 量」のような装飾を外して見出し語と比べる
+        c = re.sub(r'[\s\u3000・]', '', c)
+        c = re.sub(r'[（(\[【][^）)\]】]*[）)\]】]', '', c)
+        return c
+
+    def _looks_like_header(r):
+        if not r:
+            return False
+        cells = [c.strip() for c in r if c is not None]
+        if not any(cells):
+            return False
+        # 金額・数量らしいセルが1つでもあれば明細行とみなす。
+        # 「¥45,000」のように通貨記号や「円」が付く形も明細である。
+        for c in cells[1:]:
+            if c and re.fullmatch(r'[¥￥]?[\d,，．.\-]+円?', c):
+                return False
+        # 部分一致だと「部品コード」を含む品名などでヘッダ扱いになり、
+        # 実データ行が1行まるごと捨てられる。セル全体の一致だけを数える。
+        return sum(1 for c in cells if _norm_header_cell(c) in _HEADER_WORDS) >= 2
+
+    # 「品名」見出しは何行目にあっても拾う。一方、見出しらしさによる推測は
+    # 先頭数行に限る。表の途中の小見出し（「工賃」など）をヘッダと誤認すると、
+    # それより前の明細が全部捨てられてしまう。
+    def _looks_like_data(r):
+        """品名と金額らしきセルを併せ持つ、明細とみなせる行か。"""
+        if not r:
+            return False
+        cells = [str(c or '').strip() for c in r]
+        if not any(cells):
+            return False
+        has_name = any(c and not re.fullmatch(r'[¥￥]?[\d,，．.\-]+円?', c) for c in cells)
+        has_amount = any(
+            c and re.fullmatch(r'[¥￥]?[\d,，．.\-]+円?', c)
+            and re.search(r'[1-9]', c)
+            for c in cells[1:]
+        )
+        return has_name and has_amount
+
+    def _is_detail_start(r):
+        """見出しの探索を打ち切るべき「本物の明細行」か。
+
+        「見積番号,12345」のようなメタ情報行や、表の上に置かれた
+        「御見積金額,,,203170,」で打ち切ると見出しを見失い、全列が
+        ずれたうえ合計行が明細として二重計上されてしまう。
+        """
+        if not _looks_like_data(r):
+            return False
+        cells = [str(c or '').strip() for c in r]
+        if sum(1 for c in cells if c) < 3:
+            return False          # 2セルだけの行はメタ情報
+        return not _is_total_row_name(cells[0])
+
+    # 見出しは表の先頭付近にしかない。8行より下にある「品名,…」は
+    # 2ページ目のページ見出しなので見出しとして採らない
+    # （採ると、それより上の明細が丸ごと捨てられてしまう）。
+    _HEADER_SCAN = 8
     header_idx = 0
-    for i, row in enumerate(rows):
-        if row and '品名' in row[0]:
-            header_idx = i + 1  # 次行からデータ
+    for i, row in enumerate(rows[:_HEADER_SCAN]):
+        if _is_detail_start(row):
             break
+        if row and '品名' in (row[0] or ''):
+            header_idx = i + 1
+            break
+        if _looks_like_header(row):
+            header_idx = i + 1
+            break
+
+    # 見出し行があれば列名で対応付ける。位置決め打ちだと、先頭に「No」列が
+    # 付いただけで全列が1つずれ、部品代が工賃に化けてしまう。
+    _colmap = _build_column_map(rows[header_idx - 1]) if header_idx > 0 else {}
+
+    _claimed = set(_colmap.values())
+
+    def _cell(row, key, pos):
+        # 見出しに無い項目は位置で補う。「部品、油脂」「金額（部品）」の
+        # ように別名表に無い列名だと、補わなければ部品代が全額消える。
+        # ただし他のキーが既に確保した列（品名・区分など）は横取りしない。
+        idx = _colmap.get(key)
+        if idx is None:
+            idx = pos if (pos is not None and pos not in _claimed) else None
+        return row[idx].strip() if idx is not None and 0 <= idx < len(row) else ''
 
     row_idx = 0
     for row in rows[header_idx:]:
@@ -2867,17 +2861,48 @@ def parse_csv_to_items(csv_text: str) -> list:
         while len(row) < 6:
             row.append('')
 
-        name      = row[0].strip()
-        category  = row[1].strip() if len(row) > 1 else ''
-        qty       = safe_int(row[2].strip(), 1) if len(row) > 2 else 1
-        parts_amt = safe_int(row[3].strip()) if len(row) > 3 else 0
-        wage_amt  = safe_int(row[4].strip()) if len(row) > 4 else 0
-        part_no   = row[5].strip() if len(row) > 5 else ''
+        # 2ページ目以降で繰り返される見出し行が、品名「品名」の
+        # 0円明細としてNEOに書き込まれるのを防ぐ
+        if _looks_like_header(row) or (row[0] or '').strip() == '品名':
+            continue
+
+        name      = _cell(row, 'name', 0)
+        category  = _cell(row, 'work_code', 1)
+        qty       = safe_int(_cell(row, 'quantity', 2), 1)
+        parts_amt = safe_int(_cell(row, 'parts_amount', 3))
+        wage_amt  = safe_int(_cell(row, 'wage', 4))
+        part_no   = _cell(row, 'part_no', 5)
+        # 見出しに「工数」「指数」列があれば取り込む（従来は常に空だった）
+        index_val = _cell(row, 'index_value', None)
 
         if not name:
             continue
-        # 合計・小計行を除外
-        if any(kw in name for kw in ('合計', '小計', '消費税', '税額', '値引', '総額')):
+        # 表の後ろにAIが書き足す説明文（「上記のとおりです。」など）は明細ではない。
+        # 金額も数量も品番も無く、1セルだけの文章行に限って落とす。
+        if (parts_amt == 0 and wage_amt == 0 and not part_no
+                and sum(1 for c in row if str(c or '').strip()) == 1
+                and (re.search(r'[。．!！?？]', name)
+                     or re.search(r'(です|ます|ください|とおり|下さい)', name)
+                     or len(name) > 24)):
+            _trailer_notes.append(name.strip())
+            continue
+        # アプリ自身のプロンプトが末尾に付ける差異メモは明細ではない
+        _nm_s = name.strip()
+        if (re.fullmatch(r'(部品|工賃)相違[\s\u3000\d,，円]*', _nm_s)
+                or (re.match(r'^(部品|工賃)相違', _nm_s)
+                    and parts_amt == 0 and wage_amt == 0)):
+            _trailer_notes.append(','.join(c.strip() for c in row if c.strip()))
+            continue
+        # 集計行の除外。
+        # 「合計」「小計(税抜)」「税込合計」「合計金額」「【合計】」「小計①」など、
+        # 装飾を取り除くと集計語で終わる行は、金額があっても明細ではない。
+        # 一方「合計表示灯」「総額メーター」「温度計」のような正当な品名は
+        # 集計語で終わらないので残る。
+        if _is_total_row_name(name):
+            continue
+        # 「値引」単独で金額が無い行だけ落とす（金額のある値引きは明細として残す）
+        _nm = re.sub(r'[\s\u3000]', '', name)
+        if _nm in ('値引', '値引き') and parts_amt == 0 and wage_amt == 0:
             continue
         if qty < 1:
             qty = 1
@@ -2895,12 +2920,12 @@ def parse_csv_to_items(csv_text: str) -> list:
             'parts_amount': parts_amt,
             'wage':         wage_amt,
             'line_total':   parts_amt + wage_amt,
-            'index_value':  '',
+            'index_value':  index_val,
             'raw_text':     ','.join(row),
             'row_id':       f'p1_r{row_idx:03d}',
             'row_bbox':     {'x1': 0, 'y1': 0, 'x2': 1000, 'y2': 50},
         })
-    return items
+    return (items, _trailer_notes) if return_notes else items
 
 
 def parse_detail_json_to_items(json_text: str, page_num: int = 1) -> list:
@@ -3092,258 +3117,6 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
             raise ValueError(f"Gemini API呼び出しに失敗しました: {str(last_error)}")
 
 
-# ============================================================
-# チャンク分割解析: 表領域を縦に分割して各チャンクをAIで解析
-# ============================================================
-
-def analyze_estimate_chunk(api_key, chunk_bytes, mime_type, model_name,
-                           page_num, chunk_idx, total_chunks,
-                           y_start_ratio=0.0, y_end_ratio=1.0,
-                           table_top_ratio=0.0, table_bot_ratio=1.0):
-    """
-    チャンク単位で明細行を解析する（analyze_estimate_single のチャンク版）。
-    y_start_ratio / y_end_ratio : チャンクが表領域内の何%にあたるか（row_bbox補正用）
-    """
-    chunk_instruction = (
-        f'【チャンク解析】ページ {page_num} の明細表を縦に {total_chunks} 分割した'
-        f' {chunk_idx + 1}/{total_chunks} チャンク'
-        f'（ページ上端から {y_start_ratio*100:.0f}%〜{y_end_ratio*100:.0f}% の範囲）。\n'
-        'このチャンクに含まれる全明細行を漏れなく読み取ってください。\n'
-        'row_bbox の y1/y2 はこのチャンク画像内の縦位置（0-1000スケール）で返してください。\n'
-    )
-    prompt = _build_prompt("estimate_detail_page", chunk_instruction)
-
-    _schema_chunk = {
-        "type": "object",
-        "properties": {
-            "items": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name":          {"type": "string"},
-                        "description":   {"type": "string"},
-                        "method":        {"type": "string"},
-                        "quantity":      {"type": "integer"},
-                        "parts_amount":  {"type": "integer"},
-                        "wage":          {"type": "integer"},
-                        "line_total":    {"type": "integer"},
-                        "part_no":       {"type": "string"},
-                        "work_code":     {"type": "string"},
-                        "raw_text":      {"type": "string"},
-                        "row_id":        {"type": "string"},
-                        "row_bbox": {
-                            "type": "object",
-                            "properties": {
-                                "x1": {"type": "integer"},
-                                "y1": {"type": "integer"},
-                                "x2": {"type": "integer"},
-                                "y2": {"type": "integer"},
-                            },
-                        },
-                    },
-                },
-            },
-            "discount_amount": {"type": "integer"},
-        },
-    }
-
-    from google.genai import types
-    client = _get_genai_client(api_key)
-    file_part = types.Part.from_bytes(data=chunk_bytes, mime_type=mime_type)
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=[prompt, file_part],
-                config={
-                    "temperature": 0.0,
-                    "max_output_tokens": 32768,
-                    "response_mime_type": "application/json",
-                    "response_schema": _schema_chunk,
-                },
-            )
-            if response.text and response.text.strip():
-                try:
-                    res = json.loads(response.text)
-                except Exception:
-                    res = extract_json_from_response(response.text) or {}
-                # row_bbox の y座標をページ全体座標系に変換（0-1000スケール）
-                table_range = max(0.01, table_bot_ratio - table_top_ratio)
-                chunk_range = max(0.01, y_end_ratio - y_start_ratio)
-                for it in res.get('items', []):
-                    it['_chunk_idx']    = chunk_idx
-                    it['_chunk_y_start'] = y_start_ratio
-                    it['_chunk_y_end']   = y_end_ratio
-                    bbox = it.get('row_bbox')
-                    if bbox and isinstance(bbox, dict):
-                        # チャンク内y(0-1000) → ページ内y(0-1000)への変換
-                        def _conv_y(vy):
-                            # チャンク内相対位置 → 表領域内相対位置 → ページ全体相対位置
-                            in_chunk  = vy / 1000.0           # 0-1
-                            in_table  = y_start_ratio + in_chunk * chunk_range   # 0-1
-                            in_page   = table_top_ratio + in_table * table_range # 0-1
-                            return max(0, min(1000, int(in_page * 1000)))
-                        it['row_bbox'] = {
-                            'x1': bbox.get('x1', 0),
-                            'y1': _conv_y(bbox.get('y1', 0)),
-                            'x2': bbox.get('x2', 1000),
-                            'y2': _conv_y(bbox.get('y2', 0)),
-                        }
-                return res
-            if attempt < 2:
-                import time; time.sleep(1)
-        except Exception as e:
-            err = str(e)
-            if _is_model_unavailable_error(err):
-                _mark_model_unavailable(api_key, model_name)
-                raise RuntimeError(f"モデル '{model_name}' は利用できません（提供終了）。") from e
-            if '429' in err or 'RESOURCE_EXHAUSTED' in err:
-                _quota_exhausted_set().add(model_name)
-                raise ValueError(f"モデル '{model_name}' クォータ超過") from e
-            if attempt < 2:
-                import time; time.sleep(1)
-    return {"items": [], "discount_amount": 0}
-
-
-def merge_chunk_items(chunk_results, page_num):
-    """
-    複数チャンクの items を結合し、重複行を除去して page番号を付与して返す。
-    重複判定（3段階）:
-      1. raw_text 完全一致（OCR原文が同一 → 確実な重複）
-      2. 正規化name(半角化) + (parts, wage) 一致（全角/半角表記ゆれを吸収）
-      3. 絶対Y座標近傍 + 合計金額一致（チャンク境界部のOCR揺れを吸収）
-    """
-    all_items = []
-    seen_raw  = set()       # raw_text ベース
-    seen_norm = set()       # (normalized_name, parts, wage) ベース
-    seen_abs_y = []         # (abs_y, amount_total) リスト（近傍チェック用）
-    total_discount = 0
-    Y_THRESHOLD = 0.05      # ページ高さの 5% 以内 = 同一行とみなす許容誤差
-
-    for chunk_res in chunk_results:
-        total_discount += safe_int(chunk_res.get('discount_amount', 0))
-        for it in chunk_res.get('items', []):
-            name  = str(it.get('name', '')).strip()
-            parts = safe_int(it.get('parts_amount', 0))
-            wage  = safe_int(it.get('wage', 0))
-            # 完全空行はスキップ
-            if not name and parts == 0 and wage == 0:
-                continue
-            has_amount = (parts > 0 or wage > 0)
-            raw        = str(it.get('raw_text', '')).strip()
-            norm_name  = to_halfwidth_katakana(name)
-
-            # ── 重複チェック1: raw_text ──────────────────────────
-            if raw and has_amount:
-                if raw in seen_raw:
-                    continue
-
-            # ── 重複チェック2: 正規化name + (parts, wage) ────────
-            norm_key = (norm_name, parts, wage)
-            if has_amount and norm_key in seen_norm:
-                continue
-
-            # ── 重複チェック3: 絶対Y座標近傍 + 合計一致 ──────────
-            # チャンクローカル座標(0-1000)→ページ絶対座標(0.0-1.0)に変換して比較
-            bbox       = it.get('row_bbox', {})
-            local_y1   = float(bbox.get('y1', -1))
-            chunk_y_s  = float(it.get('_chunk_y_start', 0))
-            chunk_y_e  = float(it.get('_chunk_y_end', 1))
-            amt_total  = parts + wage
-            is_y_dup   = False
-            if local_y1 >= 0 and has_amount:
-                abs_y = chunk_y_s + (local_y1 / 1000.0) * (chunk_y_e - chunk_y_s)
-                for prev_y, prev_amt in seen_abs_y:
-                    if abs(abs_y - prev_y) <= Y_THRESHOLD and prev_amt == amt_total:
-                        is_y_dup = True
-                        break
-                if is_y_dup:
-                    continue
-
-            # ── 重複なし → 登録 ──────────────────────────────────
-            if raw and has_amount:
-                seen_raw.add(raw)
-            if has_amount:
-                seen_norm.add(norm_key)
-            if local_y1 >= 0 and has_amount:
-                seen_abs_y.append((abs_y, amt_total))
-
-            it['page'] = page_num
-            all_items.append(it)
-    return all_items, total_discount
-
-
-def analyze_page_with_chunks(api_key, page_bytes, mime_type, model_name,
-                              page_num, total_pages, n_chunks=3):
-    """
-    1ページ分の画像を表領域検出 → チャンク分割 → 各チャンク解析 → マージ するパイプライン。
-    JPEG画像でない場合は analyze_estimate_single にフォールバック。
-    """
-    # JPEG/PNG 画像でない場合はフォールバック
-    if mime_type not in ('image/jpeg', 'image/png'):
-        return analyze_estimate_single(api_key, page_bytes, mime_type, model_name, page_num, total_pages)
-
-    # ① 表領域を検出してクロップ
-    try:
-        table_bytes, table_top, table_bot = detect_table_region(page_bytes)
-    except Exception:
-        table_bytes, table_top, table_bot = page_bytes, 0.0, 1.0
-
-    # ② 縦分割（チャンク数は行数に応じて調整: 小さい画像は分割不要）
-    try:
-        from PIL import Image
-        _pil = Image.open(io.BytesIO(table_bytes))
-        _h = _pil.height
-        actual_chunks = n_chunks if _h >= 600 else (2 if _h >= 300 else 1)
-    except Exception:
-        actual_chunks = n_chunks
-
-    chunks = split_into_vertical_chunks(table_bytes, n_chunks=actual_chunks, overlap_ratio=0.02)
-
-    # ③ 各チャンクをAPIで解析（並列処理）
-    def _analyze_one_chunk(args):
-        ci, (cb, y_start, y_end) = args
-        try:
-            return analyze_estimate_chunk(
-                api_key, cb, 'image/jpeg', model_name,
-                page_num, ci, actual_chunks,
-                y_start_ratio=y_start, y_end_ratio=y_end,
-                table_top_ratio=table_top, table_bot_ratio=table_bot,
-            )
-        except Exception as e:
-            import sys
-            print(f"[WARN] チャンク{ci+1}解析失敗 (page={page_num}): {e}", file=sys.stderr)
-            return {"items": [], "discount_amount": 0}
-
-    chunk_results = []
-    if actual_chunks == 1:
-        # チャンク分割不要: ページ全体画像（クロップなし）をシンプルプロンプトで解析
-        chunk_results = [analyze_estimate_single(
-            api_key, page_bytes, 'image/jpeg', model_name, page_num, total_pages
-        )]
-    else:
-        with ThreadPoolExecutor(max_workers=min(actual_chunks, 3)) as _cx:
-            chunk_results = list(_cx.map(_analyze_one_chunk, enumerate(chunks)))
-
-    # ④ マージして重複除去
-    merged_items, merged_discount = merge_chunk_items(chunk_results, page_num)
-
-    # ⑤ 結果が空ならフォールバック
-    if not merged_items:
-        return analyze_estimate_single(api_key, page_bytes, mime_type, model_name, page_num, total_pages)
-
-    return {
-        "items":           merged_items,
-        "discount_amount": merged_discount,
-        "confidence":      0.85,
-        "_chunked":        True,
-        "_chunk_count":    actual_chunks,
-    }
-
-
-
-
 def validate_and_correct_items(items):
     """
     辞書ベースバリデーション: AIの誤分類を後処理で修正する。
@@ -3505,54 +3278,6 @@ def extract_special_items(items, existing_sp=0, existing_exempt=0):
     return list(items), 0, 0
 
 
-def deduplicate_page_items(all_items):
-    """
-    複数ページ分割時のページ境界での重複行を除去する。
-    同一品名＋同一金額の行がページ境界付近で連続する場合、重複とみなして除去。
-    """
-    if len(all_items) <= 1:
-        return all_items
-    deduped = [all_items[0]]
-    for i in range(1, len(all_items)):
-        curr = all_items[i]
-        prev = deduped[-1]
-        # 品名・部品金額・工賃が全て一致する場合は重複と判定
-        same_name  = str(curr.get('name', '')).strip() == str(prev.get('name', '')).strip()
-        same_parts = safe_int(curr.get('parts_amount', 0)) == safe_int(prev.get('parts_amount', 0))
-        same_wage  = safe_int(curr.get('wage', 0)) == safe_int(prev.get('wage', 0))
-        if same_name and same_parts and same_wage and str(curr.get('name', '')).strip():
-            continue  # 重複 → スキップ
-        deduped.append(curr)
-    return deduped
-
-
-def deduplicate_page_boundary_items(all_items, boundary_indices):
-    """
-    ページ境界付近でのみ重複行を除去する。
-    同一ページ内の重複行はPDF原本通り全て保持する（ユーザー指定）。
-    boundary_indices: 各ページの先頭インデックスのリスト
-    """
-    if len(all_items) <= 1:
-        return all_items
-    boundary_set = set(boundary_indices)
-    result = []
-    skip_next = False
-    for i, item in enumerate(all_items):
-        if skip_next:
-            skip_next = False
-            continue
-        # このインデックスがページ境界（ページ先頭）かつ前の行と内容が同じなら除去
-        if i in boundary_set and result:
-            prev = result[-1]
-            same_name  = str(item.get('name', '')).strip() == str(prev.get('name', '')).strip()
-            same_parts = safe_int(item.get('parts_amount', 0)) == safe_int(prev.get('parts_amount', 0))
-            same_wage  = safe_int(item.get('wage', 0))         == safe_int(prev.get('wage', 0))
-            if same_name and same_parts and same_wage and str(item.get('name', '')).strip():
-                continue  # ページ境界重複 → スキップ
-        result.append(item)
-    return result
-
-
 def global_dedup_items(items):
     """
     全ページ横断の重複行除去。
@@ -3690,10 +3415,10 @@ def build_estimate_summary(items, short_parts_wage, pdf_parts_total,
     basis = user_tax_basis if user_tax_basis in ('tax_inclusive', 'tax_exclusive') else 'tax_exclusive'
 
     if basis == 'tax_inclusive':
-        norm_parts = round(calc_parts / (1 + TAX_RATE))
-        norm_wage  = round(calc_wage  / (1 + TAX_RATE))
-        norm_sp    = round(sp         / (1 + TAX_RATE))
-        norm_disc  = round(disc       / (1 + TAX_RATE))
+        norm_parts = jpy_round(calc_parts / (1 + TAX_RATE))
+        norm_wage  = jpy_round(calc_wage  / (1 + TAX_RATE))
+        norm_sp    = jpy_round(sp         / (1 + TAX_RATE))
+        norm_disc  = jpy_round(disc       / (1 + TAX_RATE))
     else:
         norm_parts = calc_parts
         norm_wage  = calc_wage
@@ -3701,7 +3426,7 @@ def build_estimate_summary(items, short_parts_wage, pdf_parts_total,
         norm_disc  = disc
 
     TOLERANCE = 50  # 円
-    reverse_grand = round((norm_parts + norm_wage + norm_sp - norm_disc) * (1 + TAX_RATE))
+    reverse_grand = jpy_round((norm_parts + norm_wage + norm_sp - norm_disc) * (1 + TAX_RATE))
     reverse_match = abs(reverse_grand - grand) <= TOLERANCE if grand > 0 else False
 
     return {
@@ -4621,16 +4346,54 @@ def main():
             help="コントラスト・シャープネスを強化してFAX品質の画像を読みやすくします。ラスタライズ有効時のみ機能します。"
         )
         st.markdown("---")
-        st.header("🛡️ 保険情報")
-        policy_no       = st.text_input("証券番号",  value=st.session_state.get('policy_no', ''))
-        contractor_name = st.text_input("契約者名", value=st.session_state.get('contractor_name', ''))
-        st.session_state['policy_no']       = policy_no
-        st.session_state['contractor_name'] = contractor_name
+        st.header("🛡️ 事故・保険情報")
+        st.caption("コグニセブンの受付／保険欄に書き込まれます。空欄はテンプレートの値を維持します。")
+        # ウィジェットキーに連番を付ける。Streamlit ではキーを del しても
+        # ブラウザが直前の値を送り直すため入力が復活し、前のお客様の事故情報が
+        # 次の見積に混入する。連番を進めれば別のウィジェットになり確実に空になる。
+        _fseq = st.session_state.setdefault('form_seq', 0)
+        accept_no       = st.text_input("事故受付番号", value=st.session_state.get('accept_no', ''),
+                                        key=f'accept_no_input_{_fseq}', placeholder="例: 2026-001234",
+                                        max_chars=37, help="全角なら18文字までNEOに入ります")
+        accident_date   = st.text_input("事故日（YYYYMMDD）", value=st.session_state.get('accident_date', ''),
+                                        key=f'accident_date_input_{_fseq}', placeholder="例: 20260901")
+        policy_no       = st.text_input("証券番号", value=st.session_state.get('policy_no', ''),
+                                        key=f'policy_no_input_{_fseq}', max_chars=20, help="全角なら10文字までNEOに入ります")
+        contractor_name = st.text_input("契約者名", value=st.session_state.get('contractor_name', ''),
+                                        key=f'contractor_name_input_{_fseq}', max_chars=20, help="全角なら10文字までNEOに入ります")
+        agency_name     = st.text_input("保険会社・代理店名", value=st.session_state.get('agency_name', ''),
+                                        key=f'agency_name_input_{_fseq}', max_chars=20, help="全角なら10文字までNEOに入ります")
+        adjuster_name   = st.text_input("アジャスター名", value=st.session_state.get('adjuster_name', ''),
+                                        key=f'adjuster_name_input_{_fseq}', max_chars=20, help="全角なら10文字までNEOに入ります")
+        with st.expander("入庫・出庫・修理日数", expanded=False):
+            garage_in_date  = st.text_input("入庫日（YYYYMMDD）", value=st.session_state.get('garage_in_date', ''),
+                                            key=f'garage_in_input_{_fseq}')
+            garage_out_date = st.text_input("出庫日（YYYYMMDD）", value=st.session_state.get('garage_out_date', ''),
+                                            key=f'garage_out_input_{_fseq}')
+            repair_days     = st.number_input("修理日数", value=st.session_state.get('repair_days', 0),
+                                              min_value=0, step=1, key=f'repair_days_input_{_fseq}')
+            note1           = st.text_area("備考", value=st.session_state.get('note1', ''),
+                                           key=f'note1_input_{_fseq}', height=70, max_chars=40, help="全角なら20文字までNEOに入ります")
+        # 日付は YYYYMMDD / YYYY-MM-DD / YYYY/MM/DD を受け付ける。
+        # 解釈できない入力は書き込まれないので、その場で知らせる。
+        for _dlabel, _dval in (('事故日', accident_date), ('入庫日', garage_in_date),
+                               ('出庫日', garage_out_date)):
+            if _dval and not _normalize_date8(_dval):
+                st.warning(f"⚠️ {_dlabel}「{_dval}」は日付として読み取れません。"
+                           "YYYYMMDD で入力してください（このままではNEOに書き込まれません）。")
+        for _k, _v in [
+            ('accept_no', accept_no), ('accident_date', accident_date),
+            ('policy_no', policy_no), ('contractor_name', contractor_name),
+            ('agency_name', agency_name), ('adjuster_name', adjuster_name),
+            ('garage_in_date', garage_in_date), ('garage_out_date', garage_out_date),
+            ('repair_days', repair_days), ('note1', note1),
+        ]:
+            st.session_state[_k] = _v
         st.markdown("---")
         st.header("💰 費用（Expense）")
-        exp_towing    = st.number_input("レッカー費用（税抜）",  value=st.session_state.get('exp_towing', 0),    min_value=0, step=1000, key='exp_towing_input')
-        exp_rental    = st.number_input("代車費用（税抜）",      value=st.session_state.get('exp_rental', 0),    min_value=0, step=1000, key='exp_rental_input')
-        exp_exempt    = st.number_input("非課税費用",            value=st.session_state.get('exp_exempt', 0),    min_value=0, step=1000, key='exp_exempt_input')
+        exp_towing    = st.number_input("レッカー費用（税抜）",  value=st.session_state.get('exp_towing', 0),    min_value=0, step=1000, key=f'exp_towing_input_{_fseq}')
+        exp_rental    = st.number_input("代車費用（税抜）",      value=st.session_state.get('exp_rental', 0),    min_value=0, step=1000, key=f'exp_rental_input_{_fseq}')
+        exp_exempt    = st.number_input("非課税費用",            value=st.session_state.get('exp_exempt', 0),    min_value=0, step=1000, key=f'exp_exempt_input_{_fseq}')
         st.session_state['exp_towing'] = exp_towing
         st.session_state['exp_rental'] = exp_rental
         st.session_state['exp_exempt'] = exp_exempt
@@ -4663,144 +4426,6 @@ def main():
         st.markdown("---")
         st.caption(f"消費税率: {int(TAX_RATE * 100)}%（固定）")
         st.caption(f"見積日: {datetime.datetime.now().strftime('%Y/%m/%d')}（自動）")
-
-        # ── 🧠 学習データ管理 ──────────────────────────────────
-        st.markdown("---")
-        with st.expander("🧠 学習データ管理", expanded=False):
-            _err_summary = get_error_summary()
-            _total_pending = sum(s['count'] for s in _err_summary)
-
-            if _total_pending == 0:
-                st.info("訂正データはまだありません。\nSTEP③で明細を修正するとここに蓄積されます。")
-            else:
-                st.markdown(f"**未統合の訂正データ: {_total_pending}件**")
-                for _es in _err_summary:
-                    _names_str = "、".join(_es['sample_names'][:3]) if _es['sample_names'] else ""
-                    st.markdown(
-                        f"- **{_es['label']}**: {_es['count']}件"
-                        + (f"（例: {_names_str}）" if _names_str else "")
-                    )
-
-                st.markdown("---")
-                # 蓄積データ詳細
-                with st.expander("📋 訂正データ詳細", expanded=False):
-                    _all_corr = get_all_pending_corrections()
-                    if _all_corr:
-                        _corr_rows = []
-                        for _cr in _all_corr:
-                            _corr_rows.append({
-                                "日時": _cr['timestamp'][:16],
-                                "エラー種別": FEEDBACK_ERROR_TYPES.get(_cr['error_type'], _cr['error_type']),
-                                "修正前": f"{_cr['orig_name']} 部品¥{_cr['orig_parts']:,}/工賃¥{_cr['orig_wage']:,}",
-                                "修正後": f"{_cr['corr_name']} 部品¥{_cr['corr_parts']:,}/工賃¥{_cr['corr_wage']:,}",
-                                "コメント": (_cr['user_comment'] or "")[:40],
-                            })
-                        st.dataframe(pd.DataFrame(_corr_rows), use_container_width=True, hide_index=True)
-
-                st.markdown("---")
-                # マスタ統合
-                st.markdown("**プロンプトへのマスタ統合**")
-                if _total_pending < FEEDBACK_MERGE_THRESHOLD:
-                    st.caption(f"※ あと{FEEDBACK_MERGE_THRESHOLD - _total_pending}件蓄積されると統合推奨になります（現在{_total_pending}件）")
-
-                # 統合用パッチテキストを自動生成
-                # ・既に適用中のパッチを土台にする（統合のたびに過去の学習が
-                #   捨てられていたため）
-                # ・品名が空の記録や、ルール行を作れない種別だけの記録は捨てる
-                # ・件数に上限を設け、プロンプトが本文より長くならないようにする
-                _MAX_PATCH_RULES = 60
-                _existing_patch = _load_learned_hints("estimate_detail_page")
-                _existing_rules = [
-                    _ln for _ln in (_existing_patch.splitlines() if _existing_patch else [])
-                    if _ln.strip().startswith('-')
-                ]
-                _rule_lines = list(_existing_rules)
-                _comment_lines = []
-                _seen_types = set()
-                _seen_comments = set()
-                _all_corr2 = get_all_pending_corrections()
-                for _cr2 in _all_corr2:
-                    _et = _cr2['error_type']
-                    _on = (_cr2['orig_name'] or '').strip()
-                    _cn = (_cr2.get('corr_name') or '').strip()
-                    _cp = _cr2['corr_parts']
-                    _cw = _cr2['corr_wage']
-                    _cm = (_cr2['user_comment'] or "").strip()
-                    _label = _on or _cn
-                    if not _label:
-                        continue  # 品名が取れない記録からはルールを作れない
-                    _key = (_et, _label)
-                    if _key in _seen_types:
-                        continue
-                    _seen_types.add(_key)
-                    _new_rule = None
-                    if _et == "column_swap":
-                        if _cp == 0 and _cw > 0:
-                            _new_rule = f"- 「{_label}」は部品列に記載されていても工賃（wage）として扱うこと"
-                        elif _cp > 0 and _cw == 0:
-                            _new_rule = f"- 「{_label}」は工賃列に記載されていても部品（parts_amount）として扱うこと"
-                    elif _et == "missed_row":
-                        _new_rule = f"- 「{_label}」のような行を見落とさないこと"
-                    elif _et == "amount_misread":
-                        _new_rule = f"- 「{_label}」の金額を正確に読み取ること（桁ずれ注意）"
-                    elif _et == "name_error" and _on and _cn and _on != _cn:
-                        _new_rule = f"- 「{_on}」は「{_cn}」と読むこと"
-                    elif _et == "quantity_error":
-                        _new_rule = f"- 「{_label}」の数量を正確に読み取ること"
-                    if not _new_rule:
-                        continue
-                    if _new_rule not in _rule_lines:
-                        _rule_lines.append(_new_rule)
-                    if _cm and _cm not in _seen_comments:
-                        _seen_comments.add(_cm)
-                        _comment_lines.append(f"  （補足: {_cm[:60]}）")
-
-                if len(_rule_lines) > _MAX_PATCH_RULES:
-                    _rule_lines = _rule_lines[-_MAX_PATCH_RULES:]
-                _auto_patch = ("\n".join(["【学習済み訂正パターン（自動生成）】"]
-                                         + _rule_lines + _comment_lines[:10])
-                               if _rule_lines else "")
-                # value と key を同時に渡すと、以降の再実行で value が無視され、
-                # 後から記録した訂正が反映されないまま統合されてしまう。
-                if st.session_state.get('_patch_auto_src') != _auto_patch:
-                    st.session_state['_patch_auto_src'] = _auto_patch
-                    st.session_state['patch_text_input'] = _auto_patch
-                _patch_text = st.text_area(
-                    "統合するプロンプトパッチ（編集可）",
-                    height=200,
-                    key="patch_text_input",
-                )
-
-                _mc1, _mc2 = st.columns(2)
-                with _mc1:
-                    if st.button("🔄 マスタ版に統合する", key="merge_patch_btn", type="primary",
-                                 disabled=(_total_pending == 0)):
-                        if _patch_text.strip():
-                            try:
-                                generate_and_save_patch(_patch_text.strip(), "estimate_detail_page")
-                            except Exception as _me:
-                                st.error(f"学習データの保存に失敗しました: {_me}")
-                            else:
-                                st.success("✅ プロンプトパッチを適用しました。次回解析から有効になります。")
-                                st.rerun()
-                        else:
-                            st.warning("パッチテキストが空です。")
-                with _mc2:
-                    if st.button("🗑 パッチを無効化", key="deactivate_patch_btn"):
-                        try:
-                            _conn = _get_feedback_db()
-                            _conn.execute("UPDATE prompt_patches SET is_active = 0")
-                            _conn.commit(); _conn.close()
-                            st.success("パッチを無効化しました。")
-                            st.rerun()
-                        except Exception as _pe:
-                            st.error(f"エラー: {_pe}")
-
-            # 現在適用中のパッチ表示
-            _current_patch = _load_learned_hints("estimate_detail_page")
-            if _current_patch:
-                with st.expander("📌 現在適用中のパッチ", expanded=False):
-                    st.code(_current_patch, language=None)
 
     # セッション状態初期化
     for key, default in [
@@ -4882,10 +4507,32 @@ def main():
             )
             if custom_neo_file:
                 _neo_bytes_read = custom_neo_file.read()
-                st.session_state['custom_neo_bytes'] = _neo_bytes_read
-                st.session_state['custom_neo_name']  = custom_neo_file.name
                 custom_neo_file.seek(0)
-                st.success(f"✅ {custom_neo_file.name} ({len(_neo_bytes_read):,} bytes)")
+                # 中身がNEOかどうかをこの場で確かめる。最後の生成時まで
+                # 気づけないと、入力をやり直す手間が大きい。
+                _tpl_ok = False
+                try:
+                    _tpl_ck = find_real_cks(_neo_bytes_read)
+                    if _tpl_ck:
+                        # CKの並びがあるだけでは不十分（"CK"を含むPDF等が通る）。
+                        # 実際に展開して明細DBが入っているところまで確かめる。
+                        _tpl_raw = decompress_neo(_neo_bytes_read, _tpl_ck)
+                        _tpl_mgmt, _tpl_entries = parse_entries(_neo_bytes_read, _tpl_ck[0])
+                        _tpl_files = extract_files(_tpl_raw, _tpl_entries)
+                        _tpl_ok = 'AnSMB.txt' in _tpl_files
+                except Exception:
+                    _tpl_ok = False
+                if not _tpl_ok:
+                    st.session_state.pop('custom_neo_bytes', None)
+                    st.session_state.pop('custom_neo_name', None)
+                    st.error(
+                        f"❌ {custom_neo_file.name} はコグニセブンのNEOファイルとして読み取れません。"
+                        "別のファイルを選択してください（デフォルトテンプレートで続行できます）。"
+                    )
+                else:
+                    st.session_state['custom_neo_bytes'] = _neo_bytes_read
+                    st.session_state['custom_neo_name']  = custom_neo_file.name
+                    st.success(f"✅ {custom_neo_file.name} ({len(_neo_bytes_read):,} bytes)")
                 st.caption("📋 テンプレートの工場名・証券番号等はそのまま引き継ぎます")
             elif st.session_state.get('custom_neo_bytes'):
                 _saved_name = st.session_state.get('custom_neo_name', 'テンプレートNEO')
@@ -4984,7 +4631,7 @@ def main():
                 "Geminiの解析結果CSVを貼り付け（ヘッダー行必須）",
                 height=180,
                 placeholder="品名,区分,数量,部品金額,工賃,部品コード\nフロントバンパー,取替,1,45000,0,\nバンパー交換工賃,取替,1,0,12000,",
-                key='csv_paste_area',
+                key=f"csv_paste_area_{st.session_state.get('csv_area_seq', 0)}",
                 value=st.session_state.get('_csv_paste_saved', ''),
             )
         with _csv_col2:
@@ -4995,17 +4642,6 @@ def main():
                 key='csv_file_upload',
                 label_visibility='collapsed',
             )
-            if st.session_state.get('csv_mode') and st.session_state.get('csv_items'):
-                _p = sum(safe_int(it.get('parts_amount', 0)) for it in st.session_state['csv_items'])
-                _w = sum(safe_int(it.get('wage', 0)) for it in st.session_state['csv_items'])
-                st.success(f"✅ {len(st.session_state['csv_items'])}行 取込済")
-                st.caption(f"部品: ¥{_p:,} / 工賃: ¥{_w:,}")
-                if st.button("🗑️ クリア", key='csv_clear_btn'):
-                    st.session_state.pop('csv_items', None)
-                    st.session_state.pop('csv_mode', None)
-                    st.session_state.pop('_csv_paste_saved', None)
-                    st.rerun()
-
         _csv_text = ''
         if _csv_file:
             try:
@@ -5018,6 +4654,15 @@ def main():
                         continue
             except Exception:
                 pass
+            if not _csv_text:
+                st.error(
+                    "❌ CSVファイルの文字コードを判別できません。"
+                    "UTF-8 または Shift_JIS で保存し直してください"
+                    "（Excelの「Unicodeテキスト」形式は非対応です）。"
+                )
+            elif not _csv_text.strip():
+                st.error("❌ CSVファイルが空です。")
+                _csv_text = ''
         elif _csv_paste and _csv_paste.strip():
             _csv_text = _csv_paste.strip()
 
@@ -5029,7 +4674,9 @@ def main():
             st.session_state.pop('_csv_paste_saved', None)
 
         if _csv_text:
-            _preview_items = parse_csv_to_items(_csv_text)
+            _preview_items, _csv_notes = parse_csv_to_items(_csv_text, return_notes=True)
+            for _note in _csv_notes[:3]:
+                st.warning(f"⚠️ 見積書との差異が記録されています: {_note}")
             if _preview_items:
                 st.success(f"✅ {len(_preview_items)}行 読み込み完了 — 部品: ¥{sum(safe_int(it.get('parts_amount',0)) for it in _preview_items):,} / 工賃: ¥{sum(safe_int(it.get('wage',0)) for it in _preview_items):,}")
                 st.session_state['csv_items'] = _preview_items
@@ -5039,6 +4686,21 @@ def main():
                 st.error("❌ CSVの読み込みに失敗しました。1行目にヘッダー（品名,区分,数量,部品金額,工賃,部品コード）が必要です。")
                 st.session_state.pop('csv_items', None)
                 st.session_state.pop('csv_mode', None)
+
+        # クリアは取り込みの後ろに置く。前に置くと、貼り付けた直後の描画では
+        # まだ csv_items が無いためボタンが1回遅れて出る。
+        if st.session_state.get('csv_mode') and st.session_state.get('csv_items'):
+            if st.button("🗑️ 取り込みをクリア", key='csv_clear_btn'):
+                st.session_state.pop('csv_items', None)
+                st.session_state.pop('csv_mode', None)
+                st.session_state.pop('_csv_paste_saved', None)
+                # 貼り付け欄も空にしないと、ブラウザが直前の値を送り直して
+                # 同じ実行内で再取込され、クリアが効かない。キーを消すだけ
+                # では戻ってくるので、版番号を上げて別ウィジェットにする。
+                _seq = st.session_state.get('csv_area_seq', 0)
+                st.session_state.pop(f'csv_paste_area_{_seq}', None)
+                st.session_state['csv_area_seq'] = _seq + 1
+                st.rerun()
 
         # ── PDF見積 → NEO 自動変換 ──────────────────────
         st.markdown("---")
@@ -5081,6 +4743,14 @@ def main():
                 st.error("❌ PDFからNEOを生成できませんでした。")
                 for _w in (_p2n_res.get('warnings') or [])[:5]:
                     st.caption(f"・{_w}")
+            elif not (_p2n_res.get('items') or []):
+                st.error(
+                    "❌ 見積書から明細を1行も読み取れませんでした。"
+                    "スキャン画像で文字が読めない、APIのクォータ超過、"
+                    "対応していない書式のいずれかが考えられます。"
+                )
+                for _w in (_p2n_res.get('warnings') or [])[:5]:
+                    st.caption(f"・{_w}")
             else:
                 _p2n_items = _p2n_res.get('items') or []
                 _p2n_parts = sum(safe_int(it.get('parts_amount', 0)) for it in _p2n_items)
@@ -5089,6 +4759,9 @@ def main():
                     f"✅ 解析完了 — {len(_p2n_items)}行 ／ "
                     f"部品 ¥{_p2n_parts:,} ／ 工賃 ¥{_p2n_wage:,}"
                 )
+                # 車検証OCRの失敗など、成功扱いでも伝えるべき警告がある
+                for _w in (_p2n_res.get('warnings') or [])[:5]:
+                    st.warning(f"⚠️ {_w}")
                 _p2n_v = _p2n_res.get('verify') or {}
                 if _p2n_v.get('count_match') and _p2n_v.get('total_match'):
                     st.caption("🔍 検証OK: 生成NEOの明細件数と部品金額（税抜）がPDFと一致しました。")
@@ -5194,14 +4867,19 @@ def main():
             # PDF→NEO変換で読み取った車両情報があれば引き継ぐ（車検証未添付時）
             _p2n_vi = st.session_state.get('pdf2neo_vehicle_info')
             if _p2n_vi and not vehicle_bytes:
-                vehicle_data = dict(_p2n_vi)
+                vehicle_data = {k: v for k, v in dict(_p2n_vi).items() if k != '_error'}
             if vehicle_bytes:
                 with st.spinner("🔍 車検証を解析中..."):
                     try:
                         vehicle_mime = get_mime_type(vehicle_name) if vehicle_bytes else None
                         vehicle_data = analyze_vehicle_registration(api_key, vehicle_bytes, vehicle_mime) or {}
                     except Exception as _veh_err:
-                        st.warning(f"⚠️ 車検証OCRに失敗しました（{str(_veh_err)[:60]}）。車両情報なしで続行します。")
+                        vehicle_data = {'_error': str(_veh_err)[:120]}
+                    if vehicle_data.get('_error'):
+                        st.warning(
+                            f"⚠️ 車検証を読み取れませんでした（{vehicle_data['_error']}）。"
+                            "車両情報は空のまま進みます。ステップ③で手入力できます。"
+                        )
                         vehicle_data = {}
             st.session_state['vehicle_data'] = vehicle_data
             # CSVアイテムをestimate_dataとして格納
@@ -5221,6 +4899,9 @@ def main():
                 '_vehicle_info':    {},
                 '_repair_shop_name': '',
                 '_csv_import':      True,
+                # CSVは貼り付けた内容がそのまま正なので、PDFとの照合や
+                # 逆算チェックは対象外。以前は必ず不一致の警告が出ていた。
+                '_reverse_match':   True,
             }
             if _is_tax_incl_csv:
                 st.info("💴 税込モード: CSVの金額は税込みとして処理されます")
@@ -5269,9 +4950,14 @@ def main():
                         _use_fax, _use_raster, _use_enhance, _enable_sc
                     )
                     try:
-                        vehicle_data = fut_vehicle.result()
+                        vehicle_data = fut_vehicle.result() or {}
                     except Exception as _veh_err:
-                        st.warning(f"⚠️ 車検証OCR失敗（{str(_veh_err)[:60]}）。車両情報なしで続行します。")
+                        vehicle_data = {'_error': str(_veh_err)[:120]}
+                    if vehicle_data.get('_error'):
+                        st.warning(
+                            f"⚠️ 車検証を読み取れませんでした（{vehicle_data['_error']}）。"
+                            "車両情報は空のまま進みます。ステップ③で手入力できます。"
+                        )
                         vehicle_data = {}
                     progress.progress(40, text="✅ 車検証の解析完了、見積書を処理中...")
                     try:
@@ -5283,7 +4969,13 @@ def main():
             elif vehicle_bytes:
                 # 車検証のみ
                 progress.progress(10, text="🔍 車検証を解析中...")
-                vehicle_data  = analyze_vehicle_registration(api_key, vehicle_bytes, vehicle_mime)
+                vehicle_data  = analyze_vehicle_registration(api_key, vehicle_bytes, vehicle_mime) or {}
+                if vehicle_data.get('_error'):
+                    st.warning(
+                        f"⚠️ 車検証を読み取れませんでした（{vehicle_data['_error']}）。"
+                        "車両情報は空のまま進みます。ステップ③で手入力できます。"
+                    )
+                    vehicle_data = {}
                 estimate_data = None
             else:
                 # 見積書のみ（車検証なし）— 逐次解析でプログレス更新可能
@@ -5633,8 +5325,10 @@ def main():
             # 車両情報（修正可能なフォーム）
             col1, col2 = st.columns(2)
             with col1:
-                v_customer = st.text_input("使用者名",    value=safe_str(vehicle_data.get('customer_name', '')),    key='v_customer')
-                v_owner    = st.text_input("所有者名",    value=safe_str(vehicle_data.get('owner_name', '')),       key='v_owner')
+                v_customer = st.text_input("使用者名",    value=safe_str(vehicle_data.get('customer_name', '')),    key='v_customer',
+                                           help="コグニセブンの列幅の都合で、全角10文字（20バイト）までがNEOに入ります")
+                v_owner    = st.text_input("所有者名",    value=safe_str(vehicle_data.get('owner_name', '')),       key='v_owner',
+                                           help="全角10文字（20バイト）までNEOに入ります")
                 v_postal   = st.text_input("郵便番号",    value=safe_str(vehicle_data.get('postal_no', '')),        key='v_postal')
                 v_pref     = st.text_input("都道府県",    value=safe_str(vehicle_data.get('prefecture', '')),       key='v_pref')
                 v_muni     = st.text_input("市区町村",    value=safe_str(vehicle_data.get('municipality', '')),     key='v_muni')
@@ -5645,7 +5339,8 @@ def main():
                 v_biz    = st.text_input("登録番号 かな",   value=safe_str(vehicle_data.get('car_reg_business', '')),   key='v_biz')
                 v_serial = st.text_input("登録番号 一連番号", value=safe_str(vehicle_data.get('car_reg_serial', '')),    key='v_serial')
                 v_csn    = st.text_input("車台番号",       value=safe_str(vehicle_data.get('car_serial_no', '')),       key='v_csn')
-                v_carname = st.text_input("車名",          value=safe_str(vehicle_data.get('car_name', '')),             key='v_carname')
+                v_carname = st.text_input("車名",          value=safe_str(vehicle_data.get('car_name', '')),             key='v_carname',
+                                          help="全角25文字（50バイト）までNEOに入ります")
             col3, col4, col5 = st.columns(3)
             with col3:
                 v_km      = st.number_input("走行距離 (km)", value=safe_int(vehicle_data.get('kilometer', 0)), min_value=0, step=1000, key='v_km')
@@ -5654,8 +5349,42 @@ def main():
             with col5:
                 v_regdate = st.text_input("初度登録年月 (YYYYMM00)", value=safe_str(vehicle_data.get('car_reg_date', '')), key='v_regdate')
 
+            # 列幅を超えた分は無言で切り捨てられ、画面には全文が残るため
+            # ユーザーは気づけない。実際に切られる項目だけを知らせる。
+            for _lbl, _val, _w in (
+                ('使用者名',   v_customer, _CUST_WIDTH['UserName']),
+                ('所有者名',   v_owner,    _CUST_WIDTH['OwnerName']),
+                ('郵便番号',   v_postal,   _CUST_WIDTH['PostalNo']),
+                ('市区町村',   v_muni,     _CUST_WIDTH['Municipality']),
+                ('その他住所', v_addr,     _CUST_WIDTH['AddressOther1']),
+                ('車台番号',   v_csn,      _CUST_WIDTH['CarSerialNo']),
+                ('車名',       v_carname,  _CAR_WIDTH['CarName']),
+            ):
+                _cut = cp932_trim(_val, _w)
+                if _val and _cut != safe_str(_val):
+                    st.warning(
+                        f"⚠️ {_lbl}はコグニセブンの列幅（{_w}バイト＝全角{_w // 2}文字）を"
+                        f"超えています。NEOには「{_cut}」までしか入りません。"
+                        "短い表記に直してください。")
+
+            # 読み取れない日付は黙って捨てられる（または和暦の組み立てで
+            # 落ちる）ので、事故日と同じように画面で知らせる。
+            for _lbl, _val, _norm, _hint in (
+                ('有効期限', v_term, _normalize_date8, 'YYYYMMDD（例: 20280315）'),
+                ('初度登録年月', v_regdate, _normalize_ym8, 'YYYYMM00（例: 20190300）'),
+            ):
+                if _val and not _norm(_val):
+                    st.warning(f"⚠️ {_lbl}「{_val}」は日付として読み取れません。"
+                               f"{_hint} の形式で入力してください。"
+                               "このままでは NEO に書き込まれません。")
+
             # 車両詳細情報
             st.markdown('<div class="section-title" style="margin-top:16px">🔧 車両詳細</div>', unsafe_allow_html=True)
+            st.caption(
+                "※ 型式・エンジン型式・車両重量・排気量は、コグニセブンのNEOに対応する"
+                "保存先が無いため参考表示です（ファイルには書き込まれません）。"
+                "車体の色・カラーコード・トリムコード・型式指定番号・類別区分番号は書き込まれます。"
+            )
             dc1, dc2, dc3 = st.columns(3)
             with dc1:
                 v_model     = st.text_input("型式",         value=safe_str(vehicle_data.get('car_model', '')),              key='v_model')
@@ -5725,10 +5454,6 @@ def main():
 
             # ── 明細行一覧 (編集可) ──────────────────────────────
             st.markdown('<div class="section-title">📋 明細行一覧（全項目・編集可）</div>', unsafe_allow_html=True)
-
-            # AI初期出力を _original_items として保存（初回のみ）
-            if '_original_items' not in st.session_state:
-                st.session_state['_original_items'] = [dict(it) for it in estimate_data.get('items', [])]
 
             _items_src = estimate_data['items']
             # ── 行操作ボタン（挿入・コピー・削除） ──────────────────────
@@ -5850,65 +5575,6 @@ def main():
             pdf_parts = safe_int(estimate_data.get('pdf_parts_total', 0))
             pdf_wages = safe_int(estimate_data.get('pdf_wage_total', 0))
 
-            # ── フィードバック: 差分検出（アイテムが変わった時だけ再計算）─────
-            _orig_items_fb = st.session_state.get('_original_items', [])
-            _fb_hash = hash(str([(it.get('name',''), it.get('parts_amount',0), it.get('wage',0)) for it in edited_items]))
-            if st.session_state.get('_fb_hash') != _fb_hash:
-                st.session_state['_fb_cache'] = _detect_corrections(_orig_items_fb, edited_items)
-                st.session_state['_fb_hash']  = _fb_hash
-            _fb_corrections = st.session_state.get('_fb_cache', [])
-            if _fb_corrections:
-                _fb_key = f"fb_open_{hash(str(_fb_corrections))}"
-                with st.expander(f"📝 読み取り訂正レポート（{len(_fb_corrections)}件の変更を検出）", expanded=False):
-                    st.markdown("**以下の行が修正されました。AIへのフィードバックとして記録できます。**")
-                    _fb_rows = []
-                    for _fc in _fb_corrections:
-                        _orig = _fc.get("original", {})
-                        _corr = _fc.get("corrected", {})
-                        _fb_rows.append({
-                            "行": _fc["row_index"],
-                            "品名(修正前)": _orig.get("name", "-"),
-                            "部品(修正前)": f"¥{safe_int(_orig.get('parts_amount',0)):,}" if _orig else "-",
-                            "工賃(修正前)": f"¥{safe_int(_orig.get('wage',0)):,}" if _orig else "-",
-                            "品名(修正後)": _corr.get("name", "-") if _corr else "（削除）",
-                            "部品(修正後)": f"¥{safe_int(_corr.get('parts_amount',0)):,}" if _corr else "-",
-                            "工賃(修正後)": f"¥{safe_int(_corr.get('wage',0)):,}" if _corr else "-",
-                            "推定エラー種別": FEEDBACK_ERROR_TYPES.get(_fc.get("error_type","other"), _fc.get("error_type","")),
-                        })
-                    st.table(pd.DataFrame(_fb_rows).set_index("行"))
-
-                    st.markdown("**エラーの原因を文章で教えてください（任意）:**")
-                    _fb_comment = st.text_area(
-                        "例: 工賃列に記載されているのに部品として読み取られた",
-                        key="fb_comment_input", height=80, label_visibility="collapsed"
-                    )
-                    _fb_doc_type = estimate_data.get('_document_type', '不明')
-                    _fbc1, _fbc2 = st.columns([1, 3])
-                    with _fbc1:
-                        if st.button("✅ フィードバックを記録する", key="fb_record_btn", type="primary"):
-                            try:
-                                record_correction(_fb_corrections, _fb_comment, _fb_doc_type)
-                            except Exception as _re:
-                                st.error(f"訂正データの保存に失敗しました: {_re}")
-                                st.stop()
-                            st.session_state['_original_items'] = [dict(it) for it in edited_items]
-                            # 差分キャッシュを捨てないとレポートが残り続け、
-                            # 同じ訂正を何度も記録できてしまう
-                            st.session_state['_fb_cache'] = []
-                            st.session_state.pop('_fb_hash', None)
-                            st.success(f"✅ {len(_fb_corrections)}件の訂正をDBに記録しました")
-                            # 蓄積件数チェック
-                            _summary = get_error_summary()
-                            _total_pending = sum(s['count'] for s in _summary)
-                            if _total_pending >= FEEDBACK_MERGE_THRESHOLD:
-                                st.info(f"💡 訂正データが{_total_pending}件蓄積されました。サイドバーの「🧠 学習データ管理」からマスタ統合を実行できます。")
-                    with _fbc2:
-                        if st.button("⏭ スキップ", key="fb_skip_btn"):
-                            st.session_state['_original_items'] = [dict(it) for it in edited_items]
-                            st.session_state['_fb_cache'] = []
-                            st.session_state.pop('_fb_hash', None)
-                            st.rerun()
-
             st.markdown("---")
             # ── 金額サマリー ────────────────────────────────────
             st.markdown('<div class="section-title">💰 金額サマリー</div>', unsafe_allow_html=True)
@@ -5920,6 +5586,12 @@ def main():
             tax_label_sfx  = "税込" if is_tax_incl_s3 else "税抜"
 
             # 金額差額の計算
+            # CSV取り込みでは「PDF記載の金額」が存在しないため、
+            # 明細を編集するたびに存在しないPDFとの差異警告が出ていた。
+            _csv_mode_s3 = bool(estimate_data.get('_csv_import'))
+            if _csv_mode_s3:
+                pdf_parts = 0
+                pdf_wages = 0
             parts_diff = calc_parts - pdf_parts if pdf_parts > 0 else 0
             # SP込みでも一致チェック（部品）
             parts_match_sp = (calc_parts + sp == pdf_parts) if pdf_parts > 0 else False
@@ -5961,12 +5633,17 @@ def main():
                 exp_tow = st.session_state.get('exp_towing', 0)
                 exp_ren = st.session_state.get('exp_rental', 0)
                 exp_exm = st.session_state.get('exp_exempt', 0)
+                # ショートパーツを合計に含める（0のままだと画面だけ少なくなる）
+                sp = safe_int((estimate_data or {}).get('short_parts_wage', 0)) or sp
                 sub = calc_parts + calc_wages + sp + exp_tow + exp_ren
                 if is_tax_incl_s3:
-                    # 税込モード: 明細金額は既に税込 → 消費税を加算しない
-                    total = sub + exp_exm
+                    # 税込モード: 明細金額は既に税込。ただし費用欄は「税抜」で
+                    # 入力させているため、費用ぶんの消費税は別に足す。
+                    # これを忘れると画面の合計とNEOの合計が食い違う。
+                    tax   = jpy_round((sp + exp_tow + exp_ren) * TAX_RATE)
+                    total = sub + tax + exp_exm
                 else:
-                    tax   = round(sub * TAX_RATE)
+                    tax   = jpy_round(sub * TAX_RATE)
                     total = sub + tax + exp_exm
                 st.metric("合計（税込）", f"¥{total:,}")
                 if rev_match:
@@ -6066,7 +5743,7 @@ def main():
                         # 税込モード: 金額は既に税込 → 消費税を加算しない
                         reverse_grand = reverse_sub + st.session_state.get('exp_exempt', 0)
                     else:
-                        reverse_tax = round(reverse_sub * TAX_RATE)
+                        reverse_tax = jpy_round(reverse_sub * TAX_RATE)
                         reverse_grand = reverse_sub + reverse_tax + st.session_state.get('exp_exempt', 0)
                     _rev_tolerance = min(_n_items + 10, 50)
                     reverse_ok = abs(reverse_grand - pdf_grand) <= _rev_tolerance
@@ -6244,13 +5921,20 @@ def main():
                 amount_confirmed = True
 
             # ── Total strip ──
-            sub   = calc_parts + calc_wages + sp + st.session_state.get('exp_towing', 0) + st.session_state.get('exp_rental', 0)
+            # sp は初期化のまま0で使われていたため、画面の合計だけ
+            # ショートパーツぶん少なく表示されていた（short_parts_wage の
+            # 定義はこの後なので estimate_data から直接読む）
+            sp = safe_int((estimate_data or {}).get('short_parts_wage', 0)) or sp
+            _exp_tow_s4 = st.session_state.get('exp_towing', 0)
+            _exp_ren_s4 = st.session_state.get('exp_rental', 0)
+            sub   = calc_parts + calc_wages + sp + _exp_tow_s4 + _exp_ren_s4
             _is_tax_incl_strip = (estimate_data.get('_is_tax_inclusive', False) if estimate_data else False)
             if _is_tax_incl_strip:
-                tax   = 0
-                total = sub + st.session_state.get('exp_exempt', 0)
+                # 費用欄は「税抜」入力なので、税込モードでも費用ぶんの税は加算する
+                tax   = jpy_round((sp + _exp_tow_s4 + _exp_ren_s4) * TAX_RATE)
+                total = sub + tax + st.session_state.get('exp_exempt', 0)
             else:
-                tax   = round(sub * TAX_RATE)
+                tax   = jpy_round(sub * TAX_RATE)
                 total = sub + tax + st.session_state.get('exp_exempt', 0)
             # 費用（レッカー・代車・非課税）は合計に加算されるのに画面に
             # 出ていなかったため、部品代＋工賃＋消費税と合計が一致せず
@@ -6331,10 +6015,6 @@ def main():
                 st.session_state['step'] = 1
                 st.session_state['vehicle_data']  = None
                 st.session_state['estimate_data'] = None
-                # 前の見積の比較元を残すと、次の見積で「訂正レポート」に
-                # 前回との差分が誤検出され、学習データに誤りが記録される
-                for _k in ('_original_items', '_fb_hash', '_fb_cache'):
-                    st.session_state.pop(_k, None)
                 st.rerun()
         with bcol2:
             # 金額差異未確認時のみボタンを無効化（分類エラーではブロックしない）
@@ -6365,6 +6045,14 @@ def main():
         insurance_info  = {
             'policy_no':        st.session_state.get('policy_no', ''),
             'contractor_name':  st.session_state.get('contractor_name', ''),
+            'accept_no':        st.session_state.get('accept_no', ''),
+            'accident_date':    st.session_state.get('accident_date', ''),
+            'agency_name':      st.session_state.get('agency_name', ''),
+            'adjuster_name':    st.session_state.get('adjuster_name', ''),
+            'garage_in_date':   st.session_state.get('garage_in_date', ''),
+            'garage_out_date':  st.session_state.get('garage_out_date', ''),
+            'repair_days':      st.session_state.get('repair_days', 0),
+            'note1':            st.session_state.get('note1', ''),
         }
         expense_info = {
             'towing':      st.session_state.get('exp_towing', 0),
@@ -6545,17 +6233,16 @@ def main():
                     'vehicle_file_bytes', 'vehicle_file_name', 'estimate_file_bytes',
                     'estimate_file_name', 'updated_vehicle', 'calc_parts', 'calc_wages',
                     'pdf_parts', 'pdf_wages',
-                    'policy_no', 'contractor_name',
+                    # 事故・保険情報
+                    'policy_no', 'contractor_name', 'accept_no', 'accident_date',
+                    'agency_name', 'adjuster_name', 'garage_in_date', 'garage_out_date',
+                    'repair_days', 'note1',
                     'exp_towing', 'exp_rental', 'exp_exempt',
-                    # ウィジェットキー側も消さないと入力値が次の見積に残り、
-                    # 別のお客様の費用が混入する
-                    'exp_towing_input', 'exp_rental_input', 'exp_exempt_input',
                     'custom_neo_bytes', 'custom_neo_name',
                     'tax_override',
                     'classification_confirmed', 'classification_alerts',
                     'discrepancies', 'total_diff',
                     'amount_confirmed',
-                    '_original_items', '_fb_hash', '_fb_cache',
                     # CSV取り込み関連
                     'csv_mode', 'csv_items', '_csv_paste_saved',
                     # PDF→NEO変換関連
@@ -6566,6 +6253,8 @@ def main():
                 ]:
                     if key in st.session_state:
                         del st.session_state[key]
+                # サイドバー入力のウィジェットを作り直して確実に空にする
+                st.session_state['form_seq'] = st.session_state.get('form_seq', 0) + 1
                 st.session_state['step'] = 1
                 st.rerun()
         except Exception as e:

@@ -29,13 +29,14 @@ logger = logging.getLogger(__name__)
 def _pdfium_lock():
     """pdfium はスレッドセーフでないため、app 側と同じロックで直列化する。
 
-    複数スレッドから同時に触るとCヒープが壊れてプロセスごと落ちるため、
-    app.py が持つロックを共有する。取得できない場合はこのモジュール専用の
-    ロックを使う（少なくとも自分同士の同時実行は防げる）。
+    複数スレッドから同時に触るとCヒープが壊れてプロセスごと落ちる。
+    `streamlit run app.py` では app.py は __main__ として動くため
+    `from app import ...` は app.py を二重読み込みして別のロックを返す。
+    ロックだけを置いた専用モジュールを介して確実に共有する。
     """
     try:
-        from app import _PDFIUM_LOCK  # type: ignore
-        return _PDFIUM_LOCK
+        from _pdfium_lock_mod import PDFIUM_LOCK
+        return PDFIUM_LOCK
     except Exception:
         global _LOCAL_PDFIUM_LOCK
         if _LOCAL_PDFIUM_LOCK is None:
@@ -1307,7 +1308,10 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                     {"type": "total", "neo": neo_total, "pdf": pdf_parts_total,
                      "note": "部品(税抜)どうしの比較"}
                 )
-            res["ok"] = bool(res["count_match"] and res["total_match"])
+            # 明細が1行も無いのに「一致」と言ってはいけない。
+            # OCRがクォータ超過等で失敗すると 0件 対 0件 で一致してしまい、
+            # 空のNEOに緑の「検証OK」が付いてしまう。
+            res["ok"] = bool(res["count_match"] and res["total_match"] and neo_count > 0)
             return res
         finally:
             try:
@@ -1430,7 +1434,14 @@ def process_pdf_to_neo(pdf_path,
             if need_vi and _vi_future is not None:
                 try:
                     vi = _vi_future.result()
-                    if isinstance(vi, dict):
+                    if isinstance(vi, dict) and vi.get('_error'):
+                        # 失敗を空の車両情報として扱うと、中身の無いNEOが
+                        # 「生成成功」としてキャッシュまでされてしまう
+                        vehicle_info = {}
+                        out["ocr_incomplete"] = True
+                        warnings.append(f"車検証OCR失敗: {vi['_error']}")
+                        log.append(f"OCR vehicle_info 失敗: {vi['_error']}")
+                    elif isinstance(vi, dict):
                         vehicle_info = vi
                         out["ocr_used"] = True
                         log.append("OCR vehicle_info OK")
@@ -1825,7 +1836,9 @@ def process_pdf_to_neo(pdf_path,
         out["ok"] = False
 
     # Iter9: 成功結果をキャッシュ
-    if cache_key and out.get("ok") and out.get("neo_bytes"):
+    # OCRが途中で失敗した結果をキャッシュすると、クォータ回復後に
+    # 同じPDFを処理しても中身の欠けたNEOが返り続ける。
+    if cache_key and out.get("ok") and out.get("neo_bytes") and not out.get("ocr_incomplete"):
         if len(_PIPELINE_CACHE) >= _PIPELINE_CACHE_MAX:
             _PIPELINE_CACHE.pop(next(iter(_PIPELINE_CACHE)))
         _PIPELINE_CACHE[cache_key] = copy.deepcopy(out)
