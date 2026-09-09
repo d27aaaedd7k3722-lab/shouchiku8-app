@@ -1433,7 +1433,13 @@ def process_pdf_to_neo(pdf_path,
             if need_vi and _vi_future is not None:
                 try:
                     vi = _vi_future.result()
-                    if isinstance(vi, dict):
+                    if isinstance(vi, dict) and vi.get('_error'):
+                        # 失敗を空の車両情報として扱うと、中身の無いNEOが
+                        # 「生成成功」としてキャッシュまでされてしまう
+                        vehicle_info = {}
+                        warnings.append(f"車検証OCR失敗: {vi['_error']}")
+                        log.append(f"OCR vehicle_info 失敗: {vi['_error']}")
+                    elif isinstance(vi, dict):
                         vehicle_info = vi
                         out["ocr_used"] = True
                         log.append("OCR vehicle_info OK")

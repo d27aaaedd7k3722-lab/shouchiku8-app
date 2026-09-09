@@ -421,6 +421,24 @@ def _xml_escape(value) -> str:
             .replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
 
 
+def cp932_trim(value, max_bytes: int) -> str:
+    """コグニセブンの列幅（CP932のバイト数）に収まるよう切り詰める。
+
+    日本語は1文字2バイトなので、文字数で切ると宣言幅の2倍入ってしまう。
+    多バイト文字の途中で切れないよう、デコードできる位置まで戻す。
+    """
+    s = str(value if value is not None else '')
+    if not s:
+        return ''
+    b = s.encode('cp932', 'replace')[:max_bytes]
+    while b:
+        try:
+            return b.decode('cp932')
+        except UnicodeDecodeError:
+            b = b[:-1]
+    return ''
+
+
 def jpy_round(value) -> int:
     """日本の商習慣どおり四捨五入して整数の円にする。
 
@@ -978,7 +996,7 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
     """, (
         total_parts, total_parts + parts_tax_total, parts_tax_total,
         total_wages, total_wages + wages_tax_total, wages_tax_total,
-        taxable_expenses, taxable_expenses + round(taxable_expenses * TAX_RATE) if taxable_expenses > 0 else 0, round(taxable_expenses * TAX_RATE) if taxable_expenses > 0 else 0,
+        taxable_expenses, taxable_expenses + jpy_round(taxable_expenses * TAX_RATE) if taxable_expenses > 0 else 0, jpy_round(taxable_expenses * TAX_RATE) if taxable_expenses > 0 else 0,
         tax_total,   tax_total,
         sub_total,   grand_total
     ))
@@ -1114,17 +1132,18 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
     ''', (estimated_date, est_era, est_era_year))
     # コグニセブンの列幅に合わせて切り詰める。SQLite は TEXT(n) を強制しないため
     # ここで守らないと、桁あふれした値がそのまま入る。
-    policy_no     = safe_str(insurance_info.get('policy_no', ''))[:20]
-    contractor    = safe_str(insurance_info.get('contractor_name', ''))[:20]
-    agency_name   = safe_str(insurance_info.get('agency_name', ''))[:20]
-    adjuster_name = safe_str(insurance_info.get('adjuster_name', ''))[:20]
-    accept_no     = safe_str(insurance_info.get('accept_no', ''))[:37]
+    policy_no     = cp932_trim(insurance_info.get('policy_no', ''), 20)
+    contractor    = cp932_trim(insurance_info.get('contractor_name', ''), 20)
+    agency_name   = cp932_trim(insurance_info.get('agency_name', ''), 20)
+    adjuster_name = cp932_trim(insurance_info.get('adjuster_name', ''), 20)
+    accept_no     = cp932_trim(insurance_info.get('accept_no', ''), 37)
     accident_date = _normalize_date8(insurance_info.get('accident_date', ''))
     garage_in     = _normalize_date8(insurance_info.get('garage_in_date', ''))
     garage_out    = _normalize_date8(insurance_info.get('garage_out_date', ''))
     repair_days   = safe_int(insurance_info.get('repair_days', 0))
     # 備考は改行を含むと固定長レコードが崩れるため1行に潰す
-    note1         = re.sub(r'\s+', ' ', safe_str(insurance_info.get('note1', ''))).strip()[:40]
+    note1         = cp932_trim(
+        re.sub(r'\s+', ' ', safe_str(insurance_info.get('note1', ''))).strip(), 40)
 
     # Insurance テーブル: 入力があった項目だけ書き込む。
     # 空欄で既存値を消すと、テンプレート由来の工場情報などが失われるため。
@@ -2509,7 +2528,7 @@ def analyze_estimate_totals(api_key, file_bytes, mime_type, model_name):
     return None
 
 
-def parse_csv_to_items(csv_text: str) -> list:
+def parse_csv_to_items(csv_text: str, return_notes: bool = False):
     """Claude.ai / Gemini.ai 等から出力されたCSVテキストをitemsリストに変換する。
     期待フォーマット（ヘッダあり）:
         品名,区分,数量,部品金額,工賃,部品コード
@@ -2517,17 +2536,21 @@ def parse_csv_to_items(csv_text: str) -> list:
     import csv as _csv
     import io as _io
 
+    _trailer_notes: list = []
+
     # BOM除去・改行正規化
     text = csv_text.strip().lstrip('\ufeff').replace('\r\n', '\n').replace('\r', '\n')
+    # AIの回答をそのまま貼り付けたときに付いてくるコードフェンスを外す
+    text = '\n'.join(l for l in text.split('\n') if not l.strip().startswith('```'))
     items = []
     try:
         reader = _csv.reader(_io.StringIO(text))
         rows = list(reader)
     except Exception:
-        return items
+        return (items, _trailer_notes) if return_notes else items
 
     if not rows:
-        return items
+        return (items, _trailer_notes) if return_notes else items
 
     # ヘッダ行を特定する。「品名」が無くてもヘッダらしい行なら読み飛ばす。
     # 以前は先頭セルに「品名」が無いとヘッダ行をそのまま明細として
@@ -2548,7 +2571,7 @@ def parse_csv_to_items(csv_text: str) -> list:
         return sum(1 for c in cells if any(w in c for w in _HEADER_WORDS)) >= 2
 
     header_idx = 0
-    for i, row in enumerate(rows[:5]):
+    for i, row in enumerate(rows):
         if row and '品名' in (row[0] or ''):
             header_idx = i + 1
             break
@@ -2557,7 +2580,6 @@ def parse_csv_to_items(csv_text: str) -> list:
             break
 
     row_idx = 0
-    _trailer_notes = []
     for row in rows[header_idx:]:
         if not row or not any(c.strip() for c in row):
             continue
@@ -2575,19 +2597,20 @@ def parse_csv_to_items(csv_text: str) -> list:
         if not name:
             continue
         # アプリ自身のプロンプトが末尾に付ける差異メモは明細ではない
-        if re.match(r'^(部品|工賃)相違', name.strip()):
+        if re.fullmatch(r'(部品|工賃)相違[\d,，]*円?', name.strip()):
             _trailer_notes.append(','.join(c.strip() for c in row if c.strip()))
             continue
-        # 合計行の除外。ただし金額のある行は消さない。
-        # 以前は品名の部分一致で判定していたため、「特別値引 -5,000」や
-        # 「合計表示灯」のような正当な明細まで消えて金額が狂っていた。
-        _nm = name.strip()
-        _is_total_row = (
-            _nm in ('合計', '小計', '消費税', '税額', '総額', '値引', '値引き',
-                    '合計金額', '小計金額', '消費税額', '総額計')
-            or re.fullmatch(r'(合計|小計|総額|消費税|税額)[（(].*[）)]', _nm) is not None
-        )
-        if _is_total_row and parts_amt == 0 and wage_amt == 0:
+        # 集計行の除外。
+        # 「合計」「小計(税抜)」のように集計語で始まり、そこで終わるか
+        # 括弧書きが続くだけの行は、金額があっても明細ではないので必ず落とす。
+        # 一方「合計表示灯」「特別値引」のような正当な品名は残す。
+        # （以前は品名の部分一致だったため正当な明細まで消え、
+        #   その後の緩和では逆に合計行が明細に混ざって総額が膨らんでいた）
+        _nm = re.sub(r'[\s\u3000]', '', name)
+        if re.match(r'^(合計|小計|総額|総計|消費税|税額|内税|外税)([（(].*)?$', _nm):
+            continue
+        # 「値引」単独で金額が無い行だけ落とす（金額のある値引きは明細として残す）
+        if _nm in ('値引', '値引き') and parts_amt == 0 and wage_amt == 0:
             continue
         if qty < 1:
             qty = 1
@@ -2610,7 +2633,7 @@ def parse_csv_to_items(csv_text: str) -> list:
             'row_id':       f'p1_r{row_idx:03d}',
             'row_bbox':     {'x1': 0, 'y1': 0, 'x2': 1000, 'y2': 50},
         })
-    return items
+    return (items, _trailer_notes) if return_notes else items
 
 
 def parse_detail_json_to_items(json_text: str, page_num: int = 1) -> list:
@@ -3100,10 +3123,10 @@ def build_estimate_summary(items, short_parts_wage, pdf_parts_total,
     basis = user_tax_basis if user_tax_basis in ('tax_inclusive', 'tax_exclusive') else 'tax_exclusive'
 
     if basis == 'tax_inclusive':
-        norm_parts = round(calc_parts / (1 + TAX_RATE))
-        norm_wage  = round(calc_wage  / (1 + TAX_RATE))
-        norm_sp    = round(sp         / (1 + TAX_RATE))
-        norm_disc  = round(disc       / (1 + TAX_RATE))
+        norm_parts = jpy_round(calc_parts / (1 + TAX_RATE))
+        norm_wage  = jpy_round(calc_wage  / (1 + TAX_RATE))
+        norm_sp    = jpy_round(sp         / (1 + TAX_RATE))
+        norm_disc  = jpy_round(disc       / (1 + TAX_RATE))
     else:
         norm_parts = calc_parts
         norm_wage  = calc_wage
@@ -3111,7 +3134,7 @@ def build_estimate_summary(items, short_parts_wage, pdf_parts_total,
         norm_disc  = disc
 
     TOLERANCE = 50  # 円
-    reverse_grand = round((norm_parts + norm_wage + norm_sp - norm_disc) * (1 + TAX_RATE))
+    reverse_grand = jpy_round((norm_parts + norm_wage + norm_sp - norm_disc) * (1 + TAX_RATE))
     reverse_match = abs(reverse_grand - grand) <= TOLERANCE if grand > 0 else False
 
     return {
@@ -4039,17 +4062,17 @@ def main():
         _fseq = st.session_state.setdefault('form_seq', 0)
         accept_no       = st.text_input("事故受付番号", value=st.session_state.get('accept_no', ''),
                                         key=f'accept_no_input_{_fseq}', placeholder="例: 2026-001234",
-                                        max_chars=37)
+                                        max_chars=37, help="全角なら18文字までNEOに入ります")
         accident_date   = st.text_input("事故日（YYYYMMDD）", value=st.session_state.get('accident_date', ''),
                                         key=f'accident_date_input_{_fseq}', placeholder="例: 20260901")
         policy_no       = st.text_input("証券番号", value=st.session_state.get('policy_no', ''),
-                                        key=f'policy_no_input_{_fseq}', max_chars=20)
+                                        key=f'policy_no_input_{_fseq}', max_chars=20, help="全角なら10文字までNEOに入ります")
         contractor_name = st.text_input("契約者名", value=st.session_state.get('contractor_name', ''),
-                                        key=f'contractor_name_input_{_fseq}', max_chars=20)
+                                        key=f'contractor_name_input_{_fseq}', max_chars=20, help="全角なら10文字までNEOに入ります")
         agency_name     = st.text_input("保険会社・代理店名", value=st.session_state.get('agency_name', ''),
-                                        key=f'agency_name_input_{_fseq}', max_chars=20)
+                                        key=f'agency_name_input_{_fseq}', max_chars=20, help="全角なら10文字までNEOに入ります")
         adjuster_name   = st.text_input("アジャスター名", value=st.session_state.get('adjuster_name', ''),
-                                        key=f'adjuster_name_input_{_fseq}', max_chars=20)
+                                        key=f'adjuster_name_input_{_fseq}', max_chars=20, help="全角なら10文字までNEOに入ります")
         with st.expander("入庫・出庫・修理日数", expanded=False):
             garage_in_date  = st.text_input("入庫日（YYYYMMDD）", value=st.session_state.get('garage_in_date', ''),
                                             key=f'garage_in_input_{_fseq}')
@@ -4058,7 +4081,7 @@ def main():
             repair_days     = st.number_input("修理日数", value=st.session_state.get('repair_days', 0),
                                               min_value=0, step=1, key=f'repair_days_input_{_fseq}')
             note1           = st.text_area("備考", value=st.session_state.get('note1', ''),
-                                           key=f'note1_input_{_fseq}', height=70, max_chars=40)
+                                           key=f'note1_input_{_fseq}', height=70, max_chars=40, help="全角なら20文字までNEOに入ります")
         # 日付は YYYYMMDD / YYYY-MM-DD / YYYY/MM/DD を受け付ける。
         # 解釈できない入力は書き込まれないので、その場で知らせる。
         for _dlabel, _dval in (('事故日', accident_date), ('入庫日', garage_in_date),
@@ -4195,8 +4218,16 @@ def main():
                 custom_neo_file.seek(0)
                 # 中身がNEOかどうかをこの場で確かめる。最後の生成時まで
                 # 気づけないと、入力をやり直す手間が大きい。
+                _tpl_ok = False
                 try:
-                    _tpl_ok = bool(find_real_cks(_neo_bytes_read))
+                    _tpl_ck = find_real_cks(_neo_bytes_read)
+                    if _tpl_ck:
+                        # CKの並びがあるだけでは不十分（"CK"を含むPDF等が通る）。
+                        # 実際に展開して明細DBが入っているところまで確かめる。
+                        _tpl_raw = decompress_neo(_neo_bytes_read, _tpl_ck)
+                        _tpl_mgmt, _tpl_entries = parse_entries(_neo_bytes_read, _tpl_ck[0])
+                        _tpl_files = extract_files(_tpl_raw, _tpl_entries)
+                        _tpl_ok = 'AnSMB.txt' in _tpl_files
                 except Exception:
                     _tpl_ok = False
                 if not _tpl_ok:
@@ -4362,7 +4393,9 @@ def main():
             st.session_state.pop('_csv_paste_saved', None)
 
         if _csv_text:
-            _preview_items = parse_csv_to_items(_csv_text)
+            _preview_items, _csv_notes = parse_csv_to_items(_csv_text, return_notes=True)
+            for _note in _csv_notes[:3]:
+                st.warning(f"⚠️ 見積書との差異が記録されています: {_note}")
             if _preview_items:
                 st.success(f"✅ {len(_preview_items)}行 読み込み完了 — 部品: ¥{sum(safe_int(it.get('parts_amount',0)) for it in _preview_items):,} / 工賃: ¥{sum(safe_int(it.get('wage',0)) for it in _preview_items):,}")
                 st.session_state['csv_items'] = _preview_items
@@ -4535,7 +4568,7 @@ def main():
             # PDF→NEO変換で読み取った車両情報があれば引き継ぐ（車検証未添付時）
             _p2n_vi = st.session_state.get('pdf2neo_vehicle_info')
             if _p2n_vi and not vehicle_bytes:
-                vehicle_data = dict(_p2n_vi)
+                vehicle_data = {k: v for k, v in dict(_p2n_vi).items() if k != '_error'}
             if vehicle_bytes:
                 with st.spinner("🔍 車検証を解析中..."):
                     try:
@@ -4618,9 +4651,14 @@ def main():
                         _use_fax, _use_raster, _use_enhance, _enable_sc
                     )
                     try:
-                        vehicle_data = fut_vehicle.result()
+                        vehicle_data = fut_vehicle.result() or {}
                     except Exception as _veh_err:
-                        st.warning(f"⚠️ 車検証OCR失敗（{str(_veh_err)[:60]}）。車両情報なしで続行します。")
+                        vehicle_data = {'_error': str(_veh_err)[:120]}
+                    if vehicle_data.get('_error'):
+                        st.warning(
+                            f"⚠️ 車検証を読み取れませんでした（{vehicle_data['_error']}）。"
+                            "車両情報は空のまま進みます。ステップ③で手入力できます。"
+                        )
                         vehicle_data = {}
                     progress.progress(40, text="✅ 車検証の解析完了、見積書を処理中...")
                     try:
@@ -5266,10 +5304,13 @@ def main():
                 exp_exm = st.session_state.get('exp_exempt', 0)
                 sub = calc_parts + calc_wages + sp + exp_tow + exp_ren
                 if is_tax_incl_s3:
-                    # 税込モード: 明細金額は既に税込 → 消費税を加算しない
-                    total = sub + exp_exm
+                    # 税込モード: 明細金額は既に税込。ただし費用欄は「税抜」で
+                    # 入力させているため、費用ぶんの消費税は別に足す。
+                    # これを忘れると画面の合計とNEOの合計が食い違う。
+                    tax   = jpy_round((sp + exp_tow + exp_ren) * TAX_RATE)
+                    total = sub + tax + exp_exm
                 else:
-                    tax   = round(sub * TAX_RATE)
+                    tax   = jpy_round(sub * TAX_RATE)
                     total = sub + tax + exp_exm
                 st.metric("合計（税込）", f"¥{total:,}")
                 if rev_match:
@@ -5369,7 +5410,7 @@ def main():
                         # 税込モード: 金額は既に税込 → 消費税を加算しない
                         reverse_grand = reverse_sub + st.session_state.get('exp_exempt', 0)
                     else:
-                        reverse_tax = round(reverse_sub * TAX_RATE)
+                        reverse_tax = jpy_round(reverse_sub * TAX_RATE)
                         reverse_grand = reverse_sub + reverse_tax + st.session_state.get('exp_exempt', 0)
                     _rev_tolerance = min(_n_items + 10, 50)
                     reverse_ok = abs(reverse_grand - pdf_grand) <= _rev_tolerance
@@ -5547,13 +5588,16 @@ def main():
                 amount_confirmed = True
 
             # ── Total strip ──
-            sub   = calc_parts + calc_wages + sp + st.session_state.get('exp_towing', 0) + st.session_state.get('exp_rental', 0)
+            _exp_tow_s4 = st.session_state.get('exp_towing', 0)
+            _exp_ren_s4 = st.session_state.get('exp_rental', 0)
+            sub   = calc_parts + calc_wages + sp + _exp_tow_s4 + _exp_ren_s4
             _is_tax_incl_strip = (estimate_data.get('_is_tax_inclusive', False) if estimate_data else False)
             if _is_tax_incl_strip:
-                tax   = 0
-                total = sub + st.session_state.get('exp_exempt', 0)
+                # 費用欄は「税抜」入力なので、税込モードでも費用ぶんの税は加算する
+                tax   = jpy_round((sp + _exp_tow_s4 + _exp_ren_s4) * TAX_RATE)
+                total = sub + tax + st.session_state.get('exp_exempt', 0)
             else:
-                tax   = round(sub * TAX_RATE)
+                tax   = jpy_round(sub * TAX_RATE)
                 total = sub + tax + st.session_state.get('exp_exempt', 0)
             # 費用（レッカー・代車・非課税）は合計に加算されるのに画面に
             # 出ていなかったため、部品代＋工賃＋消費税と合計が一致せず
