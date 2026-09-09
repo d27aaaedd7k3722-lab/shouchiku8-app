@@ -1033,9 +1033,14 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             _m_side = re.search(
                 r'[（(\[]?\s*(左|右|Ｌ|Ｒ|LH|RH|L|R)\s*(側|前|後)?\s*[)）\]]?$', name)
             if _m_side and len(name.encode('cp932', 'replace')) > _avail:
-                _side_txt = name[_m_side.start():]
+                # 正規表現の先頭が \s* なので、re.search は左右記号の直前の
+                # 空白の連なりからマッチする。そのまま温存すると22バイトの
+                # 持ち分を空白が食い、識別に必要な語尾から先に消える。
+                # 「…アウタ R」と「…インナ R」が両方「※フロントドアパネル  R」
+                # になり、別部品が同じ文字列で並ぶ。空白は落として詰める。
+                _side_txt = re.sub(r'\s+', '', name[_m_side.start():])
                 _side_len = len(_side_txt.encode('cp932', 'replace'))
-                _body = name[:_m_side.start()]
+                _body = re.sub(r'\s+', '', name[:_m_side.start()])
                 name = cp932_trim(_body, max(_avail - _side_len, 0)) + _side_txt
             name = '※' + cp932_trim(name, _avail)
         
@@ -4855,7 +4860,10 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     # ──────────────────────────────────────────────────────────────────────────
 
     # ── キャッシュ保存 ──────────────────────────────────────────────────────────
-    _analyze_result_cache[_cache_key] = result
+    # 保存側もコピーする。参照のまま入れると、この呼び出しの後段（生成側）が
+    # result を書き換えたときにキャッシュに残り、2回目の入力になる。
+    # 取り出し側だけ守っても、1回目の書き換えは防げない。
+    _analyze_result_cache[_cache_key] = copy.deepcopy(result)
     # キャッシュが大きくなりすぎないよう古いエントリを削除（最大20件）
     while len(_analyze_result_cache) > 20:
         oldest_key = next(iter(_analyze_result_cache))
@@ -6878,13 +6886,22 @@ def main():
                 # CSV取り込みは常にこれに当たるのに「PDF原本と完全一致」と
                 # 断言していたため、利用者が原本との突き合わせをここで
                 # 打ち切る根拠になっていた。
-                _has_reference = (pdf_parts > 0 or pdf_wages > 0 or pdf_grand > 0)
-                if not _has_reference:
+                # 基準が「全く無い」ときだけ止めるのでは足りない。片側だけ
+                # 読めなかった場合、読めなかった側は「検証していない」のに
+                # 合格として扱われ、一致率50%と「全項目一致・完全一致」が
+                # 同じ一文に並んでいた。全項目に基準があるときだけ断言する。
+                _missing = [_n for _n, _v in (('部品計', pdf_parts), ('工賃計', pdf_wages))
+                            if _v <= 0]
+                _ref_ok = (not _missing) or pdf_grand > 0
+                if not _ref_ok:
+                    _what = ('・'.join(_missing) if _missing else '照合の基準')
+                    _note = ('（CSV取り込みでは常にこの状態です）'
+                             if len(_missing) >= 2 else '')
                     st.markdown(
                         '<div class="warning-box" style="padding:10px 16px;margin:8px 0">'
-                        'ℹ️ <b>照合の基準がありません</b> — CSV取り込みなど、'
-                        '見積書に印字された部品計・工賃計・総合計を読み取っていない場合は、'
-                        'アプリ側で突き合わせる相手がありません。'
+                        f'ℹ️ <b>{_what}を見積書から読み取れていないため、'
+                        f'この項目は検証していません</b>{_note}。'
+                        'アプリ側で突き合わせる相手がないので、'
                         '下の明細と金額を、原本とご自身で突き合わせてください。</div>',
                         unsafe_allow_html=True)
                 elif _beta_all_ok:
