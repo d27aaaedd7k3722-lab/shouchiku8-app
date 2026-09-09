@@ -1442,6 +1442,10 @@ def match_pdf_items_to_addata(items, vehicle_info, addata_root=ADDATA_ROOT):
             it['db_price'] = db_price
             it['db_parts_no'] = db_parts_no
             it['db_work_index'] = db_widx
+            # 部品コード大区分。app.py が ERParts.PartsCode に書くために読むキーで、
+            # ここで渡さないと Addata と一致した部品まで部品コード無しの
+            # 手入力行としてコグニセブンに渡ってしまう。
+            it['_master_section_code'] = str((matched or {}).get('section_code', '') or '')
             it['match_level'] = level
             it['match_note'] = note
             it['price_diff_pct'] = price_diff_pct

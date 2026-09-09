@@ -785,8 +785,10 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
     cur.execute('DELETE FROM PaintingPanel')
     # PaintingLinkParts: 塗装リンクパーツ → 全削除
     cur.execute('DELETE FROM PaintingLinkParts')
-    # PaintingOther: 1行固定テーブル。行名・LineNoは保持し工賃・時間をリセット
-    cur.execute("""UPDATE PaintingOther SET
+    # PaintingOther: 1行固定テーブル。前案件の .neo をテンプレートにすると
+    # Name に前案件の作業名（例「前案件のスポイラー塗装」）が残り、
+    # 工賃だけブランクの幽霊行として新しい見積に出てしまう。名前も消す。
+    cur.execute("""UPDATE PaintingOther SET Name='',
         Time=-1, WageOutTax=-1, WageInTax=-1, WageTax=-1, WageByManual=''""")
     # PaintingTotal: 合計テーブルをゼロリセット
     cur.execute("""UPDATE PaintingTotal SET
@@ -813,6 +815,44 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             cur.execute(f'DELETE FROM {_t}')
         except sqlite3.Error:
             pass   # テンプレートに無いテーブルは無視する
+
+    # ReserveERParts（予備明細）は ERPartsRecordNo で ERParts を指す。
+    # 全消しせずに残すと、前案件の予備行が品名・金額つきで生き残り、
+    # しかもその参照先 RecordNo は新しい ERParts に存在しない。
+    # ただしテンプレート原本でも「空欄行が1行」あるのが実機の正常な状態なので、
+    # 0行にはせず、実機が書いた空行と同じ値へ戻す。
+    # 値はテンプレート原本の ReserveERParts 1行をそのまま採取したもの。
+    try:
+        _r_cols = [c[1] for c in cur.execute('PRAGMA table_info(ReserveERParts)').fetchall()]
+    except sqlite3.Error:
+        _r_cols = []
+    if _r_cols:
+        _R_BLANK = {'RecordNo': 1, 'LineNo': 1, 'DisposalCode': 3,
+                    'WageByManual': '*', 'ERPartsRecordNo': 0}
+        _R_MINUS1 = {'PartsCodeSub', 'PartsPriceOutTax', 'PartsPriceInTax', 'PartsPriceTax',
+                     'PartsUnitPriceOutTax', 'PartsUnitPriceInTax', 'PartsUnitPriceTax',
+                     'PartsPriceStandardOutTax', 'PartsPriceStandardInTax',
+                     'PartsPriceStandardTax', 'Time', 'WageOutTax', 'WageInTax', 'WageTax',
+                     'PartsCount', 'ChangeTotalOutTax', 'ChangeTotalInTax', 'ChangeTotalTax',
+                     'SATime1', 'SATime2', 'SATime3', 'SATime4', 'SATime5'}
+        _R_EMPTY = {'PartsCode', 'DisposalName', 'DisposalNameStandard', 'PartsName',
+                    'PartsNameStandard', 'PartsNo', 'PartsNoStandard', 'PartsPriceByManual',
+                    'PartsFileTime', 'WorkCode', 'ConstructGroup', 'OrderFlag', 'Provisional',
+                    'BlockCode', 'WageFileTime', 'ShapeModifyTime', 'DamageArea', 'DamageRank',
+                    'SATime1ByManual', 'SATime2ByManual', 'SATime3ByManual',
+                    'SATime4ByManual', 'SATime5ByManual', 'Comment1', 'Comment2', 'Comment3'}
+        _vals = []
+        for _c in _r_cols:
+            if _c in _R_BLANK:   _vals.append(_R_BLANK[_c])
+            elif _c in _R_MINUS1: _vals.append(-1)
+            elif _c in _R_EMPTY:  _vals.append('')
+            else:                 _vals.append(0)   # 残りはすべてフラグ列で 0
+        try:
+            cur.execute('DELETE FROM ReserveERParts')
+            cur.execute('INSERT INTO ReserveERParts ({}) VALUES ({})'.format(
+                ', '.join(_r_cols), ', '.join(['?'] * len(_r_cols))), _vals)
+        except sqlite3.Error:
+            pass
     # 1行固定の塗装テーブルは、PaintingOther と同じくブランク(-1)へ戻す。
     # 列構成がテンプレートによって違うので、時間・工賃・材料の列を
     # 名前で拾って一括で戻す。
@@ -823,22 +863,62 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             continue
         if not _cols:
             continue
+        # ByManual は「手動入力したか」を表す TEXT(1) のフラグ列で、
+        # 値域は '' と '*'。ここに -1 を入れると値域外の2文字 '-1' が
+        # 入り、宣言幅も超える。PaintingOther と同じく '' に戻す。
         _blank = [c for c in _cols
-                  if ('Time' in c or 'Wage' in c or 'Material' in c or 'Total' in c)]
+                  if ('Time' in c or 'Wage' in c or 'Material' in c or 'Total' in c)
+                  and 'ByManual' not in c]
+        _flag  = [c for c in _cols if 'ByManual' in c]
         _zero  = [c for c in _cols if 'Disposal' in c]
-        _sets  = [f'{c}=-1' for c in _blank] + [f'{c}=0' for c in _zero]
+        _sets  = ([f'{c}=-1' for c in _blank]
+                  + [f"{c}=''" for c in _flag]
+                  + [f'{c}=0' for c in _zero])
         if _sets:
             try:
                 cur.execute(f"UPDATE {_t} SET {', '.join(_sets)}")
             except sqlite3.Error:
                 pass
 
+    # 明細を消した以上、その入力条件（計画テーブル）も前案件のまま
+    # 残してはいけない。残すと「フレーム修正あり・指数6.5・工賃52,000」
+    # のような前案件の条件だけが生き残る。
+    try:
+        cur.execute("""UPDATE FramePlan SET FrameFlag=0, PartsCode='',
+            Time=-1, TimeStandard=-1,
+            WageOutTax=-1, WageInTax=-1, WageTax=-1,
+            WageStandardOutTax=-1, WageStandardInTax=-1, WageStandardTax=-1,
+            WageByManual=''""")
+    except sqlite3.Error:
+        pass
+    try:
+        cur.execute("""UPDATE DamageBlockPlan SET
+            DamageCode='', FrontArea=0, RearArea=0, AllArea=0""")
+    except sqlite3.Error:
+        pass
+    try:
+        cur.execute("""UPDATE PaintingPlan SET
+            BoothFlag=0, BoothTime=-1, BoothWageOutTax=-1,
+            BoothWageInTax=-1, BoothWageTax=-1, BoothWageByManual='',
+            PaintingType=0, PaintingTypeName='', MaterialRate=0,
+            TwoToneFlag=0""")
+    except sqlite3.Error:
+        pass
+    # 塗装セクションの「あり」フラグも消す。工賃だけ -1 にすると
+    # 「調色あり・工賃ブランク」という説明できない状態になる。
+    try:
+        cur.execute("""UPDATE PaintingEtcetera SET
+            LCColorFlag=0, LCColorRoof=0, TwoCSolidFlag=0, TwoCSolidRoof=0""")
+    except sqlite3.Error:
+        pass
+
     # 全Expense行をクリア（LineNo=1〜8: 文字書き/内張り/配線/ショートパーツ/レッカー代１/レッカー代２/写真代他/その他控除）
-    for lno in (1, 2, 3, 4, 5, 6, 7, 8):
-        cur.execute("""UPDATE Expense SET
-            OutTaxFlag=0, WageEnabled=0, WageOutTax=0, WageInTax=0, WageTax=0,
-            Comment=''
-            WHERE LineNo=?""", (lno,))
+    # LineNo 9 以降は自由入力の費用行。前案件の .neo をテンプレートに
+    # 使うと、そこに書かれた費目と金額がそのまま残る。全行を消す。
+    cur.execute("""UPDATE Expense SET
+        OutTaxFlag=0, WageEnabled=0, WageOutTax=0, WageInTax=0, WageTax=0,
+        PartsEnabled=0, PartsPriceOutTax=0, PartsPriceInTax=0, PartsPriceTax=0,
+        Comment=''""")
     total_parts = 0
     annote_rows = []
     # 税込モードの丸め調整用
@@ -858,7 +938,12 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         # '_match_level'（数値）は旧UIの名残。以前はこちらしか見ておらず、
         # 既定値99が採用されて全行が「未マッチ」扱いになり、
         # Addataに完全一致した部品まで品名の先頭に ※ が付いていた。
-        _ml_raw = item.get('_match_level', item.get('match_level'))
+        # dict.get の第2引数は「キーが無いとき」しか使われない。明細タブは
+        # '_match_level' を必ず 0 で埋めるため、先に '_match_level' を見ると
+        # 照合が付けた 'L4' に永久に落ちず、未マッチ部品の ※ が消えていた。
+        _ml_raw = item.get('match_level')
+        if _ml_raw in (None, '', 'NA'):
+            _ml_raw = item.get('_match_level')
         if isinstance(_ml_raw, str) and _ml_raw[:1].upper() == 'L' and _ml_raw[1:].isdigit():
             m_level = int(_ml_raw[1:])
         elif isinstance(_ml_raw, (int, float)):
@@ -990,13 +1075,17 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         # 「ｱｯｾﾝﾌﾞﾘ取替」から「取替」が落ちて区分不明になる。
         _method_full = method
         method = cp932_trim(method, _ERPARTS_WIDTH['DisposalName'])
+        # 区分コードは 0=取替 / 1=脱着 / 2=修理(鈑金・塗装含む)。
+        # 実機NEO 244件を解析して確定した値で、_addata_db_search.py の
+        # 冒頭「検証結果」節と auto_matching.py:1877 が同じ対応を使う。
+        # 3 は「区分なし」の番兵で、テンプレートの空行が実際に 3 を持つ。
         _disposal_map = {
-            '取替': 1, '交換': 1, '取換': 1, '取り替え': 1, '取替え': 1,
-            '脱着': 2, '取外': 2, '取付': 2, '組付': 2, '脱外': 2,
-            '修理': 3, '補修': 3, '分解': 3, '修正': 3, '調整': 3,
-            '光軸': 3, 'フィッティング': 3, 'コーディング': 3, '穴あけ': 3,
-            'シーリング': 3, '点検': 3, '消去': 3, '設定': 3,
-            '鈑金': 4, '板金': 4, '塗装': 4, 'ペイント': 4, 'ワックス': 4, '加算': 4, 'ブース': 4,
+            '取替': 0, '交換': 0, '取換': 0, '取り替え': 0, '取替え': 0,
+            '脱着': 1, '取外': 1, '取付': 1, '組付': 1, '脱外': 1,
+            '修理': 2, '補修': 2, '分解': 2, '修正': 2, '調整': 2,
+            '光軸': 2, 'フィッティング': 2, 'コーディング': 2, '穴あけ': 2,
+            'シーリング': 2, '点検': 2, '消去': 2, '設定': 2,
+            '鈑金': 2, '板金': 2, '塗装': 2, 'ペイント': 2, 'ワックス': 2, '加算': 2, 'ブース': 2,
         }
         # 区分は完全一致だけで引くと、末尾に空白が付いただけ、
         # 「脱着（左）」のように補足が付いただけで -1（区分不明）になる。
@@ -1012,6 +1101,14 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
                 if _kw in _m_key:
                     disposal_code = _cd
                     break
+        # 指数（工数）。画面まで往復させておきながら NEO には書いていなかったため、
+        # コグニセブン側では全行が指数ゼロの見積として開かれていた。
+        # 単位は時間の小数（1.0 = 100WI, _addata_db_search.match_wage_by_time 参照）。
+        try:
+            _idx = float(str(item.get('index_value', '') or '').strip() or 0)
+        except (TypeError, ValueError):
+            _idx = 0.0
+        db_time = round(_idx, 2) if _idx > 0 else -1   # 未入力は -1（空欄）
         parts_code = item.get('_master_section_code', '')  # 部品コード大区分（例: '01'）
         _branch_raw = item.get('_master_branch_code', '')  # 枝番（例: '00101', '001AA'）
         # PartsCodeSub は SQLite integer 型。数値変換できる枝番のみ整数で保存
@@ -1055,7 +1152,7 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             -- 標準部品価格ゼロ・標準指数ゼロの見積として読まれてしまう。
             -1, -1, -1,
             '*',
-            -1, -1,
+            ?, -1,
             ?, ?, ?,
             -1, -1, -1,
             '*', ?,
@@ -1078,6 +1175,7 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             method, name,
             parts_no,
             db_parts_total, db_parts_intax, db_parts_tax,
+            db_time,
             db_wage_total, db_wage_intax, db_wage_tax,
             db_qty
         ))
@@ -1226,6 +1324,24 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         hy_Wrecker1InTax=?,
         hy_Wrecker1Tax=?,
         hy_Wrecker1TaxFlag=?,
+        -- このアプリが値を持たない集計欄。テンプレートの既定値へ戻す。
+        -- 戻さないと、過去案件の .neo をテンプレートに使ったとき
+        -- 前の案件の塗装費・材料費・リサイクル部品費・掛率割増が
+        -- 金額付きで残り、内訳と合計が一致しない見積になる。
+        ms_RecyclePartsTotalOutTax=0, ms_RecyclePartsTotalInTax=0,
+        ms_RecyclePartsTotalTax=0,
+        pn_TotalOutTax=0, pn_TotalInTax=0, pn_TotalTax=0,
+        pn_MaterialTotalOutTax=0, pn_MaterialTotalInTax=0, pn_MaterialTotalTax=0,
+        nk_TotalOutTax=0, nk_TotalInTax=0, nk_TotalTax=0,
+        hy_PartsTaxTotalOutTax=0, hy_PartsTaxTotalInTax=0, hy_PartsTaxTotalTax=0,
+        hy_Wrecker2OutTax=0, hy_Wrecker2InTax=0, hy_Wrecker2Tax=0,
+        hy_Wrecker2TaxFlag=0,
+        pt_ExtraTotalOutTax=0, pt_ExtraTotalInTax=0, pt_ExtraTotalTax=0,
+        pt_ExtraRate=-1, pt_ExtraFlag=0, pt_ExtraUnit=1,
+        pt_ExtraArrangeFlag=1, pt_IncludeRecycle=1,
+        wg_ExtraTotalOutTax=0, wg_ExtraTotalInTax=0, wg_ExtraTotalTax=0,
+        wg_ExtraRate=-1, wg_ExtraFlag=0, wg_ExtraUnit=1,
+        wg_ExtraArrangeFlag=1, wg_IncludeMaterial=1,
         tx_TotalOutTax=?,
         tx_TotalInTax=?,
         SubTotal=?,
@@ -6201,6 +6317,7 @@ def main():
                         '_master_name': '', '_master_price': 0, '_master_part_no': '',
                         '_master_repair_code': '', '_master_branch_code': '',
                         '_master_part_code_r': '', '_master_part_code_l': '',
+                        '_master_section_code': '', 'match_level': '',
                         '_match_level': 0, '_original_name': '', '_original_parts_amount': 0,
                     }
                     estimate_data['items'].append(_new_row)
@@ -6305,6 +6422,11 @@ def main():
                     '_master_branch_code': _orig.get('_master_branch_code', ''),
                     '_master_part_code_r': _orig.get('_master_part_code_r', ''),
                     '_master_part_code_l': _orig.get('_master_part_code_l', ''),
+                    # 照合結果は明細タブを通っても落としてはいけない。
+                    # 'match_level'(L1..L4) を落とすと未マッチ部品の ※ が消え、
+                    # '_master_section_code' を落とすと部品コードが空になる。
+                    'match_level': _orig.get('match_level', ''),
+                    '_master_section_code': _orig.get('_master_section_code', ''),
                     '_match_level': _orig.get('_match_level', 0),
                     '_original_name': _orig.get('name', _nv),
                     '_original_parts_amount': _orig.get('parts_amount', safe_int(_row.get('部品金額', 0))),
