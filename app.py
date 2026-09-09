@@ -4980,7 +4980,7 @@ def main():
                     st.session_state['custom_neo_bytes'] = _neo_bytes_read
                     st.session_state['custom_neo_name']  = custom_neo_file.name
                     st.success(f"✅ {custom_neo_file.name} ({len(_neo_bytes_read):,} bytes)")
-                st.caption("📋 テンプレートの工場名・証券番号等はそのまま引き継ぎます")
+                st.caption("📋 テンプレートの工場名・証券番号等はそのまま引き継ぎます。画面で入力しなかった項目（使用者名・車台番号・事故受付番号など）もテンプレートの値が残るため、別の案件として出す項目は入力し直してください")
             elif st.session_state.get('custom_neo_bytes'):
                 _saved_name = st.session_state.get('custom_neo_name', 'テンプレートNEO')
                 _saved_size = len(st.session_state['custom_neo_bytes'])
@@ -5809,6 +5809,18 @@ def main():
 ''', unsafe_allow_html=True)
 
         # ── タブ（見積明細タブ廃止・編集は合計・費用タブへ統合）──
+        # テンプレートNEOを使うと、空欄のままの項目にはテンプレート側の値
+        # （前の案件の氏名・車台番号・事故受付番号など）がそのまま残る。
+        # 画面は空欄に見えるので、書かないと利用者は気づけない。
+        if st.session_state.get('custom_neo_bytes'):
+            st.warning(
+                f"⚠️ テンプレートNEO「{safe_str(st.session_state.get('custom_neo_name', ''))}」"
+                "を使用中です。下の車両情報とサイドバーの事故情報のうち、"
+                "**空欄のままの項目はテンプレートに入っている値がそのまま .neo に残ります**"
+                "（前の案件の使用者名・車台番号・事故受付番号など）。"
+                "別の案件として出す項目は必ず入力し直してください。"
+            )
+
         tab_vehicle, tab_totals = st.tabs(["🚗 車両情報", "💰 合計・費用"])
 
         with tab_vehicle:
@@ -5992,9 +6004,17 @@ def main():
             _df_edit = pd.DataFrame(_edit_rows) if _edit_rows else pd.DataFrame(
                 columns=['No', '部品番号', '品名', '数量', '部品金額', '工数', '工賃'])
             # キーを行数と連動させることで行挿入後に data_editor を強制再初期化する
-            # キーに行数を入れると、行を足した瞬間にウィジェットが作り直され、
-            # 入力中のセルの内容が捨てられる。固定キーにする。
-            _editor_key = 'items_editor'
+            # 完全な固定キーにすると、行を削除したときのフロント側の
+            # 編集状態が残り、振り直した No が画面に反映されない。
+            # 画面の No と「コピー」が指す行がずれ、別の行が複製される。
+            # 行数が変わったときだけ作り直す（セル編集では行数は変わらない
+            # ので、入力中の内容は捨てられない）。
+            _ed_ver = st.session_state.get('items_editor_ver', 0)
+            if st.session_state.get('items_editor_rows') != len(_items_src):
+                st.session_state['items_editor_rows'] = len(_items_src)
+                _ed_ver += 1
+                st.session_state['items_editor_ver'] = _ed_ver
+            _editor_key = f'items_editor_{_ed_ver}'
             # height を固定して描画行数を制限（全行フル展開すると100行超で重くなるため）
             _editor_height = min(600, max(200, len(_items_src) * 35 + 60))
             _edited_df = st.data_editor(
@@ -6058,6 +6078,21 @@ def main():
                     '_original_parts_amount': _orig.get('parts_amount', safe_int(_row.get('部品金額', 0))),
                 })
             estimate_data['items'] = edited_items
+            # 明細も列幅で無言に切られる。車両情報と同じように画面で知らせる。
+            # 切られたことに気づけるのが、コグニセブンに取り込んだ後ではなく
+            # ここでなければ、部品番号が切れて発注に使えないまま出荷される。
+            for _wi, _wit in enumerate(edited_items, 1):
+                for _wlbl, _wraw, _ww in (
+                    ('品名',     _wit.get('name', ''),    _ERPARTS_WIDTH['PartsName']),
+                    ('部品番号', _wit.get('part_no', ''), _ERPARTS_WIDTH['PartsNo']),
+                ):
+                    _wraw = safe_str(_wraw)
+                    _wcut = cp932_trim(_wraw, _ww)
+                    if _wraw and _wcut != _wraw:
+                        st.warning(
+                            f"⚠️ {_wi}行目の{_wlbl}はコグニセブンの列幅"
+                            f"（{_ww}バイト＝全角{_ww // 2}文字）を超えています。"
+                            f"NEOには「{_wcut}」までしか入りません。")
             st.session_state['estimate_data'] = estimate_data
             for _it in edited_items:
                 calc_parts += safe_int(_it.get('parts_amount', 0))
@@ -6447,31 +6482,37 @@ def main():
                 f'<div class="total-value">¥{sp:,}</div>'
                 '</div>'
             ) if sp else ''
-            st.markdown(f"""
-            <div class="total-strip">
-                <div class="total-item">
-                    <div class="total-label">部品代</div>
-                    <div class="total-value">¥{calc_parts:,}</div>
-                </div>
-                <div class="total-sep">+</div>
-                <div class="total-item">
-                    <div class="total-label">工賃</div>
-                    <div class="total-value">¥{calc_wages:,}</div>
-                </div>
-                {_sp_cell}
-                {_exp_cell}
-                <div class="total-sep">+</div>
-                <div class="total-item">
-                    <div class="total-label">{'消費税（税込済）' if _is_tax_incl_strip else '消費税'}</div>
-                    <div class="total-value">{'—' if _is_tax_incl_strip else f'¥{tax:,}'}</div>
-                </div>
-                <div class="total-sep">=</div>
-                <div class="total-item">
-                    <div class="total-label">合計{'（税込）' if not _is_tax_incl_strip else ''}</div>
-                    <div class="total-value-highlight">¥{total:,}</div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+            # ショートパーツや費用が0のとき {_sp_cell} が空文字になり、
+            # 「空白だけの行」ができる。Markdown はそこでHTMLブロックを
+            # 終わらせるため、以降が字下げコードブロックとして生の
+            # タグのまま表示されてしまう。改行を挟まない1本の文字列にする。
+            _tax_label   = '消費税（税込済）' if _is_tax_incl_strip else '消費税'
+            _tax_value   = '—' if _is_tax_incl_strip else f'¥{tax:,}'
+            _total_label = '合計' if _is_tax_incl_strip else '合計（税込）'
+            st.markdown(
+                '<div class="total-strip">'
+                '<div class="total-item">'
+                '<div class="total-label">部品代</div>'
+                f'<div class="total-value">¥{calc_parts:,}</div>'
+                '</div>'
+                '<div class="total-sep">+</div>'
+                '<div class="total-item">'
+                '<div class="total-label">工賃</div>'
+                f'<div class="total-value">¥{calc_wages:,}</div>'
+                '</div>'
+                f'{_sp_cell}{_exp_cell}'
+                '<div class="total-sep">+</div>'
+                '<div class="total-item">'
+                f'<div class="total-label">{_tax_label}</div>'
+                f'<div class="total-value">{_tax_value}</div>'
+                '</div>'
+                '<div class="total-sep">=</div>'
+                '<div class="total-item">'
+                f'<div class="total-label">{_total_label}</div>'
+                f'<div class="total-value-highlight">¥{total:,}</div>'
+                '</div>'
+                '</div>',
+                unsafe_allow_html=True)
           else:
             amount_confirmed = True
             st.info("💡 見積書なし — 車両情報のみのNEOファイルを作成します")
