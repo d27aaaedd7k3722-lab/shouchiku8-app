@@ -1357,29 +1357,45 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             _target_parts = _best
             _target_wages = total_wages
 
-        for _target, _cur, _line, _col_out, _col_in, _col_tax in (
-            (_target_parts, total_parts, _adj_parts_line,
+        # 差額は1行に寄せず、全行に1円ずつ配る。
+        # 1行に寄せると、行ごとの逆算で積み上がった誤差がまるごとそこに乗り、
+        # 明細が増えるほどその1行だけ税抜額が原本から離れる
+        # （1,000行の見積で1行が455円ずれた）。同じ部品・同じ税込額なのに
+        # 1行だけ単価が違う見積になり、協定の場で説明できない。
+        # 税込額の大きい行から順に1円ずつ配れば、どの行も自然な逆算値から
+        # ±1円以内に収まり、合計は厳密に一致する（最大剰余法と同じ考え方）。
+        for _target, _cur, _col_out, _col_in, _col_tax in (
+            (_target_parts, total_parts,
              'PartsPriceOutTax', 'PartsPriceInTax', 'PartsPriceTax'),
-            (_target_wages, total_wages, _adj_wage_line,
+            (_target_wages, total_wages,
              'WageOutTax', 'WageInTax', 'WageTax'),
         ):
             _delta = _target - _cur
-            if _delta == 0 or _line is None:
+            if _delta == 0:
                 continue
-            _row = cur.execute(
-                f'SELECT {_col_out}, {_col_in} FROM ERParts WHERE LineNo=?',
-                (_line,)).fetchone()
-            if not _row or _row[0] is None or _row[0] == -1:
+            # 金額の入っている行を、税込額の大きい順に並べる
+            _rows = cur.execute(
+                f'SELECT LineNo, {_col_out}, {_col_in} FROM ERParts'
+                f' WHERE {_col_out} IS NOT NULL AND {_col_out} != -1'
+                f' ORDER BY ABS({_col_in}) DESC, LineNo ASC').fetchall()
+            if not _rows:
                 continue
-            _new_out = _row[0] + _delta
-            _new_in  = _row[1]
-            cur.execute(
-                f'UPDATE ERParts SET {_col_out}=?, {_col_tax}=? WHERE LineNo=?',
-                (_new_out, _new_in - _new_out, _line))
+            _step = 1 if _delta > 0 else -1
+            _i = 0
+            while _delta != 0 and _i < abs(_target - _cur) + len(_rows):
+                _ln, _out, _in = _rows[_i % len(_rows)]
+                _new_out = _out + _step
+                cur.execute(
+                    f'UPDATE ERParts SET {_col_out}=?, {_col_tax}=? WHERE LineNo=?',
+                    (_new_out, _in - _new_out, _ln))
+                _rows[_i % len(_rows)] = (_ln, _new_out, _in)
+                _delta -= _step
+                _i += 1
+            _applied = _target - _cur - _delta
             if _col_out == 'PartsPriceOutTax':
-                total_parts += _delta
+                total_parts += _applied
             else:
-                total_wages += _delta
+                total_wages += _applied
 
     # ── Total計算 ──
     # total_parts / total_wages は既に税抜値（is_tax_inclusive時は逆算済み）
@@ -1388,12 +1404,31 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
     parts_tax_total   = jpy_round(total_parts * TAX_RATE)
     wages_tax_total   = jpy_round(total_wages * TAX_RATE)
     sp_tax_total      = jpy_round(sp_out * TAX_RATE)
-    # 消費税は、内訳の各欄（部品計・工賃計・諸経費計）と同じ刻みで丸めて足す。
-    # 以前は小計をまとめて1回で丸めていたため、内訳の税額欄の合計と
-    # tx_Total が一致せず、同じ .neo の中で内訳と総額が1円食い違っていた。
-    # 画面も内訳と同じ刻みで出しているので、画面とファイルも1円ずれていた。
     expenses_tax_total = jpy_round(taxable_expenses * TAX_RATE)
-    tax_total         = parts_tax_total + wages_tax_total + expenses_tax_total
+    # 消費税は請求書単位で1回だけ丸める。これが見積書に印字された税込総額の
+    # 作り方であり、画面もこの刻みで出している。
+    # バケットごとに丸めて足すと、約4件に1件で原本の税込総額から1円離れる。
+    # 税込表記のときは、上で「税を足すと原本の税込総額に戻る」税抜額を
+    # わざわざ探索しているので、明細ぶんと費用ぶんを分けて丸めないと
+    # その探索の成果が壊れる。
+    if is_tax_inclusive:
+        tax_total = (jpy_round((total_parts + total_wages) * TAX_RATE)
+                     + expenses_tax_total)
+    else:
+        tax_total = jpy_round(sub_total * TAX_RATE)
+    # 内訳の税額欄（部品計・工賃計・諸経費計）の合計は tx_Total と
+    # 一致していなければならない。まとめ丸めとの差を、いちばん金額の
+    # 大きい欄に寄せて整合を保つ。
+    _tax_resid = tax_total - (parts_tax_total + wages_tax_total + expenses_tax_total)
+    if _tax_resid:
+        _biggest = max((abs(total_parts), 'p'), (abs(total_wages), 'w'),
+                       (abs(taxable_expenses), 'e'))[1]
+        if _biggest == 'p':
+            parts_tax_total += _tax_resid
+        elif _biggest == 'w':
+            wages_tax_total += _tax_resid
+        else:
+            expenses_tax_total += _tax_resid
     grand_total       = sub_total + tax_total + tax_exempt  # 非課税は税計算後に加算
     cur.execute("""UPDATE Total SET
         ms_PartsTotalOutTax=?,
@@ -1938,6 +1973,9 @@ def generate_annote(rows):
         name_bytes = cp932_trim(_strip_control_chars(name), 30).encode('cp932', errors='replace')
         for j, b in enumerate(name_bytes):
             line[14 + j] = b
+        # 注記の数量欄は2桁固定。3桁以上は入らないので丸めるしかないが、
+        # 明細テーブルには150、注記には99と書かれ、同じ .neo の中で
+        # 数量が食い違う。丸めたことは画面で知らせる（下の警告で拾う）。
         qty_str = f'{min(qty, 99):02d}'
         line[98] = ord(qty_str[0])
         line[99] = ord(qty_str[1])
@@ -3484,6 +3522,7 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
     import io as _io
 
     _trailer_notes: list = []
+    _dropped_amount: list = []
 
     # BOM除去・改行正規化
     text = csv_text.strip().lstrip('\ufeff').replace('\r\n', '\n').replace('\r', '\n')
@@ -3619,6 +3658,12 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
         index_val = _cell(row, 'index_value', None)
 
         if not name:
+            # 品名が無い行は明細として扱えない。ただし金額が入っているなら
+            # 落としたことを知らせる。黙って落とすと、300行貼って「295行
+            # 読み込み完了」とだけ出て、5行と その金額が消えたことに
+            # 気づけない（CSV経路は原本合計との突き合わせも効かない）。
+            if parts_amt or wage_amt:
+                _dropped_amount.append(parts_amt + wage_amt)
             continue
         # 表の後ろにAIが書き足す説明文（「上記のとおりです。」など）は明細ではない。
         # 金額も数量も品番も無く、1セルだけの文章行に限って落とす。
@@ -3668,6 +3713,11 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
             'row_id':       f'p1_r{row_idx:03d}',
             'row_bbox':     {'x1': 0, 'y1': 0, 'x2': 1000, 'y2': 50},
         })
+    if _dropped_amount:
+        _trailer_notes.append(
+            f'⚠️ 品名が空欄の行を{len(_dropped_amount)}行読み飛ばしました'
+            f'（金額の合計 {sum(_dropped_amount):,}円）。'
+            'CSVの品名欄をご確認ください。')
     return (items, _trailer_notes) if return_notes else items
 
 
@@ -6425,6 +6475,19 @@ def main():
                 v_term    = st.text_input("有効期限 (YYYYMMDD)",   value=safe_str(vehicle_data.get('term_date', '')),    key='v_term')
             with col5:
                 v_regdate = st.text_input("初度登録年月 (YYYYMM00)", value=safe_str(vehicle_data.get('car_reg_date', '')), key='v_regdate')
+
+            # 注記(AnNote.ini)の数量欄は2桁固定で、100以上は99として書かれる。
+            # 明細テーブルには原本どおり入るので、同じ .neo の中で数量が
+            # 食い違う。黙って丸めず知らせる。
+            _qty_over = [str(_it.get('name', '') or '')
+                         for _it in (estimate_data.get('items') or [])
+                         if safe_int(_it.get('quantity', 1), 1) > 99]
+            if _qty_over:
+                st.warning(
+                    f"⚠️ 数量が100以上の行が{len(_qty_over)}件あります"
+                    f"（{'、'.join(_qty_over[:3])}{'ほか' if len(_qty_over) > 3 else ''}）。"
+                    "コグニセブンの注記欄は数量が2桁までのため、注記側は99として"
+                    "書かれます（明細欄には原本どおりの数量が入ります）。")
 
             # 読み取れない日付は黙って捨てられる（または和暦の組み立てで
             # 落ちる）ので、事故日と同じように画面で知らせる。
