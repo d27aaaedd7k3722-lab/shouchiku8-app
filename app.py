@@ -570,7 +570,10 @@ def replace_xml_tag(text, tag_name, value):
     """XMLタグの中身を現在値に関係なく置換"""
     pattern = rf'<{re.escape(tag_name)}>[^<]*</{re.escape(tag_name)}>'
     replacement = f'<{tag_name}>{value}</{tag_name}>'
-    result = re.sub(pattern, replacement, text)
+    # 置換文字列を生で渡すと、値の中の「\1」が後方参照として解釈されて
+    # 落ちる。JIS配列の ¥ キーは U+005C を送るので、備考に「¥1,200」と
+    # 打っただけで NEO 生成が失敗していた。lambda で解釈を止める。
+    result = re.sub(pattern, lambda _m: replacement, text)
     # 空タグ形式も対応
     empty_pattern = rf'<{re.escape(tag_name)}/>'
     result = result.replace(empty_pattern, replacement)
@@ -580,8 +583,9 @@ def replace_xml_tag(text, tag_name, value):
 def replace_ini_value(text, key, value):
     """INIキー値を確実に更新"""
     pattern = rf'^({re.escape(key)}\s*=).*$'
-    replacement = rf'\g<1>{value}'
-    return re.sub(pattern, replacement, text, flags=re.MULTILINE)
+    # 上と同じ理由で、値をそのまま置換文字列にしない
+    return re.sub(pattern, lambda m: m.group(1) + str(value), text,
+                  flags=re.MULTILINE)
 
 
 # ============================================================
@@ -1078,35 +1082,65 @@ _CAR_WIDTH = {
 }
 
 
+def _trimmed_cust_values(cust: dict) -> dict:
+    """DB・ヘッダXML・INI で同じ値を書くための、列幅で切り詰め済みの束。
+
+    片側だけ切り詰めると、1つの .neo の中で使用者名や車名が
+    2種類存在する状態になってしまう。
+    """
+    cust = cust or {}
+    return {
+        'customer_name': cp932_trim(cust.get('customer_name', ''), _CUST_WIDTH['Name1']),
+        'user_name':     cp932_trim(cust.get('customer_name', ''), _CUST_WIDTH['UserName']),
+        'owner_name':    cp932_trim(cust.get('owner_name', ''),    _CUST_WIDTH['OwnerName']),
+        'postal_no':     cp932_trim(cust.get('postal_no', ''),     _CUST_WIDTH['PostalNo']),
+        'prefecture':    cp932_trim(cust.get('prefecture', ''),    _CUST_WIDTH['Prefecture']),
+        'municipality':  cp932_trim(cust.get('municipality', ''),  _CUST_WIDTH['Municipality']),
+        'address_other': cp932_trim(cust.get('address_other', ''), _CUST_WIDTH['AddressOther1']),
+        'car_dept':      cp932_trim(cust.get('car_reg_department', ''), _CUST_WIDTH['CarRegNoDepartment']),
+        'car_div':       cp932_trim(cust.get('car_reg_division', ''),   _CUST_WIDTH['CarRegNoDivision']),
+        'car_biz':       cp932_trim(cust.get('car_reg_business', ''),   _CUST_WIDTH['CarRegNoBusiness']),
+        'car_serial':    cp932_trim(cust.get('car_reg_serial', ''),     _CUST_WIDTH['CarRegNoSerial']),
+        'car_serial_no': cp932_trim(cust.get('car_serial_no', ''),      _CUST_WIDTH['CarSerialNo']),
+        'model_desig':   cp932_trim(cust.get('car_model_designation', ''), _CUST_WIDTH['CarMouldNo']),
+        'category_num':  cp932_trim(cust.get('car_category_number', ''),   _CUST_WIDTH['CarKindNo']),
+        'car_name':      cp932_trim(cust.get('car_name', ''),      _CAR_WIDTH['CarName']),
+        'body_color':    cp932_trim(cust.get('body_color', ''),    _CAR_WIDTH['ColorName']),
+        'color_code':    cp932_trim(cust.get('color_code', ''),    _CAR_WIDTH['ColorCode']),
+        'trim_code':     cp932_trim(cust.get('trim_code', ''),     _CAR_WIDTH['TrimCode']),
+    }
+
+
 def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
                        is_tax_inclusive, merge_mode):
     conn = sqlite3.connect(_tmp_db_path)
     cur  = conn.cursor()
     # コグニセブンの列幅（CP932バイト数）に合わせて切り詰める。
     # SQLite は TEXT(n) を強制しないため、ここで守らないと桁あふれした値が
-    # そのまま入る。Name1 と UserName は宣言幅が違うので別々に切る。
-    customer_name = cp932_trim(cust.get('customer_name', ''), _CUST_WIDTH['Name1'])
-    user_name     = cp932_trim(cust.get('customer_name', ''), _CUST_WIDTH['UserName'])
-    owner_name    = cp932_trim(cust.get('owner_name', ''), _CUST_WIDTH['OwnerName'])
-    postal_no     = cp932_trim(cust.get('postal_no', ''), _CUST_WIDTH['PostalNo'])
-    prefecture    = cp932_trim(cust.get('prefecture', ''), _CUST_WIDTH['Prefecture'])
-    municipality  = cp932_trim(cust.get('municipality', ''), _CUST_WIDTH['Municipality'])
-    address_other = cp932_trim(cust.get('address_other', ''), _CUST_WIDTH['AddressOther1'])
-    car_dept      = cp932_trim(cust.get('car_reg_department', ''), _CUST_WIDTH['CarRegNoDepartment'])
-    car_div       = cp932_trim(cust.get('car_reg_division', ''), _CUST_WIDTH['CarRegNoDivision'])
-    car_biz       = cp932_trim(cust.get('car_reg_business', ''), _CUST_WIDTH['CarRegNoBusiness'])
-    car_serial    = cp932_trim(cust.get('car_reg_serial', ''), _CUST_WIDTH['CarRegNoSerial'])
-    car_serial_no = cp932_trim(cust.get('car_serial_no', ''), _CUST_WIDTH['CarSerialNo'])
-    car_name       = cp932_trim(cust.get('car_name', ''), _CAR_WIDTH['CarName'])
+    # そのまま入る。同じ束をヘッダXML・INIでも使い、表記を一致させる。
+    _t = _trimmed_cust_values(cust)
+    customer_name = _t['customer_name']
+    user_name     = _t['user_name']
+    owner_name    = _t['owner_name']
+    postal_no     = _t['postal_no']
+    prefecture    = _t['prefecture']
+    municipality  = _t['municipality']
+    address_other = _t['address_other']
+    car_dept      = _t['car_dept']
+    car_div       = _t['car_div']
+    car_biz       = _t['car_biz']
+    car_serial    = _t['car_serial']
+    car_serial_no = _t['car_serial_no']
+    car_name       = _t['car_name']
     car_model      = safe_str(cust.get('car_model', ''))
     engine_model   = safe_str(cust.get('engine_model', ''))
-    body_color     = cp932_trim(cust.get('body_color', ''), _CAR_WIDTH['ColorName'])
-    color_code     = cp932_trim(cust.get('color_code', ''), _CAR_WIDTH['ColorCode'])
-    trim_code      = cp932_trim(cust.get('trim_code', ''), _CAR_WIDTH['TrimCode'])
+    body_color     = _t['body_color']
+    color_code     = _t['color_code']
+    trim_code      = _t['trim_code']
     car_weight     = safe_int(cust.get('car_weight', 0))
     displacement   = safe_int(cust.get('engine_displacement', 0))
-    model_desig    = cp932_trim(cust.get('car_model_designation', ''), _CUST_WIDTH['CarMouldNo'])
-    category_num   = cp932_trim(cust.get('car_category_number', ''), _CUST_WIDTH['CarKindNo'])
+    model_desig    = _t['model_desig']
+    category_num   = _t['category_num']
     kilometer      = safe_int(cust.get('kilometer', -1), -1)
     # 「2026/03/01」のような区切り付きをそのまま通すと、和暦の組み立てで
     # int('/0') となり NEO 生成が丸ごと失敗する。必ず正規化してから使う。
@@ -1258,15 +1292,19 @@ def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mo
     merge_mode=True の場合、非空の値のみ上書きする。
     """
     text         = orig_bytes.decode('cp932', errors='replace')
-    customer_name = safe_str(cust.get('customer_name', ''))
-    owner_name    = safe_str(cust.get('owner_name', ''))
-    car_dept      = safe_str(cust.get('car_reg_department', ''))
-    car_div       = safe_str(cust.get('car_reg_division', ''))
-    car_biz       = safe_str(cust.get('car_reg_business', ''))
-    car_serial    = safe_str(cust.get('car_reg_serial', ''))
+    # DB と同じ切り詰め済みの値を使う。片側だけ切ると、1つの .neo の中で
+    # 使用者名や車名が2種類存在する状態になる。
+    _t = _trimmed_cust_values(cust)
+    customer_name = _t['customer_name']
+    user_name     = _t['user_name']
+    owner_name    = _t['owner_name']
+    car_dept      = _t['car_dept']
+    car_div       = _t['car_div']
+    car_biz       = _t['car_biz']
+    car_serial    = _t['car_serial']
     car_no_full   = f'{car_dept}{car_div}{car_biz}{car_serial}'
-    car_name      = safe_str(cust.get('car_name', ''))
-    car_serial_no = safe_str(cust.get('car_serial_no', ''))
+    car_name      = _t['car_name']
+    car_serial_no = _t['car_serial_no']
     kilometer     = safe_str(cust.get('kilometer', ''))
     # DB側と同じ正規化を通す。ここだけ生の値を使うと、同じNEOの中で
     # DBとヘッダXMLが食い違ったり int('/0') で落ちたりする。
@@ -1276,7 +1314,7 @@ def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mo
     tag_values = {
         'CustomerName1': customer_name,
         'OwnerName':     owner_name,
-        'UserName':      customer_name,
+        'UserName':      user_name,
         'CarNo':         car_no_full,
         'CarName':       car_name,
         'CarSerialNo':   car_serial_no,
@@ -1297,9 +1335,9 @@ def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mo
             re.sub(r'\s+', ' ', safe_str(ins.get('note1', ''))).strip(), 40),
         'GarageInDate':  _normalize_date8(ins.get('garage_in_date', '')),
         'GarageOutDate': _normalize_date8(ins.get('garage_out_date', '')),
-        'CarMouldNo':    safe_str(cust.get('car_model_designation', '')),
-        'CarKindNo':     safe_str(cust.get('car_category_number', '')),
-        'ColorCode':     safe_str(cust.get('color_code', '')),
+        'CarMouldNo':    _t['model_desig'],
+        'CarKindNo':     _t['category_num'],
+        'ColorCode':     _t['color_code'],
     }
     if term_date and term_date != '00000000':
         term_era, term_era_year = get_era_info(term_date)
@@ -1339,16 +1377,20 @@ def update_imge_ini(orig_bytes, cust, insurance_info=None, merge_mode=False):
     merge_mode=True の場合、非空の値のみ上書きする。
     """
     text      = orig_bytes.decode('cp932', errors='replace')
+    # DB・ヘッダXML と同じ切り詰め済みの値を使う
+    _t = _trimmed_cust_values(cust)
     ini_values = {
-        'CustomerName':    safe_str(cust.get('customer_name', '')),
-        'CarNoDepartment': safe_str(cust.get('car_reg_department', '')),
-        'CarNoDivision':   safe_str(cust.get('car_reg_division', '')),
-        'CarNoBusiness':   safe_str(cust.get('car_reg_business', '')),
-        'CarNoSerial':     safe_str(cust.get('car_reg_serial', '')),
-        'CarName':         safe_str(cust.get('car_name', '')),
+        'CustomerName':    _t['customer_name'],
+        'CarNoDepartment': _t['car_dept'],
+        'CarNoDivision':   _t['car_div'],
+        'CarNoBusiness':   _t['car_biz'],
+        'CarNoSerial':     _t['car_serial'],
+        'CarName':         _t['car_name'],
         # 事故情報。書かないとテンプレート再利用時に前の案件の値が残る。
         'AcceptNo':        cp932_trim((insurance_info or {}).get('accept_no', ''), 37),
-        'AccidentDate':    _normalize_date8((insurance_info or {}).get('accident_date', '')),
+        # 8桁固定の欄。未入力は純正テンプレートと同じ 00000000 にする
+        # （空文字だと DB の Insurance.AccidentDate='00000000' と食い違う）
+        'AccidentDate':    _normalize_date8((insurance_info or {}).get('accident_date', '')) or '00000000',
     }
     for key, value in ini_values.items():
         if merge_mode and not value:
@@ -4589,7 +4631,7 @@ def main():
                 "Geminiの解析結果CSVを貼り付け（ヘッダー行必須）",
                 height=180,
                 placeholder="品名,区分,数量,部品金額,工賃,部品コード\nフロントバンパー,取替,1,45000,0,\nバンパー交換工賃,取替,1,0,12000,",
-                key='csv_paste_area',
+                key=f"csv_paste_area_{st.session_state.get('csv_area_seq', 0)}",
                 value=st.session_state.get('_csv_paste_saved', ''),
             )
         with _csv_col2:
@@ -4600,17 +4642,6 @@ def main():
                 key='csv_file_upload',
                 label_visibility='collapsed',
             )
-            if st.session_state.get('csv_mode') and st.session_state.get('csv_items'):
-                _p = sum(safe_int(it.get('parts_amount', 0)) for it in st.session_state['csv_items'])
-                _w = sum(safe_int(it.get('wage', 0)) for it in st.session_state['csv_items'])
-                st.success(f"✅ {len(st.session_state['csv_items'])}行 取込済")
-                st.caption(f"部品: ¥{_p:,} / 工賃: ¥{_w:,}")
-                if st.button("🗑️ クリア", key='csv_clear_btn'):
-                    st.session_state.pop('csv_items', None)
-                    st.session_state.pop('csv_mode', None)
-                    st.session_state.pop('_csv_paste_saved', None)
-                    st.rerun()
-
         _csv_text = ''
         if _csv_file:
             try:
@@ -4655,6 +4686,21 @@ def main():
                 st.error("❌ CSVの読み込みに失敗しました。1行目にヘッダー（品名,区分,数量,部品金額,工賃,部品コード）が必要です。")
                 st.session_state.pop('csv_items', None)
                 st.session_state.pop('csv_mode', None)
+
+        # クリアは取り込みの後ろに置く。前に置くと、貼り付けた直後の描画では
+        # まだ csv_items が無いためボタンが1回遅れて出る。
+        if st.session_state.get('csv_mode') and st.session_state.get('csv_items'):
+            if st.button("🗑️ 取り込みをクリア", key='csv_clear_btn'):
+                st.session_state.pop('csv_items', None)
+                st.session_state.pop('csv_mode', None)
+                st.session_state.pop('_csv_paste_saved', None)
+                # 貼り付け欄も空にしないと、ブラウザが直前の値を送り直して
+                # 同じ実行内で再取込され、クリアが効かない。キーを消すだけ
+                # では戻ってくるので、版番号を上げて別ウィジェットにする。
+                _seq = st.session_state.get('csv_area_seq', 0)
+                st.session_state.pop(f'csv_paste_area_{_seq}', None)
+                st.session_state['csv_area_seq'] = _seq + 1
+                st.rerun()
 
         # ── PDF見積 → NEO 自動変換 ──────────────────────
         st.markdown("---")
@@ -5279,8 +5325,10 @@ def main():
             # 車両情報（修正可能なフォーム）
             col1, col2 = st.columns(2)
             with col1:
-                v_customer = st.text_input("使用者名",    value=safe_str(vehicle_data.get('customer_name', '')),    key='v_customer')
-                v_owner    = st.text_input("所有者名",    value=safe_str(vehicle_data.get('owner_name', '')),       key='v_owner')
+                v_customer = st.text_input("使用者名",    value=safe_str(vehicle_data.get('customer_name', '')),    key='v_customer',
+                                           help="コグニセブンの列幅の都合で、全角10文字（20バイト）までがNEOに入ります")
+                v_owner    = st.text_input("所有者名",    value=safe_str(vehicle_data.get('owner_name', '')),       key='v_owner',
+                                           help="全角10文字（20バイト）までNEOに入ります")
                 v_postal   = st.text_input("郵便番号",    value=safe_str(vehicle_data.get('postal_no', '')),        key='v_postal')
                 v_pref     = st.text_input("都道府県",    value=safe_str(vehicle_data.get('prefecture', '')),       key='v_pref')
                 v_muni     = st.text_input("市区町村",    value=safe_str(vehicle_data.get('municipality', '')),     key='v_muni')
@@ -5291,7 +5339,8 @@ def main():
                 v_biz    = st.text_input("登録番号 かな",   value=safe_str(vehicle_data.get('car_reg_business', '')),   key='v_biz')
                 v_serial = st.text_input("登録番号 一連番号", value=safe_str(vehicle_data.get('car_reg_serial', '')),    key='v_serial')
                 v_csn    = st.text_input("車台番号",       value=safe_str(vehicle_data.get('car_serial_no', '')),       key='v_csn')
-                v_carname = st.text_input("車名",          value=safe_str(vehicle_data.get('car_name', '')),             key='v_carname')
+                v_carname = st.text_input("車名",          value=safe_str(vehicle_data.get('car_name', '')),             key='v_carname',
+                                          help="全角25文字（50バイト）までNEOに入ります")
             col3, col4, col5 = st.columns(3)
             with col3:
                 v_km      = st.number_input("走行距離 (km)", value=safe_int(vehicle_data.get('kilometer', 0)), min_value=0, step=1000, key='v_km')
@@ -5299,6 +5348,24 @@ def main():
                 v_term    = st.text_input("有効期限 (YYYYMMDD)",   value=safe_str(vehicle_data.get('term_date', '')),    key='v_term')
             with col5:
                 v_regdate = st.text_input("初度登録年月 (YYYYMM00)", value=safe_str(vehicle_data.get('car_reg_date', '')), key='v_regdate')
+
+            # 列幅を超えた分は無言で切り捨てられ、画面には全文が残るため
+            # ユーザーは気づけない。実際に切られる項目だけを知らせる。
+            for _lbl, _val, _w in (
+                ('使用者名',   v_customer, _CUST_WIDTH['UserName']),
+                ('所有者名',   v_owner,    _CUST_WIDTH['OwnerName']),
+                ('郵便番号',   v_postal,   _CUST_WIDTH['PostalNo']),
+                ('市区町村',   v_muni,     _CUST_WIDTH['Municipality']),
+                ('その他住所', v_addr,     _CUST_WIDTH['AddressOther1']),
+                ('車台番号',   v_csn,      _CUST_WIDTH['CarSerialNo']),
+                ('車名',       v_carname,  _CAR_WIDTH['CarName']),
+            ):
+                _cut = cp932_trim(_val, _w)
+                if _val and _cut != safe_str(_val):
+                    st.warning(
+                        f"⚠️ {_lbl}はコグニセブンの列幅（{_w}バイト＝全角{_w // 2}文字）を"
+                        f"超えています。NEOには「{_cut}」までしか入りません。"
+                        "短い表記に直してください。")
 
             # 読み取れない日付は黙って捨てられる（または和暦の組み立てで
             # 落ちる）ので、事故日と同じように画面で知らせる。
