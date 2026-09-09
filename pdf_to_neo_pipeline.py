@@ -1598,31 +1598,38 @@ def process_pdf_to_neo(pdf_path,
                     # Iter13 v3 (Iter14で停止): リトライは Gemini非決定性で精度悪化リスクあり、
                     # かつ Iter6 thinking_budget=0 単独で十分な速度向上が得られたためコメントアウト
 
-                    # Iter8: 金額誤差自動リカバリ
-                    # OCR出力の合計と PDF表示総合計が ±5%超ずれてたら rasterize=ON で再OCR
+                    # 明細の合算と、見積書に印字された総額のずれを検知する。
+                    #
+                    # 以前は存在しないキー（grand_total / pdf_total / line_total）を
+                    # 見ていたため判定値が常に 0 になり、この安全網は一度も
+                    # 発火していなかった。実際のキーは pdf_grand_total と
+                    # parts_amount / wage。
+                    #
+                    # 検知後に rasterize=ON で再OCRしていたが、明細抽出は
+                    # rasterize の有無で送信内容が変わらないため、結果は必ず
+                    # 同一になる。課金と待ち時間だけが増えるので再OCRはやめ、
+                    # 利用者に差分を知らせて確認を促す。
                     try:
-                        pdf_total = _to_float(ocr_meta_first.get("grand_total") or
-                                              ocr_meta_first.get("pdf_total"))
-                        items_sum = sum(_to_float(it.get("line_total")) for it in items)
-                        diff_ratio = abs(items_sum - pdf_total) / pdf_total if pdf_total > 0 else 0
-                        if diff_ratio > 0.05 and not skip_ocr:
-                            log.append(f"⚠ 金額差{diff_ratio:.1%} → rasterize=ON で再OCR試行")
-                            res2 = analyze_estimate(api_key, pdf_bytes, "application/pdf",
-                                                    use_rasterize=True,
-                                                    model_name=_ocr_model or None)
-                            if isinstance(res2, dict) and "items" in res2:
-                                items2 = res2.get("items", [])
-                                items2_sum = sum(_to_float(it.get("line_total")) for it in items2)
-                                diff2 = abs(items2_sum - pdf_total) / pdf_total if pdf_total > 0 else 1
-                                if diff2 < diff_ratio:
-                                    log.append(f"✅ 再OCR採用 ({diff2:.1%} < {diff_ratio:.1%})")
-                                    items = items2
-                                    out["ocr_meta"] = res2
-                                    out["ocr_retry"] = True
-                                else:
-                                    log.append(f"× 再OCRも改善せず ({diff2:.1%}) - 元結果を採用")
+                        pdf_total = _to_float(ocr_meta_first.get("pdf_grand_total")
+                                              or ocr_meta_first.get("grand_total")
+                                              or ocr_meta_first.get("pdf_total"))
+                        items_sum = sum(
+                            _to_float(it.get("line_total"))
+                            or (_to_float(it.get("parts_amount")) + _to_float(it.get("wage")))
+                            for it in items)
+                        diff_ratio = (abs(items_sum - pdf_total) / pdf_total
+                                      if pdf_total > 0 else 0)
+                        out["items_total_diff_ratio"] = diff_ratio
+                        if diff_ratio > 0.05:
+                            log.append(f"⚠ 明細合算と総額の差 {diff_ratio:.1%}")
+                            warnings.append(
+                                f"読み取った明細の合算（{int(items_sum):,}円）が、"
+                                f"見積書に印字された総額（{int(pdf_total):,}円）と"
+                                f"{diff_ratio:.1%} ずれています。"
+                                "明細の取りこぼしや誤読の可能性があるため、"
+                                "生成前にプレビューで内容をご確認ください。")
                     except Exception as e:
-                        log.append(f"金額リカバリ判定失敗: {e}")
+                        log.append(f"金額差の判定に失敗: {e}")
                 except Exception as e:
                     items = []
                     warnings.append(f"estimate OCR 失敗: {e}")

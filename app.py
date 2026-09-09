@@ -1813,48 +1813,46 @@ def rasterize_pdf_page(pdf_bytes, page_index, dpi=200, enhance=False):
         result = enhance_image_for_ocr(result)
 
     return result
+
+
+def _pdf_visual_size(page):
+    """ページの「見た目の」幅と高さ。/Rotate 90・270 なら縦横が入れ替わる。"""
+    box = page.mediabox
+    w, h = float(box.width), float(box.height)
     try:
-        from pypdf import PdfReader, PdfWriter
-        reader       = PdfReader(io.BytesIO(pdf_bytes))
-        needs_rotation = False
-        for page in reader.pages:
-            box = page.mediabox
-            if float(box.width) > float(box.height) * 1.2:
-                needs_rotation = True
-                break
-        if not needs_rotation:
-            return pdf_bytes
-        writer = PdfWriter()
-        for page in reader.pages:
-            box = page.mediabox
-            if float(box.width) > float(box.height) * 1.2:
-                page.rotate(270)
-            writer.add_page(page)
-        buf = io.BytesIO()
-        writer.write(buf)
-        return buf.getvalue()
-    except Exception:
-        return pdf_bytes
+        rot = int(page.get('/Rotate', 0) or 0) % 360
+    except (TypeError, ValueError):
+        rot = 0
+    return (h, w) if rot in (90, 270) else (w, h)
 
 
 def try_fix_landscape_pdf(pdf_bytes):
-    """横向きPDFを検出して縦向きに回転する"""
+    """横向きPDFを検出して縦向きに回転する。
+
+    MediaBox の縦横だけで判断すると、スキャナやFAXが作る
+    「MediaBox は横長だが /Rotate 90 で正立している」PDF を横向きと
+    誤認し、正立していたページをわざわざ倒してしまう。見た目の向きで
+    判定し、既存の /Rotate に加算した結果も 0〜359 に正規化する。
+    """
     try:
         from pypdf import PdfReader, PdfWriter
-        reader       = PdfReader(io.BytesIO(pdf_bytes))
-        needs_rotation = False
-        for page in reader.pages:
-            box = page.mediabox
-            if float(box.width) > float(box.height) * 1.2:
-                needs_rotation = True
-                break
-        if not needs_rotation:
+        from pypdf.generic import NameObject, NumberObject
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        targets = set()
+        for i, page in enumerate(reader.pages):
+            w, h = _pdf_visual_size(page)
+            if w > h * 1.2:
+                targets.add(i)
+        if not targets:
             return pdf_bytes
         writer = PdfWriter()
-        for page in reader.pages:
-            box = page.mediabox
-            if float(box.width) > float(box.height) * 1.2:
-                page.rotate(270)
+        for i, page in enumerate(reader.pages):
+            if i in targets:
+                try:
+                    _cur = int(page.get('/Rotate', 0) or 0)
+                except (TypeError, ValueError):
+                    _cur = 0
+                page[NameObject('/Rotate')] = NumberObject((_cur + 270) % 360)
             writer.add_page(page)
         buf = io.BytesIO()
         writer.write(buf)
@@ -3909,11 +3907,15 @@ def extract_honda_cars_subtotals(file_bytes):
         from pypdf import PdfReader
         import io as _io
         reader = PdfReader(_io.BytesIO(file_bytes))
+        # reader.pages は遅延評価で、パスワード付きPDFではここで
+        # FileNotDecryptedError を投げる。try の外に出すと、成功済みの
+        # 合計OCRごと解析全体が中断してしまう。
+        _pages = list(reader.pages)
     except Exception:
         return None
 
     all_text = ''
-    for page in reader.pages:
+    for page in _pages:
         try:
             t = page.extract_text() or ''
             all_text += t + '\n'
@@ -4021,7 +4023,22 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     pages = try_split_pdf_pages(file_bytes) if mime_type == 'application/pdf' else None
     # ③-a ページ順序自動補正（FAXヘッダ等で逆順になっている場合を修正）
     if pages and len(pages) > 1:
-        pages = detect_and_reorder_pages(pages)
+        _reordered = detect_and_reorder_pages(pages)
+        if _reordered != pages:
+            # 並べ替えた順で1つのPDFに組み直す。組み直さないと、
+            # 以降の処理（Geminiへの送信・合計欄のラスタライズ）は
+            # 物理順の file_bytes を見るため、補正が効かない。
+            try:
+                from pypdf import PdfReader as _PR, PdfWriter as _PW
+                _w = _PW()
+                for _pb in _reordered:
+                    _w.add_page(_PR(io.BytesIO(_pb)).pages[0])
+                _buf = io.BytesIO()
+                _w.write(_buf)
+                file_bytes = _buf.getvalue()
+            except Exception:
+                pass   # 組み直しに失敗したら元のまま（順序は直らないがデータは壊さない）
+        pages = _reordered
     _logw(f"③ ページ分割: {len(pages) if pages else 1}ページ")
 
     # ③-b&c ラスタライズ: PDF→JPEG変換（行ズレ防止）
@@ -4107,7 +4124,11 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     # Geminiは「小計 195,398 482,976」の数値を誤認することがある。
     # pypdf解析は列レイアウトに依存しないため確実。
     if mime_type == 'application/pdf':
-        _pypdf_totals = extract_honda_cars_subtotals(file_bytes)
+        # 補助的な抽出。ここでの失敗が明細抽出を巻き込まないようにする。
+        try:
+            _pypdf_totals = extract_honda_cars_subtotals(file_bytes)
+        except Exception:
+            _pypdf_totals = None
         if _pypdf_totals:
             _pypdf_parts, _pypdf_wages = _pypdf_totals
             import sys
@@ -4122,8 +4143,11 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     _cb(45, f"④ 明細行を解析中...（{len(pages) if pages else 1}ページ / 30秒〜2分かかる場合があります）")
     _page_count = len(pages) if pages else 1
     _logw(f"⑤ 全ページ一括解析開始 ({_page_count}ページ)")
+    # 全ページを1リクエストで送っているので、ページ指定の文言は付けない。
+    # 「これは全Nページ中の1ページ目です」と指示すると、2ページ目以降の
+    # 明細を読ませない方向にモデルを誘導してしまう。
     result = analyze_estimate_single(
-        api_key, file_bytes, 'application/pdf', used_model, 1, _page_count
+        api_key, file_bytes, 'application/pdf', used_model, 1, 1
     ) or {}
     result.setdefault('items', [])
     result.setdefault('short_parts_wage', 0)
