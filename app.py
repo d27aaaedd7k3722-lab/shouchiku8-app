@@ -396,6 +396,10 @@ def safe_int(val, default=0):
     if isinstance(val, int):
         return val
     if isinstance(val, float):
+        # 明細エディタでセルを空にすると NaN が入る。int(round(nan)) は
+        # 例外になり、画面が操作不能になるため既定値に倒す。
+        if val != val or val in (float('inf'), float('-inf')):
+            return default
         return int(round(val))
     s = _normalize_number_text(str(val))
     if s is None:
@@ -4831,6 +4835,13 @@ def main():
         elif _csv_paste and _csv_paste.strip():
             _csv_text = _csv_paste.strip()
 
+        if not _csv_text and not _csv_file and st.session_state.get('csv_mode'):
+            # 貼り付け欄を空にしたのに前回の取込が残っていると、
+            # 消したはずの見積がそのまま生成されてしまう
+            st.session_state.pop('csv_items', None)
+            st.session_state.pop('csv_mode', None)
+            st.session_state.pop('_csv_paste_saved', None)
+
         if _csv_text:
             _preview_items = parse_csv_to_items(_csv_text)
             if _preview_items:
@@ -4936,11 +4947,13 @@ def main():
         with st.expander("⚙️ オプション設定", expanded=False):
             opt_col1, opt_col2, opt_col3 = st.columns(3)
             with opt_col1:
-                policy_no_step1 = st.text_input("保険会社", placeholder="例: 東京海上日動", key="ins_company_step1")
+                # ここで入力された値はどこにも使われておらず、証券番号の欄が
+                # サイドバーと二重に存在していた。サイドバー側に一本化する。
+                st.caption("保険会社・証券番号・契約者名はサイドバーの「🛡️ 保険情報」で入力してください。")
             with opt_col2:
-                policy_no_step1b = st.text_input("証券番号", placeholder="例: TK-12345678", key="ins_policy_step1")
+                st.write("")
             with opt_col3:
-                assignee_step1 = st.text_input("担当者名", placeholder="例: 田中 花子", key="assignee_step1")
+                st.write("")
 
         # ── 開始ボタン ──
         st.markdown("")
@@ -5307,6 +5320,17 @@ def main():
                 st.rerun()
             st.stop()
 
+        # ステップ①に戻ると vehicle_data は捨てられるが、ユーザーが車両情報
+        # フォームに入力した内容は updated_vehicle として保存してある。
+        # 戻って再開したときに入力が全部消えないよう、そちらを初期値に使う。
+        _saved_vehicle = st.session_state.get('updated_vehicle') or {}
+        if _saved_vehicle:
+            _merged_vehicle = dict(_saved_vehicle)
+            for _k, _v in (vehicle_data or {}).items():
+                if _v not in (None, '') and not _merged_vehicle.get(_k):
+                    _merged_vehicle[_k] = _v
+            vehicle_data = _merged_vehicle
+
         # ── 車両ストリップ ──
         veh_match_result = estimate_data.get('_veh_match_result', {}) if estimate_data else {}
         match_is_db = veh_match_result.get('is_supported', False)
@@ -5391,7 +5415,7 @@ def main():
                 cogni_tax_icon = '🟢'
                 basis_label = '税抜明細（ユーザー設定）'
             rev_icon = '✅ 逆算一致' if rev_match else '⚠️ 逆算不一致（金額を確認してください）'
-            shop_html   = f'<div style="font-size:13px;color:#374151;margin-bottom:10px">🏭 修理工場: <b>{shop_name}</b></div>' if shop_name else ''
+            shop_html   = f'<div style="font-size:13px;color:#374151;margin-bottom:10px">🏭 修理工場: <b>{esc_html(shop_name)}</b></div>' if shop_name else ''
             st.markdown(f'''
 <div style="border:2px solid {cogni_tax_border};border-radius:8px;background:{cogni_tax_bg};padding:14px 18px;margin-bottom:12px">
   {shop_html}
@@ -5450,6 +5474,8 @@ def main():
             with dc6:
                 v_displace  = st.number_input("排気量 (cc)",    value=safe_int(vehicle_data.get('engine_displacement', 0)), min_value=0, step=100, key='v_displace')
 
+        # 入力途中の内容を毎回保存しておく。ステップ①に戻ると
+        # vehicle_data が捨てられるため、保存しないと入力が全て消える。
         updated_vehicle = {
             'customer_name':      v_customer,
             'owner_name':         v_owner,
@@ -5476,6 +5502,8 @@ def main():
             'term_date':          v_term,
             'car_reg_date':       v_regdate,
         }
+        # 生成ボタンを押す前でも入力内容を保持する（ステップ①に戻っても消えない）
+        st.session_state['updated_vehicle'] = updated_vehicle
 
         # 見積明細（合計・費用タブ内で編集）
         calc_parts    = 0
@@ -5546,7 +5574,9 @@ def main():
             _df_edit = pd.DataFrame(_edit_rows) if _edit_rows else pd.DataFrame(
                 columns=['No', '部品番号', '品名', '数量', '部品金額', '工数', '工賃'])
             # キーを行数と連動させることで行挿入後に data_editor を強制再初期化する
-            _editor_key = f'items_editor_{len(_items_src)}'
+            # キーに行数を入れると、行を足した瞬間にウィジェットが作り直され、
+            # 入力中のセルの内容が捨てられる。固定キーにする。
+            _editor_key = 'items_editor'
             # height を固定して描画行数を制限（全行フル展開すると100行超で重くなるため）
             _editor_height = min(600, max(200, len(_items_src) * 35 + 60))
             _edited_df = st.data_editor(
@@ -5642,6 +5672,10 @@ def main():
                         if st.button("✅ フィードバックを記録する", key="fb_record_btn", type="primary"):
                             record_correction(_fb_corrections, _fb_comment, _fb_doc_type)
                             st.session_state['_original_items'] = [dict(it) for it in edited_items]
+                            # 差分キャッシュを捨てないとレポートが残り続け、
+                            # 同じ訂正を何度も記録できてしまう
+                            st.session_state['_fb_cache'] = []
+                            st.session_state.pop('_fb_hash', None)
                             st.success(f"✅ {len(_fb_corrections)}件の訂正をDBに記録しました")
                             # 蓄積件数チェック
                             _summary = get_error_summary()
@@ -5651,6 +5685,9 @@ def main():
                     with _fbc2:
                         if st.button("⏭ スキップ", key="fb_skip_btn"):
                             st.session_state['_original_items'] = [dict(it) for it in edited_items]
+                            st.session_state['_fb_cache'] = []
+                            st.session_state.pop('_fb_hash', None)
+                            st.rerun()
 
             st.markdown("---")
             # ── 金額サマリー ────────────────────────────────────
@@ -5762,7 +5799,12 @@ def main():
                     })
 
                 with st.expander("📊 明細行一覧（全項目）", expanded=False):
-                    st.table(pd.DataFrame(_beta_verification_rows).set_index('No'))
+                    # 全行を削除すると空リストになる。set_index('No') が
+                    # KeyError で落ちて画面が操作不能になるため列を明示する。
+                    st.table(pd.DataFrame(
+                        _beta_verification_rows,
+                        columns=['No', '品名', '部品価格', '工賃'],
+                    ).set_index('No'))
 
                 # 合算値の一致確認
                 _verify_items = []
@@ -5859,7 +5901,7 @@ def main():
                         for a in _error_alerts:
                             st.markdown(
                                 f'<div style="background:#fef2f2;border-left:4px solid #dc2626;padding:8px 12px;margin:4px 0;font-size:13px">'
-                                f'🔴 <b>行{a["row_no"]}「{a["name"]}」</b>: '
+                                f'🔴 <b>行{a["row_no"]}「{esc_html(a["name"])}」</b>: '
                                 f'部品¥{a["parts_amount"]:,} / 工賃¥{a["wage"]:,}<br>'
                                 f'⚠️ {a["message"]}'
                                 f'</div>',
@@ -5871,7 +5913,7 @@ def main():
                             for a in _warning_alerts:
                                 st.markdown(
                                     f'<div style="background:#fffbeb;border-left:4px solid #d97706;padding:8px 12px;margin:4px 0;font-size:13px">'
-                                    f'🟡 <b>行{a["row_no"]}「{a["name"]}」</b>: '
+                                    f'🟡 <b>行{a["row_no"]}「{esc_html(a["name"])}」</b>: '
                                     f'部品¥{a["parts_amount"]:,} / 工賃¥{a["wage"]:,}<br>'
                                     f'{a["message"]}'
                                     f'</div>',
@@ -5990,6 +6032,26 @@ def main():
             else:
                 tax   = round(sub * TAX_RATE)
                 total = sub + tax + st.session_state.get('exp_exempt', 0)
+            # 費用（レッカー・代車・非課税）は合計に加算されるのに画面に
+            # 出ていなかったため、部品代＋工賃＋消費税と合計が一致せず
+            # 「計算が合っていない」ように見えていた。金額がある時だけ表示する。
+            _exp_sum_strip = (st.session_state.get('exp_towing', 0)
+                              + st.session_state.get('exp_rental', 0)
+                              + st.session_state.get('exp_exempt', 0))
+            _exp_cell = (
+                '<div class="total-sep">+</div>'
+                '<div class="total-item">'
+                '<div class="total-label">費用</div>'
+                f'<div class="total-value">¥{_exp_sum_strip:,}</div>'
+                '</div>'
+            ) if _exp_sum_strip else ''
+            _sp_cell = (
+                '<div class="total-sep">+</div>'
+                '<div class="total-item">'
+                '<div class="total-label">ショートパーツ</div>'
+                f'<div class="total-value">¥{sp:,}</div>'
+                '</div>'
+            ) if sp else ''
             st.markdown(f"""
             <div class="total-strip">
                 <div class="total-item">
@@ -6001,6 +6063,8 @@ def main():
                     <div class="total-label">工賃</div>
                     <div class="total-value">¥{calc_wages:,}</div>
                 </div>
+                {_sp_cell}
+                {_exp_cell}
                 <div class="total-sep">+</div>
                 <div class="total-item">
                     <div class="total-label">{'消費税（税込済）' if _is_tax_incl_strip else '消費税'}</div>
@@ -6047,6 +6111,10 @@ def main():
                 st.session_state['step'] = 1
                 st.session_state['vehicle_data']  = None
                 st.session_state['estimate_data'] = None
+                # 前の見積の比較元を残すと、次の見積で「訂正レポート」に
+                # 前回との差分が誤検出され、学習データに誤りが記録される
+                for _k in ('_original_items', '_fb_hash', '_fb_cache'):
+                    st.session_state.pop(_k, None)
                 st.rerun()
         with bcol2:
             # 金額差異未確認時のみボタンを無効化（分類エラーではブロックしない）
@@ -6166,7 +6234,7 @@ def main():
                     st.markdown(
                         f'<div style="background:#fef9c3;border:1px solid #ca8a04;border-radius:6px;padding:10px 14px;margin:8px 0;font-size:13px">'
                         f'✅ <b>部品・工賃区分確認済み</b> — {len(_cls_errors_s4)} 件の要確認項目が確認・承認された上でNEOを生成しました。<br>'
-                        + ''.join(f'<div style="margin-top:4px">⚠️ 行{a["row_no"]}「{a["name"]}」: 部品¥{a["parts_amount"]:,} / 工賃¥{a["wage"]:,}</div>' for a in _cls_errors_s4)
+                        + ''.join(f'<div style="margin-top:4px">⚠️ 行{a["row_no"]}「{esc_html(a["name"])}」: 部品¥{a["parts_amount"]:,} / 工賃¥{a["wage"]:,}</div>' for a in _cls_errors_s4)
                         + '</div>',
                         unsafe_allow_html=True
                     )
@@ -6259,12 +6327,15 @@ def main():
                     'pdf_parts', 'pdf_wages',
                     'policy_no', 'contractor_name',
                     'exp_towing', 'exp_rental', 'exp_exempt',
+                    # ウィジェットキー側も消さないと入力値が次の見積に残り、
+                    # 別のお客様の費用が混入する
+                    'exp_towing_input', 'exp_rental_input', 'exp_exempt_input',
                     'custom_neo_bytes', 'custom_neo_name',
                     'tax_override',
                     'classification_confirmed', 'classification_alerts',
                     'discrepancies', 'total_diff',
                     'amount_confirmed',
-                    '_original_items',
+                    '_original_items', '_fb_hash', '_fb_cache',
                     # CSV取り込み関連
                     'csv_mode', 'csv_items', '_csv_paste_saved',
                     # PDF→NEO変換関連
@@ -6279,8 +6350,12 @@ def main():
                 st.rerun()
         except Exception as e:
             progress.empty()
+            try:
+                _neo_wait.empty()  # 待機メッセージが残り続けるのを防ぐ
+            except Exception:
+                pass
             st.error(f"⚠️ NEO生成中にエラーが発生しました:\n\n{str(e)}")
-            st.code(traceback.format_exc())
+            print("[NEO生成エラー]", traceback.format_exc())
             if st.button("← ステップ③に戻る"):
                 st.session_state['step'] = 3
                 st.rerun()
