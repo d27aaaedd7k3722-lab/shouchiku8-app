@@ -1,10 +1,12 @@
-streamlit
-pandas
-google-genai
-reportlab
-jaconv
-Levenshtein
-python-dotenv
-Pillow
-pdf2image
-pypdfium2
+# Streamlit Community Cloud 再ビルド時の依存関係変動によるアプリ停止を防ぐためバージョン固定
+# （Python 3.11〜3.14 でインストール可能なことを確認済み）
+streamlit==1.63.0
+pandas==3.0.5
+google-genai==2.22.0
+reportlab==5.0.1
+jaconv==0.5.0
+Levenshtein==0.27.4
+python-dotenv==1.2.3
+Pillow==12.3.0
+pdf2image==1.17.0
+pypdfium2==5.13.0
