@@ -46,6 +46,7 @@ import datetime
 import json
 import io
 import re
+import sys
 import unicodedata
 import traceback
 import pandas as pd
@@ -593,7 +594,9 @@ def replace_xml_tag(text, tag_name, value):
 
 def replace_ini_value(text, key, value):
     """INIキー値を確実に更新"""
-    pattern = rf'^({re.escape(key)}\s*=).*$'
+    # `.` は MULTILINE でも \r に一致するため、`.*$` にすると
+    # 書き換えた行だけ CRLF が LF に変わり、テンプレートと改行が混ざる。
+    pattern = rf'^({re.escape(key)}\s*=)[^\r\n]*'
     # 上と同じ理由で、値をそのまま置換文字列にしない
     return re.sub(pattern, lambda m: m.group(1) + str(value), text,
                   flags=re.MULTILINE)
@@ -603,12 +606,25 @@ def replace_ini_value(text, key, value):
 # NEO バイナリ解析
 # ============================================================
 
-def find_real_cks(data, start=424):
+# CKマーカーの位置を貯める上限。正規のNEOは1500明細でも数百KBで、
+# CKは多くても数千個しかない。「CK」を敷き詰めただけのファイルを
+# 投げられると、位置のリストが入力の十数倍のメモリを食い、
+# 1プロセスを共有する本番では全利用者を巻き添えにして落ちる。
+MAX_CK_MARKS = 1_000_000
+# テンプレートNEOのアップロード上限。実データは数百KB。
+MAX_NEO_UPLOAD_BYTES = 8 * 1024 * 1024
+
+
+def find_real_cks(data, start=424, max_marks=MAX_CK_MARKS):
     """comp_len連鎖法でCK位置を特定（偽CK除外）"""
     all_ck = []
     for i in range(start, len(data) - 1):
         if data[i] == 0x43 and data[i + 1] == 0x4B:
             all_ck.append(i)
+            if len(all_ck) > max_marks:
+                raise ValueError(
+                    "NEOファイルの構造が異常です（CKマーカーが多すぎます）。"
+                    "壊れているか、コグニセブンのNEOファイルではありません。")
     if not all_ck:
         return []
     real_ck = []
@@ -1256,6 +1272,20 @@ _CAR_WIDTH = {
 }
 
 
+def _queue_step2_msg(kind: str, text: str):
+    """ステップ②の通知を、ステップ③で表示できるように預ける。
+
+    ステップ②は解析後すぐ st.rerun() でステップ③へ進むため、
+    その場で st.warning しても画面には一瞬も残らない。車検証を
+    読み取れなかったことが利用者に一切伝わらず、空欄のまま
+    .neo が作られてしまうのを防ぐ。
+    """
+    try:
+        st.session_state.setdefault('_step2_msgs', []).append((kind, text))
+    except Exception:
+        pass
+
+
 def _trimmed_cust_values(cust: dict) -> dict:
     """DB・ヘッダXML・INI で同じ値を書くための、列幅で切り詰め済みの束。
 
@@ -1264,24 +1294,24 @@ def _trimmed_cust_values(cust: dict) -> dict:
     """
     cust = cust or {}
     return {
-        'customer_name': cp932_trim(cust.get('customer_name', ''), _CUST_WIDTH['Name1']),
-        'user_name':     cp932_trim(cust.get('customer_name', ''), _CUST_WIDTH['UserName']),
-        'owner_name':    cp932_trim(cust.get('owner_name', ''),    _CUST_WIDTH['OwnerName']),
-        'postal_no':     cp932_trim(cust.get('postal_no', ''),     _CUST_WIDTH['PostalNo']),
-        'prefecture':    cp932_trim(cust.get('prefecture', ''),    _CUST_WIDTH['Prefecture']),
-        'municipality':  cp932_trim(cust.get('municipality', ''),  _CUST_WIDTH['Municipality']),
-        'address_other': cp932_trim(cust.get('address_other', ''), _CUST_WIDTH['AddressOther1']),
-        'car_dept':      cp932_trim(cust.get('car_reg_department', ''), _CUST_WIDTH['CarRegNoDepartment']),
-        'car_div':       cp932_trim(cust.get('car_reg_division', ''),   _CUST_WIDTH['CarRegNoDivision']),
-        'car_biz':       cp932_trim(cust.get('car_reg_business', ''),   _CUST_WIDTH['CarRegNoBusiness']),
-        'car_serial':    cp932_trim(cust.get('car_reg_serial', ''),     _CUST_WIDTH['CarRegNoSerial']),
-        'car_serial_no': cp932_trim(cust.get('car_serial_no', ''),      _CUST_WIDTH['CarSerialNo']),
-        'model_desig':   cp932_trim(cust.get('car_model_designation', ''), _CUST_WIDTH['CarMouldNo']),
-        'category_num':  cp932_trim(cust.get('car_category_number', ''),   _CUST_WIDTH['CarKindNo']),
-        'car_name':      cp932_trim(cust.get('car_name', ''),      _CAR_WIDTH['CarName']),
-        'body_color':    cp932_trim(cust.get('body_color', ''),    _CAR_WIDTH['ColorName']),
-        'color_code':    cp932_trim(cust.get('color_code', ''),    _CAR_WIDTH['ColorCode']),
-        'trim_code':     cp932_trim(cust.get('trim_code', ''),     _CAR_WIDTH['TrimCode']),
+        'customer_name': cp932_trim(_strip_control_chars(cust.get('customer_name', '')), _CUST_WIDTH['Name1']),
+        'user_name':     cp932_trim(_strip_control_chars(cust.get('customer_name', '')), _CUST_WIDTH['UserName']),
+        'owner_name':    cp932_trim(_strip_control_chars(cust.get('owner_name', '')),    _CUST_WIDTH['OwnerName']),
+        'postal_no':     cp932_trim(_strip_control_chars(cust.get('postal_no', '')),     _CUST_WIDTH['PostalNo']),
+        'prefecture':    cp932_trim(_strip_control_chars(cust.get('prefecture', '')),    _CUST_WIDTH['Prefecture']),
+        'municipality':  cp932_trim(_strip_control_chars(cust.get('municipality', '')),  _CUST_WIDTH['Municipality']),
+        'address_other': cp932_trim(_strip_control_chars(cust.get('address_other', '')), _CUST_WIDTH['AddressOther1']),
+        'car_dept':      cp932_trim(_strip_control_chars(cust.get('car_reg_department', '')), _CUST_WIDTH['CarRegNoDepartment']),
+        'car_div':       cp932_trim(_strip_control_chars(cust.get('car_reg_division', '')),   _CUST_WIDTH['CarRegNoDivision']),
+        'car_biz':       cp932_trim(_strip_control_chars(cust.get('car_reg_business', '')),   _CUST_WIDTH['CarRegNoBusiness']),
+        'car_serial':    cp932_trim(_strip_control_chars(cust.get('car_reg_serial', '')),     _CUST_WIDTH['CarRegNoSerial']),
+        'car_serial_no': cp932_trim(_strip_control_chars(cust.get('car_serial_no', '')),      _CUST_WIDTH['CarSerialNo']),
+        'model_desig':   cp932_trim(_strip_control_chars(cust.get('car_model_designation', '')), _CUST_WIDTH['CarMouldNo']),
+        'category_num':  cp932_trim(_strip_control_chars(cust.get('car_category_number', '')),   _CUST_WIDTH['CarKindNo']),
+        'car_name':      cp932_trim(_strip_control_chars(cust.get('car_name', '')),      _CAR_WIDTH['CarName']),
+        'body_color':    cp932_trim(_strip_control_chars(cust.get('body_color', '')),    _CAR_WIDTH['ColorName']),
+        'color_code':    cp932_trim(_strip_control_chars(cust.get('color_code', '')),    _CAR_WIDTH['ColorCode']),
+        'trim_code':     cp932_trim(_strip_control_chars(cust.get('trim_code', '')),     _CAR_WIDTH['TrimCode']),
     }
 
 
@@ -2847,7 +2877,8 @@ def _build_prompt(task_type: str, extra: str = "") -> str:
     return "\n\n".join(p for p in parts if p)
 
 
-def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None):
+def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None,
+                                 _retried=False):
     """車検証をAI-OCRで解析（JSON mode + プロンプトベースの構造化出力）
 
     model_name を省略した場合は、サイドバーで選択中のモデル →
@@ -2949,10 +2980,33 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
     # 黙って作られてしまう。
     if not result or not any(v for v in result.values() if v and str(v).strip()):
         _msg = str(_last_error) if _last_error else '車検証のページを判別できませんでした'
-        if '429' in _msg or 'RESOURCE_EXHAUSTED' in _msg:
+        # 失敗の理由を記録しないと、提供終了やクォータ超過のモデルを
+        # 毎回選び直して4回ずつ無駄に叩き続ける（明細側には同じ記録が
+        # あるのに、車検証側だけ抜けていた）。
+        _model_used = model_name or get_default_gemini_model(api_key)
+        _switch = False
+        if _is_model_unavailable_error(_msg):
+            _mark_model_unavailable(api_key, _model_used)
+            _msg = f'モデル「{_model_used}」は利用できません（提供終了の可能性があります）'
+            _switch = True
+        elif '429' in _msg or 'RESOURCE_EXHAUSTED' in _msg:
+            _quota_exhausted_set().add(_model_used)
+            try:
+                _availability_cache().pop(_model_cache_key(api_key), None)
+            except Exception:
+                pass
             _msg = 'Gemini APIのクォータが上限に達しました'
+            _switch = True
         elif 'API key not valid' in _msg or 'API_KEY_INVALID' in _msg:
             _msg = 'Gemini APIキーが正しくありません'
+        # モデルが原因なら、使える別モデルで1度だけやり直す
+        if _switch and not _retried:
+            _alt = get_alternative_gemini_model(api_key, _model_used)
+            if _alt and _alt != _model_used:
+                print(f"[shaken_ocr] '{_model_used}' が使えないため "
+                      f"'{_alt}' で再試行します", file=sys.stderr)
+                return analyze_vehicle_registration(api_key, file_bytes, mime_type,
+                                                    _alt, _retried=True)
         return {'_error': _msg}
 
     # 数値フィールドを文字列→数値に変換（response_schema が string 型で返すため）
@@ -3991,14 +4045,18 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
         return _analyze_result_cache[_cache_key]
     # ──────────────────────────────────────────────────────────────────────────
 
-    # クォータ超過モデルを除外して使用モデルを決定
-    if used_model in _quota_exhausted_set():
-        # 代替モデルを選択
-        for alt_model in _PREFERRED_MODELS:
-            if alt_model not in _quota_exhausted_set():
-                print(f"[INFO] モデル '{used_model}' はクォータ超過のため '{alt_model}' に切り替えます", file=sys.stderr)
-                used_model = alt_model
-                break
+    # クォータ超過・提供終了のモデルを避けて使用モデルを決定する。
+    # 以前は静的な _PREFERRED_MODELS の先頭から選んでいたため、
+    # そこに実在しないモデルが並んでいると 404 になり、しかも
+    # 提供終了と分かっているモデルを除外していなかったため、
+    # 同じ死んだモデルを毎回選び直して復旧しなかった。
+    # APIが実際に返したモデルから選ぶ。
+    if used_model in _quota_exhausted_set() or used_model in _unavailable_set():
+        _alt = get_alternative_gemini_model(api_key, used_model)
+        if _alt and _alt != used_model:
+            print(f"[INFO] モデル '{used_model}' は利用できないため "
+                  f"'{_alt}' に切り替えます", file=sys.stderr)
+            used_model = _alt
 
     _logw(f"🤖 使用モデル: {used_model}")
     _logw(f"📂 ファイルサイズ: {len(file_bytes):,} bytes / MIMEタイプ: {mime_type}")
@@ -4979,6 +5037,16 @@ def main():
             if custom_neo_file:
                 _neo_bytes_read = custom_neo_file.read()
                 custom_neo_file.seek(0)
+                # 解析にかける前にサイズで弾く。巨大なファイルは
+                # 解析そのものがメモリを食い、共有プロセスを落としうる。
+                if len(_neo_bytes_read) > MAX_NEO_UPLOAD_BYTES:
+                    st.session_state.pop('custom_neo_bytes', None)
+                    st.session_state.pop('custom_neo_name', None)
+                    st.error(
+                        f"❌ {custom_neo_file.name} はサイズが大きすぎます"
+                        f"（{MAX_NEO_UPLOAD_BYTES // (1024 * 1024)}MBまで）。"
+                        "コグニセブンのNEOファイルではない可能性があります。")
+                    _neo_bytes_read = b''
                 # 中身がNEOかどうかをこの場で確かめる。最後の生成時まで
                 # 気づけないと、入力をやり直す手間が大きい。
                 _tpl_ok = False
@@ -5383,11 +5451,22 @@ def main():
                     except Exception as _veh_err:
                         vehicle_data = {'_error': str(_veh_err)[:120]}
                     if vehicle_data.get('_error'):
-                        st.warning(
+                        _queue_step2_msg(
+                            'warning',
                             f"⚠️ 車検証を読み取れませんでした（{vehicle_data['_error']}）。"
-                            "車両情報は空のまま進みます。ステップ③で手入力できます。"
+                            "車両情報は空のまま進みます。下の車両情報欄で手入力できます。"
                         )
                         vehicle_data = {}
+                    else:
+                        # 低信頼度の注意喚起は、この CSV 取り込み経路にも要る。
+                        # 以前は見積書PDF経路にしか無く、主経路である
+                        # CSV 取り込みでは読み取り精度が低くても無警告だった。
+                        _vc = safe_float(vehicle_data.get('confidence', 1.0), 1.0)
+                        if _vc < CONFIDENCE_THRESHOLD:
+                            _queue_step2_msg(
+                                'warning',
+                                f"⚠️ 車検証の読み取り信頼度が低いです（{_vc:.0%}）。"
+                                "下の車両情報が正しいかご確認ください。")
             st.session_state['vehicle_data'] = vehicle_data
             # CSVアイテムをestimate_dataとして格納
             _tax_s2 = st.session_state.get('tax_override', '税抜き（外税）')
@@ -5461,9 +5540,10 @@ def main():
                     except Exception as _veh_err:
                         vehicle_data = {'_error': str(_veh_err)[:120]}
                     if vehicle_data.get('_error'):
-                        st.warning(
+                        _queue_step2_msg(
+                            'warning',
                             f"⚠️ 車検証を読み取れませんでした（{vehicle_data['_error']}）。"
-                            "車両情報は空のまま進みます。ステップ③で手入力できます。"
+                            "車両情報は空のまま進みます。下の車両情報欄で手入力できます。"
                         )
                         vehicle_data = {}
                     progress.progress(40, text="✅ 車検証の解析完了、見積書を処理中...")
@@ -5478,9 +5558,10 @@ def main():
                 progress.progress(10, text="🔍 車検証を解析中...")
                 vehicle_data  = analyze_vehicle_registration(api_key, vehicle_bytes, vehicle_mime) or {}
                 if vehicle_data.get('_error'):
-                    st.warning(
+                    _queue_step2_msg(
+                        'warning',
                         f"⚠️ 車検証を読み取れませんでした（{vehicle_data['_error']}）。"
-                        "車両情報は空のまま進みます。ステップ③で手入力できます。"
+                        "車両情報は空のまま進みます。下の車両情報欄で手入力できます。"
                     )
                     vehicle_data = {}
                 estimate_data = None
@@ -5501,7 +5582,9 @@ def main():
             if vehicle_bytes:
                 v_conf = safe_float(vehicle_data.get('confidence', 1.0), 1.0)
                 if v_conf < CONFIDENCE_THRESHOLD:
-                    st.warning(f"⚠️ 車検証の読み取り信頼度が低いです（{v_conf:.0%}）。プレビュー画面で内容をご確認ください。")
+                    _queue_step2_msg('warning',
+                        f"⚠️ 車検証の読み取り信頼度が低いです（{v_conf:.0%}）。"
+                        "下の車両情報が正しいかご確認ください。")
 
             # 見積書の後処理
             if estimate_data:
@@ -5540,7 +5623,9 @@ def main():
 
                 e_conf = safe_float(estimate_data.get('confidence', 1.0), 1.0)
                 if e_conf < CONFIDENCE_THRESHOLD:
-                    st.warning(f"⚠️ 見積書の読み取り信頼度が低いです（{e_conf:.0%}）。プレビュー画面で内容をご確認ください。")
+                    _queue_step2_msg('warning',
+                        f"⚠️ 見積書の読み取り信頼度が低いです（{e_conf:.0%}）。"
+                        "明細の内容が正しいかご確認ください。")
 
                 # --- 11. Addata 連携 (車両特定 & 部品マッチング) ---
                 _current_mode = st.session_state.get('selected_mode', 'db')
@@ -5833,6 +5918,11 @@ def main():
 ''', unsafe_allow_html=True)
 
         # ── タブ（見積明細タブ廃止・編集は合計・費用タブへ統合）──
+        # ステップ②で出せなかった通知（車検証の読み取り失敗・低信頼度など）を
+        # ここで表示する。ステップ②は直後に rerun するため、あちらでは残らない。
+        for _k2, _m2 in st.session_state.pop('_step2_msgs', []):
+            getattr(st, _k2, st.info)(_m2)
+
         # テンプレートNEOを使うと、空欄のままの項目にはテンプレート側の値
         # （前の案件の氏名・車台番号・事故受付番号など）がそのまま残る。
         # 画面は空欄に見えるので、書かないと利用者は気づけない。
@@ -6799,6 +6889,7 @@ def main():
                     # PDF側の税区分と、その引き継ぎ用の一時キー。消し忘れると
                     # 次の見積で意図しない税区分が復活し、税抜の見積が
                     # 税込として処理される。
+                    '_step2_msgs',
                     '_tax_carry_pending', 'pdf_tax_override',
                     'pdf2neo_tax_inclusive', 'csv_tax_radio', 'pdf_tax_radio',
                     'classification_confirmed', 'classification_alerts',
