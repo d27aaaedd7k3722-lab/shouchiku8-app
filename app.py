@@ -62,22 +62,36 @@ try:
     GEMINI_API_KEY = st.secrets.get('GEMINI_API_KEY', os.environ.get('GEMINI_API_KEY', ''))
 except Exception:
     GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
-GEMINI_MODEL      = "gemini-2.5-flash"          # フォールバック（動的に上書きされる）
+GEMINI_MODEL      = "gemini-3.5-flash"          # フォールバック（動的に上書きされる）
 CONFIDENCE_THRESHOLD = 0.6
 
 # 優先順位付きのモデル候補リスト（上位が最優先）
-# gemini-2.5-flashを最優先（安定・クォータ余裕あり）
-# gemini-3.1-pro-previewはクォータ250回/日の制限があるため後方に配置
+# ※ Gemini 2.5 系は 2026年に提供終了（gemini-2.5-flash は予告より早く停止）。
+#    実際に使えるモデルは API の models.list で動的に検出し、このリストは
+#    「検出結果の並び順」と「API検出に失敗した時の静的フォールバック」に使う。
 _PREFERRED_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.1-pro",
+    "gemini-3-pro",
     "gemini-2.5-flash",
     "gemini-2.5-pro",
-    "gemini-3.1-pro-preview",
-    "gemini-3-pro-preview",
 ]
-_FALLBACK_MODEL = "gemini-2.5-flash"
+_FALLBACK_MODEL = "gemini-3.5-flash"
+
+# 汎用の文書/画像理解に使えないモデル種別（models.list の結果から除外）
+_EXCLUDED_MODEL_KEYWORDS = (
+    'tts', 'image', 'live', 'embedding', 'omni', 'transcribe', 'audio',
+    'robotics', 'computer-use', 'veo', 'imagen', 'aqa', 'learnlm', 'gemma',
+    'deep-research', 'latest', 'exp',
+)
 
 # クォータ超過で利用不可になったモデルを記録（セッション内キャッシュ）
 _quota_exhausted_models: set = set()
+# 提供終了（404 NOT_FOUND / no longer available）と判明したモデルを記録
+_unavailable_models: set = set()
 
 _model_availability_cache: dict = {}  # key: api_key_hash, value: list of model IDs
 
@@ -85,31 +99,98 @@ _model_availability_cache: dict = {}  # key: api_key_hash, value: list of model 
 # key: md5_hex + "_" + model_name + "_" + str(use_rasterize) → value: 解析結果dict
 _analyze_result_cache: dict = {}
 
+
+def _model_cache_key(api_key: str) -> str:
+    return api_key[-8:] if api_key else ''
+
+
+def _is_model_unavailable_error(err_msg: str) -> bool:
+    """モデル提供終了・存在しないモデルを示すエラーかどうか"""
+    m = str(err_msg)
+    return ('no longer available' in m) or ('NOT_FOUND' in m) or ('404' in m) or ('is not found' in m)
+
+
+def _mark_model_unavailable(api_key: str, model_name: str):
+    """提供終了モデルを記録し、モデル一覧キャッシュを破棄する"""
+    if model_name:
+        _unavailable_models.add(model_name)
+    _model_availability_cache.pop(_model_cache_key(api_key), None)
+
+
+def _model_sort_key(name: str):
+    """モデルIDを優先順位でソートするためのキー（小さいほど優先）。
+    GA版 > preview、通常 > lite、flash > pro（クォータ・速度優先）、新バージョン > 旧バージョン"""
+    m = re.match(r'^gemini-(\d+)(?:\.(\d+))?-(flash|pro)(-lite)?(.*)$', name)
+    if not m:
+        return (9, 0, 0, 0, name)
+    major = int(m.group(1)); minor = int(m.group(2) or 0)
+    kind = 0 if m.group(3) == 'flash' else 1
+    lite = 1 if m.group(4) else 0
+    preview = 1 if 'preview' in (m.group(5) or '') else 0
+    return (preview, lite, kind, -(major * 100 + minor), name)
+
+
+def _list_models_from_api(api_key: str) -> list:
+    """Gemini API の models.list から generateContent 対応モデルIDを取得する。失敗時は空リスト"""
+    try:
+        client = _get_genai_client(api_key)
+        names = []
+        for m in client.models.list():
+            name = (getattr(m, 'name', '') or '')
+            if name.startswith('models/'):
+                name = name[len('models/'):]
+            if not name.startswith('gemini-'):
+                continue
+            actions = getattr(m, 'supported_actions', None) or []
+            if actions and 'generateContent' not in actions:
+                continue
+            if any(k in name for k in _EXCLUDED_MODEL_KEYWORDS):
+                continue
+            names.append(name)
+        return names
+    except Exception as e:
+        print("Gemini models.list error:", e)
+        return []
+
+
 def get_available_gemini_models(api_key: str) -> list:
     """利用可能なGeminiモデルを返す（優先順位付き）。
-    API疎通テストなしで即返却（高速化）。クォータ超過モデルのみ除外。"""
+    API の models.list で実際に使えるモデルを検出し、提供終了・クォータ超過モデルを除外する。
+    API検出に失敗した場合は静的な優先リストにフォールバックする。"""
     if not api_key:
         return [_FALLBACK_MODEL]
-    cache_key = api_key[-8:]
+    cache_key = _model_cache_key(api_key)
     if cache_key in _model_availability_cache:
         return _model_availability_cache[cache_key]
-    # API呼び出しなしで優先リストをそのまま返す（疎通テスト廃止で高速化）
-    result = [m for m in _PREFERRED_MODELS if m not in _quota_exhausted_models]
+    api_models = _list_models_from_api(api_key)
+    if api_models:
+        candidates = sorted(set(api_models), key=_model_sort_key)
+    else:
+        candidates = list(_PREFERRED_MODELS)
+    result = [m for m in candidates
+              if m not in _quota_exhausted_models and m not in _unavailable_models]
     if not result:
-        result = [_FALLBACK_MODEL]
+        result = [m for m in candidates if m not in _unavailable_models] or [_FALLBACK_MODEL]
     _model_availability_cache[cache_key] = result
     return result
 
 
 def get_default_gemini_model(api_key: str) -> str:
-    """利用可能なモデルの中から最優先モデルを返す。クォータ超過モデルは除外。"""
+    """利用可能なモデルの中から最優先モデルを返す。クォータ超過・提供終了モデルは除外。"""
     models = get_available_gemini_models(api_key)
-    # クォータ超過モデルを除外して最優先を返す
     for m in models:
-        if m not in _quota_exhausted_models:
+        if m not in _quota_exhausted_models and m not in _unavailable_models:
             return m
     # 全モデルがクォータ超過の場合はフォールバック
     return models[0] if models else _FALLBACK_MODEL
+
+
+def get_alternative_gemini_model(api_key: str, failed_model: str) -> str:
+    """failed_model 以外で利用可能な代替モデルを返す（無ければ空文字）"""
+    for m in get_available_gemini_models(api_key):
+        if m != failed_model and m not in _quota_exhausted_models and m not in _unavailable_models:
+            return m
+    return ''
 SELF_CORRECTION_THRESHOLD = 1000  # 差額が1000円以上の場合のみ自己修復を試行（高速化）
 
 DOS_DBVER = bytes.fromhex('334cc198')   # AnDBVersion.ini 固定値
@@ -1542,7 +1623,7 @@ def complement_vehicle_info_with_gemini(api_key, model_code, current_car_name, c
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=api_key, http_options={'timeout': 600})
+    client = _get_genai_client(api_key)
 
     prompt = f'''あなたは日本の自動車の専門家です。
 以下の型式（Model Code）を持つ自動車の「一般的な車種名（通称名）」と「エンジン型式」を特定し、厳密なJSON形式で出力してください。
@@ -1559,8 +1640,7 @@ def complement_vehicle_info_with_gemini(api_key, model_code, current_car_name, c
 もし明確に不明な場合は、無理に嘘をつかず空文字列にしてください。'''
 
     try:
-        _avail = get_available_gemini_models(api_key)
-        _veh_model = _avail[0] if _avail else 'gemini-2.5-flash'
+        _veh_model = get_default_gemini_model(api_key)
         response = client.models.generate_content(
             model=_veh_model,
             contents=prompt,
@@ -2462,8 +2542,9 @@ def analyze_estimate_totals(api_key, file_bytes, mime_type, model_name):
                 return extract_json_from_response(response.text)
     except Exception as e:
         err_msg = str(e)
-        if 'no longer available' in err_msg or '404' in err_msg or 'NOT_FOUND' in err_msg:
-            raise RuntimeError(f"モデル '{model_name}' は利用できません。サイドバーで別のモデルを選択してください。\n詳細: {err_msg}") from e
+        if _is_model_unavailable_error(err_msg):
+            _mark_model_unavailable(api_key, model_name)
+            raise RuntimeError(f"モデル '{model_name}' は利用できません（提供終了）。サイドバーで別のモデルを選択してください。\n詳細: {err_msg}") from e
     return None
 
 
@@ -2704,10 +2785,12 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
             last_error = e
             err_msg = str(e)
             # モデル廃止エラーはリトライせずに即座に再送出
-            if 'no longer available' in err_msg or 'NOT_FOUND' in err_msg:
+            if _is_model_unavailable_error(err_msg):
+                _mark_model_unavailable(api_key, model_name)
+                _alt = get_alternative_gemini_model(api_key, model_name)
                 raise RuntimeError(
-                    f"モデル '{model_name}' は利用できません。"
-                    "サイドバーで「gemini-2.5-flash」または「gemini-2.5-pro」を選択してください。"
+                    f"モデル '{model_name}' は利用できません（提供終了）。"
+                    + (f"代替モデル「{_alt}」に自動切り替えします。" if _alt else "サイドバーで別のモデルを選択してください。")
                 ) from e
             # クォータ超過エラー
             if '429' in err_msg or 'RESOURCE_EXHAUSTED' in err_msg:
@@ -2828,8 +2911,9 @@ def analyze_estimate_chunk(api_key, chunk_bytes, mime_type, model_name,
                 import time; time.sleep(1)
         except Exception as e:
             err = str(e)
-            if 'no longer available' in err or 'NOT_FOUND' in err:
-                raise RuntimeError(f"モデル '{model_name}' は利用できません。") from e
+            if _is_model_unavailable_error(err):
+                _mark_model_unavailable(api_key, model_name)
+                raise RuntimeError(f"モデル '{model_name}' は利用できません（提供終了）。") from e
             if '429' in err or 'RESOURCE_EXHAUSTED' in err:
                 _quota_exhausted_models.add(model_name)
                 raise ValueError(f"モデル '{model_name}' クォータ超過") from e
@@ -4059,7 +4143,7 @@ def main():
             )
         # 利用可能なモデルをAPIで動的取得（APIキーがある場合のみ）
         if api_key:
-            _ck = api_key[-8:] if len(api_key) >= 8 else api_key
+            _ck = _model_cache_key(api_key)
             if _ck in _model_availability_cache:
                 _avail_models = _model_availability_cache[_ck]
             else:
@@ -4067,12 +4151,15 @@ def main():
                     _avail_models = get_available_gemini_models(api_key)
         else:
             _avail_models = [_FALLBACK_MODEL]
+        # 自動切り替え済みのモデルがあればそれを初期選択にする
+        _pref_model = st.session_state.get('selected_model')
+        _model_index = _avail_models.index(_pref_model) if _pref_model in _avail_models else 0
         selected_model = st.selectbox(
             "🤖 AIモデル",
             options=_avail_models,
-            index=0,
+            index=_model_index,
             key="model_selector_v2",
-            help="APIで利用可能なモデルを自動検出。3.1 Pro=最高精度、2.5 Flash=高速・コスパ良好"
+            help="Gemini APIで実際に利用可能なモデルを自動検出（提供終了モデルは除外）。Flash=高速・コスパ良好、Pro=高精度"
         )
         st.markdown("---")
         st.markdown("**🗂 DBパス設定**")
@@ -4781,9 +4868,27 @@ def main():
         except Exception as e:
             progress.empty()
             err_str = str(e)
+            _cur_model = st.session_state.get('selected_model', _model or _FALLBACK_MODEL)
+            # モデル提供終了（404 NOT_FOUND）の場合、利用可能な代替モデルへ自動切り替え
+            if _is_model_unavailable_error(err_str) or '提供終了' in err_str:
+                _mark_model_unavailable(api_key, _cur_model)
+                _alt = get_alternative_gemini_model(api_key, _cur_model)
+                if _alt:
+                    st.warning(
+                        f"⚠️ モデル「{_cur_model}」は提供終了のため利用できません。\n\n"
+                        f"**🔄 代替モデル「{_alt}」に自動切り替えました。「② AI解析」をもう一度実行してください。**",
+                        icon="⚠️"
+                    )
+                    st.session_state['selected_model'] = _alt
+                    st.session_state.pop('model_selector_v2', None)
+                else:
+                    st.error(
+                        "⚠️ 利用可能なGeminiモデルが見つかりません。\n\n"
+                        "APIキーが有効か、Google AI Studio で利用できるモデルを確認してください。\n\n"
+                        f"詳細: {err_str}"
+                    )
             # クォータ超過エラーの場合、分かりやすいメッセージとリトライを促す
-            if '429' in err_str or 'RESOURCE_EXHAUSTED' in err_str or 'クォータが上限' in err_str:
-                _cur_model = st.session_state.get('selected_model', _model or 'gemini-2.5-flash')
+            elif '429' in err_str or 'RESOURCE_EXHAUSTED' in err_str or 'クォータが上限' in err_str:
                 _quota_exhausted_models.add(_cur_model)
                 # キャッシュクリア
                 _api_key_for_err = api_key
@@ -4792,7 +4897,7 @@ def main():
                     if _ck in _model_availability_cache:
                         del _model_availability_cache[_ck]
                 # 代替モデルを探す
-                _alt = next((m for m in _PREFERRED_MODELS if m not in _quota_exhausted_models), None)
+                _alt = get_alternative_gemini_model(api_key, _cur_model)
                 if _alt:
                     st.warning(
                         f"⚠️ モデル「{_cur_model}」の1日クォータ（250回）が上限に達しました。\n\n"
