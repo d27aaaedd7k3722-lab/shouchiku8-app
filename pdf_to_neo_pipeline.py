@@ -671,6 +671,44 @@ def _final_dedup_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def _is_discount_row(it: Dict[str, Any]) -> bool:
+    """値引き・割引の行か。app.py の _has_disc_row と同じ規則を使う。
+
+    見積書に印字された「部品計」「工賃計」は値引き前の小計なので、
+    値引き行を含んだ明細合算と直接くらべると、必ず値引き額ぶんの差が出る。
+    その差を「読み落とし」と解釈して調整行を足すと、値引きを打ち消す行が
+    原本に無いまま増えてしまう。
+    """
+    name = str(it.get("name", "") or it.get("parts_name", "") or "")
+    if re.search(r"(値引|割引)", name):
+        return True
+    return _to_int(it.get("wage", 0)) < 0 or _to_int(it.get("parts_amount", 0)) < 0
+
+
+def _sum_items_outtax(items: List[Dict[str, Any]], skip_discount: bool = False) -> int:
+    """明細の合算（部品＋工賃）。skip_discount で値引き・調整行を除く。"""
+    total = 0
+    for it in items or []:
+        if skip_discount and (it.get("is_adjustment_row") or _is_discount_row(it)):
+            continue
+        try:
+            pa = it.get("parts_amount") or it.get("amount") or 0
+            if pa:
+                total += _to_int(pa)
+            else:
+                up = _to_float(it.get("unit_price") or it.get("part_price"))
+                qty = max(_to_int(it.get("quantity"), 1), 1)
+                if up > 0:
+                    total += int(up * qty)
+        except Exception:
+            pass
+        try:
+            total += _to_int(it.get("wage", 0) or it.get("labor_fee", 0) or 0)
+        except Exception:
+            pass
+    return total
+
+
 def _enforce_grand_total_match(items: List[Dict[str, Any]],
                                pdf_grand_total: int,
                                is_tax_inclusive: bool = True,
@@ -766,10 +804,14 @@ def _enforce_total_match(items: List[Dict[str, Any]],
     if pdf_parts_total <= 0 and pdf_wage_total <= 0:
         return items  # PDF総額未取得 → 調整しない
     out = list(items)
-    # 明細合算
+    # 明細合算。pdf_parts_total / pdf_wage_total は見積書に印字された
+    # 「値引き前」の小計なので、値引き行・既に足した調整行を混ぜて比べると
+    # 必ず値引き額ぶんの差が出て、それを埋める行を1本捏造してしまう。
     sum_parts = 0
     sum_wage = 0
     for it in out:
+        if it.get("is_adjustment_row") or _is_discount_row(it):
+            continue
         try:
             pa = it.get("parts_amount") or it.get("amount") or 0
             if pa:
@@ -1650,8 +1692,14 @@ def process_pdf_to_neo(pdf_path,
                             _to_float(it.get("line_total"))
                             or (_to_float(it.get("parts_amount")) + _to_float(it.get("wage")))
                             for it in items)
-                        diff_ratio = (abs(items_sum - pdf_total) / pdf_total
-                                      if pdf_total > 0 else 0)
+                        # 印字された総額は税込のことも税抜のこともあり、
+                        # 明細合算とは基準が違う。基準を揃えずに比べると、
+                        # 税抜表記の見積では明細が完全に正しくても必ず
+                        # 9.1%(=1-1/1.1)ずれて警告が出る。恒常的に出る警告は
+                        # 本物の読み落としを埋もれさせるので、近いほうで比べる。
+                        _diff_abs = min(abs(items_sum - pdf_total),
+                                        abs(items_sum - pdf_total / 1.10))
+                        diff_ratio = (_diff_abs / pdf_total if pdf_total > 0 else 0)
                         out["items_total_diff_ratio"] = diff_ratio
                         if diff_ratio > 0.05:
                             log.append(f"⚠ 明細合算と総額の差 {diff_ratio:.1%}")
@@ -1695,7 +1743,20 @@ def process_pdf_to_neo(pdf_path,
                     pdf_w = items_wage_sum
             except Exception:
                 pass
-            if pdf_p > 0 or pdf_w > 0:
+            # 総合計が明細合算と一致しているなら、明細は取りこぼしていない。
+            # そのとき部品計・工賃計と合わないのは、小計に含まれない行
+            # （レッカー代・諸経費・値引き）が明細にあるからで、行を足す理由にならない。
+            # 足すと部品計と工賃計の間で金額が動き、原本と違う小計になる。
+            _grand_ok = False
+            if pdf_g > 0:
+                _s0 = _sum_items_outtax(items)
+                _tol0 = max(int(round(pdf_g * 0.02)), 1000)
+                _grand_ok = (abs(pdf_g - _s0) <= _tol0
+                             or abs(int(round(pdf_g / 1.10)) - _s0) <= _tol0)
+                if _grand_ok:
+                    log.append(f"[total_match] 総合計{pdf_g}と明細合算{_s0}が一致 → "
+                               f"部品計/工賃計との差は小計対象外の行によるものとみなし調整しない")
+            if (pdf_p > 0 or pdf_w > 0) and not _grand_ok:
                 # v12 iter_006: tolerance を 2% / 1000円 に再拡大
                 # （iter_005 でも 2.3% 差で M6=1 残ったため許容差を広げる）
                 _tol = max(int(round((pdf_p + pdf_w) * 0.02)), 1000)
@@ -1708,21 +1769,36 @@ def process_pdf_to_neo(pdf_path,
                 # この引数は「PDFの総額を明細の基準に換算するか」を意味する。
                 # 明細が税抜なら総額(税込)を1.1で割って合わせる。
                 # 明細が税込なら総額と同じ基準なので換算しない。
-                _grand_is_intax = not is_tax_inclusive
-                # ただし総合計が税込とは限らない。見積書が税抜表記で
-                # 「合計＝部品計＋工賃計」と印字されている場合、1.1で割ると
-                # 明細が完全に正しくても約9%の減額調整行が入ってしまう。
-                _pw = pdf_p + pdf_w
-                if (_grand_is_intax and _pw > 0
-                        and abs(pdf_g - _pw) <= max(int(_pw * 0.01), 100)):
-                    log.append(f"[grand_total_match] 総合計{pdf_g}は"
-                               f"部品計+工賃計{_pw}と同額 → 税抜とみなす")
-                    _grand_is_intax = False
-                items = _enforce_grand_total_match(
-                    items, pdf_g,
-                    is_tax_inclusive=_grand_is_intax,
-                    tolerance=_tol_g)
-                log.append(f"[grand_total_match] grand={pdf_g} tol={_tol_g} 適用")
+                # 印字された総合計が税込か税抜かは、表記の選択だけでは決まらない。
+                # 「税抜表記＝総合計は税込」と決め打つと、合計欄が税抜の見積で
+                # 明細が完全に正しくても約9%の減額調整行が入る。逆も同じ。
+                # 両方の解釈を明細合算と突き合わせ、近いほうを採る。
+                _sum_now = _sum_items_outtax(items)
+                _d_same = abs(pdf_g - _sum_now)
+                _d_intax = abs(int(round(pdf_g / 1.10)) - _sum_now)
+                _grand_is_intax = _d_intax < _d_same
+                log.append(f"[grand_total_match] 総合計{pdf_g}の税区分判定: "
+                           f"そのまま差={_d_same} / 税込とみなす差={_d_intax} → "
+                           f"{'税込' if _grand_is_intax else '税抜'}")
+                # どちらの解釈でも許容差に収まらない差は、税区分の問題ではなく
+                # 本当の読み落としか誤読。ここで行を捏造すると、原本に無い行が
+                # 入った見積を「合計は合っている」という理由で出してしまう。
+                # 協定見積は行と金額が原本と一致していることが条件なので、
+                # 差が大きいときは調整行を作らず警告だけにする。
+                if min(_d_same, _d_intax) > max(_tol_g * 5, int(pdf_g * 0.10)):
+                    log.append(f"[grand_total_match] 差が大きすぎるため調整行は作らない "
+                               f"(最小差={min(_d_same, _d_intax)})")
+                    warnings.append(
+                        f"見積書に印字された総額（{int(pdf_g):,}円）と、読み取った明細の"
+                        f"合算（{int(_sum_now):,}円）の差が大きすぎます。"
+                        "明細の読み落としが疑われるため、差額を埋める行は追加していません。"
+                        "生成前にプレビューで原本と1行ずつ突き合わせてください。")
+                else:
+                    items = _enforce_grand_total_match(
+                        items, pdf_g,
+                        is_tax_inclusive=_grand_is_intax,
+                        tolerance=_tol_g)
+                    log.append(f"[grand_total_match] grand={pdf_g} tol={_tol_g} 適用")
             # v11.0 Phase A-4 v2: pdf_grand_total すら 0 のとき、items 合計を grand とみなして調整
             elif pdf_g == 0 and items:
                 try:
@@ -1765,12 +1841,22 @@ def process_pdf_to_neo(pdf_path,
             # 許容差(2%または1000円)の範囲内は調整行を作らないため、
             # 差が残ったまま出荷されうる。黙って通さず警告に残す。
             try:
-                _sum_p = sum(_to_int(it.get("parts_amount") or it.get("part_price")) for it in items)
-                _sum_w = sum(_to_int(it.get("wage") or it.get("labor_fee")) for it in items)
+                # pdf_p / pdf_w は値引き前の小計なので、値引き行・調整行を
+                # 含めて比べると値引き額がそのまま「残差」として警告に出る。
+                # 説明のつく差で毎回警告を出すと、本物の読み落としが埋もれる。
+                _resid_src = [it for it in items
+                              if not (it.get("is_adjustment_row") or _is_discount_row(it))]
+                _sum_p = sum(_to_int(it.get("parts_amount") or it.get("part_price"))
+                             for it in _resid_src)
+                _sum_w = sum(_to_int(it.get("wage") or it.get("labor_fee"))
+                             for it in _resid_src)
                 _resid_p = pdf_p - _sum_p if pdf_p > 0 else 0
                 _resid_w = pdf_w - _sum_w if pdf_w > 0 else 0
                 out["total_residual"] = {"parts": _resid_p, "wage": _resid_w}
-                if _resid_p or _resid_w:
+                # 総合計が明細合算と一致しているなら、この差は小計対象外の行
+                # （レッカー代・諸経費）で説明がつく。毎回出す警告にすると
+                # 本物の読み落としの警告が埋もれるので、そのときは出さない。
+                if (_resid_p or _resid_w) and not _grand_ok:
                     warnings.append(
                         f"見積書の合計と明細の合計に差が残っています"
                         f"（部品 {_resid_p:+,}円 / 工賃 {_resid_w:+,}円）。明細を確認してください。"
