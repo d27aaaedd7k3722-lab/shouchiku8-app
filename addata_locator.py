@@ -35,6 +35,19 @@ _STANDARD_PATHS = (
     r"C:\cogni車種データ\Addata",
     r"D:\cogni車種データ\Addata",
     r"E:\cogni車種データ\Addata",
+    # Linux / コンテナ配置（Streamlit Cloud・Docker・Cloud Run）。
+    # Windows パスしか見ていないと、本番では必ず未検出になり
+    # 常にモードA（ベタ打ち）へ落ちてしまう。
+    "/mnt/addata",
+    "/mnt/Addata",
+    "/data/addata",
+    "/data/Addata",
+    "/opt/addata",
+    "/opt/Addata",
+    "/app/Addata",
+    os.path.join(os.path.expanduser("~"), "Addata"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "Addata"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "addata"),
 )
 
 # v10.4: OneDrive ルート配下の業務典型サブパス（再帰検索より高速で確実な O(1) パス確認）

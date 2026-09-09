@@ -856,7 +856,8 @@ def _normalize_items_for_neo(items: List[Dict[str, Any]]) -> List[Dict[str, Any]
 def _call_generate_neo(template_bytes: bytes,
                        customer_info: Dict[str, Any],
                        items: List[Dict[str, Any]],
-                       is_beta_mode: bool = False) -> bytes:
+                       is_beta_mode: bool = False,
+                       is_tax_inclusive: bool = False) -> bytes:
     """app.generate_neo_file の薄ラッパ。lazy import + items正規化(Iter6)"""
     try:
         from app import generate_neo_file  # type: ignore
@@ -871,7 +872,10 @@ def _call_generate_neo(template_bytes: bytes,
         short_parts_wage=0,
         insurance_info={},
         expenses=None,
-        is_tax_inclusive=False,
+        # 見積書の明細金額が税込表記かどうか。税込なら generate_neo_file 側で
+        # 税抜に逆算される。ここを決め打ちにすると、税込表記の見積を
+        # 取り込んだときに総額が消費税ぶん膨らむ。
+        is_tax_inclusive=is_tax_inclusive,
         # モードA(ベタ打ち)ではDB照合していないので、未マッチを表す ※ を
         # 品名に付けてはいけない（付けると全品名が ※ 付きで出荷される）
         is_beta_mode=is_beta_mode,
@@ -969,19 +973,22 @@ def _merge_vehicle_into_customer(vehicle_info: Dict[str, Any],
 def build_neo_mode_a(items: List[Dict[str, Any]],
                      vehicle_info: Dict[str, Any],
                      template_path: Optional[str] = None,
-                     customer_info: Optional[Dict[str, Any]] = None) -> bytes:
+                     customer_info: Optional[Dict[str, Any]] = None,
+                     is_tax_inclusive: bool = False) -> bytes:
     """モードA: ベタ打ち (収録外)。OCR項目をそのまま転写。"""
     tpl = _load_template_bytes(template_path)
     cust = _merge_vehicle_into_customer(vehicle_info or {}, customer_info)
     # ベタ打ち: DB照合していないため ※（DB未マッチ印）を付けない
-    return _call_generate_neo(tpl, cust, items or [], is_beta_mode=True)
+    return _call_generate_neo(tpl, cust, items or [], is_beta_mode=True,
+                              is_tax_inclusive=is_tax_inclusive)
 
 
 def build_neo_mode_b(items: List[Dict[str, Any]],
                      vehicle_info: Dict[str, Any],
                      template_path: Optional[str] = None,
                      addata_root: str = r"C:\Addata",
-                     customer_info: Optional[Dict[str, Any]] = None) -> bytes:
+                     customer_info: Optional[Dict[str, Any]] = None,
+                     is_tax_inclusive: bool = False) -> bytes:
     """モードB: 完全複製 (cogni判定)。価格不一致マーカー付与。"""
     matched = items or []
     # Iter13: 品番空 → DB逆引き補完
@@ -1032,14 +1039,16 @@ def build_neo_mode_b(items: List[Dict[str, Any]],
 
     tpl = _load_template_bytes(template_path)
     cust = _merge_vehicle_into_customer(vehicle_info or {}, customer_info)
-    return _call_generate_neo(tpl, cust, matched)
+    return _call_generate_neo(tpl, cust, matched,
+                              is_tax_inclusive=is_tax_inclusive)
 
 
 def build_neo_mode_c(items: List[Dict[str, Any]],
                      vehicle_info: Dict[str, Any],
                      template_path: Optional[str] = None,
                      addata_root: str = r"C:\Addata",
-                     customer_info: Optional[Dict[str, Any]] = None) -> bytes:
+                     customer_info: Optional[Dict[str, Any]] = None,
+                     is_tax_inclusive: bool = False) -> bytes:
     """モードC: あいまい複製。L4 or db_parts_no 空 → ※ADDATA該当なし マーカー。"""
     matched = items or []
     vcode = (vehicle_info or {}).get("model_code") or (vehicle_info or {}).get("vehicle_code")
@@ -1068,7 +1077,8 @@ def build_neo_mode_c(items: List[Dict[str, Any]],
         # v4成功 → 旧ロジックはスキップして即返却
         tpl = _load_template_bytes(template_path)
         cust = _merge_vehicle_into_customer(vehicle_info or {}, customer_info)
-        return _call_generate_neo(tpl, cust, matched)
+        return _call_generate_neo(tpl, cust, matched,
+                              is_tax_inclusive=is_tax_inclusive)
     try:
         from auto_matching import match_pdf_items_to_addata  # type: ignore
         matched = match_pdf_items_to_addata(matched, vehicle_info or {}, addata_root)
@@ -1086,7 +1096,8 @@ def build_neo_mode_c(items: List[Dict[str, Any]],
 
     tpl = _load_template_bytes(template_path)
     cust = _merge_vehicle_into_customer(vehicle_info or {}, customer_info)
-    return _call_generate_neo(tpl, cust, matched)
+    return _call_generate_neo(tpl, cust, matched,
+                              is_tax_inclusive=is_tax_inclusive)
 
 
 # ============================================================
@@ -1140,7 +1151,9 @@ def _find_erparts_blob(files: Dict[str, bytes]) -> Optional[bytes]:
 
 def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                            pdf_parts_total: Optional[int] = None,
-                           pdf_wage_total: Optional[int] = None) -> Dict[str, Any]:
+                           pdf_wage_total: Optional[int] = None,
+                           is_tax_inclusive: bool = False,
+                           tax_rate: float = 0.10) -> Dict[str, Any]:
     """生成したNEOの明細を、見積書PDFの金額と突き合わせる。
 
     pdf_parts_total / pdf_wage_total には、見積書に「印字されている」合計
@@ -1191,6 +1204,12 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
             res["total_source"] = "items_sum"
         if pdf_wage_total_arg is not None and _to_int(pdf_wage_total_arg) > 0:
             pdf_wage_total = _to_int(pdf_wage_total_arg)
+        # NEO の ERParts は常に税抜。見積書が税込表記なら、比較する前に
+        # PDF 側を税抜へ換算する。換算しないと税込を選ぶたびに必ず
+        # 「差異あり」と警告が出て、正しい .neo を疑わせてしまう。
+        if is_tax_inclusive:
+            pdf_parts_total = int(round(pdf_parts_total / (1 + tax_rate)))
+            pdf_wage_total  = int(round(pdf_wage_total / (1 + tax_rate)))
         pdf_total = pdf_parts_total + pdf_wage_total
         res["pdf_parts_total"] = pdf_parts_total
         res["pdf_wage_total"] = pdf_wage_total
@@ -1298,7 +1317,10 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
             res["neo_count"] = neo_count
             res["neo_total"] = neo_total
             res["count_match"] = (neo_count == res["pdf_count"])
-            res["total_match"] = abs(neo_total - pdf_parts_total) < 1.0
+            # 税込は行ごとに税抜を逆算するため数円ずれる。行数ぶんの
+            # 許容を持たせないと、正しい .neo でも不一致と判定される。
+            _tol = max(1.0, float(len(items or []))) if is_tax_inclusive else 1.0
+            res["total_match"] = abs(neo_total - pdf_parts_total) < _tol
             if not res["count_match"]:
                 res["mismatches"].append(
                     {"type": "count", "neo": neo_count, "pdf": res["pdf_count"]}
@@ -1347,7 +1369,8 @@ def process_pdf_to_neo(pdf_path,
                        mode_override: Optional[str] = None,
                        model_name: Optional[str] = None,
                        api_key: Optional[str] = None,
-                       cache_scope: str = "") -> Dict[str, Any]:
+                       cache_scope: str = "",
+                       is_tax_inclusive: bool = False) -> Dict[str, Any]:
     """E2E ディスパッチャ。
 
     - vehicle_info/items 未提供かつ skip_ocr=False かつ GEMINI_API_KEY あり → OCR
@@ -1359,6 +1382,7 @@ def process_pdf_to_neo(pdf_path,
     out: Dict[str, Any] = {
         "ok": False,
         "mode": None,
+        "is_tax_inclusive": bool(is_tax_inclusive),
         "source": "unknown",
         "source_kind": "unknown",
         "addata": {"found": False, "vehicle_code": None, "confidence": 0.0,
@@ -1400,6 +1424,9 @@ def process_pdf_to_neo(pdf_path,
             _pdf_md5(pdf_bytes),
             str(mode_override), str(addata_root),
             str(template_path), str(model_name),
+            # 税区分は出力を変えるのでキーに含める。含めないと、税区分を
+            # 選び直して生成し直しても前回の .neo がそのまま返る。
+            str(bool(is_tax_inclusive)),
             _pdf_md5((ocr_text or "").encode("utf-8", "ignore")),
         ])
         if cache_key in _PIPELINE_CACHE:
@@ -1638,8 +1665,13 @@ def process_pdf_to_neo(pdf_path,
             if pdf_g > 0:
                 # v12 iter_006: grand_total も 2% / 1000円
                 _tol_g = max(int(round(pdf_g * 0.02)), 1000)
-                items = _enforce_grand_total_match(items, pdf_g, is_tax_inclusive=True,
-                                                   tolerance=_tol_g)
+                # この引数は「PDFの総額を明細の基準に換算するか」を意味する。
+                # 明細が税抜なら総額(税込)を1.1で割って合わせる。
+                # 明細が税込なら総額と同じ基準なので換算しない。
+                items = _enforce_grand_total_match(
+                    items, pdf_g,
+                    is_tax_inclusive=not is_tax_inclusive,
+                    tolerance=_tol_g)
                 log.append(f"[grand_total_match] grand={pdf_g} tol={_tol_g} 適用")
             # v11.0 Phase A-4 v2: pdf_grand_total すら 0 のとき、items 合計を grand とみなして調整
             elif pdf_g == 0 and items:
@@ -1813,18 +1845,22 @@ def process_pdf_to_neo(pdf_path,
 
     try:
         if mode == "A":
-            neo = build_neo_mode_a(items, vehicle_info, template_path, customer_info)
+            neo = build_neo_mode_a(items, vehicle_info, template_path, customer_info,
+                                   is_tax_inclusive=is_tax_inclusive)
         elif mode == "B":
-            neo = build_neo_mode_b(items, vehicle_info, template_path, addata_root, customer_info)
+            neo = build_neo_mode_b(items, vehicle_info, template_path, addata_root, customer_info,
+                                   is_tax_inclusive=is_tax_inclusive)
         else:
-            neo = build_neo_mode_c(items, vehicle_info, template_path, addata_root, customer_info)
+            neo = build_neo_mode_c(items, vehicle_info, template_path, addata_root, customer_info,
+                                   is_tax_inclusive=is_tax_inclusive)
         out["neo_bytes"] = neo
         log.append(f"NEO生成成功 size={len(neo) if neo else 0}")
         # verify
         try:
             v = verify_neo_against_pdf(neo, items,
                                        pdf_parts_total=hdr_parts_total or None,
-                                       pdf_wage_total=hdr_wage_total or None)
+                                       pdf_wage_total=hdr_wage_total or None,
+                                       is_tax_inclusive=is_tax_inclusive)
             out["verify"] = v
             log.append(f"verify ok={v.get('ok')} count={v.get('count_match')} total={v.get('total_match')}")
         except Exception as e:

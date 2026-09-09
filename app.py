@@ -46,6 +46,7 @@ import datetime
 import json
 import io
 import re
+import unicodedata
 import traceback
 import pandas as pd
 import threading
@@ -455,6 +456,16 @@ def _xml_escape(value) -> str:
             .replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
 
 
+def _strip_control_chars(value) -> str:
+    """改行・タブ・NUL などの制御文字を空白1つに潰す。
+
+    NEO の内部ファイルには142バイト固定長のレコードがあり、
+    制御文字が入ると行構造そのものが壊れる。
+    """
+    s = re.sub(r'[\x00-\x1f\x7f]', ' ', str(value or ''))
+    return re.sub(r'[ \t]+', ' ', s).strip()
+
+
 def cp932_trim(value, max_bytes: int) -> str:
     """コグニセブンの列幅（CP932のバイト数）に収まるよう切り詰める。
 
@@ -721,10 +732,10 @@ def extract_files(full_raw, entries):
 def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclusive=False, is_beta_mode=False):
     """ERParts/Expense/Total を更新（値引き行の負工賃も対応）
     expenses: {
-        'towing': レッカー費用,              # LineNo=1
-        'rental_car': 代車費用,              # LineNo=2
+        'towing': レッカー費用,              # LineNo=5「レッカー代１」
+        'rental_car': 代車費用,              # LineNo=7「写真代他」（専用行が無いため）
         'short_parts': ショートパーツ,       # LineNo=4（short_parts_wageと同義）
-        'tax_exempt': 非課税費用,            # LineNo=5（消費税なし）
+        'tax_exempt': 非課税費用,            # LineNo=8「その他控除」（消費税なし）
     }
     is_tax_inclusive: True の場合、items の金額は税込値として扱い、
                      OutTax/InTax/Tax を正しく逆算する。
@@ -777,12 +788,50 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         MaterialTotalEtceteraOutTax=0, MaterialTotalEtceteraInTax=0, MaterialTotalEtceteraTax=0,
         MaterialTotalOutTax=0, MaterialTotalInTax=0, MaterialTotalTax=0, MaterialTotalbyManual='',
         TotalOutTax=0, TotalInTax=0, TotalTax=0""")
+    # 明細に紐づくテーブルは、前案件の .neo をテンプレートにしたときに
+    # 残ると別案件の塗装工賃・損害コメント・リサイクル部品が混入する。
+    # ERParts と同じタイミングで必ず消す。
+    for _t in ('DamageParts', 'DamageBlock', 'DamageComment', 'DamageImage',
+               'RCParts', 'RCLinkParts', 'RWLinkParts', 'EPCLinkParts', 'Frame'):
+        try:
+            cur.execute(f'DELETE FROM {_t}')
+        except sqlite3.Error:
+            pass   # テンプレートに無いテーブルは無視する
+    # 1行固定の塗装テーブルは、PaintingOther と同じくブランク(-1)へ戻す。
+    # 列構成がテンプレートによって違うので、時間・工賃・材料の列を
+    # 名前で拾って一括で戻す。
+    for _t in ('PaintingBumper', 'PaintingFrame', 'PaintingEtcetera'):
+        try:
+            _cols = [c[1] for c in cur.execute(f'PRAGMA table_info({_t})').fetchall()]
+        except sqlite3.Error:
+            continue
+        if not _cols:
+            continue
+        _blank = [c for c in _cols
+                  if ('Time' in c or 'Wage' in c or 'Material' in c or 'Total' in c)]
+        _zero  = [c for c in _cols if 'Disposal' in c]
+        _sets  = [f'{c}=-1' for c in _blank] + [f'{c}=0' for c in _zero]
+        if _sets:
+            try:
+                cur.execute(f"UPDATE {_t} SET {', '.join(_sets)}")
+            except sqlite3.Error:
+                pass
+
     # 全Expense行をクリア（LineNo=1〜8: 文字書き/内張り/配線/ショートパーツ/レッカー代１/レッカー代２/写真代他/その他控除）
     for lno in (1, 2, 3, 4, 5, 6, 7, 8):
         cur.execute("""UPDATE Expense SET
-            WageEnabled=0, WageOutTax=0, WageInTax=0, WageTax=0
+            OutTaxFlag=0, WageEnabled=0, WageOutTax=0, WageInTax=0, WageTax=0,
+            Comment=''
             WHERE LineNo=?""", (lno,))
     total_parts = 0
+    annote_rows = []
+    # 税込モードの丸め調整用
+    total_parts_intax = 0
+    total_wages_intax = 0
+    _adj_parts_line = None
+    _adj_wage_line  = None
+    _adj_parts_amount = 0
+    _adj_wage_amount  = 0
     total_wages = 0
     for i, item in enumerate(items):
         name   = item.get('name', '')
@@ -808,6 +857,11 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         
         # 区分: work_code（Markdownパーサー保存先）または method から取得
         method = item.get('method', '') or item.get('work_code', '')
+        # 明細もコグニセブンの宣言列幅（CP932バイト）に収める。
+        # 顧客欄と同じ理由で、ここで守らないと桁あふれした値が入る。
+        # 「フロントバンパーカバーASSY」程度の普通の部品名で超える。
+        name     = cp932_trim(name, _ERPARTS_WIDTH['PartsName'])
+        parts_no = cp932_trim(parts_no, _ERPARTS_WIDTH['PartsNo'])
 
         # 品名から作業種別を自動推定（区分が空白の場合）
         if not method:
@@ -877,6 +931,17 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             wage_intax   = wage_total + wage_tax if wage_total != 0 else 0
         total_parts += parts_outtax
         total_wages += wage_outtax
+        # 税込モードでは行ごとに税抜を逆算するため、丸め誤差が積み上がって
+        # 見積書に書かれた税込総額と生成NEOの合計がずれる。合計から1回で
+        # 逆算し直せるよう、税込の合計と、差額を寄せる行を覚えておく。
+        total_parts_intax += parts_intax
+        total_wages_intax += wage_intax
+        if parts_total != 0 and abs(parts_outtax) >= abs(_adj_parts_amount):
+            _adj_parts_amount = parts_outtax
+            _adj_parts_line   = line_no
+        if wage_total != 0 and abs(wage_outtax) >= abs(_adj_wage_amount):
+            _adj_wage_amount = wage_outtax
+            _adj_wage_line   = line_no
         # コグニセブンは -1 を空白として表示する（0やNULLは「0」と表示される）
         db_parts_total = parts_outtax if parts_total != 0 else -1
         db_parts_intax = parts_intax  if parts_total != 0 else -1
@@ -887,15 +952,32 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         # 部品金額がある行のみ数量を設定。脱着など部品なし行は -1（空白）
         db_qty = qty if parts_total != 0 else -1
         # ── Addata マスタ照合結果から PartsCode / PartsCodeSub / DisposalCode を設定 ──
+        # 区分の判定は切り詰める前の文字列で行う。先に8バイトへ切ると
+        # 「ｱｯｾﾝﾌﾞﾘ取替」から「取替」が落ちて区分不明になる。
+        _method_full = method
+        method = cp932_trim(method, _ERPARTS_WIDTH['DisposalName'])
         _disposal_map = {
-            '取替': 1, '交換': 1, '取換': 1,
+            '取替': 1, '交換': 1, '取換': 1, '取り替え': 1, '取替え': 1,
             '脱着': 2, '取外': 2, '取付': 2, '組付': 2, '脱外': 2,
             '修理': 3, '補修': 3, '分解': 3, '修正': 3, '調整': 3,
             '光軸': 3, 'フィッティング': 3, 'コーディング': 3, '穴あけ': 3,
             'シーリング': 3, '点検': 3, '消去': 3, '設定': 3,
             '鈑金': 4, '板金': 4, '塗装': 4, 'ペイント': 4, 'ワックス': 4, '加算': 4, 'ブース': 4,
         }
-        disposal_code = _disposal_map.get(method, -1)
+        # 区分は完全一致だけで引くと、末尾に空白が付いただけ、
+        # 「脱着（左）」のように補足が付いただけで -1（区分不明）になる。
+        # 記号や括弧書きを落として正規化し、それでも決まらなければ
+        # 部分一致に落とす。CSV取込では区分欄が埋まっているのが普通なので、
+        # ここで取りこぼすと全行が区分不明になる。
+        _m_key = unicodedata.normalize('NFKC', str(_method_full or ''))
+        _m_key = re.sub(r'[（(\[【][^）)\]】]*[）)\]】]?', '', _m_key)
+        _m_key = re.sub(r'[\s\u3000※*・/／,、]', '', _m_key).strip()
+        disposal_code = _disposal_map.get(_m_key, -1)
+        if disposal_code == -1 and _m_key:
+            for _kw, _cd in _disposal_map.items():
+                if _kw in _m_key:
+                    disposal_code = _cd
+                    break
         parts_code = item.get('_master_section_code', '')  # 部品コード大区分（例: '01'）
         _branch_raw = item.get('_master_branch_code', '')  # 枝番（例: '00101', '001AA'）
         # PartsCodeSub は SQLite integer 型。数値変換できる枝番のみ整数で保存
@@ -935,9 +1017,11 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             ?, '',
             ?, ?, ?,
             -1, -1, -1,
-            NULL, NULL, NULL,
+            -- 空欄は -1。NULL や 0 にすると帳票に「0」と表示され、
+            -- 標準部品価格ゼロ・標準指数ゼロの見積として読まれてしまう。
+            -1, -1, -1,
             '*',
-            -1, 0,
+            -1, -1,
             ?, ?, ?,
             -1, -1, -1,
             '*', ?,
@@ -963,6 +1047,10 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             db_wage_total, db_wage_intax, db_wage_tax,
             db_qty
         ))
+        # AnNote.ini は ERParts と同じ値でなければならない。生の items から
+        # 別に組み立てると、マスタ名への置換・「※」付与・数量ブランクが
+        # 反映されず、同じ行なのに品名と数量が2通り存在することになる。
+        annote_rows.append({'line_no': line_no, 'name': name, 'qty': db_qty})
     # ── 税込/税抜に応じた費用計算ヘルパー ──
     def _calc_tax(amount, inclusive=False):
         """金額から OutTax, InTax, Tax を計算"""
@@ -988,25 +1076,92 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
         WHERE LineNo=4""", (1 if sp_wage > 0 else 0, sp_out, sp_intax, sp_tax))
 
-    # LineNo=1: レッカー費用（課税）
+    # Expense の行名は NameFix=1 の固定名で、コグニセブンはその名前のまま
+    # 表示する。以前はレッカーを LineNo=1（文字書き費用）、代車を
+    # LineNo=2（内張り費用）、非課税を LineNo=5（レッカー代１）に
+    # 書き込んでいたため、金額は合っていても費目名が全部別物だった。
+
+    # LineNo=5: レッカー代１（課税）
     towing = safe_int(expenses.get('towing', 0))
     tow_out, tow_intax, tow_tax = _calc_tax(towing, False)
     cur.execute("""UPDATE Expense SET
         WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
-        WHERE LineNo=1""", (1 if towing > 0 else 0, tow_out, tow_intax, tow_tax))
+        WHERE LineNo=5""", (1 if towing > 0 else 0, tow_out, tow_intax, tow_tax))
 
-    # LineNo=2: 代車費用（課税）
+    # LineNo=7: 写真代他（課税）。テンプレートに代車専用の行が無いため、
+    # 汎用の「その他課税費用」行に入れ、Comment に費目を書き添える。
     rental_car = safe_int(expenses.get('rental_car', 0))
     rent_out, rent_intax, rent_tax = _calc_tax(rental_car, False)
     cur.execute("""UPDATE Expense SET
-        WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
-        WHERE LineNo=2""", (1 if rental_car > 0 else 0, rent_out, rent_intax, rent_tax))
+        WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?, Comment=?
+        WHERE LineNo=7""", (1 if rental_car > 0 else 0, rent_out, rent_intax, rent_tax,
+                            cp932_trim('代車費用', 30) if rental_car > 0 else ''))
 
-    # LineNo=5: 非課税費用（消費税なし）
+    # LineNo=8: その他控除（非課税）。OutTaxFlag で非課税であることを示す。
     tax_exempt = safe_int(expenses.get('tax_exempt', 0))
     cur.execute("""UPDATE Expense SET
-        WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
-        WHERE LineNo=5""", (1 if tax_exempt > 0 else 0, tax_exempt, tax_exempt, 0))
+        OutTaxFlag=?, WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?, Comment=?
+        WHERE LineNo=8""", (1 if tax_exempt > 0 else 0, 1 if tax_exempt > 0 else 0,
+                            tax_exempt, tax_exempt, 0,
+                            cp932_trim('非課税費用', 30) if tax_exempt > 0 else ''))
+
+    # ── 税込モードの丸め調整 ──
+    # 行ごとの逆算をそのまま足すと、見積書の税込総額と生成NEOの合計が
+    # 1〜5円ずれる（明細が増えるほど外れる）。総額から1回で逆算した値を
+    # 正とし、差額を最も金額の大きい行に寄せて、行と合計の整合を保つ。
+    if is_tax_inclusive:
+        def _outtax_from_intax(v):
+            if not v:
+                return 0
+            o = jpy_round(abs(v) / (1 + TAX_RATE))
+            return -o if v < 0 else o
+
+        # 部品と工賃を別々に丸めると、その2つの誤差がさらに積み上がる。
+        # 明細ぶんの税抜合計 S を「S + 消費税 が見積書の税込総額に一致する」
+        # ように選び直してから、部品→工賃の順に差額を割り当てる。
+        _items_intax = total_parts_intax + total_wages_intax
+        _base = _outtax_from_intax(_items_intax)
+        _best, _best_err = _base, None
+        for _off in (0, -1, 1, -2, 2):
+            _cand = _base + _off
+            _err = abs(_cand + jpy_round(_cand * TAX_RATE) - _items_intax)
+            if _best_err is None or _err < _best_err:
+                _best, _best_err = _cand, _err
+            if _err == 0:
+                break
+        _target_parts = _outtax_from_intax(total_parts_intax)
+        _target_wages = _best - _target_parts
+        # 寄せ先の行が無い側には差額を割り当てられないので、もう一方に回す
+        if _adj_parts_line is None:
+            _target_wages = _best
+            _target_parts = total_parts
+        elif _adj_wage_line is None:
+            _target_parts = _best
+            _target_wages = total_wages
+
+        for _target, _cur, _line, _col_out, _col_in, _col_tax in (
+            (_target_parts, total_parts, _adj_parts_line,
+             'PartsPriceOutTax', 'PartsPriceInTax', 'PartsPriceTax'),
+            (_target_wages, total_wages, _adj_wage_line,
+             'WageOutTax', 'WageInTax', 'WageTax'),
+        ):
+            _delta = _target - _cur
+            if _delta == 0 or _line is None:
+                continue
+            _row = cur.execute(
+                f'SELECT {_col_out}, {_col_in} FROM ERParts WHERE LineNo=?',
+                (_line,)).fetchone()
+            if not _row or _row[0] is None or _row[0] == -1:
+                continue
+            _new_out = _row[0] + _delta
+            _new_in  = _row[1]
+            cur.execute(
+                f'UPDATE ERParts SET {_col_out}=?, {_col_tax}=? WHERE LineNo=?',
+                (_new_out, _new_in - _new_out, _line))
+            if _col_out == 'PartsPriceOutTax':
+                total_parts += _delta
+            else:
+                total_wages += _delta
 
     # ── Total計算 ──
     # total_parts / total_wages は既に税抜値（is_tax_inclusive時は逆算済み）
@@ -1027,6 +1182,16 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         hy_WageTaxTotalOutTax=?,
         hy_WageTaxTotalInTax=?,
         hy_WageTaxTotalTax=?,
+        hy_PartsNoTaxTotalOutTax=?,
+        hy_PartsNoTaxTotalInTax=?,
+        hy_PartsNoTaxTotalTax=?,
+        hy_WageNoTaxTotalOutTax=?,
+        hy_WageNoTaxTotalInTax=?,
+        hy_WageNoTaxTotalTax=?,
+        hy_Wrecker1OutTax=?,
+        hy_Wrecker1InTax=?,
+        hy_Wrecker1Tax=?,
+        hy_Wrecker1TaxFlag=?,
         tx_TotalOutTax=?,
         tx_TotalInTax=?,
         SubTotal=?,
@@ -1035,6 +1200,12 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         total_parts, total_parts + parts_tax_total, parts_tax_total,
         total_wages, total_wages + wages_tax_total, wages_tax_total,
         taxable_expenses, taxable_expenses + jpy_round(taxable_expenses * TAX_RATE) if taxable_expenses > 0 else 0, jpy_round(taxable_expenses * TAX_RATE) if taxable_expenses > 0 else 0,
+        # 非課税ぶんは工賃側の非課税欄に計上する。どの内訳にも入れないと
+        # 小計＋消費税が合計に届かず、帳票の検算が合わなくなる。
+        0, 0, 0,
+        tax_exempt, tax_exempt, 0,
+        # レッカーは専用欄にも入れる
+        tow_out, tow_intax, tow_tax, (1 if towing > 0 else 0),
         tax_total,   tax_total,
         sub_total,   grand_total
     ))
@@ -1042,7 +1213,7 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
     conn.close()
     with open(_tmp_db_path, 'rb') as f:
         result = f.read()
-    return result, total_parts, total_wages, grand_total
+    return result, total_parts, total_wages, grand_total, annote_rows
 
 
 # ============================================================
@@ -1068,6 +1239,9 @@ def update_em_db(db_bytes, cust, insurance_info, estimated_date, is_tax_inclusiv
         except OSError:
             pass
 
+
+# AnSMB.txt の ERParts の宣言列幅（CP932バイト数）
+_ERPARTS_WIDTH = {'DisposalName': 8, 'PartsName': 24, 'PartsNo': 18}
 
 # AnSvEm0001Ex.db の宣言列幅（CP932バイト数）
 _CUST_WIDTH = {
@@ -1403,16 +1577,22 @@ def update_imge_ini(orig_bytes, cust, insurance_info=None, merge_mode=False):
 # 内部ファイル更新: AnNote.ini（明細簡易表現）
 # ============================================================
 
-def generate_annote(items):
-    """142B固定長 × 行数 の AnNote.ini を生成"""
-    if not items:
+def generate_annote(rows):
+    """142B固定長 × 行数 の AnNote.ini を生成
+
+    rows は _update_ansmb_impl が ERParts に実際に書いた値
+    （line_no / name / qty）。生の items から組み直すと、
+    マスタ名への置換や「※」付与、数量ブランクが反映されず、
+    同じ行なのに DB と AnNote で品名・数量が食い違う。
+    """
+    if not rows:
         return b''
     lines = []
-    for i, item in enumerate(items):
-        name    = item.get('name', '')
-        qty     = safe_int(item.get('quantity', 1), 1)
-        rec_no  = i + 1
-        line_no = rec_no * 10
+    for row in rows:
+        name    = row.get('name', '')
+        _q      = safe_int(row.get('qty', 1), 1)
+        qty     = _q if _q > 0 else 1     # -1（ブランク）は表示上1として扱う
+        line_no = row.get('line_no', 0)
         line    = bytearray(142)
         for j in range(142):
             line[j] = 0x20
@@ -1421,7 +1601,9 @@ def generate_annote(items):
             line[j] = ord(c)
         # バイト数で単純に切ると2バイト文字の途中で割れ、末尾に
         # 復号できない片割れが残る。文字境界で切り詰める。
-        name_bytes = cp932_trim(name, 30).encode('cp932', errors='replace')
+        # 改行やタブが混ざると142B固定長レコードが行単位で割れる。
+        # 見積書の部品名が2行に折り返された表をCSV化すると普通に起きる。
+        name_bytes = cp932_trim(_strip_control_chars(name), 30).encode('cp932', errors='replace')
         for j, b in enumerate(name_bytes):
             line[14 + j] = b
         qty_str = f'{min(qty, 99):02d}'
@@ -1513,11 +1695,11 @@ def generate_neo_file(template_data, customer_info, items, short_parts_wage, ins
     files        = extract_files(full_raw, entries)
     estimated_date = datetime.datetime.now().strftime('%Y%m%d')
     normalized_items = items or []
-    files['AnSMB.txt'], total_parts, total_wages, grand_total = update_ansmb(
+    files['AnSMB.txt'], total_parts, total_wages, grand_total, _annote_rows = update_ansmb(
         files['AnSMB.txt'], normalized_items, short_parts_wage,
         expenses=expenses, is_tax_inclusive=is_tax_inclusive, is_beta_mode=is_beta_mode
     )
-    files['AnNote.ini']       = generate_annote(normalized_items)
+    files['AnNote.ini']       = generate_annote(_annote_rows)
     files['AnSvEm0001Ex.db']  = update_em_db(
         files['AnSvEm0001Ex.db'], customer_info, insurance_info, estimated_date,
         is_tax_inclusive=is_tax_inclusive, merge_mode=merge_mode
@@ -1908,26 +2090,232 @@ def guess_manufacturer_from_vin(vin):
 
 
 # ============================================================
-# Addata / マスタ連携用関数群（一時除外）
-# → _開発資料/addata_matching.py に保存済み
-# 将来的にAddataマッチングを再統合する場合はこのファイルを参照
+# Addata / マスタ連携
 # ============================================================
+# Addata は「A〜Z の1文字フォルダ / 車種コード / *NN.DB」という配置の
+# 車種データベースで、コグニセブン本体に同梱される。これがあると
+# 部品名・品番・価格をマスタと突き合わせ、部品コードや損害コードを
+# 引き当てられる（モードB/C）。無ければベタ打ち（モードA）になる。
+#
+# 取得経路は3つ。上から順に見る。
+#   1. 画面からアップロードされた ZIP を展開したもの（本番はこれだけ）
+#   2. 環境変数 ADDATA_ROOT / st.secrets の ADDATA_ROOT
+#   3. ローカルの標準的な設置場所（Windows の C:\Addata など）
+# 本番の Streamlit Cloud は Linux で利用者のPCも見えないため、
+# 1 以外は基本的に当たらない。
+
+# アップロードされた Addata の「ルート」と「展開先ディレクトリ」。
+# ルートは ZIP の作り方によって展開先より下の階層になることがあるため、
+# 消すときは必ず展開先の方を消す（ルートの親を消すと /tmp を消しかねない）。
+_ADDATA_UPLOAD_KEY = '_addata_upload_root'
+_ADDATA_UPLOAD_BASE_KEY = '_addata_upload_base'
+# ZIP 展開の上限。壊れた/悪意ある ZIP でディスクを埋めないための歯止め。
+ADDATA_ZIP_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024   # 展開後 合計2GB
+ADDATA_ZIP_MAX_MEMBERS     = 200_000                   # ファイル数
+
+
+def _addata_is_valid(path) -> bool:
+    """Addata ルートとして妥当か（A-Z1文字フォルダ配下に *.DB があるか）。"""
+    if not path or not os.path.isdir(path):
+        return False
+    try:
+        import addata_locator as _loc
+        return bool(_loc._is_valid_addata(path))
+    except Exception:
+        return False
+
+
+def extract_addata_zip(zip_bytes: bytes, dest_dir: str) -> tuple:
+    """Addata の ZIP を dest_dir に安全に展開し、(ルートパス, 説明) を返す。
+
+    ルートが見つからない場合は (None, 理由) を返す。
+    ZIP の中身は利用者が持ち込む外部データなので、
+    パス抜け（zip slip）・容量爆弾・シンボリックリンクを弾く。
+    """
+    import zipfile
+    dest_real = os.path.realpath(dest_dir)
+    total = 0
+    count = 0
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for info in zf.infolist():
+                count += 1
+                if count > ADDATA_ZIP_MAX_MEMBERS:
+                    return (None, f'ZIP内のファイル数が多すぎます（{ADDATA_ZIP_MAX_MEMBERS:,}件を超過）')
+                # シンボリックリンクは展開しない（外部を指しうる）
+                if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                    continue
+                if info.is_dir():
+                    continue
+                total += info.file_size
+                if total > ADDATA_ZIP_MAX_TOTAL_BYTES:
+                    return (None, 'ZIPの展開後サイズが大きすぎます（2GBを超過）')
+                # 展開先が dest_dir の外に出ないことを実パスで確認する
+                target = os.path.realpath(os.path.join(dest_real, info.filename))
+                if not (target == dest_real or target.startswith(dest_real + os.sep)):
+                    return (None, f'ZIP内に不正なパスが含まれています: {info.filename}')
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(info) as _s, open(target, 'wb') as _d:
+                    while True:
+                        chunk = _s.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        _d.write(chunk)
+    except zipfile.BadZipFile:
+        return (None, 'ZIPファイルとして読み取れません')
+    except Exception as e:
+        return (None, f'ZIPの展開に失敗しました: {e}')
+
+    # 展開結果から Addata ルートを探す。ZIP の作り方によって
+    # 直下だったり Addata/ で1階層包まれていたりするため両方見る。
+    if _addata_is_valid(dest_real):
+        return (dest_real, 'ZIP直下')
+    try:
+        for entry in sorted(os.listdir(dest_real)):
+            cand = os.path.join(dest_real, entry)
+            if _addata_is_valid(cand):
+                return (cand, entry)
+            # もう1階層だけ潜る（OneDrive等で余計な親が付く場合）
+            if os.path.isdir(cand):
+                for sub in sorted(os.listdir(cand)):
+                    cand2 = os.path.join(cand, sub)
+                    if _addata_is_valid(cand2):
+                        return (cand2, os.path.join(entry, sub))
+    except OSError:
+        pass
+    return (None, 'Addataの構造（A〜Zの1文字フォルダ／車種コード／*.DB）が見つかりません')
+
+
+# 展開先を掃除するまでの猶予。これより古いものは他セッションの
+# 置き土産とみなして回収する。
+_ADDATA_TMP_TTL_SEC = 6 * 3600
+
+
+def _sweep_stale_addata_dirs():
+    """古い Addata 展開先を回収する。
+
+    Streamlit にはセッション終了フックが無く、解除せずにタブを閉じられると
+    展開先が残り続ける。Addata は大きいので、放置するとディスクが尽きて
+    アプリごと止まる。自分が作った形（一時ディレクトリ直下の addata_*）で、
+    かつ十分に古いものだけを消す。
+    """
+    import glob as _glob, shutil as _sh, time as _t
+    try:
+        base = os.path.realpath(tempfile.gettempdir())
+        # 使用中の展開先。os.path.realpath('\0') は全バージョンで例外に
+        # なるため、番兵文字列を渡してはいけない（関数ごと死ぬ）。
+        _keep_src = st.session_state.get(_ADDATA_UPLOAD_BASE_KEY)
+        keep = os.path.realpath(_keep_src) if _keep_src else None
+        now = _t.time()
+        for d in _glob.glob(os.path.join(base, 'addata_*')):
+            rd = os.path.realpath(d)
+            if (os.path.dirname(rd) == base
+                    and os.path.basename(rd).startswith('addata_')
+                    and os.path.isdir(rd) and rd != keep
+                    and now - os.path.getmtime(rd) > _ADDATA_TMP_TTL_SEC):
+                _sh.rmtree(rd, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _discard_uploaded_addata():
+    """アップロードされた Addata の展開先を消し、セッションから外す。
+
+    消すのは mkdtemp で作った展開先そのものだけにする。ルートの親を
+    たどって消すと、ZIPが直下構造だったときに /tmp ごと消してしまう。
+    """
+    base = st.session_state.pop(_ADDATA_UPLOAD_BASE_KEY, None)
+    st.session_state.pop(_ADDATA_UPLOAD_KEY, None)
+    st.session_state.pop('_addata_upload_label', None)
+    st.session_state.pop('_addata_zip_id', None)
+    if base and os.path.isdir(base) and os.path.basename(base).startswith('addata_'):
+        import shutil as _sh
+        _sh.rmtree(base, ignore_errors=True)
+
 
 def find_addata_dir():
-    """Addataフォルダ探索スタブ（Addata機能無効化中）"""
+    """Addata ルートを返す。見つからなければ None。"""
+    # 1. この画面でアップロードされたもの
+    try:
+        up = st.session_state.get(_ADDATA_UPLOAD_KEY)
+        if up and _addata_is_valid(up):
+            # 使用中であることを更新時刻で示す。展開したきりだと、
+            # 長時間開いている別セッションの Addata を掃除で消してしまう。
+            try:
+                os.utime(st.session_state.get(_ADDATA_UPLOAD_BASE_KEY) or up, None)
+            except OSError:
+                pass
+            return up
+    except Exception:
+        pass
+    # 2. 環境変数 / secrets（Docker・Cloud Run で外部ボリュームを渡す場合）
+    for _env in (os.environ.get('ADDATA_ROOT'), _secret_addata_root()):
+        if _env and _addata_is_valid(_env):
+            return _env
+    # 3. ローカルの標準的な設置場所
+    try:
+        import addata_locator as _loc
+        found = _loc.find_addata()
+        if found and _addata_is_valid(found):
+            return found
+    except Exception:
+        pass
     return None
+
+
+def _secret_addata_root():
+    """st.secrets の ADDATA_ROOT（未設定でも例外にしない）。"""
+    try:
+        return st.secrets.get('ADDATA_ROOT', '')
+    except Exception:
+        return ''
+
 
 def find_ka06_path(addata_base):
-    """KA06_ALL.DBパス探索スタブ（Addata機能無効化中）"""
-    return None
+    """KA06_ALL.DB（車種マスタ）のパス。無ければ None。"""
+    if not addata_base:
+        return None
+    p = os.path.join(addata_base, 'COM', 'KA06_ALL.DB')
+    return p if os.path.exists(p) else None
+
 
 def identify_vehicle(addata_base, vehicle_data):
-    """車両特定スタブ（Addata機能無効化中）"""
-    return {'match_layer': 3, 'is_supported': False, 'reason': 'Addata disabled'}
+    """車検証情報から Addata の車種コードを特定する。"""
+    if not addata_base:
+        return {'match_layer': 3, 'is_supported': False, 'reason': 'Addata未検出'}
+    try:
+        from auto_matching import identify_vehicle_wrapper
+    except Exception as e:
+        return {'match_layer': 3, 'is_supported': False,
+                'reason': f'車種特定モジュールを読み込めません: {e}'}
+    try:
+        return identify_vehicle_wrapper(addata_base, vehicle_data or {})
+    except Exception as e:
+        return {'match_layer': 3, 'is_supported': False,
+                'reason': f'車種特定に失敗しました: {e}'}
 
-def match_parts_with_addata(items, addata_folder):
-    """部品マッチングスタブ（Addata機能無効化中）"""
-    return (items, False)
+
+def match_parts_with_addata(items, addata_folder, vehicle_info=None):
+    """明細を Addata マスタと突き合わせる。(items, 照合できたか) を返す。
+
+    照合できなかった場合は元の items をそのまま返す。ここで例外を
+    投げると NEO 生成まるごとが失敗するので、必ず握って戻す。
+    """
+    if not items or not addata_folder:
+        return (items, False)
+    try:
+        from auto_matching import match_pdf_items_to_addata
+    except Exception:
+        return (items, False)
+    try:
+        matched = match_pdf_items_to_addata(items, vehicle_info or {}, addata_folder)
+    except Exception:
+        return (items, False)
+    if isinstance(matched, tuple):
+        matched = matched[0]
+    if not isinstance(matched, list) or not matched:
+        return (items, False)
+    return (matched, True)
 
 
 def complement_vehicle_info_with_gemini(api_key, model_code, current_car_name, current_engine):
@@ -2911,10 +3299,10 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
         items.append({
             'page':         1,
             'row_type':     'detail',
-            'name':         to_halfwidth_katakana(name),
+            'name':         _strip_control_chars(to_halfwidth_katakana(name)),
             'description':  '',
-            'work_code':    category,
-            'method':       category,
+            'work_code':    _strip_control_chars(category),
+            'method':       _strip_control_chars(category),
             'part_no':      part_no,
             'quantity':     qty,
             'parts_amount': parts_amt,
@@ -4071,7 +4459,8 @@ def _session_cache_scope() -> str:
         return _uuid.uuid4().hex
 
 
-def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=None):
+def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=None,
+                           is_tax_inclusive=False):
     """見積書PDFから直接NEOファイルを生成する。
 
     pdf_to_neo_pipeline.process_pdf_to_neo をStreamlitから安全に呼ぶための薄いラッパ。
@@ -4114,6 +4503,9 @@ def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=
             model_name=model_name or None,
             api_key=api_key or None,
             cache_scope=_session_cache_scope(),
+            # 見積書の明細が税込表記かどうか。画面で利用者が指定する。
+            # 決め打ちにすると、税込表記の見積で総額が消費税ぶん膨らむ。
+            is_tax_inclusive=bool(is_tax_inclusive),
         )
         if not isinstance(result, dict):
             return {'ok': False, 'error': 'PDF→NEO変換が想定外の値を返しました'}
@@ -4321,13 +4713,68 @@ def main():
             help="Gemini APIで実際に利用可能なモデルを自動検出（提供終了モデルは除外）。Flash=高速・コスパ良好、Pro=高精度"
         )
         st.markdown("---")
-        st.markdown("**🗂 DBパス設定**")
+        st.markdown("**🗂 Addata（車種データベース）**")
         addata_status = find_addata_dir()
         if addata_status:
-            st.success(f"Addata検出済み")
+            _ka06 = find_ka06_path(addata_status)
+            st.success("Addata検出済み")
             st.caption(addata_status)
+            st.caption(("車種マスタ KA06_ALL.DB あり" if _ka06
+                        else "※ COM/KA06_ALL.DB が無いため車種の自動特定はできません"))
+            if st.button("🗑️ Addataを解除", key='addata_clear_btn'):
+                _discard_uploaded_addata()
+                st.rerun()
         else:
-            st.warning("Addataフォルダ未検出")
+            st.warning("Addataフォルダ未検出（ベタ打ちモードで生成します）")
+
+        with st.expander("Addataを読み込む", expanded=not addata_status):
+            st.caption(
+                "Addata があると、部品名・品番・価格をコグニセブンのマスタと"
+                "突き合わせて部品コードや損害コードを引き当てます。"
+                "無い場合はベタ打ち（モードA）で生成します。"
+            )
+            st.caption(
+                "このアプリはクラウド上で動いているため、お使いのPCの "
+                "C:\\Addata を直接読むことはできません。ZIPにして"
+                "アップロードしてください。"
+            )
+            st.caption(
+                "ZIPの中身は「A〜Zの1文字フォルダ ／ 車種コード ／ *.DB」の構造。"
+                "車種の自動特定には COM/KA06_ALL.DB も必要です。"
+                "全体が大きい場合は、対象車種のフォルダと COM だけでも動きます。"
+            )
+            _addata_zip = st.file_uploader(
+                "Addata の ZIP",
+                type=['zip'],
+                key='addata_zip_upload',
+                help="アップロードできるZIPは200MBまでです。"
+                     "セッション内でのみ保持し、他の利用者からは見えません。",
+            )
+            # 同じファイルで再実行するたびに展開し直さないよう、
+            # 何を展開済みかを名前とサイズで覚えておく。別のZIPが
+            # 選ばれたら、前の展開先を消してから入れ替える。
+            _zip_id = (f'{_addata_zip.name}:{_addata_zip.size}'
+                       if _addata_zip is not None else None)
+            if _zip_id and st.session_state.get('_addata_zip_id') != _zip_id:
+                _discard_uploaded_addata()
+                with st.spinner("Addataを展開しています…"):
+                    _sweep_stale_addata_dirs()
+                    _dest = tempfile.mkdtemp(prefix='addata_')
+                    try:
+                        _root, _why = extract_addata_zip(_addata_zip.getvalue(), _dest)
+                    except Exception as _e:
+                        _root, _why = None, f'展開に失敗しました: {_e}'
+                if _root:
+                    st.session_state[_ADDATA_UPLOAD_BASE_KEY] = _dest
+                    st.session_state[_ADDATA_UPLOAD_KEY] = _root
+                    st.session_state['_addata_upload_label'] = _why
+                    st.session_state['_addata_zip_id'] = _zip_id
+                    st.rerun()
+                else:
+                    import shutil as _sh
+                    _sh.rmtree(_dest, ignore_errors=True)
+                    st.session_state['_addata_zip_id'] = _zip_id
+                    st.error(f"❌ {_why}")
         st.markdown("---")
         st.header("🔬 精度オプション")
         use_fax_filter = st.checkbox(
@@ -4533,7 +4980,7 @@ def main():
                     st.session_state['custom_neo_bytes'] = _neo_bytes_read
                     st.session_state['custom_neo_name']  = custom_neo_file.name
                     st.success(f"✅ {custom_neo_file.name} ({len(_neo_bytes_read):,} bytes)")
-                st.caption("📋 テンプレートの工場名・証券番号等はそのまま引き継ぎます")
+                st.caption("📋 テンプレートの工場名・証券番号等はそのまま引き継ぎます。画面で入力しなかった項目（使用者名・車台番号・事故受付番号など）もテンプレートの値が残るため、別の案件として出す項目は入力し直してください")
             elif st.session_state.get('custom_neo_bytes'):
                 _saved_name = st.session_state.get('custom_neo_name', 'テンプレートNEO')
                 _saved_size = len(st.session_state['custom_neo_bytes'])
@@ -4614,6 +5061,12 @@ def main():
 
         # 税区分選択
         _tax_options = ['税抜き（外税）', '税込み（内税）']
+        # PDF側から引き継いだ税区分を、ウィジェットを描画する前に反映する。
+        # 描画後に代入すると Streamlit が例外を投げる。
+        _pending_tax = st.session_state.pop('_tax_carry_pending', None)
+        if _pending_tax:
+            st.session_state['tax_override'] = _pending_tax
+            st.session_state['csv_tax_radio'] = _pending_tax
         _saved_tax_override = st.session_state.get('tax_override', '税抜き（外税）')
         _tax_default_idx = 1 if '内税' in str(_saved_tax_override) or '税込' in str(_saved_tax_override) else 0
         _tax_sel = st.radio(
@@ -4709,6 +5162,22 @@ def main():
             "見積書PDFをそのままアップロードすると、AI-OCRで明細を読み取り、"
             "NEOファイルまで一気に生成します。Geminiへのコピペは不要です。"
         )
+        _pdf_tax_options = ['税抜き（外税）', '税込み（内税）']
+        _saved_pdf_tax = st.session_state.get('pdf_tax_override',
+                                              st.session_state.get('tax_override', '税抜き（外税）'))
+        _pdf_tax_idx = 1 if ('内税' in str(_saved_pdf_tax) or '税込' in str(_saved_pdf_tax)) else 0
+        _pdf_tax_sel = st.radio(
+            "💴 添付する見積書の金額表記",
+            options=_pdf_tax_options,
+            index=_pdf_tax_idx,
+            horizontal=True,
+            key='pdf_tax_radio',
+            help="明細の金額が税込みで書かれている見積書は「税込み（内税）」を選んでください。"
+                 "取り違えると、NEOの合計が消費税ぶん（10%）ずれます。",
+        )
+        st.session_state['pdf_tax_override'] = _pdf_tax_sel
+        _pdf_is_tax_incl = ('内税' in _pdf_tax_sel or '税込' in _pdf_tax_sel)
+
         _p2n_file = st.file_uploader(
             "見積書PDF",
             type=['pdf'],
@@ -4732,7 +5201,9 @@ def main():
                         api_key,
                         model_name=selected_model,
                         template_bytes=st.session_state.get('custom_neo_bytes'),
+                        is_tax_inclusive=_pdf_is_tax_incl,
                     )
+                st.session_state['pdf2neo_tax_inclusive'] = _pdf_is_tax_incl
                 st.rerun()
 
         _p2n_res = st.session_state.get('pdf2neo_result')
@@ -4793,6 +5264,18 @@ def main():
                                                 use_container_width=True):
                         st.session_state['csv_items'] = _p2n_items
                         st.session_state['csv_mode']  = True
+                        # PDF側で選んだ税区分をプレビュー側にも引き継ぐ。
+                        # 引き継がないと、下流はCSV側のラジオを見るため
+                        # 税区分が食い違い、合計が10%ずれる。
+                        _carry = ('税込み（内税）'
+                                  if st.session_state.get('pdf2neo_tax_inclusive')
+                                  else '税抜き（外税）')
+                        st.session_state['tax_override'] = _carry
+                        # ここで csv_tax_radio に直接代入すると、同じ実行の前半で
+                        # 既に描画済みのウィジェットへの代入となり Streamlit が
+                        # 例外を投げ、取り込みが中断してしまう。次の実行の
+                        # 描画前に反映させるため、一時キーに預けておく。
+                        st.session_state['_tax_carry_pending'] = _carry
                         st.session_state['pdf2neo_vehicle_info'] = _p2n_res.get('vehicle_info') or {}
                         st.session_state['vehicle_file_bytes']  = None
                         st.session_state['vehicle_file_name']   = None
@@ -5043,10 +5526,18 @@ def main():
                     veh_match_result = identify_vehicle(addata_dir, vehicle_data)
                     estimate_data['_veh_match_result'] = veh_match_result
 
-                    if veh_match_result.get('is_supported'):
-                        a_folder = veh_match_result.get('addata_folder')
+                    # is_template（TOYOTA_GENERIC 代用）は実車種が当たって
+                    # いないので照合しない。PDF→NEO 側の decide_mode_from_identify
+                    # がモードAへ落とすのと揃える。
+                    if (veh_match_result.get('is_supported')
+                            and not veh_match_result.get('is_template')):
                         if 'items' in estimate_data and estimate_data['items']:
-                            matched_items, has_rev = match_parts_with_addata(estimate_data['items'], a_folder)
+                            # 渡すのは車種フォルダではなく Addata ルート。
+                            # 車両情報も渡さないと照合側が車種を引けない。
+                            # （以前は存在しないキー addata_folder を読んでおり、
+                            #   常に None になって照合が一度も動いていなかった）
+                            matched_items, has_rev = match_parts_with_addata(
+                                estimate_data['items'], addata_dir, vehicle_data)
                             estimate_data['items'] = matched_items
                             estimate_data['_reverse_match'] = has_rev
                 elif _current_mode == 'beta':
@@ -5318,6 +5809,18 @@ def main():
 ''', unsafe_allow_html=True)
 
         # ── タブ（見積明細タブ廃止・編集は合計・費用タブへ統合）──
+        # テンプレートNEOを使うと、空欄のままの項目にはテンプレート側の値
+        # （前の案件の氏名・車台番号・事故受付番号など）がそのまま残る。
+        # 画面は空欄に見えるので、書かないと利用者は気づけない。
+        if st.session_state.get('custom_neo_bytes'):
+            st.warning(
+                f"⚠️ テンプレートNEO「{safe_str(st.session_state.get('custom_neo_name', ''))}」"
+                "を使用中です。下の車両情報とサイドバーの事故情報のうち、"
+                "**空欄のままの項目はテンプレートに入っている値がそのまま .neo に残ります**"
+                "（前の案件の使用者名・車台番号・事故受付番号など）。"
+                "別の案件として出す項目は必ず入力し直してください。"
+            )
+
         tab_vehicle, tab_totals = st.tabs(["🚗 車両情報", "💰 合計・費用"])
 
         with tab_vehicle:
@@ -5501,9 +6004,17 @@ def main():
             _df_edit = pd.DataFrame(_edit_rows) if _edit_rows else pd.DataFrame(
                 columns=['No', '部品番号', '品名', '数量', '部品金額', '工数', '工賃'])
             # キーを行数と連動させることで行挿入後に data_editor を強制再初期化する
-            # キーに行数を入れると、行を足した瞬間にウィジェットが作り直され、
-            # 入力中のセルの内容が捨てられる。固定キーにする。
-            _editor_key = 'items_editor'
+            # 完全な固定キーにすると、行を削除したときのフロント側の
+            # 編集状態が残り、振り直した No が画面に反映されない。
+            # 画面の No と「コピー」が指す行がずれ、別の行が複製される。
+            # 行数が変わったときだけ作り直す（セル編集では行数は変わらない
+            # ので、入力中の内容は捨てられない）。
+            _ed_ver = st.session_state.get('items_editor_ver', 0)
+            if st.session_state.get('items_editor_rows') != len(_items_src):
+                st.session_state['items_editor_rows'] = len(_items_src)
+                _ed_ver += 1
+                st.session_state['items_editor_ver'] = _ed_ver
+            _editor_key = f'items_editor_{_ed_ver}'
             # height を固定して描画行数を制限（全行フル展開すると100行超で重くなるため）
             _editor_height = min(600, max(200, len(_items_src) * 35 + 60))
             _edited_df = st.data_editor(
@@ -5567,6 +6078,21 @@ def main():
                     '_original_parts_amount': _orig.get('parts_amount', safe_int(_row.get('部品金額', 0))),
                 })
             estimate_data['items'] = edited_items
+            # 明細も列幅で無言に切られる。車両情報と同じように画面で知らせる。
+            # 切られたことに気づけるのが、コグニセブンに取り込んだ後ではなく
+            # ここでなければ、部品番号が切れて発注に使えないまま出荷される。
+            for _wi, _wit in enumerate(edited_items, 1):
+                for _wlbl, _wraw, _ww in (
+                    ('品名',     _wit.get('name', ''),    _ERPARTS_WIDTH['PartsName']),
+                    ('部品番号', _wit.get('part_no', ''), _ERPARTS_WIDTH['PartsNo']),
+                ):
+                    _wraw = safe_str(_wraw)
+                    _wcut = cp932_trim(_wraw, _ww)
+                    if _wraw and _wcut != _wraw:
+                        st.warning(
+                            f"⚠️ {_wi}行目の{_wlbl}はコグニセブンの列幅"
+                            f"（{_ww}バイト＝全角{_ww // 2}文字）を超えています。"
+                            f"NEOには「{_wcut}」までしか入りません。")
             st.session_state['estimate_data'] = estimate_data
             for _it in edited_items:
                 calc_parts += safe_int(_it.get('parts_amount', 0))
@@ -5956,31 +6482,37 @@ def main():
                 f'<div class="total-value">¥{sp:,}</div>'
                 '</div>'
             ) if sp else ''
-            st.markdown(f"""
-            <div class="total-strip">
-                <div class="total-item">
-                    <div class="total-label">部品代</div>
-                    <div class="total-value">¥{calc_parts:,}</div>
-                </div>
-                <div class="total-sep">+</div>
-                <div class="total-item">
-                    <div class="total-label">工賃</div>
-                    <div class="total-value">¥{calc_wages:,}</div>
-                </div>
-                {_sp_cell}
-                {_exp_cell}
-                <div class="total-sep">+</div>
-                <div class="total-item">
-                    <div class="total-label">{'消費税（税込済）' if _is_tax_incl_strip else '消費税'}</div>
-                    <div class="total-value">{'—' if _is_tax_incl_strip else f'¥{tax:,}'}</div>
-                </div>
-                <div class="total-sep">=</div>
-                <div class="total-item">
-                    <div class="total-label">合計{'（税込）' if not _is_tax_incl_strip else ''}</div>
-                    <div class="total-value-highlight">¥{total:,}</div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+            # ショートパーツや費用が0のとき {_sp_cell} が空文字になり、
+            # 「空白だけの行」ができる。Markdown はそこでHTMLブロックを
+            # 終わらせるため、以降が字下げコードブロックとして生の
+            # タグのまま表示されてしまう。改行を挟まない1本の文字列にする。
+            _tax_label   = '消費税（税込済）' if _is_tax_incl_strip else '消費税'
+            _tax_value   = '—' if _is_tax_incl_strip else f'¥{tax:,}'
+            _total_label = '合計' if _is_tax_incl_strip else '合計（税込）'
+            st.markdown(
+                '<div class="total-strip">'
+                '<div class="total-item">'
+                '<div class="total-label">部品代</div>'
+                f'<div class="total-value">¥{calc_parts:,}</div>'
+                '</div>'
+                '<div class="total-sep">+</div>'
+                '<div class="total-item">'
+                '<div class="total-label">工賃</div>'
+                f'<div class="total-value">¥{calc_wages:,}</div>'
+                '</div>'
+                f'{_sp_cell}{_exp_cell}'
+                '<div class="total-sep">+</div>'
+                '<div class="total-item">'
+                f'<div class="total-label">{_tax_label}</div>'
+                f'<div class="total-value">{_tax_value}</div>'
+                '</div>'
+                '<div class="total-sep">=</div>'
+                '<div class="total-item">'
+                f'<div class="total-label">{_total_label}</div>'
+                f'<div class="total-value-highlight">¥{total:,}</div>'
+                '</div>'
+                '</div>',
+                unsafe_allow_html=True)
           else:
             amount_confirmed = True
             st.info("💡 見積書なし — 車両情報のみのNEOファイルを作成します")
@@ -6240,6 +6772,11 @@ def main():
                     'exp_towing', 'exp_rental', 'exp_exempt',
                     'custom_neo_bytes', 'custom_neo_name',
                     'tax_override',
+                    # PDF側の税区分と、その引き継ぎ用の一時キー。消し忘れると
+                    # 次の見積で意図しない税区分が復活し、税抜の見積が
+                    # 税込として処理される。
+                    '_tax_carry_pending', 'pdf_tax_override',
+                    'pdf2neo_tax_inclusive', 'csv_tax_radio', 'pdf_tax_radio',
                     'classification_confirmed', 'classification_alerts',
                     'discrepancies', 'total_diff',
                     'amount_confirmed',
