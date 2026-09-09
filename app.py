@@ -420,6 +420,22 @@ def _xml_escape(value) -> str:
             .replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
 
 
+def _normalize_date8(raw) -> str:
+    """日付入力を YYYYMMDD の8桁に正規化する。解釈できなければ空文字。
+
+    「2026/09/01」「2026-09-01」「20260901」いずれも受け付ける。
+    妥当でない日付（13月など）は書き込まない。
+    """
+    s = re.sub(r'[^\d]', '', str(raw or ''))
+    if len(s) != 8:
+        return ''
+    try:
+        datetime.datetime.strptime(s, '%Y%m%d')
+    except ValueError:
+        return ''
+    return s
+
+
 def _normalize_number_text(raw):
     """金額・数量の文字列を符号付きの数値文字列に正規化する。解釈不能なら None。
 
@@ -1070,25 +1086,54 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
     cur.execute('''UPDATE FileInfo SET
         EstimatedDate=?, EstimatedEra=?, EstimatedEraYear=?
     ''', (estimated_date, est_era, est_era_year))
-    policy_no  = safe_str(insurance_info.get('policy_no', ''))
-    contractor = safe_str(insurance_info.get('contractor_name', ''))
-    if merge_mode:
-        # マージモード: 非空の保険情報のみ上書き
-        _ins_updates = []
-        _ins_values  = []
-        if policy_no:
-            _ins_updates.append('PolicyNo=?')
-            _ins_values.append(policy_no)
-        if contractor:
-            _ins_updates.append('ContractorName=?')
-            _ins_values.append(contractor)
-        if _ins_updates:
-            cur.execute(f"UPDATE Insurance SET {', '.join(_ins_updates)}", _ins_values)
-    else:
-        cur.execute('''UPDATE Insurance SET
-            PolicyNo=?, ContractorName=?,
-            AccidentDate='00000000', AccidentEra='令和'
-        ''', (policy_no, contractor))
+    policy_no     = safe_str(insurance_info.get('policy_no', ''))
+    contractor    = safe_str(insurance_info.get('contractor_name', ''))
+    agency_name   = safe_str(insurance_info.get('agency_name', ''))
+    adjuster_name = safe_str(insurance_info.get('adjuster_name', ''))
+    accept_no     = safe_str(insurance_info.get('accept_no', ''))
+    accident_date = _normalize_date8(insurance_info.get('accident_date', ''))
+    garage_in     = _normalize_date8(insurance_info.get('garage_in_date', ''))
+    garage_out    = _normalize_date8(insurance_info.get('garage_out_date', ''))
+    repair_days   = safe_int(insurance_info.get('repair_days', 0))
+    note1         = safe_str(insurance_info.get('note1', ''))
+
+    # Insurance テーブル: 入力があった項目だけ書き込む。
+    # 空欄で既存値を消すと、テンプレート由来の工場情報などが失われるため。
+    _ins_updates, _ins_values = [], []
+    for _col, _val in (('PolicyNo', policy_no), ('ContractorName', contractor),
+                       ('AgencyName', agency_name), ('AdjusterName', adjuster_name)):
+        if _val:
+            _ins_updates.append(f'{_col}=?')
+            _ins_values.append(_val)
+    if repair_days > 0:
+        _ins_updates.append('RepairDays=?')
+        _ins_values.append(repair_days)
+    if accident_date:
+        _acc_era, _acc_era_year = get_era_info(accident_date)
+        _ins_updates += ['AccidentDate=?', 'AccidentEra=?', 'AccidentEraYear=?']
+        _ins_values  += [accident_date, _acc_era, _acc_era_year]
+    elif not merge_mode:
+        # 新規作成時は事故日を未入力状態で初期化する
+        _ins_updates += ['AccidentDate=?', 'AccidentEra=?']
+        _ins_values  += ['00000000', '令和']
+    if _ins_updates:
+        cur.execute(f"UPDATE Insurance SET {', '.join(_ins_updates)}", _ins_values)
+
+    # FileInfo テーブル: 受付番号・入出庫日・備考
+    _fi_updates, _fi_values = [], []
+    if accept_no:
+        _fi_updates.append('AcceptNo=?')
+        _fi_values.append(accept_no)
+    if note1:
+        _fi_updates.append('Note1=?')
+        _fi_values.append(note1)
+    for _prefix, _date in (('GarageIn', garage_in), ('GarageOut', garage_out)):
+        if _date:
+            _era, _era_year = get_era_info(_date)
+            _fi_updates += [f'{_prefix}Date=?', f'{_prefix}Era=?', f'{_prefix}EraYear=?']
+            _fi_values  += [_date, _era, _era_year]
+    if _fi_updates:
+        cur.execute(f"UPDATE FileInfo SET {', '.join(_fi_updates)}", _fi_values)
     conn.commit()
 
     # TaxKindFlag 更新 (1=内税, 0=外税)
@@ -2301,368 +2346,10 @@ status フィールドを追加すること:
 
 
 def _build_prompt(task_type: str, extra: str = "") -> str:
-    """CORE_PROMPT + TASK_PROMPTS[task_type] + learned_hints + extra を結合して返す"""
+    """CORE_PROMPT + TASK_PROMPTS[task_type] + extra を結合して返す"""
     task_part = TASK_PROMPTS.get(task_type, "")
-    learned   = _load_learned_hints(task_type)
-    parts = [CORE_PROMPT, task_part, learned, extra]
+    parts = [CORE_PROMPT, task_part, extra]
     return "\n\n".join(p for p in parts if p)
-
-
-# ============================================================
-# フィードバック学習DB
-# ============================================================
-import uuid as _uuid
-
-_FEEDBACK_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feedback.db")
-
-# エラー種別の日本語ラベル
-FEEDBACK_ERROR_TYPES = {
-    "column_swap":    "部品↔工賃の取り違え",
-    "missed_row":     "行の見落とし",
-    "amount_misread": "金額の読み取りミス",
-    "wrong_category": "分類誤り（合計行混入等）",
-    "name_error":     "品名の誤読",
-    "quantity_error": "数量の誤読",
-    "extra_row":      "不要な行が追加されている",
-    "other":          "その他",
-}
-
-# 積算しきい値（この件数を超えたらマスタ統合を推奨）
-FEEDBACK_MERGE_THRESHOLD = 5
-
-
-_FEEDBACK_EXPECTED_COLUMNS = {
-    'corrections': {
-        'id': 'TEXT', 'timestamp': 'TEXT', 'document_type': 'TEXT',
-        'error_type': 'TEXT', 'row_index': 'INTEGER',
-        'orig_name': 'TEXT', 'orig_parts': 'INTEGER', 'orig_wage': 'INTEGER',
-        'corr_name': 'TEXT', 'corr_parts': 'INTEGER', 'corr_wage': 'INTEGER',
-        'user_comment': 'TEXT', 'page_context': 'TEXT', 'status': 'TEXT',
-    },
-}
-
-
-def _migrate_feedback_db(conn):
-    """既存DBに不足している列を足す。
-
-    以前のバージョンで作られたDBがあると CREATE TABLE IF NOT EXISTS は
-    何もしないため、列が足りないまま INSERT が例外になり、記録ボタンを
-    押した瞬間に画面が落ちていた。
-    """
-    cur = conn.cursor()
-    for table, columns in _FEEDBACK_EXPECTED_COLUMNS.items():
-        try:
-            existing = {r[1] for r in cur.execute(f"PRAGMA table_info({table})")}
-        except sqlite3.Error:
-            continue
-        if not existing:
-            continue
-        for col, col_type in columns.items():
-            if col not in existing:
-                try:
-                    cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
-                    print(f"[feedback.db] 列を追加しました: {table}.{col}")
-                except sqlite3.Error as e:
-                    print(f"[feedback.db] 列追加に失敗: {table}.{col}: {e}")
-    conn.commit()
-
-
-def _get_feedback_db():
-    """フィードバックDB接続を返す（テーブルが存在しない場合は作成）"""
-    conn = sqlite3.connect(_FEEDBACK_DB_PATH)
-    cur  = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS corrections (
-            id            TEXT PRIMARY KEY,
-            timestamp     TEXT NOT NULL,
-            document_type TEXT,
-            error_type    TEXT,
-            row_index     INTEGER,
-            orig_name     TEXT,
-            orig_parts    INTEGER,
-            orig_wage     INTEGER,
-            corr_name     TEXT,
-            corr_parts    INTEGER,
-            corr_wage     INTEGER,
-            user_comment  TEXT,
-            page_context  TEXT,
-            status        TEXT DEFAULT 'pending'
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS prompt_patches (
-            id          TEXT PRIMARY KEY,
-            task_type   TEXT NOT NULL,
-            patch_text  TEXT NOT NULL,
-            created_at  TEXT NOT NULL,
-            is_active   INTEGER DEFAULT 1
-        )
-    """)
-    conn.commit()
-    _migrate_feedback_db(conn)
-    return conn
-
-
-def record_correction(corrections: list, user_comment: str, document_type: str = "不明"):
-    """
-    明細の訂正データをDBに記録する。
-    corrections: [{"row_index": int, "error_type": str, "original": dict, "corrected": dict}]
-    """
-    if not corrections:
-        return
-    conn = _get_feedback_db()
-    cur  = conn.cursor()
-    ts   = datetime.datetime.now().isoformat()
-    for c in corrections:
-        orig = c.get("original", {})
-        corr = c.get("corrected", {})
-        cur.execute("""
-            INSERT INTO corrections
-            (id, timestamp, document_type, error_type, row_index,
-             orig_name, orig_parts, orig_wage,
-             corr_name, corr_parts, corr_wage,
-             user_comment, page_context, status)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            str(_uuid.uuid4()), ts, document_type,
-            c.get("error_type", "other"),
-            c.get("row_index", 0),
-            str(orig.get("name", "")),
-            safe_int(orig.get("parts_amount", 0)),
-            safe_int(orig.get("wage", 0)),
-            str(corr.get("name", "")),
-            safe_int(corr.get("parts_amount", 0)),
-            safe_int(corr.get("wage", 0)),
-            user_comment,
-            c.get("page_context", ""),
-            "pending",
-        ))
-    conn.commit()
-    conn.close()
-
-
-def get_error_summary():
-    """エラー種別ごとの件数・代表例をまとめて返す"""
-    try:
-        conn = _get_feedback_db()
-        cur  = conn.cursor()
-        cur.execute("""
-            SELECT error_type, COUNT(*) as cnt,
-                   GROUP_CONCAT(orig_name, '|') as names
-            FROM corrections
-            WHERE status = 'pending'
-            GROUP BY error_type
-            ORDER BY cnt DESC
-        """)
-        rows = cur.fetchall()
-        conn.close()
-        result = []
-        for r in rows:
-            names = list(set((r[2] or "").split("|")))[:5]
-            result.append({
-                "error_type": r[0],
-                "label": FEEDBACK_ERROR_TYPES.get(r[0], r[0]),
-                "count": r[1],
-                "sample_names": [n for n in names if n],
-            })
-        return result
-    except Exception:
-        return []
-
-
-def get_all_pending_corrections():
-    """未統合の全訂正レコードを返す"""
-    try:
-        conn = _get_feedback_db()
-        cur  = conn.cursor()
-        cur.execute("""
-            SELECT id, timestamp, document_type, error_type,
-                   orig_name, orig_parts, orig_wage,
-                   corr_name, corr_parts, corr_wage,
-                   user_comment
-            FROM corrections
-            WHERE status = 'pending'
-            ORDER BY timestamp DESC
-        """)
-        rows = cur.fetchall()
-        conn.close()
-        cols = ["id","timestamp","document_type","error_type",
-                "orig_name","orig_parts","orig_wage",
-                "corr_name","corr_parts","corr_wage","user_comment"]
-        return [dict(zip(cols, r)) for r in rows]
-    except Exception:
-        return []
-
-
-def generate_and_save_patch(patch_text: str, task_type: str = "estimate_detail_page"):
-    """
-    生成されたプロンプトパッチをDBに保存し、既存のアクティブパッチを無効化する。
-    """
-    conn = _get_feedback_db()
-    cur  = conn.cursor()
-    # 既存アクティブパッチを無効化
-    cur.execute("UPDATE prompt_patches SET is_active = 0 WHERE task_type = ?", (task_type,))
-    # 新パッチを挿入
-    cur.execute("""
-        INSERT INTO prompt_patches (id, task_type, patch_text, created_at, is_active)
-        VALUES (?,?,?,?,1)
-    """, (str(_uuid.uuid4()), task_type, patch_text,
-          datetime.datetime.now().isoformat()))
-    # 統合済みの pending レコードを merged に更新
-    cur.execute("UPDATE corrections SET status = 'merged' WHERE status = 'pending'")
-    conn.commit()
-    conn.close()
-
-
-def _load_learned_hints(task_type: str = "estimate_detail_page") -> str:
-    """
-    現在アクティブなプロンプトパッチを返す。なければ空文字列。
-    _build_prompt() から呼ばれる。
-    """
-    try:
-        conn = _get_feedback_db()
-        cur  = conn.cursor()
-        cur.execute("""
-            SELECT patch_text FROM prompt_patches
-            WHERE task_type = ? AND is_active = 1
-            ORDER BY created_at DESC LIMIT 1
-        """, (task_type,))
-        row = cur.fetchone()
-        conn.close()
-        return row[0] if row else ""
-    except Exception:
-        return ""
-
-
-def _classify_correction(orig: dict, corr: dict) -> str:
-    """1行の修正内容からエラー種別を推定する。
-
-    部品↔工賃の取り違え（column_swap）は、部品金額と工賃が実際に入れ替わって
-    いる時だけとする。単なる金額の直しをこれに分類すると、自動生成される
-    学習パッチが「工賃列の金額を部品として扱え」という誤った指示になり、
-    次回以降の解析で金額が失われる。
-    """
-    orig_p = safe_int(orig.get("parts_amount", 0))
-    orig_w = safe_int(orig.get("wage", 0))
-    corr_p = safe_int(corr.get("parts_amount", 0))
-    corr_w = safe_int(corr.get("wage", 0))
-    orig_n = str(orig.get("name", ""))
-    corr_n = str(corr.get("name", ""))
-    orig_q = safe_int(orig.get("quantity", 1), 1)
-    corr_q = safe_int(corr.get("quantity", 1), 1)
-
-    amount_changed = (orig_p != corr_p) or (orig_w != corr_w)
-    name_changed = orig_n != corr_n
-
-    # 部品と工賃がそのまま入れ替わっている場合のみ取り違え
-    if amount_changed and orig_p == corr_w and orig_w == corr_p and (orig_p or orig_w):
-        return "column_swap"
-    if name_changed and not amount_changed:
-        return "name_error"
-    if amount_changed and not name_changed:
-        return "amount_misread"
-    if amount_changed and name_changed:
-        # 品名も金額も変わっている＝行そのものの読み違え
-        return "amount_misread"
-    if orig_q != corr_q:
-        return "quantity_error"
-    return "other"
-
-
-def _row_identity(item: dict) -> str:
-    """行の同一性を判定するためのキー（品番があれば品番、無ければ品名）"""
-    pno = str(item.get("part_no", "") or item.get("parts_no", "") or "").strip()
-    if pno:
-        return "P:" + pno.lower()
-    return "N:" + to_halfwidth_katakana(str(item.get("name", "") or "")).strip().lower()
-
-
-def _detect_corrections(original_items: list, edited_items: list) -> list:
-    """
-    AIが出力したオリジナル明細とユーザー編集後を比較し、差分リストを返す。
-    Returns: [{"row_index", "error_type", "original", "corrected", "page_context"}]
-
-    行は位置ではなく内容（品番・品名）で対応付ける。位置で突き合わせると、
-    途中に1行挿入しただけで以降の全行が「別の行に化けた」と誤検出され、
-    その誤りがそのまま学習データに記録されてしまう。
-    """
-    import difflib as _difflib
-
-    corrections = []
-    orig_keys = [_row_identity(it) for it in (original_items or [])]
-    edit_keys = [_row_identity(it) for it in (edited_items or [])]
-    matcher = _difflib.SequenceMatcher(a=orig_keys, b=edit_keys, autojunk=False)
-
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
-            for off in range(i2 - i1):
-                orig = original_items[i1 + off]
-                corr = edited_items[j1 + off]
-                etype = _classify_correction(orig, corr)
-                if etype == "other" and \
-                        safe_int(orig.get("parts_amount", 0)) == safe_int(corr.get("parts_amount", 0)) and \
-                        safe_int(orig.get("wage", 0)) == safe_int(corr.get("wage", 0)) and \
-                        str(orig.get("name", "")) == str(corr.get("name", "")):
-                    continue  # 変更なし
-                corrections.append({
-                    "row_index":    j1 + off + 1,
-                    "error_type":   etype,
-                    "original":     orig,
-                    "corrected":    corr,
-                    "page_context": f"{j1 + off + 1}行目: {orig.get('name', '')}",
-                })
-        elif tag == "replace":
-            # 置き換え：対応が取れる分だけ突き合わせ、余りは追加/削除として扱う
-            common = min(i2 - i1, j2 - j1)
-            for off in range(common):
-                orig = original_items[i1 + off]
-                corr = edited_items[j1 + off]
-                corrections.append({
-                    "row_index":    j1 + off + 1,
-                    "error_type":   _classify_correction(orig, corr),
-                    "original":     orig,
-                    "corrected":    corr,
-                    "page_context": f"{j1 + off + 1}行目: {orig.get('name', '')}",
-                })
-            for off in range(common, j2 - j1):
-                corr = edited_items[j1 + off]
-                corrections.append({
-                    "row_index":    j1 + off + 1,
-                    "error_type":   "missed_row",
-                    "original":     {},
-                    "corrected":    corr,
-                    "page_context": f"{j1 + off + 1}行目（追加）",
-                })
-            for off in range(common, i2 - i1):
-                orig = original_items[i1 + off]
-                corrections.append({
-                    "row_index":    i1 + off + 1,
-                    "error_type":   "extra_row",
-                    "original":     orig,
-                    "corrected":    {},
-                    "page_context": f"{i1 + off + 1}行目（削除）",
-                })
-        elif tag == "insert":
-            for off in range(j2 - j1):
-                corr = edited_items[j1 + off]
-                corrections.append({
-                    "row_index":    j1 + off + 1,
-                    "error_type":   "missed_row",
-                    "original":     {},
-                    "corrected":    corr,
-                    "page_context": f"{j1 + off + 1}行目（追加）",
-                })
-        elif tag == "delete":
-            for off in range(i2 - i1):
-                orig = original_items[i1 + off]
-                corrections.append({
-                    "row_index":    i1 + off + 1,
-                    "error_type":   "extra_row",
-                    "original":     orig,
-                    "corrected":    {},
-                    "page_context": f"{i1 + off + 1}行目（削除）",
-                })
-    return corrections
 
 
 def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None):
@@ -4621,11 +4308,37 @@ def main():
             help="コントラスト・シャープネスを強化してFAX品質の画像を読みやすくします。ラスタライズ有効時のみ機能します。"
         )
         st.markdown("---")
-        st.header("🛡️ 保険情報")
-        policy_no       = st.text_input("証券番号",  value=st.session_state.get('policy_no', ''))
-        contractor_name = st.text_input("契約者名", value=st.session_state.get('contractor_name', ''))
-        st.session_state['policy_no']       = policy_no
-        st.session_state['contractor_name'] = contractor_name
+        st.header("🛡️ 事故・保険情報")
+        st.caption("コグニセブンの受付／保険欄に書き込まれます。空欄はテンプレートの値を維持します。")
+        accept_no       = st.text_input("事故受付番号", value=st.session_state.get('accept_no', ''),
+                                        key='accept_no_input', placeholder="例: 2026-001234")
+        accident_date   = st.text_input("事故日（YYYYMMDD）", value=st.session_state.get('accident_date', ''),
+                                        key='accident_date_input', placeholder="例: 20260901", max_chars=8)
+        policy_no       = st.text_input("証券番号", value=st.session_state.get('policy_no', ''),
+                                        key='policy_no_input')
+        contractor_name = st.text_input("契約者名", value=st.session_state.get('contractor_name', ''),
+                                        key='contractor_name_input')
+        agency_name     = st.text_input("保険会社・代理店名", value=st.session_state.get('agency_name', ''),
+                                        key='agency_name_input')
+        adjuster_name   = st.text_input("アジャスター名", value=st.session_state.get('adjuster_name', ''),
+                                        key='adjuster_name_input')
+        with st.expander("入庫・出庫・修理日数", expanded=False):
+            garage_in_date  = st.text_input("入庫日（YYYYMMDD）", value=st.session_state.get('garage_in_date', ''),
+                                            key='garage_in_input', max_chars=8)
+            garage_out_date = st.text_input("出庫日（YYYYMMDD）", value=st.session_state.get('garage_out_date', ''),
+                                            key='garage_out_input', max_chars=8)
+            repair_days     = st.number_input("修理日数", value=st.session_state.get('repair_days', 0),
+                                              min_value=0, step=1, key='repair_days_input')
+            note1           = st.text_area("備考", value=st.session_state.get('note1', ''),
+                                           key='note1_input', height=70)
+        for _k, _v in [
+            ('accept_no', accept_no), ('accident_date', accident_date),
+            ('policy_no', policy_no), ('contractor_name', contractor_name),
+            ('agency_name', agency_name), ('adjuster_name', adjuster_name),
+            ('garage_in_date', garage_in_date), ('garage_out_date', garage_out_date),
+            ('repair_days', repair_days), ('note1', note1),
+        ]:
+            st.session_state[_k] = _v
         st.markdown("---")
         st.header("💰 費用（Expense）")
         exp_towing    = st.number_input("レッカー費用（税抜）",  value=st.session_state.get('exp_towing', 0),    min_value=0, step=1000, key='exp_towing_input')
@@ -4663,144 +4376,6 @@ def main():
         st.markdown("---")
         st.caption(f"消費税率: {int(TAX_RATE * 100)}%（固定）")
         st.caption(f"見積日: {datetime.datetime.now().strftime('%Y/%m/%d')}（自動）")
-
-        # ── 🧠 学習データ管理 ──────────────────────────────────
-        st.markdown("---")
-        with st.expander("🧠 学習データ管理", expanded=False):
-            _err_summary = get_error_summary()
-            _total_pending = sum(s['count'] for s in _err_summary)
-
-            if _total_pending == 0:
-                st.info("訂正データはまだありません。\nSTEP③で明細を修正するとここに蓄積されます。")
-            else:
-                st.markdown(f"**未統合の訂正データ: {_total_pending}件**")
-                for _es in _err_summary:
-                    _names_str = "、".join(_es['sample_names'][:3]) if _es['sample_names'] else ""
-                    st.markdown(
-                        f"- **{_es['label']}**: {_es['count']}件"
-                        + (f"（例: {_names_str}）" if _names_str else "")
-                    )
-
-                st.markdown("---")
-                # 蓄積データ詳細
-                with st.expander("📋 訂正データ詳細", expanded=False):
-                    _all_corr = get_all_pending_corrections()
-                    if _all_corr:
-                        _corr_rows = []
-                        for _cr in _all_corr:
-                            _corr_rows.append({
-                                "日時": _cr['timestamp'][:16],
-                                "エラー種別": FEEDBACK_ERROR_TYPES.get(_cr['error_type'], _cr['error_type']),
-                                "修正前": f"{_cr['orig_name']} 部品¥{_cr['orig_parts']:,}/工賃¥{_cr['orig_wage']:,}",
-                                "修正後": f"{_cr['corr_name']} 部品¥{_cr['corr_parts']:,}/工賃¥{_cr['corr_wage']:,}",
-                                "コメント": (_cr['user_comment'] or "")[:40],
-                            })
-                        st.dataframe(pd.DataFrame(_corr_rows), use_container_width=True, hide_index=True)
-
-                st.markdown("---")
-                # マスタ統合
-                st.markdown("**プロンプトへのマスタ統合**")
-                if _total_pending < FEEDBACK_MERGE_THRESHOLD:
-                    st.caption(f"※ あと{FEEDBACK_MERGE_THRESHOLD - _total_pending}件蓄積されると統合推奨になります（現在{_total_pending}件）")
-
-                # 統合用パッチテキストを自動生成
-                # ・既に適用中のパッチを土台にする（統合のたびに過去の学習が
-                #   捨てられていたため）
-                # ・品名が空の記録や、ルール行を作れない種別だけの記録は捨てる
-                # ・件数に上限を設け、プロンプトが本文より長くならないようにする
-                _MAX_PATCH_RULES = 60
-                _existing_patch = _load_learned_hints("estimate_detail_page")
-                _existing_rules = [
-                    _ln for _ln in (_existing_patch.splitlines() if _existing_patch else [])
-                    if _ln.strip().startswith('-')
-                ]
-                _rule_lines = list(_existing_rules)
-                _comment_lines = []
-                _seen_types = set()
-                _seen_comments = set()
-                _all_corr2 = get_all_pending_corrections()
-                for _cr2 in _all_corr2:
-                    _et = _cr2['error_type']
-                    _on = (_cr2['orig_name'] or '').strip()
-                    _cn = (_cr2.get('corr_name') or '').strip()
-                    _cp = _cr2['corr_parts']
-                    _cw = _cr2['corr_wage']
-                    _cm = (_cr2['user_comment'] or "").strip()
-                    _label = _on or _cn
-                    if not _label:
-                        continue  # 品名が取れない記録からはルールを作れない
-                    _key = (_et, _label)
-                    if _key in _seen_types:
-                        continue
-                    _seen_types.add(_key)
-                    _new_rule = None
-                    if _et == "column_swap":
-                        if _cp == 0 and _cw > 0:
-                            _new_rule = f"- 「{_label}」は部品列に記載されていても工賃（wage）として扱うこと"
-                        elif _cp > 0 and _cw == 0:
-                            _new_rule = f"- 「{_label}」は工賃列に記載されていても部品（parts_amount）として扱うこと"
-                    elif _et == "missed_row":
-                        _new_rule = f"- 「{_label}」のような行を見落とさないこと"
-                    elif _et == "amount_misread":
-                        _new_rule = f"- 「{_label}」の金額を正確に読み取ること（桁ずれ注意）"
-                    elif _et == "name_error" and _on and _cn and _on != _cn:
-                        _new_rule = f"- 「{_on}」は「{_cn}」と読むこと"
-                    elif _et == "quantity_error":
-                        _new_rule = f"- 「{_label}」の数量を正確に読み取ること"
-                    if not _new_rule:
-                        continue
-                    if _new_rule not in _rule_lines:
-                        _rule_lines.append(_new_rule)
-                    if _cm and _cm not in _seen_comments:
-                        _seen_comments.add(_cm)
-                        _comment_lines.append(f"  （補足: {_cm[:60]}）")
-
-                if len(_rule_lines) > _MAX_PATCH_RULES:
-                    _rule_lines = _rule_lines[-_MAX_PATCH_RULES:]
-                _auto_patch = ("\n".join(["【学習済み訂正パターン（自動生成）】"]
-                                         + _rule_lines + _comment_lines[:10])
-                               if _rule_lines else "")
-                # value と key を同時に渡すと、以降の再実行で value が無視され、
-                # 後から記録した訂正が反映されないまま統合されてしまう。
-                if st.session_state.get('_patch_auto_src') != _auto_patch:
-                    st.session_state['_patch_auto_src'] = _auto_patch
-                    st.session_state['patch_text_input'] = _auto_patch
-                _patch_text = st.text_area(
-                    "統合するプロンプトパッチ（編集可）",
-                    height=200,
-                    key="patch_text_input",
-                )
-
-                _mc1, _mc2 = st.columns(2)
-                with _mc1:
-                    if st.button("🔄 マスタ版に統合する", key="merge_patch_btn", type="primary",
-                                 disabled=(_total_pending == 0)):
-                        if _patch_text.strip():
-                            try:
-                                generate_and_save_patch(_patch_text.strip(), "estimate_detail_page")
-                            except Exception as _me:
-                                st.error(f"学習データの保存に失敗しました: {_me}")
-                            else:
-                                st.success("✅ プロンプトパッチを適用しました。次回解析から有効になります。")
-                                st.rerun()
-                        else:
-                            st.warning("パッチテキストが空です。")
-                with _mc2:
-                    if st.button("🗑 パッチを無効化", key="deactivate_patch_btn"):
-                        try:
-                            _conn = _get_feedback_db()
-                            _conn.execute("UPDATE prompt_patches SET is_active = 0")
-                            _conn.commit(); _conn.close()
-                            st.success("パッチを無効化しました。")
-                            st.rerun()
-                        except Exception as _pe:
-                            st.error(f"エラー: {_pe}")
-
-            # 現在適用中のパッチ表示
-            _current_patch = _load_learned_hints("estimate_detail_page")
-            if _current_patch:
-                with st.expander("📌 現在適用中のパッチ", expanded=False):
-                    st.code(_current_patch, language=None)
 
     # セッション状態初期化
     for key, default in [
@@ -5726,10 +5301,6 @@ def main():
             # ── 明細行一覧 (編集可) ──────────────────────────────
             st.markdown('<div class="section-title">📋 明細行一覧（全項目・編集可）</div>', unsafe_allow_html=True)
 
-            # AI初期出力を _original_items として保存（初回のみ）
-            if '_original_items' not in st.session_state:
-                st.session_state['_original_items'] = [dict(it) for it in estimate_data.get('items', [])]
-
             _items_src = estimate_data['items']
             # ── 行操作ボタン（挿入・コピー・削除） ──────────────────────
             _op_col1, _op_col2, _op_col3, _op_col4 = st.columns([1, 1, 1, 5])
@@ -5849,65 +5420,6 @@ def main():
             sp = 0
             pdf_parts = safe_int(estimate_data.get('pdf_parts_total', 0))
             pdf_wages = safe_int(estimate_data.get('pdf_wage_total', 0))
-
-            # ── フィードバック: 差分検出（アイテムが変わった時だけ再計算）─────
-            _orig_items_fb = st.session_state.get('_original_items', [])
-            _fb_hash = hash(str([(it.get('name',''), it.get('parts_amount',0), it.get('wage',0)) for it in edited_items]))
-            if st.session_state.get('_fb_hash') != _fb_hash:
-                st.session_state['_fb_cache'] = _detect_corrections(_orig_items_fb, edited_items)
-                st.session_state['_fb_hash']  = _fb_hash
-            _fb_corrections = st.session_state.get('_fb_cache', [])
-            if _fb_corrections:
-                _fb_key = f"fb_open_{hash(str(_fb_corrections))}"
-                with st.expander(f"📝 読み取り訂正レポート（{len(_fb_corrections)}件の変更を検出）", expanded=False):
-                    st.markdown("**以下の行が修正されました。AIへのフィードバックとして記録できます。**")
-                    _fb_rows = []
-                    for _fc in _fb_corrections:
-                        _orig = _fc.get("original", {})
-                        _corr = _fc.get("corrected", {})
-                        _fb_rows.append({
-                            "行": _fc["row_index"],
-                            "品名(修正前)": _orig.get("name", "-"),
-                            "部品(修正前)": f"¥{safe_int(_orig.get('parts_amount',0)):,}" if _orig else "-",
-                            "工賃(修正前)": f"¥{safe_int(_orig.get('wage',0)):,}" if _orig else "-",
-                            "品名(修正後)": _corr.get("name", "-") if _corr else "（削除）",
-                            "部品(修正後)": f"¥{safe_int(_corr.get('parts_amount',0)):,}" if _corr else "-",
-                            "工賃(修正後)": f"¥{safe_int(_corr.get('wage',0)):,}" if _corr else "-",
-                            "推定エラー種別": FEEDBACK_ERROR_TYPES.get(_fc.get("error_type","other"), _fc.get("error_type","")),
-                        })
-                    st.table(pd.DataFrame(_fb_rows).set_index("行"))
-
-                    st.markdown("**エラーの原因を文章で教えてください（任意）:**")
-                    _fb_comment = st.text_area(
-                        "例: 工賃列に記載されているのに部品として読み取られた",
-                        key="fb_comment_input", height=80, label_visibility="collapsed"
-                    )
-                    _fb_doc_type = estimate_data.get('_document_type', '不明')
-                    _fbc1, _fbc2 = st.columns([1, 3])
-                    with _fbc1:
-                        if st.button("✅ フィードバックを記録する", key="fb_record_btn", type="primary"):
-                            try:
-                                record_correction(_fb_corrections, _fb_comment, _fb_doc_type)
-                            except Exception as _re:
-                                st.error(f"訂正データの保存に失敗しました: {_re}")
-                                st.stop()
-                            st.session_state['_original_items'] = [dict(it) for it in edited_items]
-                            # 差分キャッシュを捨てないとレポートが残り続け、
-                            # 同じ訂正を何度も記録できてしまう
-                            st.session_state['_fb_cache'] = []
-                            st.session_state.pop('_fb_hash', None)
-                            st.success(f"✅ {len(_fb_corrections)}件の訂正をDBに記録しました")
-                            # 蓄積件数チェック
-                            _summary = get_error_summary()
-                            _total_pending = sum(s['count'] for s in _summary)
-                            if _total_pending >= FEEDBACK_MERGE_THRESHOLD:
-                                st.info(f"💡 訂正データが{_total_pending}件蓄積されました。サイドバーの「🧠 学習データ管理」からマスタ統合を実行できます。")
-                    with _fbc2:
-                        if st.button("⏭ スキップ", key="fb_skip_btn"):
-                            st.session_state['_original_items'] = [dict(it) for it in edited_items]
-                            st.session_state['_fb_cache'] = []
-                            st.session_state.pop('_fb_hash', None)
-                            st.rerun()
 
             st.markdown("---")
             # ── 金額サマリー ────────────────────────────────────
@@ -6331,10 +5843,6 @@ def main():
                 st.session_state['step'] = 1
                 st.session_state['vehicle_data']  = None
                 st.session_state['estimate_data'] = None
-                # 前の見積の比較元を残すと、次の見積で「訂正レポート」に
-                # 前回との差分が誤検出され、学習データに誤りが記録される
-                for _k in ('_original_items', '_fb_hash', '_fb_cache'):
-                    st.session_state.pop(_k, None)
                 st.rerun()
         with bcol2:
             # 金額差異未確認時のみボタンを無効化（分類エラーではブロックしない）
@@ -6365,6 +5873,14 @@ def main():
         insurance_info  = {
             'policy_no':        st.session_state.get('policy_no', ''),
             'contractor_name':  st.session_state.get('contractor_name', ''),
+            'accept_no':        st.session_state.get('accept_no', ''),
+            'accident_date':    st.session_state.get('accident_date', ''),
+            'agency_name':      st.session_state.get('agency_name', ''),
+            'adjuster_name':    st.session_state.get('adjuster_name', ''),
+            'garage_in_date':   st.session_state.get('garage_in_date', ''),
+            'garage_out_date':  st.session_state.get('garage_out_date', ''),
+            'repair_days':      st.session_state.get('repair_days', 0),
+            'note1':            st.session_state.get('note1', ''),
         }
         expense_info = {
             'towing':      st.session_state.get('exp_towing', 0),
@@ -6555,7 +6071,6 @@ def main():
                     'classification_confirmed', 'classification_alerts',
                     'discrepancies', 'total_diff',
                     'amount_confirmed',
-                    '_original_items', '_fb_hash', '_fb_cache',
                     # CSV取り込み関連
                     'csv_mode', 'csv_items', '_csv_paste_saved',
                     # PDF→NEO変換関連
