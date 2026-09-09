@@ -88,12 +88,51 @@ _EXCLUDED_MODEL_KEYWORDS = (
     'deep-research', 'latest', 'exp',
 )
 
-# クォータ超過で利用不可になったモデルを記録（セッション内キャッシュ）
-_quota_exhausted_models: set = set()
-# 提供終了（404 NOT_FOUND / no longer available）と判明したモデルを記録
-_unavailable_models: set = set()
+# Streamlitはユーザー操作のたびにスクリプト全体を再実行するため、モジュール変数は
+# 毎回初期化されてしまう。モデル一覧・利用不可モデルの記録は st.session_state に
+# 逃がして再実行をまたいで保持する（毎回 models.list を叩かないため）。
+_FALLBACK_STORE: dict = {}
 
-_model_availability_cache: dict = {}  # key: api_key_hash, value: list of model IDs
+
+def _persist_store() -> dict:
+    """再実行をまたいで保持されるストアを返す（session_state が使えない場合はモジュール変数）"""
+    try:
+        store = st.session_state.setdefault('_gemini_model_store', {})
+        if isinstance(store, dict):
+            return store
+    except Exception:
+        pass
+    return _FALLBACK_STORE
+
+
+def _quota_exhausted_set() -> set:
+    """クォータ超過で利用不可になったモデルの集合"""
+    store = _persist_store()
+    val = store.get('quota_exhausted')
+    if not isinstance(val, set):
+        val = set()
+        store['quota_exhausted'] = val
+    return val
+
+
+def _unavailable_set() -> set:
+    """提供終了（404 NOT_FOUND / no longer available）と判明したモデルの集合"""
+    store = _persist_store()
+    val = store.get('unavailable')
+    if not isinstance(val, set):
+        val = set()
+        store['unavailable'] = val
+    return val
+
+
+def _availability_cache() -> dict:
+    """APIキーごとの利用可能モデル一覧キャッシュ"""
+    store = _persist_store()
+    val = store.get('availability')
+    if not isinstance(val, dict):
+        val = {}
+        store['availability'] = val
+    return val
 
 # 解析結果キャッシュ: 同一ファイル（md5）の再解析を防ぐ（セッション中に有効）
 # key: md5_hex + "_" + model_name + "_" + str(use_rasterize) → value: 解析結果dict
@@ -113,8 +152,8 @@ def _is_model_unavailable_error(err_msg: str) -> bool:
 def _mark_model_unavailable(api_key: str, model_name: str):
     """提供終了モデルを記録し、モデル一覧キャッシュを破棄する"""
     if model_name:
-        _unavailable_models.add(model_name)
-    _model_availability_cache.pop(_model_cache_key(api_key), None)
+        _unavailable_set().add(model_name)
+    _availability_cache().pop(_model_cache_key(api_key), None)
 
 
 def _model_sort_key(name: str):
@@ -160,18 +199,18 @@ def get_available_gemini_models(api_key: str) -> list:
     if not api_key:
         return [_FALLBACK_MODEL]
     cache_key = _model_cache_key(api_key)
-    if cache_key in _model_availability_cache:
-        return _model_availability_cache[cache_key]
+    if cache_key in _availability_cache():
+        return _availability_cache()[cache_key]
     api_models = _list_models_from_api(api_key)
     if api_models:
         candidates = sorted(set(api_models), key=_model_sort_key)
     else:
         candidates = list(_PREFERRED_MODELS)
     result = [m for m in candidates
-              if m not in _quota_exhausted_models and m not in _unavailable_models]
+              if m not in _quota_exhausted_set() and m not in _unavailable_set()]
     if not result:
-        result = [m for m in candidates if m not in _unavailable_models] or [_FALLBACK_MODEL]
-    _model_availability_cache[cache_key] = result
+        result = [m for m in candidates if m not in _unavailable_set()] or [_FALLBACK_MODEL]
+    _availability_cache()[cache_key] = result
     return result
 
 
@@ -179,7 +218,7 @@ def get_default_gemini_model(api_key: str) -> str:
     """利用可能なモデルの中から最優先モデルを返す。クォータ超過・提供終了モデルは除外。"""
     models = get_available_gemini_models(api_key)
     for m in models:
-        if m not in _quota_exhausted_models and m not in _unavailable_models:
+        if m not in _quota_exhausted_set() and m not in _unavailable_set():
             return m
     # 全モデルがクォータ超過の場合はフォールバック
     return models[0] if models else _FALLBACK_MODEL
@@ -188,7 +227,7 @@ def get_default_gemini_model(api_key: str) -> str:
 def get_alternative_gemini_model(api_key: str, failed_model: str) -> str:
     """failed_model 以外で利用可能な代替モデルを返す（無ければ空文字）"""
     for m in get_available_gemini_models(api_key):
-        if m != failed_model and m not in _quota_exhausted_models and m not in _unavailable_models:
+        if m != failed_model and m not in _quota_exhausted_set() and m not in _unavailable_set():
             return m
     return ''
 SELF_CORRECTION_THRESHOLD = 1000  # 差額が1000円以上の場合のみ自己修復を試行（高速化）
@@ -2394,9 +2433,21 @@ def _detect_corrections(original_items: list, edited_items: list) -> list:
     return corrections
 
 
-def analyze_vehicle_registration(api_key, file_bytes, mime_type):
-    """車検証をAI-OCRで解析（JSON mode + プロンプトベースの構造化出力）"""
+def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None):
+    """車検証をAI-OCRで解析（JSON mode + プロンプトベースの構造化出力）
+
+    model_name を省略した場合は、サイドバーで選択中のモデル →
+    利用可能なモデルの既定 の順に解決する。定数 GEMINI_MODEL を直接使うと、
+    そのモデルが提供終了したときに車検証OCRだけが恒久的に失敗するため。
+    """
     prompt = _build_prompt("shaken_ocr")
+    if not model_name:
+        try:
+            model_name = st.session_state.get('selected_model')
+        except Exception:
+            model_name = None
+    if not model_name:
+        model_name = get_default_gemini_model(api_key)
 
     # 方式1: response_schema を使用（全フィールドstring型で安全にパース）
     _schema_shaken = {
@@ -2436,7 +2487,7 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type):
         client = _get_genai_client(api_key)
         file_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
         response = client.models.generate_content(
-            model=GEMINI_MODEL,
+            model=model_name,
             contents=[prompt, file_part],
             config={
                 "temperature": 0.0,
@@ -2460,7 +2511,8 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type):
     if not result or not any(v for v in result.values() if v and str(v).strip()):
         try:
             print(f"[shaken_ocr] Method '{_method_used}' returned empty, trying json_mode fallback")
-            result_text = call_gemini(api_key, file_bytes, mime_type, prompt, use_json_mode=True)
+            result_text = call_gemini(api_key, file_bytes, mime_type, prompt,
+                                      model_name=model_name, use_json_mode=True)
             if result_text:
                 try:
                     result = json.loads(result_text)
@@ -2794,10 +2846,10 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
                 ) from e
             # クォータ超過エラー
             if '429' in err_msg or 'RESOURCE_EXHAUSTED' in err_msg:
-                _quota_exhausted_models.add(model_name)
+                _quota_exhausted_set().add(model_name)
                 cache_key = api_key[-8:] if api_key else ''
-                if cache_key in _model_availability_cache:
-                    del _model_availability_cache[cache_key]
+                if cache_key in _availability_cache():
+                    del _availability_cache()[cache_key]
                 raise ValueError(
                     f"モデル '{model_name}' のクォータが上限に達しました。"
                     "自動的に代替モデルに切り替えます。"
@@ -2915,7 +2967,7 @@ def analyze_estimate_chunk(api_key, chunk_bytes, mime_type, model_name,
                 _mark_model_unavailable(api_key, model_name)
                 raise RuntimeError(f"モデル '{model_name}' は利用できません（提供終了）。") from e
             if '429' in err or 'RESOURCE_EXHAUSTED' in err:
-                _quota_exhausted_models.add(model_name)
+                _quota_exhausted_set().add(model_name)
                 raise ValueError(f"モデル '{model_name}' クォータ超過") from e
             if attempt < 2:
                 import time; time.sleep(1)
@@ -3583,10 +3635,10 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     # ──────────────────────────────────────────────────────────────────────────
 
     # クォータ超過モデルを除外して使用モデルを決定
-    if used_model in _quota_exhausted_models:
+    if used_model in _quota_exhausted_set():
         # 代替モデルを選択
         for alt_model in _PREFERRED_MODELS:
-            if alt_model not in _quota_exhausted_models:
+            if alt_model not in _quota_exhausted_set():
                 print(f"[INFO] モデル '{used_model}' はクォータ超過のため '{alt_model}' に切り替えます", file=sys.stderr)
                 used_model = alt_model
                 break
@@ -3970,6 +4022,70 @@ def generate_filename(cust, calc_parts, calc_wages, pdf_parts, pdf_wages,
 # Streamlit UI
 # ============================================================
 
+# ============================================================
+# PDF見積 → NEO 自動変換（pdf_to_neo_pipeline のラッパ）
+# ============================================================
+def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=None):
+    """見積書PDFから直接NEOファイルを生成する。
+
+    pdf_to_neo_pipeline.process_pdf_to_neo をStreamlitから安全に呼ぶための薄いラッパ。
+    - APIキーはサイドバー入力を環境変数に一時的に渡す（パイプラインが環境変数を読むため）
+    - Addataが無い環境ではモードA（ベタ打ち）を強制する。
+      マーカー付きのモードB/Cは車種DBが存在する場合のみ意味を持ち、
+      DBが無いまま実行すると全部品に「※ADDATA該当なし」が付いてしまうため。
+    戻り値: process_pdf_to_neo の結果dict。失敗時は {'ok': False, 'error': '...'}
+    """
+    tmp_pdf = None
+    tmp_tpl = None
+    prev_key = os.environ.get('GEMINI_API_KEY')
+    try:
+        try:
+            import pdf_to_neo_pipeline as _pipe
+        except Exception as e:
+            return {'ok': False, 'error': f'PDF→NEO変換モジュールを読み込めません: {e}'}
+
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as _f:
+            _f.write(pdf_bytes)
+            tmp_pdf = _f.name
+
+        if template_bytes:
+            with tempfile.NamedTemporaryFile(suffix='.neo', delete=False) as _f:
+                _f.write(template_bytes)
+                tmp_tpl = _f.name
+            template_path = tmp_tpl
+        else:
+            template_path = TEMPLATE_PATH
+
+        addata_root = find_addata_dir()
+        mode_override = None if addata_root else 'A'
+
+        if api_key:
+            os.environ['GEMINI_API_KEY'] = api_key
+        result = _pipe.process_pdf_to_neo(
+            tmp_pdf,
+            addata_root=addata_root or '',
+            template_path=template_path,
+            mode_override=mode_override,
+            model_name=model_name or None,
+        )
+        if not isinstance(result, dict):
+            return {'ok': False, 'error': 'PDF→NEO変換が想定外の値を返しました'}
+        return result
+    except Exception as e:
+        return {'ok': False, 'error': f'PDF→NEO変換に失敗しました: {e}'}
+    finally:
+        if prev_key is None:
+            os.environ.pop('GEMINI_API_KEY', None)
+        else:
+            os.environ['GEMINI_API_KEY'] = prev_key
+        for _path in (tmp_pdf, tmp_tpl):
+            if _path:
+                try:
+                    os.unlink(_path)
+                except OSError:
+                    pass
+
+
 def main():
     st.set_page_config(
         page_title="NEO自動生成アプリ",
@@ -4144,8 +4260,8 @@ def main():
         # 利用可能なモデルをAPIで動的取得（APIキーがある場合のみ）
         if api_key:
             _ck = _model_cache_key(api_key)
-            if _ck in _model_availability_cache:
-                _avail_models = _model_availability_cache[_ck]
+            if _ck in _availability_cache():
+                _avail_models = _availability_cache()[_ck]
             else:
                 with st.spinner("利用可能なモデルを確認中..."):
                     _avail_models = get_available_gemini_models(api_key)
@@ -4561,6 +4677,95 @@ def main():
                 st.session_state.pop('csv_items', None)
                 st.session_state.pop('csv_mode', None)
 
+        # ── PDF見積 → NEO 自動変換 ──────────────────────
+        st.markdown("---")
+        st.markdown("#### 📄 PDF見積 → NEO 自動変換")
+        st.caption(
+            "見積書PDFをそのままアップロードすると、AI-OCRで明細を読み取り、"
+            "NEOファイルまで一気に生成します。Geminiへのコピペは不要です。"
+        )
+        _p2n_file = st.file_uploader(
+            "見積書PDF",
+            type=['pdf'],
+            key='pdf2neo_upload',
+        )
+        if _p2n_file is not None:
+            _p2n_bytes = _p2n_file.read()
+            _p2n_file.seek(0)
+            st.caption(f"📄 {_p2n_file.name}（{len(_p2n_bytes):,} bytes）")
+            if not api_key:
+                st.warning(
+                    "⚠️ この機能にはGemini APIキーが必要です。"
+                    "サイドバーの「APIキー設定」でキーを入力してください。"
+                )
+            elif st.button("🚀 PDFからNEOを生成", key='pdf2neo_run', type="primary",
+                           use_container_width=True):
+                st.session_state.pop('pdf2neo_result', None)
+                with st.spinner("PDFを解析してNEOを生成しています…（AI-OCRのため30〜90秒かかります）"):
+                    st.session_state['pdf2neo_result'] = run_pdf_to_neo_pipeline(
+                        _p2n_bytes,
+                        api_key,
+                        model_name=selected_model,
+                        template_bytes=st.session_state.get('custom_neo_bytes'),
+                    )
+                st.rerun()
+
+        _p2n_res = st.session_state.get('pdf2neo_result')
+        if _p2n_res:
+            if _p2n_res.get('error'):
+                st.error(f"❌ {_p2n_res['error']}")
+            elif not _p2n_res.get('ok'):
+                st.error("❌ PDFからNEOを生成できませんでした。")
+                for _w in (_p2n_res.get('warnings') or [])[:5]:
+                    st.caption(f"・{_w}")
+            else:
+                _p2n_items = _p2n_res.get('items') or []
+                _p2n_parts = sum(safe_int(it.get('parts_amount', 0)) for it in _p2n_items)
+                _p2n_wage  = sum(safe_int(it.get('wage', 0)) for it in _p2n_items)
+                st.success(
+                    f"✅ 解析完了 — {len(_p2n_items)}行 ／ "
+                    f"部品 ¥{_p2n_parts:,} ／ 工賃 ¥{_p2n_wage:,}"
+                )
+                _p2n_v = _p2n_res.get('verify') or {}
+                if _p2n_v.get('count_match') and _p2n_v.get('total_match'):
+                    st.caption("🔍 検証OK: 生成NEOの明細件数と部品金額（税抜）がPDFと一致しました。")
+                elif _p2n_v.get('error'):
+                    st.caption(f"🔍 検証スキップ: {_p2n_v['error']}")
+                else:
+                    st.warning(
+                        "🔍 検証: PDFと生成NEOに差異があります。"
+                        f"件数 NEO {_p2n_v.get('neo_count')} / PDF {_p2n_v.get('pdf_count')}、"
+                        f"部品金額(税抜) NEO ¥{safe_int(_p2n_v.get('neo_total')):,} / "
+                        f"PDF ¥{safe_int(_p2n_v.get('pdf_parts_total')):,}。"
+                        "「プレビューに取り込む」で内容を確認・修正してください。"
+                    )
+                _p2n_neo = _p2n_res.get('neo_bytes')
+                _p2n_c1, _p2n_c2 = st.columns(2)
+                with _p2n_c1:
+                    if _p2n_neo:
+                        st.download_button(
+                            "📥 NEOファイルをダウンロード",
+                            data=_p2n_neo,
+                            file_name="PDF変換_見積.neo",
+                            mime="application/octet-stream",
+                            key='pdf2neo_dl',
+                            use_container_width=True,
+                        )
+                with _p2n_c2:
+                    if _p2n_items and st.button("📝 プレビューに取り込んで修正する",
+                                                key='pdf2neo_to_preview',
+                                                use_container_width=True):
+                        st.session_state['csv_items'] = _p2n_items
+                        st.session_state['csv_mode']  = True
+                        st.session_state['pdf2neo_vehicle_info'] = _p2n_res.get('vehicle_info') or {}
+                        st.session_state['vehicle_file_bytes']  = None
+                        st.session_state['vehicle_file_name']   = None
+                        st.session_state['estimate_file_bytes'] = None
+                        st.session_state['estimate_file_name']  = None
+                        st.session_state['selected_model'] = selected_model
+                        st.session_state['step'] = 2
+                        st.rerun()
+
         # ── オプション設定 ──
         with st.expander("⚙️ オプション設定", expanded=False):
             opt_col1, opt_col2, opt_col3 = st.columns(3)
@@ -4621,6 +4826,10 @@ def main():
             st.info(f"📊 CSVモード: {len(_csv_items_s2)}行を取り込みます（AI解析をスキップ）")
             # 車検証のみAI解析（ある場合）
             vehicle_data = {}
+            # PDF→NEO変換で読み取った車両情報があれば引き継ぐ（車検証未添付時）
+            _p2n_vi = st.session_state.get('pdf2neo_vehicle_info')
+            if _p2n_vi and not vehicle_bytes:
+                vehicle_data = dict(_p2n_vi)
             if vehicle_bytes:
                 with st.spinner("🔍 車検証を解析中..."):
                     try:
@@ -4889,13 +5098,13 @@ def main():
                     )
             # クォータ超過エラーの場合、分かりやすいメッセージとリトライを促す
             elif '429' in err_str or 'RESOURCE_EXHAUSTED' in err_str or 'クォータが上限' in err_str:
-                _quota_exhausted_models.add(_cur_model)
+                _quota_exhausted_set().add(_cur_model)
                 # キャッシュクリア
                 _api_key_for_err = api_key
                 if _api_key_for_err:
                     _ck = _api_key_for_err[-8:]
-                    if _ck in _model_availability_cache:
-                        del _model_availability_cache[_ck]
+                    if _ck in _availability_cache():
+                        del _availability_cache()[_ck]
                 # 代替モデルを探す
                 _alt = get_alternative_gemini_model(api_key, _cur_model)
                 if _alt:
@@ -5892,6 +6101,8 @@ def main():
                     '_original_items',
                     # CSV取り込み関連
                     'csv_mode', 'csv_items', '_csv_paste_saved',
+                    # PDF→NEO変換関連
+                    'pdf2neo_result', 'pdf2neo_vehicle_info',
                     # その他の残留データ
                     'use_fax_filter', 'use_rasterize', 'use_enhance', 'selected_model',
                     'short_parts_wage',
