@@ -423,33 +423,42 @@ def _xml_escape(value) -> str:
 def _normalize_number_text(raw):
     """金額・数量の文字列を符号付きの数値文字列に正規化する。解釈不能なら None。
 
-    見積書では値引きが「△5,000」「▲5,000」「(5,000)」「－5,000」と書かれる。
-    以前は記号を一律に削っていたため、これらが全て +5,000 になり、
-    値引きが加算されて請求額が過大になっていた。
+    見積書では値引きが「△5,000」「▲5,000」「(5,000)」「－5,000」と書かれ、
+    車検証には「12,345km」「1,230kg」「1,490cc」のように単位が付く。
+    記号を一律に削ると値引きが加算に化け、逆に厳格に弾くと単位付きの数字が
+    0 になる。ここでは
+      1. 通貨・区切り・既知の単位を落とす
+      2. 先頭の符号（△▲ 各種マイナス）を符号として解釈して落とす
+      3. 末尾のハイフン／長音（「1,234-」＝1,234円の慣用表記）を落とす
+      4. 残りに数字のかたまりが「ちょうど1つ」ある時だけ採用する
+    とする。「1,000～2,000」「2/3」のように数字が2つ以上あるものは
+    どちらを採るか決められないので採用しない。
     """
     import unicodedata as _ud
     s = _ud.normalize('NFKC', str(raw)).strip()
     if not s:
         return None
-    # 括弧書きは会計表記のマイナス
+    # 会計表記の括弧はマイナス
     is_negative = False
     if re.fullmatch(r'\(\s*[^()]*\s*\)', s):
         is_negative = True
         s = s[1:-1].strip()
-    # NFKC は U+2212(−) を ASCII の - に変換しないため明示的に含める
+    # 通貨・区切り・単位を先に落とす（「¥-1,000」の符号を見失わないため）
+    s = re.sub(r'[円¥￥,\s]', '', s)
+    s = re.sub(r'(個|本|枚|セット|台|式|時間)', '', s)
+    # 先頭の符号
     if re.match(r'^[△▲▽▼\-\u2212\u30fc\u2010-\u2015]', s):
         is_negative = True
-    s = re.sub(r'^[△▲▽▼\-\u2212\u2010-\u2015]+', '', s)
-    # 単位・通貨・区切り
-    s = re.sub(r'(個|本|枚|セット|台|式|時間)$', '', s)
-    s = re.sub(r'[円¥￥,\s]', '', s)
-    # 「1,234-」は「1,234円」の慣用表記
-    s = re.sub(r'[\-ー―–—]+$', '', s)
+    s = re.sub(r'^[△▲▽▼\-\u2212\u30fc\u2010-\u2015]+', '', s)
+    # 末尾のハイフン・長音（「1,234-」は 1,234円 の意味）
+    s = re.sub(r'[\-\u2212\u30fc\u2010-\u2015]+$', '', s)
     if not s:
         return None
-    if not re.fullmatch(r'\d+(\.\d+)?', s):
-        return None
-    return ('-' + s) if is_negative else s
+    runs = re.findall(r'\d+(?:\.\d+)?', s)
+    if len(runs) != 1:
+        return None  # 数字が無い、または範囲・分数のように2つ以上ある
+    value = runs[0]
+    return ('-' + value) if is_negative else value
 
 
 def safe_float(val, default=0.0):
@@ -546,6 +555,11 @@ def decompress_neo(data, real_ck):
             raise ValueError(
                 f"NEOファイルの展開後サイズが上限（{MAX_DECOMPRESSED_SIZE // (1024*1024)}MB）を超えました。"
                 "ファイルが壊れているか、想定外のファイルです。"
+            )
+        if not dobj.eof:
+            raise ValueError(
+                "NEOファイルの展開が完了しませんでした。ファイルが壊れているか、"
+                "コグニセブンのNEOファイルではない可能性があります。"
             )
         chunks.append(raw)
         total += len(raw)
@@ -2317,6 +2331,42 @@ FEEDBACK_ERROR_TYPES = {
 FEEDBACK_MERGE_THRESHOLD = 5
 
 
+_FEEDBACK_EXPECTED_COLUMNS = {
+    'corrections': {
+        'id': 'TEXT', 'timestamp': 'TEXT', 'document_type': 'TEXT',
+        'error_type': 'TEXT', 'row_index': 'INTEGER',
+        'orig_name': 'TEXT', 'orig_parts': 'INTEGER', 'orig_wage': 'INTEGER',
+        'corr_name': 'TEXT', 'corr_parts': 'INTEGER', 'corr_wage': 'INTEGER',
+        'user_comment': 'TEXT', 'page_context': 'TEXT', 'status': 'TEXT',
+    },
+}
+
+
+def _migrate_feedback_db(conn):
+    """既存DBに不足している列を足す。
+
+    以前のバージョンで作られたDBがあると CREATE TABLE IF NOT EXISTS は
+    何もしないため、列が足りないまま INSERT が例外になり、記録ボタンを
+    押した瞬間に画面が落ちていた。
+    """
+    cur = conn.cursor()
+    for table, columns in _FEEDBACK_EXPECTED_COLUMNS.items():
+        try:
+            existing = {r[1] for r in cur.execute(f"PRAGMA table_info({table})")}
+        except sqlite3.Error:
+            continue
+        if not existing:
+            continue
+        for col, col_type in columns.items():
+            if col not in existing:
+                try:
+                    cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+                    print(f"[feedback.db] 列を追加しました: {table}.{col}")
+                except sqlite3.Error as e:
+                    print(f"[feedback.db] 列追加に失敗: {table}.{col}: {e}")
+    conn.commit()
+
+
 def _get_feedback_db():
     """フィードバックDB接続を返す（テーブルが存在しない場合は作成）"""
     conn = sqlite3.connect(_FEEDBACK_DB_PATH)
@@ -2349,6 +2399,7 @@ def _get_feedback_db():
         )
     """)
     conn.commit()
+    _migrate_feedback_db(conn)
     return conn
 
 
@@ -2483,69 +2534,134 @@ def _load_learned_hints(task_type: str = "estimate_detail_page") -> str:
         return ""
 
 
+def _classify_correction(orig: dict, corr: dict) -> str:
+    """1行の修正内容からエラー種別を推定する。
+
+    部品↔工賃の取り違え（column_swap）は、部品金額と工賃が実際に入れ替わって
+    いる時だけとする。単なる金額の直しをこれに分類すると、自動生成される
+    学習パッチが「工賃列の金額を部品として扱え」という誤った指示になり、
+    次回以降の解析で金額が失われる。
+    """
+    orig_p = safe_int(orig.get("parts_amount", 0))
+    orig_w = safe_int(orig.get("wage", 0))
+    corr_p = safe_int(corr.get("parts_amount", 0))
+    corr_w = safe_int(corr.get("wage", 0))
+    orig_n = str(orig.get("name", ""))
+    corr_n = str(corr.get("name", ""))
+    orig_q = safe_int(orig.get("quantity", 1), 1)
+    corr_q = safe_int(corr.get("quantity", 1), 1)
+
+    amount_changed = (orig_p != corr_p) or (orig_w != corr_w)
+    name_changed = orig_n != corr_n
+
+    # 部品と工賃がそのまま入れ替わっている場合のみ取り違え
+    if amount_changed and orig_p == corr_w and orig_w == corr_p and (orig_p or orig_w):
+        return "column_swap"
+    if name_changed and not amount_changed:
+        return "name_error"
+    if amount_changed and not name_changed:
+        return "amount_misread"
+    if amount_changed and name_changed:
+        # 品名も金額も変わっている＝行そのものの読み違え
+        return "amount_misread"
+    if orig_q != corr_q:
+        return "quantity_error"
+    return "other"
+
+
+def _row_identity(item: dict) -> str:
+    """行の同一性を判定するためのキー（品番があれば品番、無ければ品名）"""
+    pno = str(item.get("part_no", "") or item.get("parts_no", "") or "").strip()
+    if pno:
+        return "P:" + pno.lower()
+    return "N:" + to_halfwidth_katakana(str(item.get("name", "") or "")).strip().lower()
+
+
 def _detect_corrections(original_items: list, edited_items: list) -> list:
     """
     AIが出力したオリジナル明細とユーザー編集後を比較し、差分リストを返す。
     Returns: [{"row_index", "error_type", "original", "corrected", "page_context"}]
+
+    行は位置ではなく内容（品番・品名）で対応付ける。位置で突き合わせると、
+    途中に1行挿入しただけで以降の全行が「別の行に化けた」と誤検出され、
+    その誤りがそのまま学習データに記録されてしまう。
     """
+    import difflib as _difflib
+
     corrections = []
-    max_len = max(len(original_items), len(edited_items))
-    for i in range(max_len):
-        if i >= len(original_items):
-            # 行追加
-            corr = edited_items[i]
-            corrections.append({
-                "row_index":    i + 1,
-                "error_type":   "missed_row",
-                "original":     {},
-                "corrected":    corr,
-                "page_context": f"{i+1}行目（追加）",
-            })
-            continue
-        if i >= len(edited_items):
-            # 行削除
-            orig = original_items[i]
-            corrections.append({
-                "row_index":    i + 1,
-                "error_type":   "extra_row",
-                "original":     orig,
-                "corrected":    {},
-                "page_context": f"{i+1}行目（削除）",
-            })
-            continue
+    orig_keys = [_row_identity(it) for it in (original_items or [])]
+    edit_keys = [_row_identity(it) for it in (edited_items or [])]
+    matcher = _difflib.SequenceMatcher(a=orig_keys, b=edit_keys, autojunk=False)
 
-        orig = original_items[i]
-        corr = edited_items[i]
-        orig_p = safe_int(orig.get("parts_amount", 0))
-        orig_w = safe_int(orig.get("wage", 0))
-        corr_p = safe_int(corr.get("parts_amount", 0))
-        corr_w = safe_int(corr.get("wage", 0))
-        orig_n = str(orig.get("name", ""))
-        corr_n = str(corr.get("name", ""))
-
-        if orig_p == corr_p and orig_w == corr_w and orig_n == corr_n:
-            continue  # 変更なし
-
-        # エラー種別を自動推定
-        error_type = "other"
-        if orig_p == corr_w and orig_w == corr_p and orig_p != orig_w:
-            error_type = "column_swap"
-        elif orig_n != corr_n and orig_p == corr_p and orig_w == corr_w:
-            error_type = "name_error"
-        elif orig_p != corr_p and orig_w == corr_w:
-            error_type = "amount_misread"
-        elif orig_w != corr_w and orig_p == corr_p:
-            error_type = "column_swap"
-        elif orig_p != corr_p and orig_w != corr_w:
-            error_type = "column_swap"
-
-        corrections.append({
-            "row_index":    i + 1,
-            "error_type":   error_type,
-            "original":     orig,
-            "corrected":    corr,
-            "page_context": f"{i+1}行目: {orig_n}",
-        })
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for off in range(i2 - i1):
+                orig = original_items[i1 + off]
+                corr = edited_items[j1 + off]
+                etype = _classify_correction(orig, corr)
+                if etype == "other" and \
+                        safe_int(orig.get("parts_amount", 0)) == safe_int(corr.get("parts_amount", 0)) and \
+                        safe_int(orig.get("wage", 0)) == safe_int(corr.get("wage", 0)) and \
+                        str(orig.get("name", "")) == str(corr.get("name", "")):
+                    continue  # 変更なし
+                corrections.append({
+                    "row_index":    j1 + off + 1,
+                    "error_type":   etype,
+                    "original":     orig,
+                    "corrected":    corr,
+                    "page_context": f"{j1 + off + 1}行目: {orig.get('name', '')}",
+                })
+        elif tag == "replace":
+            # 置き換え：対応が取れる分だけ突き合わせ、余りは追加/削除として扱う
+            common = min(i2 - i1, j2 - j1)
+            for off in range(common):
+                orig = original_items[i1 + off]
+                corr = edited_items[j1 + off]
+                corrections.append({
+                    "row_index":    j1 + off + 1,
+                    "error_type":   _classify_correction(orig, corr),
+                    "original":     orig,
+                    "corrected":    corr,
+                    "page_context": f"{j1 + off + 1}行目: {orig.get('name', '')}",
+                })
+            for off in range(common, j2 - j1):
+                corr = edited_items[j1 + off]
+                corrections.append({
+                    "row_index":    j1 + off + 1,
+                    "error_type":   "missed_row",
+                    "original":     {},
+                    "corrected":    corr,
+                    "page_context": f"{j1 + off + 1}行目（追加）",
+                })
+            for off in range(common, i2 - i1):
+                orig = original_items[i1 + off]
+                corrections.append({
+                    "row_index":    i1 + off + 1,
+                    "error_type":   "extra_row",
+                    "original":     orig,
+                    "corrected":    {},
+                    "page_context": f"{i1 + off + 1}行目（削除）",
+                })
+        elif tag == "insert":
+            for off in range(j2 - j1):
+                corr = edited_items[j1 + off]
+                corrections.append({
+                    "row_index":    j1 + off + 1,
+                    "error_type":   "missed_row",
+                    "original":     {},
+                    "corrected":    corr,
+                    "page_context": f"{j1 + off + 1}行目（追加）",
+                })
+        elif tag == "delete":
+            for off in range(i2 - i1):
+                orig = original_items[i1 + off]
+                corrections.append({
+                    "row_index":    i1 + off + 1,
+                    "error_type":   "extra_row",
+                    "original":     orig,
+                    "corrected":    {},
+                    "page_context": f"{i1 + off + 1}行目（削除）",
+                })
     return corrections
 
 
@@ -3920,6 +4036,10 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     #    現在は1回のリクエストでPDF全体を解析するため重複の発生源が無く、
     #    同じ部品が2行並ぶ正当な明細（左右のクリップ等）を消して金額を
     #    欠落させるだけになっていた。分割解析した場合のみ適用する。
+    # ※ 現在このフラグを立てる経路は無く、重複除去は事実上オフ。
+    #    正当な重複明細（左右のクリップ等）を消して金額を欠落させる実害の方が
+    #    大きいため、意図的にオフのままにしている。分割解析を再導入する場合は
+    #    このフラグを立てる前に、隣接判定と品番までキーに含める修正が必要。
     if result.get('_chunked'):
         _before_dedup = len(result['items'])
         result['items'] = global_dedup_items(result['items'])
@@ -4108,6 +4228,13 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     # ── 解析ログをファイルに書き出し ──────────────────────────────────────────
     try:
         _ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        # 追記のみで際限なく育つため、一定サイズを超えたら作り直す
+        try:
+            if os.path.exists(ANALYSIS_LOG_PATH) and \
+                    os.path.getsize(ANALYSIS_LOG_PATH) > 5 * 1024 * 1024:
+                os.replace(ANALYSIS_LOG_PATH, ANALYSIS_LOG_PATH + '.1')
+        except OSError:
+            pass
         with open(ANALYSIS_LOG_PATH, 'a', encoding='utf-8') as _lf:
             _lf.write(f"\n{'='*60}\n")
             _lf.write(f"[{_ts}] 解析開始\n")
@@ -4179,6 +4306,27 @@ def esc_html(value) -> str:
     """
     import html as _html
     return _html.escape(str(value if value is not None else ''), quote=True)
+
+
+def _make_estimate_token(items, vehicle_bytes=None, estimate_bytes=None) -> str:
+    """見積の識別子。入力が同じなら同じ値になる。
+
+    ステップ①に戻って同じ見積を再開したときは編集内容を復元し、
+    別の見積を読み込んだときは復元しないための判定に使う。
+    """
+    import hashlib as _hashlib
+    parts = [
+        str(len(vehicle_bytes or b'')),
+        str(len(estimate_bytes or b'')),
+    ]
+    for it in (items or [])[:20]:
+        if isinstance(it, dict):
+            parts.append('{}|{}|{}'.format(
+                it.get('name', ''),
+                safe_int(it.get('parts_amount', 0)),
+                safe_int(it.get('wage', 0)),
+            ))
+    return _hashlib.md5('/'.join(parts).encode('utf-8', 'ignore')).hexdigest()
 
 
 def _session_cache_scope() -> str:
@@ -4556,35 +4704,69 @@ def main():
                     st.caption(f"※ あと{FEEDBACK_MERGE_THRESHOLD - _total_pending}件蓄積されると統合推奨になります（現在{_total_pending}件）")
 
                 # 統合用パッチテキストを自動生成
-                _patch_lines = ["【学習済み訂正パターン（自動生成）】"]
+                # ・既に適用中のパッチを土台にする（統合のたびに過去の学習が
+                #   捨てられていたため）
+                # ・品名が空の記録や、ルール行を作れない種別だけの記録は捨てる
+                # ・件数に上限を設け、プロンプトが本文より長くならないようにする
+                _MAX_PATCH_RULES = 60
+                _existing_patch = _load_learned_hints("estimate_detail_page")
+                _existing_rules = [
+                    _ln for _ln in (_existing_patch.splitlines() if _existing_patch else [])
+                    if _ln.strip().startswith('-')
+                ]
+                _rule_lines = list(_existing_rules)
+                _comment_lines = []
                 _seen_types = set()
+                _seen_comments = set()
                 _all_corr2 = get_all_pending_corrections()
                 for _cr2 in _all_corr2:
                     _et = _cr2['error_type']
-                    _on = _cr2['orig_name']
+                    _on = (_cr2['orig_name'] or '').strip()
+                    _cn = (_cr2.get('corr_name') or '').strip()
                     _cp = _cr2['corr_parts']
                     _cw = _cr2['corr_wage']
-                    _cm = _cr2['user_comment'] or ""
-                    _key = (_et, _on)
+                    _cm = (_cr2['user_comment'] or "").strip()
+                    _label = _on or _cn
+                    if not _label:
+                        continue  # 品名が取れない記録からはルールを作れない
+                    _key = (_et, _label)
                     if _key in _seen_types:
                         continue
                     _seen_types.add(_key)
+                    _new_rule = None
                     if _et == "column_swap":
                         if _cp == 0 and _cw > 0:
-                            _patch_lines.append(f"- 「{_on}」は部品列に記載されていても工賃（wage）として扱うこと")
+                            _new_rule = f"- 「{_label}」は部品列に記載されていても工賃（wage）として扱うこと"
                         elif _cp > 0 and _cw == 0:
-                            _patch_lines.append(f"- 「{_on}」は工賃列に記載されていても部品（parts_amount）として扱うこと")
+                            _new_rule = f"- 「{_label}」は工賃列に記載されていても部品（parts_amount）として扱うこと"
                     elif _et == "missed_row":
-                        _patch_lines.append(f"- 「{_on}」のような行を見落とさないこと")
+                        _new_rule = f"- 「{_label}」のような行を見落とさないこと"
                     elif _et == "amount_misread":
-                        _patch_lines.append(f"- 「{_on}」の金額を正確に読み取ること（桁ずれ注意）")
-                    if _cm:
-                        _patch_lines.append(f"  （補足: {_cm[:60]}）")
+                        _new_rule = f"- 「{_label}」の金額を正確に読み取ること（桁ずれ注意）"
+                    elif _et == "name_error" and _on and _cn and _on != _cn:
+                        _new_rule = f"- 「{_on}」は「{_cn}」と読むこと"
+                    elif _et == "quantity_error":
+                        _new_rule = f"- 「{_label}」の数量を正確に読み取ること"
+                    if not _new_rule:
+                        continue
+                    if _new_rule not in _rule_lines:
+                        _rule_lines.append(_new_rule)
+                    if _cm and _cm not in _seen_comments:
+                        _seen_comments.add(_cm)
+                        _comment_lines.append(f"  （補足: {_cm[:60]}）")
 
-                _auto_patch = "\n".join(_patch_lines) if len(_patch_lines) > 1 else ""
+                if len(_rule_lines) > _MAX_PATCH_RULES:
+                    _rule_lines = _rule_lines[-_MAX_PATCH_RULES:]
+                _auto_patch = ("\n".join(["【学習済み訂正パターン（自動生成）】"]
+                                         + _rule_lines + _comment_lines[:10])
+                               if _rule_lines else "")
+                # value と key を同時に渡すと、以降の再実行で value が無視され、
+                # 後から記録した訂正が反映されないまま統合されてしまう。
+                if st.session_state.get('_patch_auto_src') != _auto_patch:
+                    st.session_state['_patch_auto_src'] = _auto_patch
+                    st.session_state['patch_text_input'] = _auto_patch
                 _patch_text = st.text_area(
                     "統合するプロンプトパッチ（編集可）",
-                    value=_auto_patch,
                     height=200,
                     key="patch_text_input",
                 )
@@ -4594,9 +4776,13 @@ def main():
                     if st.button("🔄 マスタ版に統合する", key="merge_patch_btn", type="primary",
                                  disabled=(_total_pending == 0)):
                         if _patch_text.strip():
-                            generate_and_save_patch(_patch_text.strip(), "estimate_detail_page")
-                            st.success("✅ プロンプトパッチを適用しました。次回解析から有効になります。")
-                            st.rerun()
+                            try:
+                                generate_and_save_patch(_patch_text.strip(), "estimate_detail_page")
+                            except Exception as _me:
+                                st.error(f"学習データの保存に失敗しました: {_me}")
+                            else:
+                                st.success("✅ プロンプトパッチを適用しました。次回解析から有効になります。")
+                                st.rerun()
                         else:
                             st.warning("パッチテキストが空です。")
                 with _mc2:
@@ -5041,6 +5227,8 @@ def main():
             else:
                 st.info("💴 税抜モード: CSVの金額は税抜きとして処理されます")
             st.session_state['estimate_data'] = estimate_data
+            st.session_state['_estimate_token'] = _make_estimate_token(
+                _csv_items_s2, vehicle_bytes, None)
             st.success(f"✅ CSV取り込み完了（{len(_csv_items_s2)}行）")
             st.session_state['step'] = 3
             st.rerun()
@@ -5251,6 +5439,9 @@ def main():
                 progress.progress(90, text="（見積書なし）")
 
             progress.progress(100, text="✅ 解析完了！")
+            st.session_state['_estimate_token'] = _make_estimate_token(
+                (estimate_data or {}).get('items') if estimate_data else None,
+                vehicle_bytes, estimate_bytes)
             st.session_state['step'] = 3
             st.rerun()
         except Exception as e:
@@ -5323,13 +5514,22 @@ def main():
         # ステップ①に戻ると vehicle_data は捨てられるが、ユーザーが車両情報
         # フォームに入力した内容は updated_vehicle として保存してある。
         # 戻って再開したときに入力が全部消えないよう、そちらを初期値に使う。
+        # 復元するのは「同じ見積」の編集内容だけ。別の見積を読み込んだのに
+        # 前のお客様の氏名・車台番号が復活しては困るので、入力元が一致する
+        # ときに限る。さらに、新しく読み取れた値の方を常に優先する。
         _saved_vehicle = st.session_state.get('updated_vehicle') or {}
-        if _saved_vehicle:
-            _merged_vehicle = dict(_saved_vehicle)
-            for _k, _v in (vehicle_data or {}).items():
-                if _v not in (None, '') and not _merged_vehicle.get(_k):
+        _uv_token = st.session_state.get('_uv_token')
+        _cur_token = st.session_state.get('_estimate_token')
+        if _saved_vehicle and _uv_token and _uv_token == _cur_token:
+            _merged_vehicle = dict(vehicle_data or {})
+            for _k, _v in _saved_vehicle.items():
+                if _v not in (None, '', 0) and not _merged_vehicle.get(_k):
                     _merged_vehicle[_k] = _v
             vehicle_data = _merged_vehicle
+        elif _saved_vehicle and _uv_token != _cur_token:
+            # 別の見積に移ったので前の入力は破棄する
+            st.session_state.pop('updated_vehicle', None)
+            st.session_state.pop('_uv_token', None)
 
         # ── 車両ストリップ ──
         veh_match_result = estimate_data.get('_veh_match_result', {}) if estimate_data else {}
@@ -5358,7 +5558,7 @@ def main():
 
         _mode_badge = '<span style="background:#f1f5f9;color:#475569;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600">✏️ ベタ打ち</span>'
 
-        _detail_text = f'{engine_strip} ／ {reg_date_display}登録 ／ {km_strip:,}km'
+        _detail_text = f'{engine_strip} ／ {esc_html(reg_date_display)}登録 ／ {km_strip:,}km'
 
         _strip_html = (
             '<div style="background:linear-gradient(135deg,#1a2744 0%,#1e3a5f 100%);color:#fff;'
@@ -5502,8 +5702,10 @@ def main():
             'term_date':          v_term,
             'car_reg_date':       v_regdate,
         }
-        # 生成ボタンを押す前でも入力内容を保持する（ステップ①に戻っても消えない）
+        # 生成ボタンを押す前でも入力内容を保持する（ステップ①に戻っても消えない）。
+        # どの見積に対する入力かを一緒に記録し、別の見積では復元しない。
         st.session_state['updated_vehicle'] = updated_vehicle
+        st.session_state['_uv_token'] = st.session_state.get('_estimate_token')
 
         # 見積明細（合計・費用タブ内で編集）
         calc_parts    = 0
@@ -5598,6 +5800,10 @@ def main():
             )
             # 編集後データを反映（既存行の内部メタデータを保持、新規行はデフォルト値）
             _edited_df = _edited_df.reset_index(drop=True)
+            # 行を削除すると位置がずれるため、連番を振り直す前に元のNoを控える。
+            # 位置で元データを引くと、削除以降の行が隣の行の区分・品番・
+            # マッチ結果を引き継いでしまい、NEOに誤った内容が書かれる。
+            _orig_no_list = _edited_df['No'].tolist() if 'No' in _edited_df.columns else []
             _edited_df['No'] = range(1, len(_edited_df) + 1)
             edited_items = []
             for _i, _row in _edited_df.iterrows():
@@ -5605,7 +5811,17 @@ def main():
                 _pc = _row.get('部品番号', ''); _pc = '' if pd.isna(_pc) else str(_pc)
                 _iv = _row.get('工数', '');     _iv = '' if pd.isna(_iv) else str(_iv)
                 # 既存行のメタデータを引き継ぐ（新規追加行はデフォルト）
-                _orig = _items_src[_i] if _i < len(_items_src) else {}
+                _src_idx = None
+                if _i < len(_orig_no_list):
+                    _no_val = _orig_no_list[_i]
+                    if _no_val is not None and not pd.isna(_no_val):
+                        try:
+                            _src_idx = int(_no_val) - 1
+                        except (TypeError, ValueError):
+                            _src_idx = None
+                _orig = (_items_src[_src_idx]
+                         if _src_idx is not None and 0 <= _src_idx < len(_items_src)
+                         else {})
                 _wk   = _orig.get('work_code', '') or _orig.get('method', '')
                 edited_items.append({
                     'name': _nv, 'method': _wk, 'work_code': _wk,
@@ -5670,7 +5886,11 @@ def main():
                     _fbc1, _fbc2 = st.columns([1, 3])
                     with _fbc1:
                         if st.button("✅ フィードバックを記録する", key="fb_record_btn", type="primary"):
-                            record_correction(_fb_corrections, _fb_comment, _fb_doc_type)
+                            try:
+                                record_correction(_fb_corrections, _fb_comment, _fb_doc_type)
+                            except Exception as _re:
+                                st.error(f"訂正データの保存に失敗しました: {_re}")
+                                st.stop()
                             st.session_state['_original_items'] = [dict(it) for it in edited_items]
                             # 差分キャッシュを捨てないとレポートが残り続け、
                             # 同じ訂正を何度も記録できてしまう
@@ -5903,7 +6123,7 @@ def main():
                                 f'<div style="background:#fef2f2;border-left:4px solid #dc2626;padding:8px 12px;margin:4px 0;font-size:13px">'
                                 f'🔴 <b>行{a["row_no"]}「{esc_html(a["name"])}」</b>: '
                                 f'部品¥{a["parts_amount"]:,} / 工賃¥{a["wage"]:,}<br>'
-                                f'⚠️ {a["message"]}'
+                                f'⚠️ {esc_html(a["message"])}'
                                 f'</div>',
                                 unsafe_allow_html=True
                             )
@@ -5915,7 +6135,7 @@ def main():
                                     f'<div style="background:#fffbeb;border-left:4px solid #d97706;padding:8px 12px;margin:4px 0;font-size:13px">'
                                     f'🟡 <b>行{a["row_no"]}「{esc_html(a["name"])}」</b>: '
                                     f'部品¥{a["parts_amount"]:,} / 工賃¥{a["wage"]:,}<br>'
-                                    f'{a["message"]}'
+                                    f'{esc_html(a["message"])}'
                                     f'</div>',
                                     unsafe_allow_html=True
                                 )
