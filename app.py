@@ -37,6 +37,7 @@ load_dotenv()
 
 import streamlit as st
 import struct
+import uuid as _uuid
 import zlib
 import sqlite3
 import tempfile
@@ -430,8 +431,11 @@ def _normalize_date8(raw) -> str:
     if len(s) != 8:
         return ''
     try:
-        datetime.datetime.strptime(s, '%Y%m%d')
+        d = datetime.datetime.strptime(s, '%Y%m%d')
     except ValueError:
+        return ''
+    # 昭和より前は和暦に変換できず、日付だけ入って元号が空になるため受け付けない
+    if d.year < 1926:
         return ''
     return s
 
@@ -1030,7 +1034,9 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
         _cust_values  = []
         _field_map = [
             ('Name1', customer_name), ('UserName', customer_name), ('OwnerName', owner_name),
-            # 住所欄はNEOに記載不要のため除外（PostalNo/Prefecture/Municipality/AddressOther1は書き込まない）
+            # 住所欄も書き込む（画面に入力欄があるのに反映されないと分かりにくいため）
+            ('PostalNo', postal_no), ('Prefecture', prefecture),
+            ('Municipality', municipality), ('AddressOther1', address_other),
             ('CarRegNoDepartment', car_dept), ('CarRegNoDivision', car_div),
             ('CarRegNoBusiness', car_biz), ('CarRegNoSerial', car_serial),
             ('CarSerialNo', car_serial_no), ('CarMouldNo', model_desig), ('CarKindNo', category_num),
@@ -1052,9 +1058,10 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
         if _cust_updates:
             cur.execute(f"UPDATE Customer SET {', '.join(_cust_updates)}", _cust_values)
     else:
-        # 通常モード: 全フィールドを上書き（住所欄はNEO不要のため除外）
+        # 通常モード: 全フィールドを上書き
         cur.execute('''UPDATE Customer SET
             Name1=?, UserName=?, OwnerName=?,
+            PostalNo=?, Prefecture=?, Municipality=?, AddressOther1=?,
             CarRegNoDepartment=?, CarRegNoDivision=?,
             CarRegNoBusiness=?, CarRegNoSerial=?,
             CarSerialNo=?, CarMouldNo=?, CarKindNo=?,
@@ -1063,6 +1070,7 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
             Kilometer=?
         ''', (
             customer_name, customer_name, owner_name,
+            postal_no, prefecture, municipality, address_other,
             car_dept, car_div, car_biz, car_serial,
             car_serial_no, model_desig, category_num,
             term_date, term_era, term_era_year,
@@ -1086,16 +1094,19 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
     cur.execute('''UPDATE FileInfo SET
         EstimatedDate=?, EstimatedEra=?, EstimatedEraYear=?
     ''', (estimated_date, est_era, est_era_year))
-    policy_no     = safe_str(insurance_info.get('policy_no', ''))
-    contractor    = safe_str(insurance_info.get('contractor_name', ''))
-    agency_name   = safe_str(insurance_info.get('agency_name', ''))
-    adjuster_name = safe_str(insurance_info.get('adjuster_name', ''))
-    accept_no     = safe_str(insurance_info.get('accept_no', ''))
+    # コグニセブンの列幅に合わせて切り詰める。SQLite は TEXT(n) を強制しないため
+    # ここで守らないと、桁あふれした値がそのまま入る。
+    policy_no     = safe_str(insurance_info.get('policy_no', ''))[:20]
+    contractor    = safe_str(insurance_info.get('contractor_name', ''))[:20]
+    agency_name   = safe_str(insurance_info.get('agency_name', ''))[:20]
+    adjuster_name = safe_str(insurance_info.get('adjuster_name', ''))[:20]
+    accept_no     = safe_str(insurance_info.get('accept_no', ''))[:37]
     accident_date = _normalize_date8(insurance_info.get('accident_date', ''))
     garage_in     = _normalize_date8(insurance_info.get('garage_in_date', ''))
     garage_out    = _normalize_date8(insurance_info.get('garage_out_date', ''))
     repair_days   = safe_int(insurance_info.get('repair_days', 0))
-    note1         = safe_str(insurance_info.get('note1', ''))
+    # 備考は改行を含むと固定長レコードが崩れるため1行に潰す
+    note1         = re.sub(r'\s+', ' ', safe_str(insurance_info.get('note1', ''))).strip()[:40]
 
     # Insurance テーブル: 入力があった項目だけ書き込む。
     # 空欄で既存値を消すと、テンプレート由来の工場情報などが失われるため。
@@ -1113,9 +1124,9 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
         _ins_updates += ['AccidentDate=?', 'AccidentEra=?', 'AccidentEraYear=?']
         _ins_values  += [accident_date, _acc_era, _acc_era_year]
     elif not merge_mode:
-        # 新規作成時は事故日を未入力状態で初期化する
-        _ins_updates += ['AccidentDate=?', 'AccidentEra=?']
-        _ins_values  += ['00000000', '令和']
+        # 新規作成時は事故日を未入力状態で初期化する（和暦の年も併せて消す）
+        _ins_updates += ['AccidentDate=?', 'AccidentEra=?', 'AccidentEraYear=?']
+        _ins_values  += ['00000000', '令和', '0000']
     if _ins_updates:
         cur.execute(f"UPDATE Insurance SET {', '.join(_ins_updates)}", _ins_values)
 
@@ -1463,87 +1474,28 @@ def rasterize_pdf_page(pdf_bytes, page_index, dpi=200, enhance=False):
         result = enhance_image_for_ocr(result)
 
     return result
-
-
-def detect_table_region(image_bytes):
-    """
-    画像から明細テーブル領域を検出し、クロップされた画像バイトと位置比率を返す。
-    OpenCV が利用可能な場合は水平線検出を使用。
-    フォールバック: ヒューリスティック（上12%・下90%）。
-    戻り値: (cropped_bytes, top_ratio, bottom_ratio)
-    """
-    # ── OpenCV による水平線ベース検出 ─────────────────────────
     try:
-        import cv2
-        import numpy as np
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        img_cv = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-        if img_cv is not None:
-            h, w = img_cv.shape
-            _, thresh = cv2.threshold(img_cv, 200, 255, cv2.THRESH_BINARY_INV)
-            horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, w // 5), 1))
-            horiz = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horiz_kernel, iterations=2)
-            coords = cv2.findNonZero(horiz)
-            if coords is not None and len(coords) > 4:
-                ys = coords[:, 0, 1]
-                top_y = max(0, int(np.min(ys)) - 15)
-                bot_y = min(h, int(np.max(ys)) + 15)
-                top_ratio = top_y / h
-                bot_ratio = bot_y / h
-                if bot_ratio - top_ratio >= 0.3:
-                    from PIL import Image
-                    pil = Image.open(io.BytesIO(image_bytes))
-                    cropped = pil.crop((0, top_y, pil.width, bot_y))
-                    buf = io.BytesIO()
-                    cropped.save(buf, format='JPEG', quality=93)
-                    return buf.getvalue(), top_ratio, bot_ratio
-    except ImportError:
-        pass
-    except Exception:
-        pass
-
-    # ── フォールバック: ヒューリスティック ──────────────────────
-    try:
-        from PIL import Image
-        pil = Image.open(io.BytesIO(image_bytes))
-        h = pil.height
-        top_y = int(h * 0.12)
-        bot_y = int(h * 0.90)
-        cropped = pil.crop((0, top_y, pil.width, bot_y))
+        from pypdf import PdfReader, PdfWriter
+        reader       = PdfReader(io.BytesIO(pdf_bytes))
+        needs_rotation = False
+        for page in reader.pages:
+            box = page.mediabox
+            if float(box.width) > float(box.height) * 1.2:
+                needs_rotation = True
+                break
+        if not needs_rotation:
+            return pdf_bytes
+        writer = PdfWriter()
+        for page in reader.pages:
+            box = page.mediabox
+            if float(box.width) > float(box.height) * 1.2:
+                page.rotate(270)
+            writer.add_page(page)
         buf = io.BytesIO()
-        cropped.save(buf, format='JPEG', quality=93)
-        return buf.getvalue(), 0.12, 0.90
+        writer.write(buf)
+        return buf.getvalue()
     except Exception:
-        return image_bytes, 0.0, 1.0
-
-
-def split_into_vertical_chunks(image_bytes, n_chunks=3, overlap_ratio=0.08):
-    """
-    画像を縦方向に n_chunks 分割（オーバーラップあり）。
-    戻り値: List of (chunk_bytes, y_start_ratio, y_end_ratio)
-    ※ y比率はクロップ画像に対する 0-1 の値
-    """
-    try:
-        from PIL import Image
-        pil = Image.open(io.BytesIO(image_bytes))
-        w, h = pil.width, pil.height
-        if h < 200:
-            return [(image_bytes, 0.0, 1.0)]
-        chunk_h = h // n_chunks
-        overlap_px = max(10, int(h * overlap_ratio))
-        chunks = []
-        for i in range(n_chunks):
-            y_start = max(0, i * chunk_h - (overlap_px if i > 0 else 0))
-            y_end   = min(h, (i + 1) * chunk_h + (overlap_px if i < n_chunks - 1 else 0))
-            if y_end <= y_start:
-                continue
-            chunk = pil.crop((0, y_start, w, y_end))
-            buf = io.BytesIO()
-            chunk.save(buf, format='JPEG', quality=93)
-            chunks.append((buf.getvalue(), y_start / h, y_end / h))
-        return chunks if chunks else [(image_bytes, 0.0, 1.0)]
-    except Exception:
-        return [(image_bytes, 0.0, 1.0)]
+        return pdf_bytes
 
 
 def try_fix_landscape_pdf(pdf_bytes):
@@ -2779,258 +2731,6 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
             raise ValueError(f"Gemini API呼び出しに失敗しました: {str(last_error)}")
 
 
-# ============================================================
-# チャンク分割解析: 表領域を縦に分割して各チャンクをAIで解析
-# ============================================================
-
-def analyze_estimate_chunk(api_key, chunk_bytes, mime_type, model_name,
-                           page_num, chunk_idx, total_chunks,
-                           y_start_ratio=0.0, y_end_ratio=1.0,
-                           table_top_ratio=0.0, table_bot_ratio=1.0):
-    """
-    チャンク単位で明細行を解析する（analyze_estimate_single のチャンク版）。
-    y_start_ratio / y_end_ratio : チャンクが表領域内の何%にあたるか（row_bbox補正用）
-    """
-    chunk_instruction = (
-        f'【チャンク解析】ページ {page_num} の明細表を縦に {total_chunks} 分割した'
-        f' {chunk_idx + 1}/{total_chunks} チャンク'
-        f'（ページ上端から {y_start_ratio*100:.0f}%〜{y_end_ratio*100:.0f}% の範囲）。\n'
-        'このチャンクに含まれる全明細行を漏れなく読み取ってください。\n'
-        'row_bbox の y1/y2 はこのチャンク画像内の縦位置（0-1000スケール）で返してください。\n'
-    )
-    prompt = _build_prompt("estimate_detail_page", chunk_instruction)
-
-    _schema_chunk = {
-        "type": "object",
-        "properties": {
-            "items": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name":          {"type": "string"},
-                        "description":   {"type": "string"},
-                        "method":        {"type": "string"},
-                        "quantity":      {"type": "integer"},
-                        "parts_amount":  {"type": "integer"},
-                        "wage":          {"type": "integer"},
-                        "line_total":    {"type": "integer"},
-                        "part_no":       {"type": "string"},
-                        "work_code":     {"type": "string"},
-                        "raw_text":      {"type": "string"},
-                        "row_id":        {"type": "string"},
-                        "row_bbox": {
-                            "type": "object",
-                            "properties": {
-                                "x1": {"type": "integer"},
-                                "y1": {"type": "integer"},
-                                "x2": {"type": "integer"},
-                                "y2": {"type": "integer"},
-                            },
-                        },
-                    },
-                },
-            },
-            "discount_amount": {"type": "integer"},
-        },
-    }
-
-    from google.genai import types
-    client = _get_genai_client(api_key)
-    file_part = types.Part.from_bytes(data=chunk_bytes, mime_type=mime_type)
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=[prompt, file_part],
-                config={
-                    "temperature": 0.0,
-                    "max_output_tokens": 32768,
-                    "response_mime_type": "application/json",
-                    "response_schema": _schema_chunk,
-                },
-            )
-            if response.text and response.text.strip():
-                try:
-                    res = json.loads(response.text)
-                except Exception:
-                    res = extract_json_from_response(response.text) or {}
-                # row_bbox の y座標をページ全体座標系に変換（0-1000スケール）
-                table_range = max(0.01, table_bot_ratio - table_top_ratio)
-                chunk_range = max(0.01, y_end_ratio - y_start_ratio)
-                for it in res.get('items', []):
-                    it['_chunk_idx']    = chunk_idx
-                    it['_chunk_y_start'] = y_start_ratio
-                    it['_chunk_y_end']   = y_end_ratio
-                    bbox = it.get('row_bbox')
-                    if bbox and isinstance(bbox, dict):
-                        # チャンク内y(0-1000) → ページ内y(0-1000)への変換
-                        def _conv_y(vy):
-                            # チャンク内相対位置 → 表領域内相対位置 → ページ全体相対位置
-                            in_chunk  = vy / 1000.0           # 0-1
-                            in_table  = y_start_ratio + in_chunk * chunk_range   # 0-1
-                            in_page   = table_top_ratio + in_table * table_range # 0-1
-                            return max(0, min(1000, int(in_page * 1000)))
-                        it['row_bbox'] = {
-                            'x1': bbox.get('x1', 0),
-                            'y1': _conv_y(bbox.get('y1', 0)),
-                            'x2': bbox.get('x2', 1000),
-                            'y2': _conv_y(bbox.get('y2', 0)),
-                        }
-                return res
-            if attempt < 2:
-                import time; time.sleep(1)
-        except Exception as e:
-            err = str(e)
-            if _is_model_unavailable_error(err):
-                _mark_model_unavailable(api_key, model_name)
-                raise RuntimeError(f"モデル '{model_name}' は利用できません（提供終了）。") from e
-            if '429' in err or 'RESOURCE_EXHAUSTED' in err:
-                _quota_exhausted_set().add(model_name)
-                raise ValueError(f"モデル '{model_name}' クォータ超過") from e
-            if attempt < 2:
-                import time; time.sleep(1)
-    return {"items": [], "discount_amount": 0}
-
-
-def merge_chunk_items(chunk_results, page_num):
-    """
-    複数チャンクの items を結合し、重複行を除去して page番号を付与して返す。
-    重複判定（3段階）:
-      1. raw_text 完全一致（OCR原文が同一 → 確実な重複）
-      2. 正規化name(半角化) + (parts, wage) 一致（全角/半角表記ゆれを吸収）
-      3. 絶対Y座標近傍 + 合計金額一致（チャンク境界部のOCR揺れを吸収）
-    """
-    all_items = []
-    seen_raw  = set()       # raw_text ベース
-    seen_norm = set()       # (normalized_name, parts, wage) ベース
-    seen_abs_y = []         # (abs_y, amount_total) リスト（近傍チェック用）
-    total_discount = 0
-    Y_THRESHOLD = 0.05      # ページ高さの 5% 以内 = 同一行とみなす許容誤差
-
-    for chunk_res in chunk_results:
-        total_discount += safe_int(chunk_res.get('discount_amount', 0))
-        for it in chunk_res.get('items', []):
-            name  = str(it.get('name', '')).strip()
-            parts = safe_int(it.get('parts_amount', 0))
-            wage  = safe_int(it.get('wage', 0))
-            # 完全空行はスキップ
-            if not name and parts == 0 and wage == 0:
-                continue
-            has_amount = (parts > 0 or wage > 0)
-            raw        = str(it.get('raw_text', '')).strip()
-            norm_name  = to_halfwidth_katakana(name)
-
-            # ── 重複チェック1: raw_text ──────────────────────────
-            if raw and has_amount:
-                if raw in seen_raw:
-                    continue
-
-            # ── 重複チェック2: 正規化name + (parts, wage) ────────
-            norm_key = (norm_name, parts, wage)
-            if has_amount and norm_key in seen_norm:
-                continue
-
-            # ── 重複チェック3: 絶対Y座標近傍 + 合計一致 ──────────
-            # チャンクローカル座標(0-1000)→ページ絶対座標(0.0-1.0)に変換して比較
-            bbox       = it.get('row_bbox', {})
-            local_y1   = float(bbox.get('y1', -1))
-            chunk_y_s  = float(it.get('_chunk_y_start', 0))
-            chunk_y_e  = float(it.get('_chunk_y_end', 1))
-            amt_total  = parts + wage
-            is_y_dup   = False
-            if local_y1 >= 0 and has_amount:
-                abs_y = chunk_y_s + (local_y1 / 1000.0) * (chunk_y_e - chunk_y_s)
-                for prev_y, prev_amt in seen_abs_y:
-                    if abs(abs_y - prev_y) <= Y_THRESHOLD and prev_amt == amt_total:
-                        is_y_dup = True
-                        break
-                if is_y_dup:
-                    continue
-
-            # ── 重複なし → 登録 ──────────────────────────────────
-            if raw and has_amount:
-                seen_raw.add(raw)
-            if has_amount:
-                seen_norm.add(norm_key)
-            if local_y1 >= 0 and has_amount:
-                seen_abs_y.append((abs_y, amt_total))
-
-            it['page'] = page_num
-            all_items.append(it)
-    return all_items, total_discount
-
-
-def analyze_page_with_chunks(api_key, page_bytes, mime_type, model_name,
-                              page_num, total_pages, n_chunks=3):
-    """
-    1ページ分の画像を表領域検出 → チャンク分割 → 各チャンク解析 → マージ するパイプライン。
-    JPEG画像でない場合は analyze_estimate_single にフォールバック。
-    """
-    # JPEG/PNG 画像でない場合はフォールバック
-    if mime_type not in ('image/jpeg', 'image/png'):
-        return analyze_estimate_single(api_key, page_bytes, mime_type, model_name, page_num, total_pages)
-
-    # ① 表領域を検出してクロップ
-    try:
-        table_bytes, table_top, table_bot = detect_table_region(page_bytes)
-    except Exception:
-        table_bytes, table_top, table_bot = page_bytes, 0.0, 1.0
-
-    # ② 縦分割（チャンク数は行数に応じて調整: 小さい画像は分割不要）
-    try:
-        from PIL import Image
-        _pil = Image.open(io.BytesIO(table_bytes))
-        _h = _pil.height
-        actual_chunks = n_chunks if _h >= 600 else (2 if _h >= 300 else 1)
-    except Exception:
-        actual_chunks = n_chunks
-
-    chunks = split_into_vertical_chunks(table_bytes, n_chunks=actual_chunks, overlap_ratio=0.02)
-
-    # ③ 各チャンクをAPIで解析（並列処理）
-    def _analyze_one_chunk(args):
-        ci, (cb, y_start, y_end) = args
-        try:
-            return analyze_estimate_chunk(
-                api_key, cb, 'image/jpeg', model_name,
-                page_num, ci, actual_chunks,
-                y_start_ratio=y_start, y_end_ratio=y_end,
-                table_top_ratio=table_top, table_bot_ratio=table_bot,
-            )
-        except Exception as e:
-            import sys
-            print(f"[WARN] チャンク{ci+1}解析失敗 (page={page_num}): {e}", file=sys.stderr)
-            return {"items": [], "discount_amount": 0}
-
-    chunk_results = []
-    if actual_chunks == 1:
-        # チャンク分割不要: ページ全体画像（クロップなし）をシンプルプロンプトで解析
-        chunk_results = [analyze_estimate_single(
-            api_key, page_bytes, 'image/jpeg', model_name, page_num, total_pages
-        )]
-    else:
-        with ThreadPoolExecutor(max_workers=min(actual_chunks, 3)) as _cx:
-            chunk_results = list(_cx.map(_analyze_one_chunk, enumerate(chunks)))
-
-    # ④ マージして重複除去
-    merged_items, merged_discount = merge_chunk_items(chunk_results, page_num)
-
-    # ⑤ 結果が空ならフォールバック
-    if not merged_items:
-        return analyze_estimate_single(api_key, page_bytes, mime_type, model_name, page_num, total_pages)
-
-    return {
-        "items":           merged_items,
-        "discount_amount": merged_discount,
-        "confidence":      0.85,
-        "_chunked":        True,
-        "_chunk_count":    actual_chunks,
-    }
-
-
-
-
 def validate_and_correct_items(items):
     """
     辞書ベースバリデーション: AIの誤分類を後処理で修正する。
@@ -3190,54 +2890,6 @@ def extract_special_items(items, existing_sp=0, existing_exempt=0):
     Returns: (items, 0, 0)  ← 常に元のリストをそのまま返す
     """
     return list(items), 0, 0
-
-
-def deduplicate_page_items(all_items):
-    """
-    複数ページ分割時のページ境界での重複行を除去する。
-    同一品名＋同一金額の行がページ境界付近で連続する場合、重複とみなして除去。
-    """
-    if len(all_items) <= 1:
-        return all_items
-    deduped = [all_items[0]]
-    for i in range(1, len(all_items)):
-        curr = all_items[i]
-        prev = deduped[-1]
-        # 品名・部品金額・工賃が全て一致する場合は重複と判定
-        same_name  = str(curr.get('name', '')).strip() == str(prev.get('name', '')).strip()
-        same_parts = safe_int(curr.get('parts_amount', 0)) == safe_int(prev.get('parts_amount', 0))
-        same_wage  = safe_int(curr.get('wage', 0)) == safe_int(prev.get('wage', 0))
-        if same_name and same_parts and same_wage and str(curr.get('name', '')).strip():
-            continue  # 重複 → スキップ
-        deduped.append(curr)
-    return deduped
-
-
-def deduplicate_page_boundary_items(all_items, boundary_indices):
-    """
-    ページ境界付近でのみ重複行を除去する。
-    同一ページ内の重複行はPDF原本通り全て保持する（ユーザー指定）。
-    boundary_indices: 各ページの先頭インデックスのリスト
-    """
-    if len(all_items) <= 1:
-        return all_items
-    boundary_set = set(boundary_indices)
-    result = []
-    skip_next = False
-    for i, item in enumerate(all_items):
-        if skip_next:
-            skip_next = False
-            continue
-        # このインデックスがページ境界（ページ先頭）かつ前の行と内容が同じなら除去
-        if i in boundary_set and result:
-            prev = result[-1]
-            same_name  = str(item.get('name', '')).strip() == str(prev.get('name', '')).strip()
-            same_parts = safe_int(item.get('parts_amount', 0)) == safe_int(prev.get('parts_amount', 0))
-            same_wage  = safe_int(item.get('wage', 0))         == safe_int(prev.get('wage', 0))
-            if same_name and same_parts and same_wage and str(item.get('name', '')).strip():
-                continue  # ページ境界重複 → スキップ
-        result.append(item)
-    return result
 
 
 def global_dedup_items(items):
@@ -4310,27 +3962,39 @@ def main():
         st.markdown("---")
         st.header("🛡️ 事故・保険情報")
         st.caption("コグニセブンの受付／保険欄に書き込まれます。空欄はテンプレートの値を維持します。")
+        # ウィジェットキーに連番を付ける。Streamlit ではキーを del しても
+        # ブラウザが直前の値を送り直すため入力が復活し、前のお客様の事故情報が
+        # 次の見積に混入する。連番を進めれば別のウィジェットになり確実に空になる。
+        _fseq = st.session_state.setdefault('form_seq', 0)
         accept_no       = st.text_input("事故受付番号", value=st.session_state.get('accept_no', ''),
-                                        key='accept_no_input', placeholder="例: 2026-001234")
+                                        key=f'accept_no_input_{_fseq}', placeholder="例: 2026-001234",
+                                        max_chars=37)
         accident_date   = st.text_input("事故日（YYYYMMDD）", value=st.session_state.get('accident_date', ''),
-                                        key='accident_date_input', placeholder="例: 20260901", max_chars=8)
+                                        key=f'accident_date_input_{_fseq}', placeholder="例: 20260901")
         policy_no       = st.text_input("証券番号", value=st.session_state.get('policy_no', ''),
-                                        key='policy_no_input')
+                                        key=f'policy_no_input_{_fseq}', max_chars=20)
         contractor_name = st.text_input("契約者名", value=st.session_state.get('contractor_name', ''),
-                                        key='contractor_name_input')
+                                        key=f'contractor_name_input_{_fseq}', max_chars=20)
         agency_name     = st.text_input("保険会社・代理店名", value=st.session_state.get('agency_name', ''),
-                                        key='agency_name_input')
+                                        key=f'agency_name_input_{_fseq}', max_chars=20)
         adjuster_name   = st.text_input("アジャスター名", value=st.session_state.get('adjuster_name', ''),
-                                        key='adjuster_name_input')
+                                        key=f'adjuster_name_input_{_fseq}', max_chars=20)
         with st.expander("入庫・出庫・修理日数", expanded=False):
             garage_in_date  = st.text_input("入庫日（YYYYMMDD）", value=st.session_state.get('garage_in_date', ''),
-                                            key='garage_in_input', max_chars=8)
+                                            key=f'garage_in_input_{_fseq}')
             garage_out_date = st.text_input("出庫日（YYYYMMDD）", value=st.session_state.get('garage_out_date', ''),
-                                            key='garage_out_input', max_chars=8)
+                                            key=f'garage_out_input_{_fseq}')
             repair_days     = st.number_input("修理日数", value=st.session_state.get('repair_days', 0),
-                                              min_value=0, step=1, key='repair_days_input')
+                                              min_value=0, step=1, key=f'repair_days_input_{_fseq}')
             note1           = st.text_area("備考", value=st.session_state.get('note1', ''),
-                                           key='note1_input', height=70)
+                                           key=f'note1_input_{_fseq}', height=70, max_chars=40)
+        # 日付は YYYYMMDD / YYYY-MM-DD / YYYY/MM/DD を受け付ける。
+        # 解釈できない入力は書き込まれないので、その場で知らせる。
+        for _dlabel, _dval in (('事故日', accident_date), ('入庫日', garage_in_date),
+                               ('出庫日', garage_out_date)):
+            if _dval and not _normalize_date8(_dval):
+                st.warning(f"⚠️ {_dlabel}「{_dval}」は日付として読み取れません。"
+                           "YYYYMMDD で入力してください（このままではNEOに書き込まれません）。")
         for _k, _v in [
             ('accept_no', accept_no), ('accident_date', accident_date),
             ('policy_no', policy_no), ('contractor_name', contractor_name),
@@ -4341,9 +4005,9 @@ def main():
             st.session_state[_k] = _v
         st.markdown("---")
         st.header("💰 費用（Expense）")
-        exp_towing    = st.number_input("レッカー費用（税抜）",  value=st.session_state.get('exp_towing', 0),    min_value=0, step=1000, key='exp_towing_input')
-        exp_rental    = st.number_input("代車費用（税抜）",      value=st.session_state.get('exp_rental', 0),    min_value=0, step=1000, key='exp_rental_input')
-        exp_exempt    = st.number_input("非課税費用",            value=st.session_state.get('exp_exempt', 0),    min_value=0, step=1000, key='exp_exempt_input')
+        exp_towing    = st.number_input("レッカー費用（税抜）",  value=st.session_state.get('exp_towing', 0),    min_value=0, step=1000, key=f'exp_towing_input_{_fseq}')
+        exp_rental    = st.number_input("代車費用（税抜）",      value=st.session_state.get('exp_rental', 0),    min_value=0, step=1000, key=f'exp_rental_input_{_fseq}')
+        exp_exempt    = st.number_input("非課税費用",            value=st.session_state.get('exp_exempt', 0),    min_value=0, step=1000, key=f'exp_exempt_input_{_fseq}')
         st.session_state['exp_towing'] = exp_towing
         st.session_state['exp_rental'] = exp_rental
         st.session_state['exp_exempt'] = exp_exempt
@@ -5231,6 +4895,11 @@ def main():
 
             # 車両詳細情報
             st.markdown('<div class="section-title" style="margin-top:16px">🔧 車両詳細</div>', unsafe_allow_html=True)
+            st.caption(
+                "※ 型式・エンジン型式・車両重量・排気量は、コグニセブンのNEOに対応する"
+                "保存先が無いため参考表示です（ファイルには書き込まれません）。"
+                "車体の色・カラーコード・トリムコード・型式指定番号・類別区分番号は書き込まれます。"
+            )
             dc1, dc2, dc3 = st.columns(3)
             with dc1:
                 v_model     = st.text_input("型式",         value=safe_str(vehicle_data.get('car_model', '')),              key='v_model')
@@ -6061,11 +5730,11 @@ def main():
                     'vehicle_file_bytes', 'vehicle_file_name', 'estimate_file_bytes',
                     'estimate_file_name', 'updated_vehicle', 'calc_parts', 'calc_wages',
                     'pdf_parts', 'pdf_wages',
-                    'policy_no', 'contractor_name',
+                    # 事故・保険情報
+                    'policy_no', 'contractor_name', 'accept_no', 'accident_date',
+                    'agency_name', 'adjuster_name', 'garage_in_date', 'garage_out_date',
+                    'repair_days', 'note1',
                     'exp_towing', 'exp_rental', 'exp_exempt',
-                    # ウィジェットキー側も消さないと入力値が次の見積に残り、
-                    # 別のお客様の費用が混入する
-                    'exp_towing_input', 'exp_rental_input', 'exp_exempt_input',
                     'custom_neo_bytes', 'custom_neo_name',
                     'tax_override',
                     'classification_confirmed', 'classification_alerts',
@@ -6081,6 +5750,8 @@ def main():
                 ]:
                     if key in st.session_state:
                         del st.session_state[key]
+                # サイドバー入力のウィジェットを作り直して確実に空にする
+                st.session_state['form_seq'] = st.session_state.get('form_seq', 0) + 1
                 st.session_state['step'] = 1
                 st.rerun()
         except Exception as e:
