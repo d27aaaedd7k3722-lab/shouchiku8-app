@@ -2531,17 +2531,26 @@ def analyze_estimate_totals(api_key, file_bytes, mime_type, model_name):
 # 明細ではなく集計を表す語（これで「終わる」品名は明細として扱わない）
 _TOTAL_SUFFIXES = ('合計', '小計', '総額', '総計', '消費税', '税額')
 # 単独で使われた場合だけ集計とみなす語
-_TOTAL_EXACT = ('内税', '外税', '請求', 'ご請求', '税', '計')
+# （「税」は入れない。「税金」「重量税」のような正当な明細まで消えるため）
+_TOTAL_EXACT = ('内税', '外税', '請求', 'ご請求', '計', '以上', '総合計', '税込', '税抜')
+# 「部品計」「工賃計」のように、この語に「計」が続く形も集計行
+_TOTAL_PREFIXES_FOR_KEI = (
+    '部品', '部品代', '工賃', '技術料', '諸費用', '費用', '材料', '塗装',
+    '作業', '整備', '修理', '合計', '小計', '値引', 'その他',
+    '課税', '非課税', '税込', '税抜',
+)
 
 
 # CSVの見出し名 → 内部キー
+# 見出し名 → 内部キー。曖昧な短い別名は最後に置き、具体的な名前を優先する。
+# 「部品」だけの列は品番のことも金額のこともあるため候補に入れない。
 _COLUMN_ALIASES = {
-    'name':         ('品名', '品目', '部品名', '名称', '摘要', '作業内容', '内容'),
-    'work_code':    ('区分', '作業区分', '作業'),
-    'quantity':     ('数量', '個数', '数'),
-    'parts_amount': ('部品金額', '部品代', '部品価格', '部品'),
+    'name':         ('品名', '部品名', '品目', '名称', '摘要', '作業内容'),
+    'work_code':    ('区分', '作業区分'),
+    'quantity':     ('数量', '個数'),
+    'parts_amount': ('部品金額', '部品代', '部品価格', '部品単価'),
     'wage':         ('工賃', '技術料', '作業工賃'),
-    'part_no':      ('部品コード', '部品番号', '品番', 'コード'),
+    'part_no':      ('部品コード', '部品番号', '品番'),
     'index_value':  ('工数', '指数'),
 }
 
@@ -2550,14 +2559,24 @@ def _build_column_map(header_row) -> dict:
     """見出し行から「内部キー → 列位置」を作る。判別できない場合は空dict。"""
     if not header_row:
         return {}
-    cells = [re.sub(r'[\s\u3000（(].*$', '', str(c or '').strip()) for c in header_row]
+    # 空白で切り捨てると「部品 コード」が「部品」になり、品番列を見失う。
+    # 空白は詰めるだけにし、括弧書きの注記だけを落とす。
+    cells = []
+    for c in header_row:
+        c = re.sub(r'[\s\u3000]', '', str(c or ''))
+        c = re.sub(r'[（(\[【].*$', '', c)
+        cells.append(c)
     colmap = {}
+    # 別名を外側で回し、具体的な名前から順に列を確保する。
+    # 列を外側で回すと「部品 コード」→「部品」のような弱い一致が
+    # 先に金額列を奪い、部品代が全部0になる。
     for key, aliases in _COLUMN_ALIASES.items():
-        for i, c in enumerate(cells):
-            if not c or i in colmap.values():
-                continue
-            if c in aliases:
-                colmap[key] = i
+        for alias in aliases:
+            for i, c in enumerate(cells):
+                if c == alias and i not in colmap.values():
+                    colmap[key] = i
+                    break
+            if key in colmap:
                 break
     # 品名の列が見つからないなら、この見出しは当てにならないので位置決め打ちに戻す
     if 'name' not in colmap:
@@ -2577,12 +2596,18 @@ def _is_total_row_name(name: str) -> bool:
     nm = re.sub(r'[\s\u3000【】\[\]「」『』¥￥:：･・]', '', str(name or ''))
     nm = re.sub(r'[（(].*?[）)]', '', nm)          # 括弧書きを除去
     nm = re.sub(r'[0-9０-９①-⑳%％]+$', '', nm)     # 末尾の番号・率を除去
+    nm = nm.replace('御', 'ご')                     # 御請求額 → ご請求額
     if not nm:
         return False
+    if re.fullmatch(r'(?i)(sub)?total', nm):        # 英語表記の合計欄
+        return True
     if nm in _TOTAL_EXACT or nm.endswith(_TOTAL_SUFFIXES):
         return True
-    # 「合計金額」「小計額」のように集計語の後ろに金額表現が付く形
-    nm2 = re.sub(r'(金額|額|金|計)$', '', nm)
+    # 「部品計」「工賃計」「諸費用計」のように、集計対象＋「計」の形
+    if nm.endswith('計') and nm[:-1] in _TOTAL_PREFIXES_FOR_KEI:
+        return True
+    # 「合計金額」「ご請求額」のように集計語の後ろに金額表現が付く形
+    nm2 = re.sub(r'(金額|額|計)$', '', nm)
     if nm2 and nm2 != nm and (nm2 in _TOTAL_EXACT or nm2.endswith(_TOTAL_SUFFIXES)):
         return True
     return False
@@ -2604,6 +2629,11 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
     # 全行から除去すると、引用符で囲まれた複数行フィールドを壊してしまう。
     text = re.sub(r'^[^\n]*```[a-zA-Z]*\n', '', text)
     text = re.sub(r'\n```[^\n]*$', '', text)
+    # フェンスの後ろに説明文が続くと閉じフェンスが行の途中に残り、
+    # 「```」だけの行が金額0円の明細として取り込まれてしまう。
+    # 行全体がフェンスだけの行に限って落とす（引用中の本文は壊さない）。
+    text = '\n'.join(l for l in text.split('\n')
+                     if not re.fullmatch(r'\s*```[a-zA-Z]*\s*', l))
     items = []
     try:
         reader = _csv.reader(_io.StringIO(text))
@@ -2621,27 +2651,57 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
                      '数量', '個数', '数', '単価', '金額', '部品金額', '工賃',
                      '部品コード', '部品番号', '工数', '番号', '備考', '単位')
 
+    def _norm_header_cell(c):
+        # 「部品金額（税抜）」「数 量」のような装飾を外して見出し語と比べる
+        c = re.sub(r'[\s\u3000・]', '', c)
+        c = re.sub(r'[（(\[【][^）)\]】]*[）)\]】]', '', c)
+        return c
+
     def _looks_like_header(r):
         if not r:
             return False
         cells = [c.strip() for c in r if c is not None]
         if not any(cells):
             return False
-        # 数字だけのセルが1つでもあれば明細行とみなす
+        # 金額・数量らしいセルが1つでもあれば明細行とみなす。
+        # 「¥45,000」のように通貨記号や「円」が付く形も明細である。
         for c in cells[1:]:
-            if c and re.fullmatch(r'[\d,．.\-]+', c):
+            if c and re.fullmatch(r'[¥￥]?[\d,，．.\-]+円?', c):
                 return False
-        return sum(1 for c in cells if any(w in c for w in _HEADER_WORDS)) >= 2
+        # 部分一致だと「部品コード」を含む品名などでヘッダ扱いになり、
+        # 実データ行が1行まるごと捨てられる。セル全体の一致だけを数える。
+        return sum(1 for c in cells if _norm_header_cell(c) in _HEADER_WORDS) >= 2
 
     # 「品名」見出しは何行目にあっても拾う。一方、見出しらしさによる推測は
     # 先頭数行に限る。表の途中の小見出し（「工賃」など）をヘッダと誤認すると、
     # それより前の明細が全部捨てられてしまう。
+    def _looks_like_data(r):
+        """品名と金額らしきセルを併せ持つ、明細とみなせる行か。"""
+        if not r:
+            return False
+        cells = [str(c or '').strip() for c in r]
+        if not any(cells):
+            return False
+        has_name = any(c and not re.fullmatch(r'[¥￥]?[\d,，．.\-]+円?', c) for c in cells)
+        has_amount = any(
+            c and re.fullmatch(r'[¥￥]?[\d,，．.\-]+円?', c)
+            and re.search(r'[1-9]', c)
+            for c in cells[1:]
+        )
+        return has_name and has_amount
+
+    # 見出しは「明細が始まる前」にしか存在しない。表の途中に現れる
+    # 「品名,…」は2枚目のページ見出しなので、そこで区切ると
+    # それより上の明細が丸ごと捨てられてしまう。
     header_idx = 0
     for i, row in enumerate(rows):
+        if _looks_like_data(row):
+            break
         if row and '品名' in (row[0] or ''):
             header_idx = i + 1
             break
-        if i < 5 and _looks_like_header(row):
+        # 推測によるヘッダ判定は先頭行だけに限る。
+        if i == 0 and _looks_like_header(row):
             header_idx = i + 1
             break
 
@@ -2650,7 +2710,9 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
     _colmap = _build_column_map(rows[header_idx - 1]) if header_idx > 0 else {}
 
     def _cell(row, key, pos):
-        idx = _colmap.get(key, pos)
+        # 見出しを認識できた場合、その見出しに無い項目まで位置で埋めると
+        # 別の列（品名など）を拾ってしまう。認識できた時は空を返す。
+        idx = _colmap.get(key, None if _colmap else pos)
         return row[idx].strip() if idx is not None and 0 <= idx < len(row) else ''
 
     row_idx = 0
@@ -2667,11 +2729,25 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
         parts_amt = safe_int(_cell(row, 'parts_amount', 3))
         wage_amt  = safe_int(_cell(row, 'wage', 4))
         part_no   = _cell(row, 'part_no', 5)
+        # 見出しに「工数」「指数」列があれば取り込む（従来は常に空だった）
+        index_val = _cell(row, 'index_value', None)
 
         if not name:
             continue
+        # 表の後ろにAIが書き足す説明文（「上記のとおりです。」など）は明細ではない。
+        # 金額も数量も品番も無く、1セルだけの文章行に限って落とす。
+        if (parts_amt == 0 and wage_amt == 0 and not part_no
+                and sum(1 for c in row if str(c or '').strip()) == 1
+                and (re.search(r'[。．!！?？]', name)
+                     or re.search(r'(です|ます|ください|とおり|下さい)', name)
+                     or len(name) > 24)):
+            _trailer_notes.append(name.strip())
+            continue
         # アプリ自身のプロンプトが末尾に付ける差異メモは明細ではない
-        if re.match(r'^(部品|工賃)相違', name.strip()) and parts_amt == 0 and wage_amt == 0:
+        _nm_s = name.strip()
+        if (re.fullmatch(r'(部品|工賃)相違[\s\u3000\d,，円]*', _nm_s)
+                or (re.match(r'^(部品|工賃)相違', _nm_s)
+                    and parts_amt == 0 and wage_amt == 0)):
             _trailer_notes.append(','.join(c.strip() for c in row if c.strip()))
             continue
         # 集計行の除外。
@@ -2701,7 +2777,7 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
             'parts_amount': parts_amt,
             'wage':         wage_amt,
             'line_total':   parts_amt + wage_amt,
-            'index_value':  '',
+            'index_value':  index_val,
             'raw_text':     ','.join(row),
             'row_id':       f'p1_r{row_idx:03d}',
             'row_bbox':     {'x1': 0, 'y1': 0, 'x2': 1000, 'y2': 50},
