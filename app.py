@@ -915,10 +915,21 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
     # 全Expense行をクリア（LineNo=1〜8: 文字書き/内張り/配線/ショートパーツ/レッカー代１/レッカー代２/写真代他/その他控除）
     # LineNo 9 以降は自由入力の費用行。前案件の .neo をテンプレートに
     # 使うと、そこに書かれた費目と金額がそのまま残る。全行を消す。
+    # Name は NameFix で扱いが分かれる。1 は「文字書き費用」等の固定費目名で
+    # 消してはいけない。0 は自由入力行で、消さないと出荷テンプレートに入っている
+    # 「ｺｰﾃｨﾝｸﾞ修正部再施工」(LineNo=9) が全生成物に付いて回り、
+    # 前案件の .neo を使えば前案件の費目名が金額ブランクで残る。
     cur.execute("""UPDATE Expense SET
         OutTaxFlag=0, WageEnabled=0, WageOutTax=0, WageInTax=0, WageTax=0,
         PartsEnabled=0, PartsPriceOutTax=0, PartsPriceInTax=0, PartsPriceTax=0,
-        Comment=''""")
+        Comment='',
+        Name = CASE WHEN NameFix = 1 THEN Name ELSE '' END""")
+    # Fixer は金額付きの調整行。前案件の .neo をテンプレートにすると
+    # 有効フラグごと残り、別案件の調整額が新しい見積に同居する。
+    try:
+        cur.execute("UPDATE Fixer SET Name='', Enabled=0, Price=0")
+    except sqlite3.Error:
+        pass
     total_parts = 0
     annote_rows = []
     # 税込モードの丸め調整用
@@ -1607,6 +1618,21 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
         cur.execute(f"UPDATE FileInfo SET {', '.join(_fi_updates)}", _fi_values)
     conn.commit()
 
+    # Statistics は案件そのものを識別する欄。過去の .neo をテンプレートに
+    # 使うと、前案件の見積ID・案件番号・協定額が新しい見積に同居する。
+    # 保険会社への提出物としては危険なので、案件固有の欄だけ初期化する。
+    # 工場区分・保険会社区分など工場固有の設定は残す（消すと毎回入れ直しになる）。
+    if not merge_mode:
+        try:
+            cur.execute("""UPDATE Statistics SET
+                EstimationId='', ProjectNo='', ProjectCompletedFlag='',
+                DefiniteOutTax=-1, DefiniteInTax=-1, DefiniteTax=-1,
+                AccidentLargeCategoryCode='', AccidentSmallCategoryCode='',
+                DisasterFlag='', DisasterIdentificationCode=''""")
+            conn.commit()
+        except Exception as e:
+            print("Statistics reset failed:", e)
+
     # TaxKindFlag 更新 (1=内税, 0=外税)
     try:
         tax_flag = 1 if is_tax_inclusive else 0
@@ -1676,6 +1702,23 @@ def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mo
         'CarMouldNo':    _t['model_desig'],
         'CarKindNo':     _t['category_num'],
         'ColorCode':     _t['color_code'],
+        # 以下はアプリが値を持たない案件固有欄。書かずに放置すると、
+        # 過去の .neo をテンプレートにしたとき前の案件の立会者名・伝票番号・
+        # 備考・グレードがそのまま新しい見積に残る（立会者名は個人情報）。
+        # マージモードでは空値はスキップされるので、テンプレート保持は壊れない。
+        'CustomerName2':        '',
+        'TicketNo':             '',
+        'Note2':                '',
+        'Note3':                '',
+        'ii_CustomerName':      '',
+        'ii_PresenceDate':      '',
+        'ii_AgreedDate':        '',
+        'ii_RepairDays':        '',
+        'ii_TimePrice':         '',
+        'GradeName':            '',
+        'CarYearName':          '',
+        'BodyName':             '',
+        'FVariationNameByUser': '',
     }
     if term_date and term_date != '00000000':
         term_era, term_era_year = get_era_info(term_date)
@@ -1696,8 +1739,14 @@ def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mo
             f'{reg_era}{reg_year_int}年{int(reg_month)}月'
             if reg_month and reg_month != '00' else ''
         )
+        # 合成文字列だけ書いて構造化タグを空のまま残すと、同じ .neo の中に
+        # 初度登録が2通り入る（DB側は Customer.CarRegDate に8桁で入っている）。
+        tag_values['CarRegistedDateYear']  = reg_era_year
+        tag_values['CarRegistedDateMonth'] = reg_month
     else:
-        tag_values['CarRegistedDate'] = ''
+        tag_values['CarRegistedDate']      = ''
+        tag_values['CarRegistedDateYear']  = ''
+        tag_values['CarRegistedDateMonth'] = ''
     for tag_name, value in tag_values.items():
         if merge_mode and not value:
             continue  # マージモード: 空値はスキップ（テンプレートの既存値を保持）
@@ -5292,7 +5341,12 @@ def main():
                         _tpl_raw = decompress_neo(_neo_bytes_read, _tpl_ck)
                         _tpl_mgmt, _tpl_entries = parse_entries(_neo_bytes_read, _tpl_ck[0])
                         _tpl_files = extract_files(_tpl_raw, _tpl_entries)
-                        _tpl_ok = 'AnSMB.txt' in _tpl_files
+                        # 内包ファイルは12個で固定。管理領域の長さが想定と違う
+                        # NEOだと、ファイルテーブルの途中から読み始めてしまい
+                        # 先頭の数ファイルを黙って落としたまま「生成成功」に
+                        # なる。壊れたNEOを出荷しないよう件数でも弾く。
+                        _tpl_ok = ('AnSMB.txt' in _tpl_files
+                                   and len(_tpl_entries) == 12)
                 except Exception:
                     _tpl_ok = False
                 if not _tpl_ok:
