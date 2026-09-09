@@ -47,6 +47,7 @@ import io
 import re
 import traceback
 import pandas as pd
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 # ============================================================
@@ -396,17 +397,55 @@ def safe_int(val, default=0):
         return val
     if isinstance(val, float):
         return int(round(val))
-    s = str(val).strip()
-    # 単位除去
-    s = re.sub(r'[個本枚セット台式時間]$', '', s)
-    s = re.sub(r'[円¥,，\s]', '', s)
-    s = re.sub(r'[^\d.\-]', '', s)
-    if not s or s == '-':
+    s = _normalize_number_text(str(val))
+    if s is None:
         return default
     try:
         return int(round(float(s)))
     except (ValueError, OverflowError):
         return default
+
+
+def _xml_escape(value) -> str:
+    """ReportLabのParagraphに渡す前のエスケープ。
+
+    Paragraphは簡易XMLを解釈するため、品名に & や < が含まれると
+    描画時に例外になったり文字が消えたりする。
+    """
+    return (str(value if value is not None else '')
+            .replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+
+
+def _normalize_number_text(raw):
+    """金額・数量の文字列を符号付きの数値文字列に正規化する。解釈不能なら None。
+
+    見積書では値引きが「△5,000」「▲5,000」「(5,000)」「－5,000」と書かれる。
+    以前は記号を一律に削っていたため、これらが全て +5,000 になり、
+    値引きが加算されて請求額が過大になっていた。
+    """
+    import unicodedata as _ud
+    s = _ud.normalize('NFKC', str(raw)).strip()
+    if not s:
+        return None
+    # 括弧書きは会計表記のマイナス
+    is_negative = False
+    if re.fullmatch(r'\(\s*[^()]*\s*\)', s):
+        is_negative = True
+        s = s[1:-1].strip()
+    # NFKC は U+2212(−) を ASCII の - に変換しないため明示的に含める
+    if re.match(r'^[△▲▽▼\-\u2212\u30fc\u2010-\u2015]', s):
+        is_negative = True
+    s = re.sub(r'^[△▲▽▼\-\u2212\u2010-\u2015]+', '', s)
+    # 単位・通貨・区切り
+    s = re.sub(r'(個|本|枚|セット|台|式|時間)$', '', s)
+    s = re.sub(r'[円¥￥,\s]', '', s)
+    # 「1,234-」は「1,234円」の慣用表記
+    s = re.sub(r'[\-ー―–—]+$', '', s)
+    if not s:
+        return None
+    if not re.fullmatch(r'\d+(\.\d+)?', s):
+        return None
+    return ('-' + s) if is_negative else s
 
 
 def safe_float(val, default=0.0):
@@ -1292,6 +1331,12 @@ def enhance_image_for_ocr(image_bytes):
         return image_bytes
 
 
+# pdfium(pypdfium2) はスレッドセーフでないため、呼び出しを直列化する
+_PDFIUM_LOCK = threading.Lock()
+# ラスタライズ時の総画素数上限（約40メガピクセル）。A3@300dpi でも約17Mpxなので余裕がある。
+MAX_RASTER_PIXELS = 40_000_000
+
+
 def rasterize_pdf_page(pdf_bytes, page_index, dpi=200, enhance=False):
     """
     PDFの指定ページをJPEG画像バイト列に変換。
@@ -1319,19 +1364,36 @@ def rasterize_pdf_page(pdf_bytes, page_index, dpi=200, enhance=False):
 
     # ── 方法2: pypdfium2 (フォールバック) ──────────────────
     if result is None:
-        try:
-            import pypdfium2 as pdfium
-            doc     = pdfium.PdfDocument(pdf_bytes)
-            page    = doc[page_index]
-            scale   = dpi / 72.0
-            bitmap  = page.render(scale=scale)
-            pil_img = bitmap.to_pil()
-            buf     = io.BytesIO()
-            pil_img.save(buf, format='JPEG', quality=90)
-            doc.close()
-            result = buf.getvalue()
-        except Exception:
-            pass
+        # pdfium はスレッドセーフではない。複数スレッドから同時に呼ぶと
+        # Cヒープが壊れてプロセスごと落ちる（Streamlitのサーバ全体が死ぬ）ため、
+        # ここはプロセス内で必ず直列に実行する。
+        with _PDFIUM_LOCK:
+            try:
+                import pypdfium2 as pdfium
+                doc     = pdfium.PdfDocument(pdf_bytes)
+                try:
+                    page    = doc[page_index]
+                    scale   = dpi / 72.0
+                    # 巨大ページ（A0など）を高DPIで描くと1GB超のメモリを使い
+                    # コンテナごとOOMで落ちるため、総画素数で上限を掛ける。
+                    try:
+                        w_pt, h_pt = page.get_size()
+                        px = (w_pt * scale) * (h_pt * scale)
+                        if px > MAX_RASTER_PIXELS and px > 0:
+                            scale *= (MAX_RASTER_PIXELS / px) ** 0.5
+                            print(f"[rasterize] ページが大きいため解像度を下げました "
+                                  f"(scale={scale:.3f})")
+                    except Exception:
+                        pass
+                    bitmap  = page.render(scale=scale)
+                    pil_img = bitmap.to_pil()
+                    buf     = io.BytesIO()
+                    pil_img.save(buf, format='JPEG', quality=90)
+                    result = buf.getvalue()
+                finally:
+                    doc.close()
+            except Exception as _rast_err:
+                print(f"[rasterize] pypdfium2でのページ画像化に失敗: {_rast_err}")
 
     # ── 画像前処理（FAX品質改善用） ──────────────────
     if result and enhance:
@@ -1816,19 +1878,23 @@ def generate_discrepancy_report_pdf(discrepancies, total_diff, vehicle_info):
         qty = d.get('quantity', 1)
         diff = (master_price - ocr_price) * qty
         
+        # 品名は Paragraph に包む。素の文字列だと ReportLab が折り返さず、
+        # 長い品名が右隣の金額欄に重なって数字が読めなくなる。
+        _name_style = styles['JapaneseNormal']
         table_data.append([
             no_str,
             judgment,
-            ocr_name,
+            Paragraph(_xml_escape(ocr_name), _name_style),
             f"¥{ocr_price:,}",
-            master_name,
+            Paragraph(_xml_escape(master_name), _name_style),
             f"¥{master_price:,}",
             str(qty),
             f"¥{diff:,}"
         ])
 
     # テーブルスタイル
-    t = Table(table_data, colWidths=[10*mm, 15*mm, 35*mm, 20*mm, 35*mm, 20*mm, 10*mm, 25*mm])
+    t = Table(table_data, colWidths=[10*mm, 15*mm, 35*mm, 20*mm, 35*mm, 20*mm, 10*mm, 25*mm],
+              repeatRows=1)  # 改ページ後も見出し行を繰り返す
     t.setStyle(TableStyle([
         ('FONT', (0,0), (-1,-1), font_name, 9),
         ('ALIGN', (0,0), (-1,0), 'CENTER'),
@@ -3571,13 +3637,23 @@ def _self_correction_retry(api_key, file_bytes, mime_type, model_name,
         new_items  = new_result.get('items', []) or new_result.get('details', [])
         if not new_items:
             return None
+        # 呼び出し側は result['items'] しか見ないため、'details' で返ってきた
+        # 正しい修正が捨てられていた。ここで 'items' に正規化しておく。
+        new_result['items'] = new_items
         new_parts  = sum(safe_int(it.get('parts_amount', 0)) for it in new_items)
         new_wage   = sum(safe_int(it.get('wage', 0))         for it in new_items)
         old_error  = abs(parts_diff) + abs(wage_diff)
         new_error  = abs(new_parts - target_parts) + abs(new_wage - target_wage)
-        if new_error < old_error:
-            return new_result  # 改善された → 採用
-        return None  # 改善なし
+        if new_error >= old_error:
+            return None  # 改善なし
+        # 明細数が大きく減る修正は、金額だけ合わせて中身を失っている可能性が高い。
+        # 完全一致するのでない限り採用しない。
+        old_count = len(original_items or [])
+        if old_count and len(new_items) < old_count * 0.7 and new_error != 0:
+            print(f"[WARN] 自己修復が明細を {old_count}行 → {len(new_items)}行 に"
+                  f"減らしたため不採用（残差 {new_error:,}円）")
+            return None
+        return new_result  # 改善された → 採用
     except Exception as e:
         import sys
         print(f"[WARN] _self_correction_retry 例外: {e}", file=sys.stderr)
@@ -3836,10 +3912,17 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     # ページ境界に限らず全行を対象にした重複除去。
     # ・Page1のAIがPage2の明細を合計額に合わせて先読み出力するケースを防止
     # ・同一ページ内で先頭数行を2回出力するAIの誤動作を防止
-    _before_dedup = len(result['items'])
-    result['items'] = global_dedup_items(result['items'])
-    _after_dedup = len(result['items'])
-    _logw(f"⑥ 全体重複除去: {_before_dedup}行 → {_after_dedup}行 ({_before_dedup - _after_dedup}件除去)")
+    # ※ この重複除去は「PDFを分割して複数回AIに投げる」時代のチャンク重複対策。
+    #    現在は1回のリクエストでPDF全体を解析するため重複の発生源が無く、
+    #    同じ部品が2行並ぶ正当な明細（左右のクリップ等）を消して金額を
+    #    欠落させるだけになっていた。分割解析した場合のみ適用する。
+    if result.get('_chunked'):
+        _before_dedup = len(result['items'])
+        result['items'] = global_dedup_items(result['items'])
+        _after_dedup = len(result['items'])
+        _logw(f"⑥ 全体重複除去: {_before_dedup}行 → {_after_dedup}行 ({_before_dedup - _after_dedup}件除去)")
+    else:
+        _logw("⑥ 全体重複除去: 分割解析ではないためスキップ（正当な重複明細を保持）")
 
     # ⑥-b 辞書ベースバリデーション
     result['items'] = validate_and_correct_items(result['items'])
@@ -3903,8 +3986,11 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
             _w_diff = abs((_cur_wage + _sc_sp) - result['pdf_wage_total'])
             if _p_diff == 0 and _w_diff == 0:
                 break  # 完全一致 → 修正不要
+            # 修復には明細解析と同じ入力（PDF全体）を渡す。
+            # ラスタ画像は最終ページ1枚だけなので、全体の再抽出を頼むと
+            # 最終ページの内容で全明細が置き換わってしまう。
             retry = _self_correction_retry(
-                api_key, raster_bytes, raster_mime, used_model,
+                api_key, file_bytes, mime_type, used_model,
                 result['items'],
                 result['pdf_parts_total'],
                 result['pdf_wage_total'],
@@ -3958,11 +4044,20 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     p_mismatch = (doc_p > 0) and (p_diff != 0)
     w_mismatch = (doc_w > 0) and (w_diff != 0)
     is_match = (not p_mismatch and not w_mismatch)
+    # 合計欄の解析自体に失敗した（部品計・工賃計とも取得できなかった）場合、
+    # 「差が無い＝一致」と報告してはいけない。検証できていないだけで、
+    # 通信エラーとの区別がつかなくなる。
+    _totals_unavailable = (doc_p <= 0 and doc_w <= 0)
+    if _totals_unavailable:
+        result['_totals_unavailable'] = True
+        is_match = None
     # Geminiが返したtotals_verificationがある場合はそちらを優先
     if not result.get('totals_verification'):
         _err_parts = []
         if p_mismatch: _err_parts.append(f'部品差額{p_diff:+,}円')
         if w_mismatch: _err_parts.append(f'工賃差額{w_diff:+,}円')
+        if _totals_unavailable:
+            _err_parts.append('見積書の合計欄を読み取れませんでした（検証未実施）')
         result['totals_verification'] = {
             'calculated_parts_total': calc_p,
             'calculated_labor_total': calc_w,
