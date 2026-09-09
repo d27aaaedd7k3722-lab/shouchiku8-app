@@ -4575,11 +4575,22 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
         # どちらの解釈でも可）なら、小計のほうが正しく、足りないのは明細。
         # そこで小計を明細合算で上書きすると、行が落ちている唯一の証拠を
         # 消してしまい、1行少ない見積が無警告で出る。上書きしない。
-        _cv_pw_stated = _cv_p_stated + _cv_w_stated
-        _cv_pw_ok = (abs(_cv_pw_stated - _cv_grand) <= max(int(_cv_grand * 0.01), 100)
-                     or abs(int(round(_cv_pw_stated * 1.10)) - _cv_grand)
-                     <= max(int(_cv_grand * 0.01), 100))
-        if _cv_match_grand and (_cv_p_wrong or _cv_w_wrong) and not _cv_pw_ok:
+        # 印字された部品計・工賃計は値引き前の小計、総合計は値引き後。
+        # 値引きを引いてから突き合わせないと、値引きのある見積では
+        # 必ず辻褄が合わないと判定され、上書きを止められない。
+        _cv_disc = safe_int(result.get('discount_amount', 0))
+        _cv_pw_stated = _cv_p_stated + _cv_w_stated - _cv_disc
+        _cv_eps = max(int(_cv_grand * 0.01), 100)
+        _cv_pw_ok = (abs(_cv_pw_stated - _cv_grand) <= _cv_eps
+                     or abs(int(round(_cv_pw_stated * 1.10)) - _cv_grand) <= _cv_eps)
+        # 明細合算が印字小計より「少ない」側は、行が落ちている可能性がある。
+        # そこを上書きすると、落ちている唯一の証拠を消して無警告で通してしまう。
+        # 上書きしてよいのは、明細のほうが多い／列の振り分けが違うだけの場合。
+        _cv_floor = max(int(_cv_grand * 0.001), 100)
+        _cv_p_short = _cv_calc_p < _cv_p_stated - _cv_floor
+        _cv_w_short = (_cv_calc_w + _cv_sp) < _cv_w_stated - _cv_floor
+        if (_cv_match_grand and (_cv_p_wrong or _cv_w_wrong)
+                and not _cv_pw_ok and not (_cv_p_short or _cv_w_short)):
             import sys as _sys_cv
             print(f"[INFO] cross-validation: Gemini stated totals誤り検出 → 明細合算値で上書き", file=_sys_cv.stderr)
             print(f"  Gemini: 部品={_cv_p_stated:,}, 工賃={_cv_w_stated:,}", file=_sys_cv.stderr)
