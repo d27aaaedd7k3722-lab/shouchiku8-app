@@ -24,6 +24,27 @@ import tempfile
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 logger = logging.getLogger(__name__)
+
+
+def _pdfium_lock():
+    """pdfium はスレッドセーフでないため、app 側と同じロックで直列化する。
+
+    複数スレッドから同時に触るとCヒープが壊れてプロセスごと落ちるため、
+    app.py が持つロックを共有する。取得できない場合はこのモジュール専用の
+    ロックを使う（少なくとも自分同士の同時実行は防げる）。
+    """
+    try:
+        from app import _PDFIUM_LOCK  # type: ignore
+        return _PDFIUM_LOCK
+    except Exception:
+        global _LOCAL_PDFIUM_LOCK
+        if _LOCAL_PDFIUM_LOCK is None:
+            import threading
+            _LOCAL_PDFIUM_LOCK = threading.Lock()
+        return _LOCAL_PDFIUM_LOCK
+
+
+_LOCAL_PDFIUM_LOCK = None
 if not logger.handlers:
     _h = logging.StreamHandler()
     _h.setFormatter(logging.Formatter("[pdf_to_neo_pipeline] %(levelname)s %(message)s"))
@@ -189,14 +210,18 @@ def _extract_pdf_text_layer(pdf_path: str) -> str:
     # pypdfium2 fallback
     try:
         import pypdfium2 as pdfium  # type: ignore
-        pdf = pdfium.PdfDocument(pdf_path)
-        chunks = []
-        for page in pdf:
+        with _pdfium_lock():
+            pdf = pdfium.PdfDocument(pdf_path)
             try:
-                tp = page.get_textpage()
-                chunks.append(tp.get_text_range() or "")
-            except Exception:
-                continue
+                chunks = []
+                for page in pdf:
+                    try:
+                        tp = page.get_textpage()
+                        chunks.append(tp.get_text_range() or "")
+                    except Exception:
+                        continue
+            finally:
+                pdf.close()
         return "\n".join(chunks)
     except Exception as e:
         logger.warning("PDFテキスト抽出失敗 %s: %s", pdf_path, e)
@@ -221,14 +246,18 @@ def _extract_pdf_text_from_bytes(pdf_bytes: bytes) -> str:
     try:
         import pypdfium2 as pdfium  # type: ignore
         import io
-        pdf = pdfium.PdfDocument(io.BytesIO(pdf_bytes))
-        chunks = []
-        for page in pdf:
+        with _pdfium_lock():
+            pdf = pdfium.PdfDocument(io.BytesIO(pdf_bytes))
             try:
-                tp = page.get_textpage()
-                chunks.append(tp.get_text_range() or "")
-            except Exception:
-                continue
+                chunks = []
+                for page in pdf:
+                    try:
+                        tp = page.get_textpage()
+                        chunks.append(tp.get_text_range() or "")
+                    except Exception:
+                        continue
+            finally:
+                pdf.close()
         return "\n".join(chunks)
     except Exception as e:
         logger.warning("PDFテキスト抽出(bytes)失敗: %s", e)
@@ -615,6 +644,9 @@ def _final_dedup_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 if sig[0] and sig == _sig(prev):
                     prev_page = prev.get("page")
                     cur_page = it.get("page")
+                    # page が無い明細（CSV取り込み等）は、どのページ由来か
+                    # 判断できないので統合しない。誤って正当な明細を消すより、
+                    # 重複が残る方が実害が小さい。
                     if prev_page is not None and cur_page is not None and prev_page != cur_page:
                         logger.info("[dedup] ページ境界の重複行を統合: %s (p%s/p%s)",
                                     sig[0], prev_page, cur_page)
@@ -1384,7 +1416,10 @@ def process_pdf_to_neo(pdf_path,
             # Iter11: 車検証OCRと見積書OCRを並列実行（pdf_bytes同一でも別関数なので重複しない）
             from concurrent.futures import ThreadPoolExecutor as _TPE
             _vi_future = None
+            _ex = None
             if need_vi:
+                # shutdown しないとワーカースレッドが残り続けるため、
+                # 結果取得後に必ず片付ける（下の finally）
                 _ex = _TPE(max_workers=2)
                 try:
                     from app import analyze_vehicle_registration  # type: ignore
@@ -1405,6 +1440,11 @@ def process_pdf_to_neo(pdf_path,
                 except Exception as e:
                     vehicle_info = {}
                     warnings.append(f"vehicle OCR 失敗: {e}")
+            if _ex is not None:
+                # 結果は受け取り済み。放置するとワーカースレッドが
+                # 実行ごとに1本ずつ残り続ける。
+                _ex.shutdown(wait=False)
+                _ex = None
             if need_items:
                 try:
                     from app import analyze_estimate  # type: ignore
