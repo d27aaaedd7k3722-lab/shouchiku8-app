@@ -1023,7 +1023,21 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             # ※ の2バイトぶん先に詰めてから付ける。後から付けると
             # 列幅24バイトの切り詰めで品名の末尾が余計に落ちる
             # （「…カバー下部」が「…カバー」になり別部品に読める）。
-            name = '※' + cp932_trim(name, _ERPARTS_WIDTH['PartsName'] - 2)
+            _avail = _ERPARTS_WIDTH['PartsName'] - 2
+            # 末尾の左右は最後まで残す。列幅ちょうどの品名だと
+            # 「フロントバンパーカバー左」と「…右」が両方
+            # 「※フロントバンパーカバー」になり、左右の部品が
+            # 同じ文字列で並ぶ。しかも未マッチ行、つまり利用者が
+            # 最も見分ける必要のある行で起きる。
+            # 「左側」「右側」のように左右の後ろに1字続く形も拾う。
+            _m_side = re.search(
+                r'[（(\[]?\s*(左|右|Ｌ|Ｒ|LH|RH|L|R)\s*(側|前|後)?\s*[)）\]]?$', name)
+            if _m_side and len(name.encode('cp932', 'replace')) > _avail:
+                _side_txt = name[_m_side.start():]
+                _side_len = len(_side_txt.encode('cp932', 'replace'))
+                _body = name[:_m_side.start()]
+                name = cp932_trim(_body, max(_avail - _side_len, 0)) + _side_txt
+            name = '※' + cp932_trim(name, _avail)
         
         # 区分: work_code（Markdownパーサー保存先）または method から取得
         method = item.get('method', '') or item.get('work_code', '')

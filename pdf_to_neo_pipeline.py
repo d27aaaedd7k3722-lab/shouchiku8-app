@@ -2185,6 +2185,21 @@ def process_pdf_to_neo(pdf_path,
     out["mode"] = mode
     log.append(f"mode={mode}")
 
+    # ページ境界の二重読み取りの統合は、これまで NEO 生成の直前
+    # （_call_generate_neo の中）で黙って行われていた。画面のプレビューは
+    # 統合前の行数を出すので、画面の行数と .neo の行数が食い違ったまま
+    # 利用者に何も伝わらない。ここで先に済ませて、統合したことを知らせる。
+    _before = len(items or [])
+    items = _final_dedup_items(items or [])
+    _merged = _before - len(items)
+    if _merged > 0:
+        out["items"] = items
+        out["dedup_merged"] = _merged
+        warnings.append(
+            f"ページの境目で二重に読み取られた明細を{_merged}行統合しました"
+            f"（{_before}行 → {len(items)}行）。同じ部品が原本にも複数行ある場合は"
+            "統合していませんが、生成前にプレビューで行数をご確認ください。")
+
     # 5) NEO生成
     if not (vehicle_info or items):
         log.append("vehicle_info/items 共に空のため NEO生成スキップ")
