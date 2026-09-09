@@ -421,6 +421,22 @@ def _xml_escape(value) -> str:
             .replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
 
 
+def jpy_round(value) -> int:
+    """日本の商習慣どおり四捨五入して整数の円にする。
+
+    Python の round() は偶数丸め（round(10.5)==10）なので、
+    消費税の計算に使うと約20件に1件、1円少なくなる。
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+    try:
+        return int(Decimal(str(value)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+    except Exception:
+        try:
+            return int(round(float(value)))
+        except (TypeError, ValueError):
+            return 0
+
+
 def _normalize_date8(raw) -> str:
     """日付入力を YYYYMMDD の8桁に正規化する。解釈できなければ空文字。
 
@@ -781,13 +797,13 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         if is_tax_inclusive:
             # 税込: 金額は既に税込値 → OutTax=税抜逆算, InTax=そのまま, Tax=差額
             if parts_total != 0:
-                parts_outtax = round(parts_total / (1 + TAX_RATE))
+                parts_outtax = jpy_round(parts_total / (1 + TAX_RATE))
                 parts_intax  = parts_total
                 parts_tax    = parts_total - parts_outtax
             else:
                 parts_outtax = 0; parts_intax = 0; parts_tax = 0
             if wage_total != 0:
-                wage_outtax  = round(abs(wage_total) / (1 + TAX_RATE))
+                wage_outtax  = jpy_round(abs(wage_total) / (1 + TAX_RATE))
                 if wage_total < 0:
                     wage_outtax = -wage_outtax
                 wage_intax   = wage_total
@@ -797,10 +813,10 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         else:
             # 税抜: 従来通り
             parts_outtax = parts_total
-            parts_tax    = round(parts_total * TAX_RATE) if parts_total != 0 else 0
+            parts_tax    = jpy_round(parts_total * TAX_RATE) if parts_total != 0 else 0
             parts_intax  = parts_total + parts_tax if parts_total != 0 else 0
             wage_outtax  = wage_total
-            wage_tax_abs = round(abs(wage_total) * TAX_RATE) if wage_total != 0 else 0
+            wage_tax_abs = jpy_round(abs(wage_total) * TAX_RATE) if wage_total != 0 else 0
             wage_tax     = wage_tax_abs if wage_total >= 0 else -wage_tax_abs
             wage_intax   = wage_total + wage_tax if wage_total != 0 else 0
         total_parts += parts_outtax
@@ -897,33 +913,35 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         if amount == 0:
             return 0, 0, 0
         if inclusive:
-            outtax = round(amount / (1 + TAX_RATE))
+            outtax = jpy_round(amount / (1 + TAX_RATE))
             intax  = amount
             tax    = amount - outtax
         else:
             outtax = amount
-            tax    = round(amount * TAX_RATE)
+            tax    = jpy_round(amount * TAX_RATE)
             intax  = amount + tax
         return outtax, intax, tax
 
     # ── Expense各行を更新 ──
     # LineNo=4: ショートパーツ
     sp_wage = safe_int(short_parts_wage)
-    sp_out, sp_intax, sp_tax = _calc_tax(sp_wage, is_tax_inclusive)
+    # サイドバーの費用欄は「（税抜）」と明示しているため、明細の税区分に
+    # かかわらず常に税抜として扱う。以前は税込モードで9.1%目減りしていた。
+    sp_out, sp_intax, sp_tax = _calc_tax(sp_wage, False)
     cur.execute("""UPDATE Expense SET
         WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
         WHERE LineNo=4""", (1 if sp_wage > 0 else 0, sp_out, sp_intax, sp_tax))
 
     # LineNo=1: レッカー費用（課税）
     towing = safe_int(expenses.get('towing', 0))
-    tow_out, tow_intax, tow_tax = _calc_tax(towing, is_tax_inclusive)
+    tow_out, tow_intax, tow_tax = _calc_tax(towing, False)
     cur.execute("""UPDATE Expense SET
         WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
         WHERE LineNo=1""", (1 if towing > 0 else 0, tow_out, tow_intax, tow_tax))
 
     # LineNo=2: 代車費用（課税）
     rental_car = safe_int(expenses.get('rental_car', 0))
-    rent_out, rent_intax, rent_tax = _calc_tax(rental_car, is_tax_inclusive)
+    rent_out, rent_intax, rent_tax = _calc_tax(rental_car, False)
     cur.execute("""UPDATE Expense SET
         WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
         WHERE LineNo=2""", (1 if rental_car > 0 else 0, rent_out, rent_intax, rent_tax))
@@ -938,11 +956,11 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
     # total_parts / total_wages は既に税抜値（is_tax_inclusive時は逆算済み）
     taxable_expenses = sp_out + tow_out + rent_out
     sub_total         = total_parts + total_wages + taxable_expenses
-    tax_total         = round(sub_total * TAX_RATE)
+    tax_total         = jpy_round(sub_total * TAX_RATE)
     grand_total       = sub_total + tax_total + tax_exempt  # 非課税は税計算後に加算
-    parts_tax_total   = round(total_parts * TAX_RATE)
-    wages_tax_total   = round(total_wages * TAX_RATE)
-    sp_tax_total      = round(sp_out * TAX_RATE)
+    parts_tax_total   = jpy_round(total_parts * TAX_RATE)
+    wages_tax_total   = jpy_round(total_wages * TAX_RATE)
+    sp_tax_total      = jpy_round(sp_out * TAX_RATE)
     cur.execute("""UPDATE Total SET
         ms_PartsTotalOutTax=?,
         ms_PartsTotalInTax=?,
@@ -1195,6 +1213,8 @@ def update_mail_ini(orig_bytes, cust, grand_total, merge_mode=False):
         'CarNoKana':     car_biz,
         'CarNoSeries':   car_serial,
         'Total':         grand_total,
+        # 作成日を更新しないと、どの見積にもテンプレート作成時の日付が残る
+        'CreatedDate':   datetime.datetime.now().strftime('%Y/%m/%d'),
     }
     if term_date and term_date != '00000000':
         term_era, term_era_year = get_era_info(term_date)
@@ -1220,7 +1240,8 @@ def update_mail_ini(orig_bytes, cust, grand_total, merge_mode=False):
     for tag_name, value in tag_values.items():
         if merge_mode and not value:
             continue  # マージモード: 空値はスキップ（テンプレートの既存値を保持）
-        text = replace_xml_tag(text, tag_name, value)
+        # 値に & や < が入るとXMLが壊れるためエスケープする（法人名の「＆」等）
+        text = replace_xml_tag(text, tag_name, _xml_escape(value))
     return text.encode('cp932', errors='replace')
 
 
@@ -2353,6 +2374,10 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
     }
     result = {}
     _method_used = ""
+    _last_error = None
+    if not api_key:
+        # キーが無ければ呼ぶ前に失敗を返す（黙って空の車両情報を返さない）
+        return {'_error': 'Gemini APIキーが設定されていません'}
     try:
         from google.genai import types
         client = _get_genai_client(api_key)
@@ -2377,6 +2402,7 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
     except Exception as e:
         print(f"[shaken_ocr] response_schema failed: {e}")
         _method_used = "fallback"
+        _last_error = e
 
     # 方式1で空結果 → 方式2: シンプルなJSON modeにフォールバック
     if not result or not any(v for v in result.values() if v and str(v).strip()):
@@ -2394,6 +2420,18 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
         except Exception as e2:
             print(f"[shaken_ocr] json_mode fallback also failed: {e2}")
             result = {}
+            _last_error = e2
+
+    # 2方式とも空 → 失敗として理由を返す。空dictを返すと呼び出し側が
+    # 「読み取れたが全項目が空」と区別できず、車両情報なしのNEOが
+    # 黙って作られてしまう。
+    if not result or not any(v for v in result.values() if v and str(v).strip()):
+        _msg = str(_last_error) if _last_error else '車検証のページを判別できませんでした'
+        if '429' in _msg or 'RESOURCE_EXHAUSTED' in _msg:
+            _msg = 'Gemini APIのクォータが上限に達しました'
+        elif 'API key not valid' in _msg or 'API_KEY_INVALID' in _msg:
+            _msg = 'Gemini APIキーが正しくありません'
+        return {'_error': _msg}
 
     # 数値フィールドを文字列→数値に変換（response_schema が string 型で返すため）
     for int_key in ('car_weight', 'engine_displacement', 'kilometer'):
@@ -2491,14 +2529,35 @@ def parse_csv_to_items(csv_text: str) -> list:
     if not rows:
         return items
 
-    # ヘッダ行を特定（"品名" を含む行を探す）
+    # ヘッダ行を特定する。「品名」が無くてもヘッダらしい行なら読み飛ばす。
+    # 以前は先頭セルに「品名」が無いとヘッダ行をそのまま明細として
+    # 取り込み、「品目」のような別表記で先頭行がゴミ明細になっていた。
+    _HEADER_WORDS = ('品名', '品目', '部品名', '名称', '区分', '数量', '金額',
+                     '部品金額', '工賃', '部品コード', '部品番号', '工数')
+
+    def _looks_like_header(r):
+        if not r:
+            return False
+        cells = [c.strip() for c in r if c is not None]
+        if not any(cells):
+            return False
+        # 数字だけのセルが1つでもあれば明細行とみなす
+        for c in cells[1:]:
+            if c and re.fullmatch(r'[\d,．.\-]+', c):
+                return False
+        return sum(1 for c in cells if any(w in c for w in _HEADER_WORDS)) >= 2
+
     header_idx = 0
-    for i, row in enumerate(rows):
-        if row and '品名' in row[0]:
-            header_idx = i + 1  # 次行からデータ
+    for i, row in enumerate(rows[:5]):
+        if row and '品名' in (row[0] or ''):
+            header_idx = i + 1
+            break
+        if _looks_like_header(row):
+            header_idx = i + 1
             break
 
     row_idx = 0
+    _trailer_notes = []
     for row in rows[header_idx:]:
         if not row or not any(c.strip() for c in row):
             continue
@@ -2515,8 +2574,20 @@ def parse_csv_to_items(csv_text: str) -> list:
 
         if not name:
             continue
-        # 合計・小計行を除外
-        if any(kw in name for kw in ('合計', '小計', '消費税', '税額', '値引', '総額')):
+        # アプリ自身のプロンプトが末尾に付ける差異メモは明細ではない
+        if re.match(r'^(部品|工賃)相違', name.strip()):
+            _trailer_notes.append(','.join(c.strip() for c in row if c.strip()))
+            continue
+        # 合計行の除外。ただし金額のある行は消さない。
+        # 以前は品名の部分一致で判定していたため、「特別値引 -5,000」や
+        # 「合計表示灯」のような正当な明細まで消えて金額が狂っていた。
+        _nm = name.strip()
+        _is_total_row = (
+            _nm in ('合計', '小計', '消費税', '税額', '総額', '値引', '値引き',
+                    '合計金額', '小計金額', '消費税額', '総額計')
+            or re.fullmatch(r'(合計|小計|総額|消費税|税額)[（(].*[）)]', _nm) is not None
+        )
+        if _is_total_row and parts_amt == 0 and wage_amt == 0:
             continue
         if qty < 1:
             qty = 1
@@ -4121,10 +4192,24 @@ def main():
             )
             if custom_neo_file:
                 _neo_bytes_read = custom_neo_file.read()
-                st.session_state['custom_neo_bytes'] = _neo_bytes_read
-                st.session_state['custom_neo_name']  = custom_neo_file.name
                 custom_neo_file.seek(0)
-                st.success(f"✅ {custom_neo_file.name} ({len(_neo_bytes_read):,} bytes)")
+                # 中身がNEOかどうかをこの場で確かめる。最後の生成時まで
+                # 気づけないと、入力をやり直す手間が大きい。
+                try:
+                    _tpl_ok = bool(find_real_cks(_neo_bytes_read))
+                except Exception:
+                    _tpl_ok = False
+                if not _tpl_ok:
+                    st.session_state.pop('custom_neo_bytes', None)
+                    st.session_state.pop('custom_neo_name', None)
+                    st.error(
+                        f"❌ {custom_neo_file.name} はコグニセブンのNEOファイルとして読み取れません。"
+                        "別のファイルを選択してください（デフォルトテンプレートで続行できます）。"
+                    )
+                else:
+                    st.session_state['custom_neo_bytes'] = _neo_bytes_read
+                    st.session_state['custom_neo_name']  = custom_neo_file.name
+                    st.success(f"✅ {custom_neo_file.name} ({len(_neo_bytes_read):,} bytes)")
                 st.caption("📋 テンプレートの工場名・証券番号等はそのまま引き継ぎます")
             elif st.session_state.get('custom_neo_bytes'):
                 _saved_name = st.session_state.get('custom_neo_name', 'テンプレートNEO')
@@ -4257,6 +4342,15 @@ def main():
                         continue
             except Exception:
                 pass
+            if not _csv_text:
+                st.error(
+                    "❌ CSVファイルの文字コードを判別できません。"
+                    "UTF-8 または Shift_JIS で保存し直してください"
+                    "（Excelの「Unicodeテキスト」形式は非対応です）。"
+                )
+            elif not _csv_text.strip():
+                st.error("❌ CSVファイルが空です。")
+                _csv_text = ''
         elif _csv_paste and _csv_paste.strip():
             _csv_text = _csv_paste.strip()
 
@@ -4318,6 +4412,14 @@ def main():
                 st.error(f"❌ {_p2n_res['error']}")
             elif not _p2n_res.get('ok'):
                 st.error("❌ PDFからNEOを生成できませんでした。")
+                for _w in (_p2n_res.get('warnings') or [])[:5]:
+                    st.caption(f"・{_w}")
+            elif not (_p2n_res.get('items') or []):
+                st.error(
+                    "❌ 見積書から明細を1行も読み取れませんでした。"
+                    "スキャン画像で文字が読めない、APIのクォータ超過、"
+                    "対応していない書式のいずれかが考えられます。"
+                )
                 for _w in (_p2n_res.get('warnings') or [])[:5]:
                     st.caption(f"・{_w}")
             else:
@@ -4440,7 +4542,12 @@ def main():
                         vehicle_mime = get_mime_type(vehicle_name) if vehicle_bytes else None
                         vehicle_data = analyze_vehicle_registration(api_key, vehicle_bytes, vehicle_mime) or {}
                     except Exception as _veh_err:
-                        st.warning(f"⚠️ 車検証OCRに失敗しました（{str(_veh_err)[:60]}）。車両情報なしで続行します。")
+                        vehicle_data = {'_error': str(_veh_err)[:120]}
+                    if vehicle_data.get('_error'):
+                        st.warning(
+                            f"⚠️ 車検証を読み取れませんでした（{vehicle_data['_error']}）。"
+                            "車両情報は空のまま進みます。ステップ③で手入力できます。"
+                        )
                         vehicle_data = {}
             st.session_state['vehicle_data'] = vehicle_data
             # CSVアイテムをestimate_dataとして格納
@@ -4460,6 +4567,9 @@ def main():
                 '_vehicle_info':    {},
                 '_repair_shop_name': '',
                 '_csv_import':      True,
+                # CSVは貼り付けた内容がそのまま正なので、PDFとの照合や
+                # 逆算チェックは対象外。以前は必ず不一致の警告が出ていた。
+                '_reverse_match':   True,
             }
             if _is_tax_incl_csv:
                 st.info("💴 税込モード: CSVの金額は税込みとして処理されます")
@@ -4522,7 +4632,13 @@ def main():
             elif vehicle_bytes:
                 # 車検証のみ
                 progress.progress(10, text="🔍 車検証を解析中...")
-                vehicle_data  = analyze_vehicle_registration(api_key, vehicle_bytes, vehicle_mime)
+                vehicle_data  = analyze_vehicle_registration(api_key, vehicle_bytes, vehicle_mime) or {}
+                if vehicle_data.get('_error'):
+                    st.warning(
+                        f"⚠️ 車検証を読み取れませんでした（{vehicle_data['_error']}）。"
+                        "車両情報は空のまま進みます。ステップ③で手入力できます。"
+                    )
+                    vehicle_data = {}
                 estimate_data = None
             else:
                 # 見積書のみ（車検証なし）— 逐次解析でプログレス更新可能
@@ -5101,6 +5217,12 @@ def main():
             tax_label_sfx  = "税込" if is_tax_incl_s3 else "税抜"
 
             # 金額差額の計算
+            # CSV取り込みでは「PDF記載の金額」が存在しないため、
+            # 明細を編集するたびに存在しないPDFとの差異警告が出ていた。
+            _csv_mode_s3 = bool(estimate_data.get('_csv_import'))
+            if _csv_mode_s3:
+                pdf_parts = 0
+                pdf_wages = 0
             parts_diff = calc_parts - pdf_parts if pdf_parts > 0 else 0
             # SP込みでも一致チェック（部品）
             parts_match_sp = (calc_parts + sp == pdf_parts) if pdf_parts > 0 else False

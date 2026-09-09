@@ -1307,7 +1307,10 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                     {"type": "total", "neo": neo_total, "pdf": pdf_parts_total,
                      "note": "部品(税抜)どうしの比較"}
                 )
-            res["ok"] = bool(res["count_match"] and res["total_match"])
+            # 明細が1行も無いのに「一致」と言ってはいけない。
+            # OCRがクォータ超過等で失敗すると 0件 対 0件 で一致してしまい、
+            # 空のNEOに緑の「検証OK」が付いてしまう。
+            res["ok"] = bool(res["count_match"] and res["total_match"] and neo_count > 0)
             return res
         finally:
             try:
