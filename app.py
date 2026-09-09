@@ -47,6 +47,7 @@ import json
 import io
 import re
 import sys
+import copy
 import math
 import unicodedata
 import traceback
@@ -68,6 +69,32 @@ TAX_RATE          = 0.10
 # 空欄のまま 4 を持っているだけで、根拠にならなかった。
 # 誤っていた場合はここだけ直せば済むように1か所にまとめている。
 _ERA_CODE = {'明治': '1', '大正': '2', '昭和': '3', '平成': '4', '令和': '5'}
+
+
+def best_intax_for(intax_total):
+    """税込総額に最も近い「実現できる税込総額」を返す。
+
+    コグニセブンは税抜で保存して消費税を計算するので、実際に .neo に
+    入る総額は必ず S + round(S*0.1) の形になる。見積書に印字された
+    税込総額がこの形で表せない場合（およそ11件に1件）、生成される
+    .neo は原本と1円ずれる。画面とファイルで別々に計算すると、
+    画面が「完全一致」と出したまま1円違うファイルが出るので、
+    両方でこの関数を使う。
+    """
+    if not intax_total:
+        return 0
+    _sign = -1 if intax_total < 0 else 1
+    _v = abs(int(intax_total))
+    base = jpy_round(_v / (1 + TAX_RATE))
+    best, best_err = base, None
+    for off in (0, -1, 1, -2, 2):
+        cand = base + off
+        err = abs(cand + jpy_round(cand * TAX_RATE) - _v)
+        if best_err is None or err < best_err:
+            best, best_err = cand, err
+        if err == 0:
+            break
+    return _sign * (best + jpy_round(best * TAX_RATE))
 # Streamlit Cloud の st.secrets にも対応（ローカルは .env を使用）
 try:
     GEMINI_API_KEY = st.secrets.get('GEMINI_API_KEY', os.environ.get('GEMINI_API_KEY', ''))
@@ -1095,8 +1122,12 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         db_wage_total  = wage_outtax  if wage_total  != 0 else -1
         db_wage_intax  = wage_intax   if wage_total  != 0 else -1
         db_wage_tax    = wage_tax     if wage_total  != 0 else -1
-        # 部品金額がある行のみ数量を設定。脱着など部品なし行は -1（空白）
-        db_qty = qty if parts_total != 0 else -1
+        # 数量は原本の値をそのまま書く。以前は部品金額が0の行を -1（空白）に
+        # していたが、画面のプレビューには数量3と出たまま .neo には入らず、
+        # 同じ .neo の中の AnNote は -1 を 1 に読み替えるため、同じ行の数量が
+        # 画面・明細テーブル・注記で3通りになっていた。「クリップ脱着 3個」の
+        # ように工賃行でも数量に意味がある。原本と同じ値を残す。
+        db_qty = qty
         # ── Addata マスタ照合結果から PartsCode / PartsCodeSub / DisposalCode を設定 ──
         # 区分の判定は切り詰める前の文字列で行う。先に8バイトへ切ると
         # 「ｱｯｾﾝﾌﾞﾘ取替」から「取替」が落ちて区分不明になる。
@@ -4363,7 +4394,12 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
 
     if _cache_key in _analyze_result_cache:
         print("[INFO] キャッシュヒット: 再解析をスキップします", file=sys.stderr)
-        return _analyze_result_cache[_cache_key]
+        # 参照のまま返すと、呼び出し側の書き換えがキャッシュに残る。
+        # このキャッシュはプロセス全体で共有（セッション跨ぎ・利用者跨ぎ）
+        # なので、1回目の生成が書いた値を2回目が入力として読み、
+        # 同じPDFから内訳の違う .neo が出ていた。
+        # items の dict も共有されており、照合結果の書き戻しでも同じ事故が起きる。
+        return copy.deepcopy(_analyze_result_cache[_cache_key])
     # ──────────────────────────────────────────────────────────────────────────
 
     # クォータ超過・提供終了のモデルを避けて使用モデルを決定する。
@@ -6693,6 +6729,20 @@ def main():
                     tax   = jpy_round(sub * TAX_RATE)
                     total = sub + tax + exp_exm
                 st.metric("合計（税込）", f"¥{total:,}")
+                if is_tax_incl_s3:
+                    # 明細ぶんの税込額が「税抜＋消費税」で表せない場合、
+                    # .neo に入る総額はここに出している額と1円ずれる。
+                    # 画面が原本どおりの数字を出したままファイルだけ違うと、
+                    # 突き合わせでは絶対に見つからない。
+                    _items_intax = calc_parts + calc_wages
+                    _achievable = best_intax_for(_items_intax)
+                    if _achievable != _items_intax:
+                        _diff = _achievable - _items_intax
+                        st.caption(
+                            f"⚠️ コグニセブンは税抜で保存して消費税を計算するため、"
+                            f"この税込額（¥{_items_intax:,}）はそのままでは表せません。"
+                            f"生成される .neo の明細合計は ¥{_achievable:,}"
+                            f"（{_diff:+,}円）になります。")
                 if rev_match:
                     st.markdown('<div class="success-box">✅ 逆算一致</div>', unsafe_allow_html=True)
 
@@ -6809,7 +6859,21 @@ def main():
                 if pdf_grand > 0 and (pdf_parts > 0 or pdf_wages > 0) and reverse_ok:
                     passed_checks += 1
                 match_rate = (passed_checks / total_checks * 100) if total_checks > 0 else 0
-                if _beta_all_ok:
+                # 比較相手（見積書に印字された部品計・工賃計・総合計）が
+                # 1つも取れていないときは、何も突き合わせていない。
+                # CSV取り込みは常にこれに当たるのに「PDF原本と完全一致」と
+                # 断言していたため、利用者が原本との突き合わせをここで
+                # 打ち切る根拠になっていた。
+                _has_reference = (pdf_parts > 0 or pdf_wages > 0 or pdf_grand > 0)
+                if not _has_reference:
+                    st.markdown(
+                        '<div class="warning-box" style="padding:10px 16px;margin:8px 0">'
+                        'ℹ️ <b>照合の基準がありません</b> — CSV取り込みなど、'
+                        '見積書に印字された部品計・工賃計・総合計を読み取っていない場合は、'
+                        'アプリ側で突き合わせる相手がありません。'
+                        '下の明細と金額を、原本とご自身で突き合わせてください。</div>',
+                        unsafe_allow_html=True)
+                elif _beta_all_ok:
                     st.markdown(f'<div class="success-box" style="padding:10px 16px;margin:8px 0">✅ <b>ベタ打ち検証: 全項目一致（一致率 {match_rate:.0f}%）</b> — PDF原本とNEO転記内容が完全一致しています。</div>', unsafe_allow_html=True)
                 else:
                     st.markdown(f'<div class="error-box" style="padding:10px 16px;margin:8px 0">⚠️ <b>ベタ打ち検証: 不一致あり（一致率 {match_rate:.0f}%）</b> — PDF原本との差異を確認してください。基準: 99%以上</div>', unsafe_allow_html=True)

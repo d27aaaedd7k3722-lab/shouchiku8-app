@@ -1953,9 +1953,15 @@ def process_pdf_to_neo(pdf_path,
                     )
                     if items_total > 0:
                         log.append(f"[A-4] header総額未取得 → items合計={items_total} を grand_total として登録")
-                        # _meta に書き戻し（後段が利用するため）
+                        # _meta は analyze_estimate の戻り値そのもので、
+                        # そのキャッシュはプロセス全体で共有されている。ここに
+                        # 書き戻すと「調整後の合算」が次回の入力になり、同じPDFから
+                        # 内訳の違う .neo が出る（2回目は調整処理が丸ごと飛ぶ）。
+                        # 自分のコピーにだけ書く。
                         if isinstance(_meta, dict):
+                            _meta = dict(_meta)
                             _meta["pdf_grand_total"] = items_total
+                            out["ocr_meta"] = _meta
                 except Exception:
                     pass
             hdr_parts_total = pdf_p
@@ -1966,15 +1972,25 @@ def process_pdf_to_neo(pdf_path,
             try:
                 _adj = next((it for it in items if it.get("is_adjustment_row")), None)
                 if _adj:
-                    _amt = _to_int(_adj.get("parts_amount")) + _to_int(_adj.get("wage"))
+                    # 部品と工賃を足した純額で知らせると、部品不足と工賃過剰が
+                    # 打ち消し合ったときに「+0円のずれ」と表示しながら、
+                    # 実際には ±1万円の行が1本入る。利用者は実害なしと読んで
+                    # 突き合わせを省いてしまう。部品と工賃を別々に出す。
+                    _adj_p = _to_int(_adj.get("parts_amount"))
+                    _adj_w = _to_int(_adj.get("wage"))
+                    _amt = _adj_p + _adj_w
                     _base = (pdf_p + pdf_w) or pdf_g or 1
-                    _pct = abs(_amt) / _base if _base else 0
+                    # 比率も純額ではなく、大きいほうの絶対値で見る。
+                    # 純額だと打ち消し合ったときに ocr_incomplete の判定も外れる。
+                    _pct = max(abs(_adj_p), abs(_adj_w)) / _base if _base else 0
                     out["adjustment_amount"] = _amt
+                    out["adjustment_parts"] = _adj_p
+                    out["adjustment_wage"] = _adj_w
                     out["adjustment_ratio"] = _pct
                     warnings.append(
-                        f"明細の合算が見積書の合計と {_amt:+,}円"
-                        f"（合計の {_pct:.1%}）ずれていたため、"
-                        "「※金額調整」の行1本で差額を埋めています。"
+                        f"見積書の合計に合わせるため、原本に無い「※金額調整」の行を"
+                        f"1本追加しました（部品 {_adj_p:+,}円 / 工賃 {_adj_w:+,}円"
+                        f"、合計の {_pct:.1%}）。"
                         "明細の読み落としや誤読の可能性が高いので、"
                         "生成前にプレビューで原本と1行ずつ突き合わせてください。")
                     if _pct > 0.05:
