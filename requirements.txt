@@ -10,3 +10,8 @@ python-dotenv==1.2.3
 Pillow==12.3.0
 pdf2image==1.17.0
 pypdfium2==5.13.0
+# PDF→NEO パイプライン（pdf_to_neo_pipeline / auto_matching）のPDFテキスト抽出に使用
+PyMuPDF==1.28.2
+# ページ分割・ページ並べ替え・FAX送付状除去に使用
+# （未導入だとこれらの機能が例外を握り潰して黙って無効化される）
+pypdf==6.4.0

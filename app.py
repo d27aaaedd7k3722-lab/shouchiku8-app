@@ -47,6 +47,7 @@ import io
 import re
 import traceback
 import pandas as pd
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 # ============================================================
@@ -88,12 +89,51 @@ _EXCLUDED_MODEL_KEYWORDS = (
     'deep-research', 'latest', 'exp',
 )
 
-# クォータ超過で利用不可になったモデルを記録（セッション内キャッシュ）
-_quota_exhausted_models: set = set()
-# 提供終了（404 NOT_FOUND / no longer available）と判明したモデルを記録
-_unavailable_models: set = set()
+# Streamlitはユーザー操作のたびにスクリプト全体を再実行するため、モジュール変数は
+# 毎回初期化されてしまう。モデル一覧・利用不可モデルの記録は st.session_state に
+# 逃がして再実行をまたいで保持する（毎回 models.list を叩かないため）。
+_FALLBACK_STORE: dict = {}
 
-_model_availability_cache: dict = {}  # key: api_key_hash, value: list of model IDs
+
+def _persist_store() -> dict:
+    """再実行をまたいで保持されるストアを返す（session_state が使えない場合はモジュール変数）"""
+    try:
+        store = st.session_state.setdefault('_gemini_model_store', {})
+        if isinstance(store, dict):
+            return store
+    except Exception:
+        pass
+    return _FALLBACK_STORE
+
+
+def _quota_exhausted_set() -> set:
+    """クォータ超過で利用不可になったモデルの集合"""
+    store = _persist_store()
+    val = store.get('quota_exhausted')
+    if not isinstance(val, set):
+        val = set()
+        store['quota_exhausted'] = val
+    return val
+
+
+def _unavailable_set() -> set:
+    """提供終了（404 NOT_FOUND / no longer available）と判明したモデルの集合"""
+    store = _persist_store()
+    val = store.get('unavailable')
+    if not isinstance(val, set):
+        val = set()
+        store['unavailable'] = val
+    return val
+
+
+def _availability_cache() -> dict:
+    """APIキーごとの利用可能モデル一覧キャッシュ"""
+    store = _persist_store()
+    val = store.get('availability')
+    if not isinstance(val, dict):
+        val = {}
+        store['availability'] = val
+    return val
 
 # 解析結果キャッシュ: 同一ファイル（md5）の再解析を防ぐ（セッション中に有効）
 # key: md5_hex + "_" + model_name + "_" + str(use_rasterize) → value: 解析結果dict
@@ -113,8 +153,8 @@ def _is_model_unavailable_error(err_msg: str) -> bool:
 def _mark_model_unavailable(api_key: str, model_name: str):
     """提供終了モデルを記録し、モデル一覧キャッシュを破棄する"""
     if model_name:
-        _unavailable_models.add(model_name)
-    _model_availability_cache.pop(_model_cache_key(api_key), None)
+        _unavailable_set().add(model_name)
+    _availability_cache().pop(_model_cache_key(api_key), None)
 
 
 def _model_sort_key(name: str):
@@ -160,18 +200,18 @@ def get_available_gemini_models(api_key: str) -> list:
     if not api_key:
         return [_FALLBACK_MODEL]
     cache_key = _model_cache_key(api_key)
-    if cache_key in _model_availability_cache:
-        return _model_availability_cache[cache_key]
+    if cache_key in _availability_cache():
+        return _availability_cache()[cache_key]
     api_models = _list_models_from_api(api_key)
     if api_models:
         candidates = sorted(set(api_models), key=_model_sort_key)
     else:
         candidates = list(_PREFERRED_MODELS)
     result = [m for m in candidates
-              if m not in _quota_exhausted_models and m not in _unavailable_models]
+              if m not in _quota_exhausted_set() and m not in _unavailable_set()]
     if not result:
-        result = [m for m in candidates if m not in _unavailable_models] or [_FALLBACK_MODEL]
-    _model_availability_cache[cache_key] = result
+        result = [m for m in candidates if m not in _unavailable_set()] or [_FALLBACK_MODEL]
+    _availability_cache()[cache_key] = result
     return result
 
 
@@ -179,7 +219,7 @@ def get_default_gemini_model(api_key: str) -> str:
     """利用可能なモデルの中から最優先モデルを返す。クォータ超過・提供終了モデルは除外。"""
     models = get_available_gemini_models(api_key)
     for m in models:
-        if m not in _quota_exhausted_models and m not in _unavailable_models:
+        if m not in _quota_exhausted_set() and m not in _unavailable_set():
             return m
     # 全モデルがクォータ超過の場合はフォールバック
     return models[0] if models else _FALLBACK_MODEL
@@ -188,7 +228,7 @@ def get_default_gemini_model(api_key: str) -> str:
 def get_alternative_gemini_model(api_key: str, failed_model: str) -> str:
     """failed_model 以外で利用可能な代替モデルを返す（無ければ空文字）"""
     for m in get_available_gemini_models(api_key):
-        if m != failed_model and m not in _quota_exhausted_models and m not in _unavailable_models:
+        if m != failed_model and m not in _quota_exhausted_set() and m not in _unavailable_set():
             return m
     return ''
 SELF_CORRECTION_THRESHOLD = 1000  # 差額が1000円以上の場合のみ自己修復を試行（高速化）
@@ -356,18 +396,60 @@ def safe_int(val, default=0):
     if isinstance(val, int):
         return val
     if isinstance(val, float):
+        # 明細エディタでセルを空にすると NaN が入る。int(round(nan)) は
+        # 例外になり、画面が操作不能になるため既定値に倒す。
+        if val != val or val in (float('inf'), float('-inf')):
+            return default
         return int(round(val))
-    s = str(val).strip()
-    # 単位除去
-    s = re.sub(r'[個本枚セット台式時間]$', '', s)
-    s = re.sub(r'[円¥,，\s]', '', s)
-    s = re.sub(r'[^\d.\-]', '', s)
-    if not s or s == '-':
+    s = _normalize_number_text(str(val))
+    if s is None:
         return default
     try:
         return int(round(float(s)))
     except (ValueError, OverflowError):
         return default
+
+
+def _xml_escape(value) -> str:
+    """ReportLabのParagraphに渡す前のエスケープ。
+
+    Paragraphは簡易XMLを解釈するため、品名に & や < が含まれると
+    描画時に例外になったり文字が消えたりする。
+    """
+    return (str(value if value is not None else '')
+            .replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+
+
+def _normalize_number_text(raw):
+    """金額・数量の文字列を符号付きの数値文字列に正規化する。解釈不能なら None。
+
+    見積書では値引きが「△5,000」「▲5,000」「(5,000)」「－5,000」と書かれる。
+    以前は記号を一律に削っていたため、これらが全て +5,000 になり、
+    値引きが加算されて請求額が過大になっていた。
+    """
+    import unicodedata as _ud
+    s = _ud.normalize('NFKC', str(raw)).strip()
+    if not s:
+        return None
+    # 括弧書きは会計表記のマイナス
+    is_negative = False
+    if re.fullmatch(r'\(\s*[^()]*\s*\)', s):
+        is_negative = True
+        s = s[1:-1].strip()
+    # NFKC は U+2212(−) を ASCII の - に変換しないため明示的に含める
+    if re.match(r'^[△▲▽▼\-\u2212\u30fc\u2010-\u2015]', s):
+        is_negative = True
+    s = re.sub(r'^[△▲▽▼\-\u2212\u2010-\u2015]+', '', s)
+    # 単位・通貨・区切り
+    s = re.sub(r'(個|本|枚|セット|台|式|時間)$', '', s)
+    s = re.sub(r'[円¥￥,\s]', '', s)
+    # 「1,234-」は「1,234円」の慣用表記
+    s = re.sub(r'[\-ー―–—]+$', '', s)
+    if not s:
+        return None
+    if not re.fullmatch(r'\d+(\.\d+)?', s):
+        return None
+    return ('-' + s) if is_negative else s
 
 
 def safe_float(val, default=0.0):
@@ -435,20 +517,39 @@ def find_real_cks(data, start=424):
     return real_ck
 
 
+# 展開後サイズの上限。実データは1500明細でも約620KBなので、64MBは十分に余裕がある。
+# 上限なしで展開すると、数百KBのNEOが数百MBに膨らむ細工ファイル（展開爆弾）で
+# プロセス全体のメモリを枯渇させられる。
+MAX_DECOMPRESSED_SIZE = 64 * 1024 * 1024
+
+
 def decompress_neo(data, real_ck):
     """辞書連鎖展開でrawデータを復元"""
-    full_raw = b''
+    chunks = []
+    total = 0
     for i, ck in enumerate(real_ck):
         start = ck + 2
         end   = real_ck[i + 1] - 8 if i + 1 < len(real_ck) else len(data)
         chunk = data[start:end]
+        remaining = MAX_DECOMPRESSED_SIZE - total
+        if remaining <= 0:
+            raise ValueError(
+                f"NEOファイルの展開後サイズが上限（{MAX_DECOMPRESSED_SIZE // (1024*1024)}MB）を超えました。"
+                "ファイルが壊れているか、想定外のファイルです。"
+            )
         if i == 0:
-            raw = zlib.decompress(chunk, -15)
+            dobj = zlib.decompressobj(-15)
         else:
-            dobj = zlib.decompressobj(-15, zdict=full_raw[-32768:])
-            raw  = dobj.decompress(chunk)
-        full_raw += raw
-    return full_raw
+            dobj = zlib.decompressobj(-15, zdict=b''.join(chunks)[-32768:])
+        raw = dobj.decompress(chunk, remaining)
+        if dobj.unconsumed_tail:
+            raise ValueError(
+                f"NEOファイルの展開後サイズが上限（{MAX_DECOMPRESSED_SIZE // (1024*1024)}MB）を超えました。"
+                "ファイルが壊れているか、想定外のファイルです。"
+            )
+        chunks.append(raw)
+        total += len(raw)
+    return b''.join(chunks)
 
 
 def parse_entries(data, first_ck):
@@ -526,9 +627,24 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
     if expenses is None:
         expenses = {}
     tf = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
-    tf.write(db_bytes)
-    tf.close()
-    conn = sqlite3.connect(tf.name)
+    try:
+        tf.write(db_bytes)
+    finally:
+        tf.close()
+    # 途中で例外が出ても一時ファイル（顧客情報を含む）を残さない
+    try:
+        return _update_ansmb_impl(tf.name, items, short_parts_wage, expenses,
+                                  is_tax_inclusive, is_beta_mode)
+    finally:
+        try:
+            os.unlink(tf.name)
+        except OSError:
+            pass
+
+
+def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
+                       is_tax_inclusive, is_beta_mode):
+    conn = sqlite3.connect(_tmp_db_path)
     cur  = conn.cursor()
     cur.execute('DELETE FROM ERParts')
     # ── 塗装セクション・その他テーブルをリセット ──
@@ -816,9 +932,8 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
     ))
     conn.commit()
     conn.close()
-    with open(tf.name, 'rb') as f:
+    with open(_tmp_db_path, 'rb') as f:
         result = f.read()
-    os.unlink(tf.name)
     return result, total_parts, total_wages, grand_total
 
 
@@ -832,9 +947,23 @@ def update_em_db(db_bytes, cust, insurance_info, estimated_date, is_tax_inclusiv
     空値のフィールドはテンプレートNEOの値を保持する。
     """
     tf = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
-    tf.write(db_bytes)
-    tf.close()
-    conn = sqlite3.connect(tf.name)
+    try:
+        tf.write(db_bytes)
+    finally:
+        tf.close()
+    try:
+        return _update_em_db_impl(tf.name, cust, insurance_info, estimated_date,
+                                  is_tax_inclusive, merge_mode)
+    finally:
+        try:
+            os.unlink(tf.name)
+        except OSError:
+            pass
+
+
+def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
+                       is_tax_inclusive, merge_mode):
+    conn = sqlite3.connect(_tmp_db_path)
     cur  = conn.cursor()
     customer_name = safe_str(cust.get('customer_name', ''))
     owner_name    = safe_str(cust.get('owner_name', ''))
@@ -957,9 +1086,8 @@ def update_em_db(db_bytes, cust, insurance_info, estimated_date, is_tax_inclusiv
         print("TaxKindFlag update failed:", e)
 
     conn.close()
-    with open(tf.name, 'rb') as f:
+    with open(_tmp_db_path, 'rb') as f:
         result = f.read()
-    os.unlink(tf.name)
     return result
 
 
@@ -1207,6 +1335,12 @@ def enhance_image_for_ocr(image_bytes):
         return image_bytes
 
 
+# pdfium(pypdfium2) はスレッドセーフでないため、呼び出しを直列化する
+_PDFIUM_LOCK = threading.Lock()
+# ラスタライズ時の総画素数上限（約40メガピクセル）。A3@300dpi でも約17Mpxなので余裕がある。
+MAX_RASTER_PIXELS = 40_000_000
+
+
 def rasterize_pdf_page(pdf_bytes, page_index, dpi=200, enhance=False):
     """
     PDFの指定ページをJPEG画像バイト列に変換。
@@ -1234,19 +1368,36 @@ def rasterize_pdf_page(pdf_bytes, page_index, dpi=200, enhance=False):
 
     # ── 方法2: pypdfium2 (フォールバック) ──────────────────
     if result is None:
-        try:
-            import pypdfium2 as pdfium
-            doc     = pdfium.PdfDocument(pdf_bytes)
-            page    = doc[page_index]
-            scale   = dpi / 72.0
-            bitmap  = page.render(scale=scale)
-            pil_img = bitmap.to_pil()
-            buf     = io.BytesIO()
-            pil_img.save(buf, format='JPEG', quality=90)
-            doc.close()
-            result = buf.getvalue()
-        except Exception:
-            pass
+        # pdfium はスレッドセーフではない。複数スレッドから同時に呼ぶと
+        # Cヒープが壊れてプロセスごと落ちる（Streamlitのサーバ全体が死ぬ）ため、
+        # ここはプロセス内で必ず直列に実行する。
+        with _PDFIUM_LOCK:
+            try:
+                import pypdfium2 as pdfium
+                doc     = pdfium.PdfDocument(pdf_bytes)
+                try:
+                    page    = doc[page_index]
+                    scale   = dpi / 72.0
+                    # 巨大ページ（A0など）を高DPIで描くと1GB超のメモリを使い
+                    # コンテナごとOOMで落ちるため、総画素数で上限を掛ける。
+                    try:
+                        w_pt, h_pt = page.get_size()
+                        px = (w_pt * scale) * (h_pt * scale)
+                        if px > MAX_RASTER_PIXELS and px > 0:
+                            scale *= (MAX_RASTER_PIXELS / px) ** 0.5
+                            print(f"[rasterize] ページが大きいため解像度を下げました "
+                                  f"(scale={scale:.3f})")
+                    except Exception:
+                        pass
+                    bitmap  = page.render(scale=scale)
+                    pil_img = bitmap.to_pil()
+                    buf     = io.BytesIO()
+                    pil_img.save(buf, format='JPEG', quality=90)
+                    result = buf.getvalue()
+                finally:
+                    doc.close()
+            except Exception as _rast_err:
+                print(f"[rasterize] pypdfium2でのページ画像化に失敗: {_rast_err}")
 
     # ── 画像前処理（FAX品質改善用） ──────────────────
     if result and enhance:
@@ -1731,19 +1882,23 @@ def generate_discrepancy_report_pdf(discrepancies, total_diff, vehicle_info):
         qty = d.get('quantity', 1)
         diff = (master_price - ocr_price) * qty
         
+        # 品名は Paragraph に包む。素の文字列だと ReportLab が折り返さず、
+        # 長い品名が右隣の金額欄に重なって数字が読めなくなる。
+        _name_style = styles['JapaneseNormal']
         table_data.append([
             no_str,
             judgment,
-            ocr_name,
+            Paragraph(_xml_escape(ocr_name), _name_style),
             f"¥{ocr_price:,}",
-            master_name,
+            Paragraph(_xml_escape(master_name), _name_style),
             f"¥{master_price:,}",
             str(qty),
             f"¥{diff:,}"
         ])
 
     # テーブルスタイル
-    t = Table(table_data, colWidths=[10*mm, 15*mm, 35*mm, 20*mm, 35*mm, 20*mm, 10*mm, 25*mm])
+    t = Table(table_data, colWidths=[10*mm, 15*mm, 35*mm, 20*mm, 35*mm, 20*mm, 10*mm, 25*mm],
+              repeatRows=1)  # 改ページ後も見出し行を繰り返す
     t.setStyle(TableStyle([
         ('FONT', (0,0), (-1,-1), font_name, 9),
         ('ALIGN', (0,0), (-1,0), 'CENTER'),
@@ -2394,9 +2549,21 @@ def _detect_corrections(original_items: list, edited_items: list) -> list:
     return corrections
 
 
-def analyze_vehicle_registration(api_key, file_bytes, mime_type):
-    """車検証をAI-OCRで解析（JSON mode + プロンプトベースの構造化出力）"""
+def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None):
+    """車検証をAI-OCRで解析（JSON mode + プロンプトベースの構造化出力）
+
+    model_name を省略した場合は、サイドバーで選択中のモデル →
+    利用可能なモデルの既定 の順に解決する。定数 GEMINI_MODEL を直接使うと、
+    そのモデルが提供終了したときに車検証OCRだけが恒久的に失敗するため。
+    """
     prompt = _build_prompt("shaken_ocr")
+    if not model_name:
+        try:
+            model_name = st.session_state.get('selected_model')
+        except Exception:
+            model_name = None
+    if not model_name:
+        model_name = get_default_gemini_model(api_key)
 
     # 方式1: response_schema を使用（全フィールドstring型で安全にパース）
     _schema_shaken = {
@@ -2436,7 +2603,7 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type):
         client = _get_genai_client(api_key)
         file_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
         response = client.models.generate_content(
-            model=GEMINI_MODEL,
+            model=model_name,
             contents=[prompt, file_part],
             config={
                 "temperature": 0.0,
@@ -2460,7 +2627,8 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type):
     if not result or not any(v for v in result.values() if v and str(v).strip()):
         try:
             print(f"[shaken_ocr] Method '{_method_used}' returned empty, trying json_mode fallback")
-            result_text = call_gemini(api_key, file_bytes, mime_type, prompt, use_json_mode=True)
+            result_text = call_gemini(api_key, file_bytes, mime_type, prompt,
+                                      model_name=model_name, use_json_mode=True)
             if result_text:
                 try:
                     result = json.loads(result_text)
@@ -2794,10 +2962,10 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
                 ) from e
             # クォータ超過エラー
             if '429' in err_msg or 'RESOURCE_EXHAUSTED' in err_msg:
-                _quota_exhausted_models.add(model_name)
+                _quota_exhausted_set().add(model_name)
                 cache_key = api_key[-8:] if api_key else ''
-                if cache_key in _model_availability_cache:
-                    del _model_availability_cache[cache_key]
+                if cache_key in _availability_cache():
+                    del _availability_cache()[cache_key]
                 raise ValueError(
                     f"モデル '{model_name}' のクォータが上限に達しました。"
                     "自動的に代替モデルに切り替えます。"
@@ -2915,7 +3083,7 @@ def analyze_estimate_chunk(api_key, chunk_bytes, mime_type, model_name,
                 _mark_model_unavailable(api_key, model_name)
                 raise RuntimeError(f"モデル '{model_name}' は利用できません（提供終了）。") from e
             if '429' in err or 'RESOURCE_EXHAUSTED' in err:
-                _quota_exhausted_models.add(model_name)
+                _quota_exhausted_set().add(model_name)
                 raise ValueError(f"モデル '{model_name}' クォータ超過") from e
             if attempt < 2:
                 import time; time.sleep(1)
@@ -3473,13 +3641,23 @@ def _self_correction_retry(api_key, file_bytes, mime_type, model_name,
         new_items  = new_result.get('items', []) or new_result.get('details', [])
         if not new_items:
             return None
+        # 呼び出し側は result['items'] しか見ないため、'details' で返ってきた
+        # 正しい修正が捨てられていた。ここで 'items' に正規化しておく。
+        new_result['items'] = new_items
         new_parts  = sum(safe_int(it.get('parts_amount', 0)) for it in new_items)
         new_wage   = sum(safe_int(it.get('wage', 0))         for it in new_items)
         old_error  = abs(parts_diff) + abs(wage_diff)
         new_error  = abs(new_parts - target_parts) + abs(new_wage - target_wage)
-        if new_error < old_error:
-            return new_result  # 改善された → 採用
-        return None  # 改善なし
+        if new_error >= old_error:
+            return None  # 改善なし
+        # 明細数が大きく減る修正は、金額だけ合わせて中身を失っている可能性が高い。
+        # 完全一致するのでない限り採用しない。
+        old_count = len(original_items or [])
+        if old_count and len(new_items) < old_count * 0.7 and new_error != 0:
+            print(f"[WARN] 自己修復が明細を {old_count}行 → {len(new_items)}行 に"
+                  f"減らしたため不採用（残差 {new_error:,}円）")
+            return None
+        return new_result  # 改善された → 採用
     except Exception as e:
         import sys
         print(f"[WARN] _self_correction_retry 例外: {e}", file=sys.stderr)
@@ -3583,10 +3761,10 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     # ──────────────────────────────────────────────────────────────────────────
 
     # クォータ超過モデルを除外して使用モデルを決定
-    if used_model in _quota_exhausted_models:
+    if used_model in _quota_exhausted_set():
         # 代替モデルを選択
         for alt_model in _PREFERRED_MODELS:
-            if alt_model not in _quota_exhausted_models:
+            if alt_model not in _quota_exhausted_set():
                 print(f"[INFO] モデル '{used_model}' はクォータ超過のため '{alt_model}' に切り替えます", file=sys.stderr)
                 used_model = alt_model
                 break
@@ -3738,10 +3916,17 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     # ページ境界に限らず全行を対象にした重複除去。
     # ・Page1のAIがPage2の明細を合計額に合わせて先読み出力するケースを防止
     # ・同一ページ内で先頭数行を2回出力するAIの誤動作を防止
-    _before_dedup = len(result['items'])
-    result['items'] = global_dedup_items(result['items'])
-    _after_dedup = len(result['items'])
-    _logw(f"⑥ 全体重複除去: {_before_dedup}行 → {_after_dedup}行 ({_before_dedup - _after_dedup}件除去)")
+    # ※ この重複除去は「PDFを分割して複数回AIに投げる」時代のチャンク重複対策。
+    #    現在は1回のリクエストでPDF全体を解析するため重複の発生源が無く、
+    #    同じ部品が2行並ぶ正当な明細（左右のクリップ等）を消して金額を
+    #    欠落させるだけになっていた。分割解析した場合のみ適用する。
+    if result.get('_chunked'):
+        _before_dedup = len(result['items'])
+        result['items'] = global_dedup_items(result['items'])
+        _after_dedup = len(result['items'])
+        _logw(f"⑥ 全体重複除去: {_before_dedup}行 → {_after_dedup}行 ({_before_dedup - _after_dedup}件除去)")
+    else:
+        _logw("⑥ 全体重複除去: 分割解析ではないためスキップ（正当な重複明細を保持）")
 
     # ⑥-b 辞書ベースバリデーション
     result['items'] = validate_and_correct_items(result['items'])
@@ -3805,8 +3990,11 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
             _w_diff = abs((_cur_wage + _sc_sp) - result['pdf_wage_total'])
             if _p_diff == 0 and _w_diff == 0:
                 break  # 完全一致 → 修正不要
+            # 修復には明細解析と同じ入力（PDF全体）を渡す。
+            # ラスタ画像は最終ページ1枚だけなので、全体の再抽出を頼むと
+            # 最終ページの内容で全明細が置き換わってしまう。
             retry = _self_correction_retry(
-                api_key, raster_bytes, raster_mime, used_model,
+                api_key, file_bytes, mime_type, used_model,
                 result['items'],
                 result['pdf_parts_total'],
                 result['pdf_wage_total'],
@@ -3860,11 +4048,20 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     p_mismatch = (doc_p > 0) and (p_diff != 0)
     w_mismatch = (doc_w > 0) and (w_diff != 0)
     is_match = (not p_mismatch and not w_mismatch)
+    # 合計欄の解析自体に失敗した（部品計・工賃計とも取得できなかった）場合、
+    # 「差が無い＝一致」と報告してはいけない。検証できていないだけで、
+    # 通信エラーとの区別がつかなくなる。
+    _totals_unavailable = (doc_p <= 0 and doc_w <= 0)
+    if _totals_unavailable:
+        result['_totals_unavailable'] = True
+        is_match = None
     # Geminiが返したtotals_verificationがある場合はそちらを優先
     if not result.get('totals_verification'):
         _err_parts = []
         if p_mismatch: _err_parts.append(f'部品差額{p_diff:+,}円')
         if w_mismatch: _err_parts.append(f'工賃差額{w_diff:+,}円')
+        if _totals_unavailable:
+            _err_parts.append('見積書の合計欄を読み取れませんでした（検証未実施）')
         result['totals_verification'] = {
             'calculated_parts_total': calc_p,
             'calculated_labor_total': calc_w,
@@ -3969,6 +4166,95 @@ def generate_filename(cust, calc_parts, calc_wages, pdf_parts, pdf_wages,
 # ============================================================
 # Streamlit UI
 # ============================================================
+
+# ============================================================
+# PDF見積 → NEO 自動変換（pdf_to_neo_pipeline のラッパ）
+# ============================================================
+def esc_html(value) -> str:
+    """HTMLに埋め込む前のエスケープ。
+
+    車検証OCRの結果や品名など、アップロードされた文書に由来する文字列を
+    unsafe_allow_html のHTMLへ直接埋め込むと、画面の崩しやリンクの差し込みが
+    できてしまう。表示直前にこれを通す。
+    """
+    import html as _html
+    return _html.escape(str(value if value is not None else ''), quote=True)
+
+
+def _session_cache_scope() -> str:
+    """このセッション固有のキャッシュ識別子。
+
+    pdf_to_neo_pipeline のキャッシュはプロセス全体で共有されるため、
+    識別子を渡さないと、同じ見積PDFを扱った別の利用者に前の利用者の
+    解析結果や生成済みNEOが返ってしまう。
+    """
+    try:
+        scope = st.session_state.get('_pipeline_cache_scope')
+        if not scope:
+            scope = _uuid.uuid4().hex
+            st.session_state['_pipeline_cache_scope'] = scope
+        return scope
+    except Exception:
+        return _uuid.uuid4().hex
+
+
+def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=None):
+    """見積書PDFから直接NEOファイルを生成する。
+
+    pdf_to_neo_pipeline.process_pdf_to_neo をStreamlitから安全に呼ぶための薄いラッパ。
+    - APIキーはサイドバー入力を環境変数に一時的に渡す（パイプラインが環境変数を読むため）
+    - Addataが無い環境ではモードA（ベタ打ち）を強制する。
+      マーカー付きのモードB/Cは車種DBが存在する場合のみ意味を持ち、
+      DBが無いまま実行すると全部品に「※ADDATA該当なし」が付いてしまうため。
+    戻り値: process_pdf_to_neo の結果dict。失敗時は {'ok': False, 'error': '...'}
+    """
+    tmp_pdf = None
+    tmp_tpl = None
+    try:
+        try:
+            import pdf_to_neo_pipeline as _pipe
+        except Exception as e:
+            return {'ok': False, 'error': f'PDF→NEO変換モジュールを読み込めません: {e}'}
+
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as _f:
+            _f.write(pdf_bytes)
+            tmp_pdf = _f.name
+
+        if template_bytes:
+            with tempfile.NamedTemporaryFile(suffix='.neo', delete=False) as _f:
+                _f.write(template_bytes)
+                tmp_tpl = _f.name
+            template_path = tmp_tpl
+        else:
+            template_path = TEMPLATE_PATH
+
+        addata_root = find_addata_dir()
+        mode_override = None if addata_root else 'A'
+
+        # APIキーは引数で直接渡す。os.environ に書くと、プロセスを共有する
+        # 他の利用者のセッションからも読めてしまう（キーの流用・課金事故）。
+        result = _pipe.process_pdf_to_neo(
+            tmp_pdf,
+            addata_root=addata_root or '',
+            template_path=template_path,
+            mode_override=mode_override,
+            model_name=model_name or None,
+            api_key=api_key or None,
+            cache_scope=_session_cache_scope(),
+        )
+        if not isinstance(result, dict):
+            return {'ok': False, 'error': 'PDF→NEO変換が想定外の値を返しました'}
+        return result
+    except Exception as e:
+        return {'ok': False, 'error': f'PDF→NEO変換に失敗しました: {e}'}
+    finally:
+        for _path in (tmp_pdf, tmp_tpl):
+            if _path:
+                try:
+                    os.unlink(_path)
+                except OSError:
+                    pass
+
 
 def main():
     st.set_page_config(
@@ -4144,8 +4430,8 @@ def main():
         # 利用可能なモデルをAPIで動的取得（APIキーがある場合のみ）
         if api_key:
             _ck = _model_cache_key(api_key)
-            if _ck in _model_availability_cache:
-                _avail_models = _model_availability_cache[_ck]
+            if _ck in _availability_cache():
+                _avail_models = _availability_cache()[_ck]
             else:
                 with st.spinner("利用可能なモデルを確認中..."):
                     _avail_models = get_available_gemini_models(api_key)
@@ -4549,6 +4835,13 @@ def main():
         elif _csv_paste and _csv_paste.strip():
             _csv_text = _csv_paste.strip()
 
+        if not _csv_text and not _csv_file and st.session_state.get('csv_mode'):
+            # 貼り付け欄を空にしたのに前回の取込が残っていると、
+            # 消したはずの見積がそのまま生成されてしまう
+            st.session_state.pop('csv_items', None)
+            st.session_state.pop('csv_mode', None)
+            st.session_state.pop('_csv_paste_saved', None)
+
         if _csv_text:
             _preview_items = parse_csv_to_items(_csv_text)
             if _preview_items:
@@ -4561,15 +4854,106 @@ def main():
                 st.session_state.pop('csv_items', None)
                 st.session_state.pop('csv_mode', None)
 
+        # ── PDF見積 → NEO 自動変換 ──────────────────────
+        st.markdown("---")
+        st.markdown("#### 📄 PDF見積 → NEO 自動変換")
+        st.caption(
+            "見積書PDFをそのままアップロードすると、AI-OCRで明細を読み取り、"
+            "NEOファイルまで一気に生成します。Geminiへのコピペは不要です。"
+        )
+        _p2n_file = st.file_uploader(
+            "見積書PDF",
+            type=['pdf'],
+            key='pdf2neo_upload',
+        )
+        if _p2n_file is not None:
+            _p2n_bytes = _p2n_file.read()
+            _p2n_file.seek(0)
+            st.caption(f"📄 {_p2n_file.name}（{len(_p2n_bytes):,} bytes）")
+            if not api_key:
+                st.warning(
+                    "⚠️ この機能にはGemini APIキーが必要です。"
+                    "サイドバーの「APIキー設定」でキーを入力してください。"
+                )
+            elif st.button("🚀 PDFからNEOを生成", key='pdf2neo_run', type="primary",
+                           use_container_width=True):
+                st.session_state.pop('pdf2neo_result', None)
+                with st.spinner("PDFを解析してNEOを生成しています…（AI-OCRのため30〜90秒かかります）"):
+                    st.session_state['pdf2neo_result'] = run_pdf_to_neo_pipeline(
+                        _p2n_bytes,
+                        api_key,
+                        model_name=selected_model,
+                        template_bytes=st.session_state.get('custom_neo_bytes'),
+                    )
+                st.rerun()
+
+        _p2n_res = st.session_state.get('pdf2neo_result')
+        if _p2n_res:
+            if _p2n_res.get('error'):
+                st.error(f"❌ {_p2n_res['error']}")
+            elif not _p2n_res.get('ok'):
+                st.error("❌ PDFからNEOを生成できませんでした。")
+                for _w in (_p2n_res.get('warnings') or [])[:5]:
+                    st.caption(f"・{_w}")
+            else:
+                _p2n_items = _p2n_res.get('items') or []
+                _p2n_parts = sum(safe_int(it.get('parts_amount', 0)) for it in _p2n_items)
+                _p2n_wage  = sum(safe_int(it.get('wage', 0)) for it in _p2n_items)
+                st.success(
+                    f"✅ 解析完了 — {len(_p2n_items)}行 ／ "
+                    f"部品 ¥{_p2n_parts:,} ／ 工賃 ¥{_p2n_wage:,}"
+                )
+                _p2n_v = _p2n_res.get('verify') or {}
+                if _p2n_v.get('count_match') and _p2n_v.get('total_match'):
+                    st.caption("🔍 検証OK: 生成NEOの明細件数と部品金額（税抜）がPDFと一致しました。")
+                elif _p2n_v.get('error'):
+                    st.caption(f"🔍 検証スキップ: {_p2n_v['error']}")
+                else:
+                    st.warning(
+                        "🔍 検証: PDFと生成NEOに差異があります。"
+                        f"件数 NEO {_p2n_v.get('neo_count')} / PDF {_p2n_v.get('pdf_count')}、"
+                        f"部品金額(税抜) NEO ¥{safe_int(_p2n_v.get('neo_total')):,} / "
+                        f"PDF ¥{safe_int(_p2n_v.get('pdf_parts_total')):,}。"
+                        "「プレビューに取り込む」で内容を確認・修正してください。"
+                    )
+                _p2n_neo = _p2n_res.get('neo_bytes')
+                _p2n_c1, _p2n_c2 = st.columns(2)
+                with _p2n_c1:
+                    if _p2n_neo:
+                        st.download_button(
+                            "📥 NEOファイルをダウンロード",
+                            data=_p2n_neo,
+                            file_name="PDF変換_見積.neo",
+                            mime="application/octet-stream",
+                            key='pdf2neo_dl',
+                            use_container_width=True,
+                        )
+                with _p2n_c2:
+                    if _p2n_items and st.button("📝 プレビューに取り込んで修正する",
+                                                key='pdf2neo_to_preview',
+                                                use_container_width=True):
+                        st.session_state['csv_items'] = _p2n_items
+                        st.session_state['csv_mode']  = True
+                        st.session_state['pdf2neo_vehicle_info'] = _p2n_res.get('vehicle_info') or {}
+                        st.session_state['vehicle_file_bytes']  = None
+                        st.session_state['vehicle_file_name']   = None
+                        st.session_state['estimate_file_bytes'] = None
+                        st.session_state['estimate_file_name']  = None
+                        st.session_state['selected_model'] = selected_model
+                        st.session_state['step'] = 2
+                        st.rerun()
+
         # ── オプション設定 ──
         with st.expander("⚙️ オプション設定", expanded=False):
             opt_col1, opt_col2, opt_col3 = st.columns(3)
             with opt_col1:
-                policy_no_step1 = st.text_input("保険会社", placeholder="例: 東京海上日動", key="ins_company_step1")
+                # ここで入力された値はどこにも使われておらず、証券番号の欄が
+                # サイドバーと二重に存在していた。サイドバー側に一本化する。
+                st.caption("保険会社・証券番号・契約者名はサイドバーの「🛡️ 保険情報」で入力してください。")
             with opt_col2:
-                policy_no_step1b = st.text_input("証券番号", placeholder="例: TK-12345678", key="ins_policy_step1")
+                st.write("")
             with opt_col3:
-                assignee_step1 = st.text_input("担当者名", placeholder="例: 田中 花子", key="assignee_step1")
+                st.write("")
 
         # ── 開始ボタン ──
         st.markdown("")
@@ -4621,6 +5005,10 @@ def main():
             st.info(f"📊 CSVモード: {len(_csv_items_s2)}行を取り込みます（AI解析をスキップ）")
             # 車検証のみAI解析（ある場合）
             vehicle_data = {}
+            # PDF→NEO変換で読み取った車両情報があれば引き継ぐ（車検証未添付時）
+            _p2n_vi = st.session_state.get('pdf2neo_vehicle_info')
+            if _p2n_vi and not vehicle_bytes:
+                vehicle_data = dict(_p2n_vi)
             if vehicle_bytes:
                 with st.spinner("🔍 車検証を解析中..."):
                     try:
@@ -4889,13 +5277,13 @@ def main():
                     )
             # クォータ超過エラーの場合、分かりやすいメッセージとリトライを促す
             elif '429' in err_str or 'RESOURCE_EXHAUSTED' in err_str or 'クォータが上限' in err_str:
-                _quota_exhausted_models.add(_cur_model)
+                _quota_exhausted_set().add(_cur_model)
                 # キャッシュクリア
                 _api_key_for_err = api_key
                 if _api_key_for_err:
                     _ck = _api_key_for_err[-8:]
-                    if _ck in _model_availability_cache:
-                        del _model_availability_cache[_ck]
+                    if _ck in _availability_cache():
+                        del _availability_cache()[_ck]
                 # 代替モデルを探す
                 _alt = get_alternative_gemini_model(api_key, _cur_model)
                 if _alt:
@@ -4932,20 +5320,31 @@ def main():
                 st.rerun()
             st.stop()
 
+        # ステップ①に戻ると vehicle_data は捨てられるが、ユーザーが車両情報
+        # フォームに入力した内容は updated_vehicle として保存してある。
+        # 戻って再開したときに入力が全部消えないよう、そちらを初期値に使う。
+        _saved_vehicle = st.session_state.get('updated_vehicle') or {}
+        if _saved_vehicle:
+            _merged_vehicle = dict(_saved_vehicle)
+            for _k, _v in (vehicle_data or {}).items():
+                if _v not in (None, '') and not _merged_vehicle.get(_k):
+                    _merged_vehicle[_k] = _v
+            vehicle_data = _merged_vehicle
+
         # ── 車両ストリップ ──
         veh_match_result = estimate_data.get('_veh_match_result', {}) if estimate_data else {}
         match_is_db = veh_match_result.get('is_supported', False)
-        car_name_strip = safe_str(vehicle_data.get('car_name', ''))
-        car_model_strip = safe_str(vehicle_data.get('car_model', ''))
-        engine_strip = safe_str(vehicle_data.get('engine_model', ''))
+        car_name_strip = esc_html(safe_str(vehicle_data.get('car_name', '')))
+        car_model_strip = esc_html(safe_str(vehicle_data.get('car_model', '')))
+        engine_strip = esc_html(safe_str(vehicle_data.get('engine_model', '')))
         reg_date_strip = safe_str(vehicle_data.get('car_reg_date', ''))
         if len(reg_date_strip) >= 6:
             reg_date_display = f"{reg_date_strip[:4]}/{reg_date_strip[4:6]}"
         else:
             reg_date_display = reg_date_strip
         km_strip = safe_int(vehicle_data.get('kilometer', 0))
-        type_desig = safe_str(vehicle_data.get('car_model_designation', ''))
-        cat_num = safe_str(vehicle_data.get('car_category_number', ''))
+        type_desig = esc_html(safe_str(vehicle_data.get('car_model_designation', '')))
+        cat_num = esc_html(safe_str(vehicle_data.get('car_category_number', '')))
         v_code = veh_match_result.get('vehicle_code', '')
         items_count = len(estimate_data.get('items', [])) if estimate_data else 0
 
@@ -5016,7 +5415,7 @@ def main():
                 cogni_tax_icon = '🟢'
                 basis_label = '税抜明細（ユーザー設定）'
             rev_icon = '✅ 逆算一致' if rev_match else '⚠️ 逆算不一致（金額を確認してください）'
-            shop_html   = f'<div style="font-size:13px;color:#374151;margin-bottom:10px">🏭 修理工場: <b>{shop_name}</b></div>' if shop_name else ''
+            shop_html   = f'<div style="font-size:13px;color:#374151;margin-bottom:10px">🏭 修理工場: <b>{esc_html(shop_name)}</b></div>' if shop_name else ''
             st.markdown(f'''
 <div style="border:2px solid {cogni_tax_border};border-radius:8px;background:{cogni_tax_bg};padding:14px 18px;margin-bottom:12px">
   {shop_html}
@@ -5075,6 +5474,8 @@ def main():
             with dc6:
                 v_displace  = st.number_input("排気量 (cc)",    value=safe_int(vehicle_data.get('engine_displacement', 0)), min_value=0, step=100, key='v_displace')
 
+        # 入力途中の内容を毎回保存しておく。ステップ①に戻ると
+        # vehicle_data が捨てられるため、保存しないと入力が全て消える。
         updated_vehicle = {
             'customer_name':      v_customer,
             'owner_name':         v_owner,
@@ -5101,6 +5502,8 @@ def main():
             'term_date':          v_term,
             'car_reg_date':       v_regdate,
         }
+        # 生成ボタンを押す前でも入力内容を保持する（ステップ①に戻っても消えない）
+        st.session_state['updated_vehicle'] = updated_vehicle
 
         # 見積明細（合計・費用タブ内で編集）
         calc_parts    = 0
@@ -5171,7 +5574,9 @@ def main():
             _df_edit = pd.DataFrame(_edit_rows) if _edit_rows else pd.DataFrame(
                 columns=['No', '部品番号', '品名', '数量', '部品金額', '工数', '工賃'])
             # キーを行数と連動させることで行挿入後に data_editor を強制再初期化する
-            _editor_key = f'items_editor_{len(_items_src)}'
+            # キーに行数を入れると、行を足した瞬間にウィジェットが作り直され、
+            # 入力中のセルの内容が捨てられる。固定キーにする。
+            _editor_key = 'items_editor'
             # height を固定して描画行数を制限（全行フル展開すると100行超で重くなるため）
             _editor_height = min(600, max(200, len(_items_src) * 35 + 60))
             _edited_df = st.data_editor(
@@ -5267,6 +5672,10 @@ def main():
                         if st.button("✅ フィードバックを記録する", key="fb_record_btn", type="primary"):
                             record_correction(_fb_corrections, _fb_comment, _fb_doc_type)
                             st.session_state['_original_items'] = [dict(it) for it in edited_items]
+                            # 差分キャッシュを捨てないとレポートが残り続け、
+                            # 同じ訂正を何度も記録できてしまう
+                            st.session_state['_fb_cache'] = []
+                            st.session_state.pop('_fb_hash', None)
                             st.success(f"✅ {len(_fb_corrections)}件の訂正をDBに記録しました")
                             # 蓄積件数チェック
                             _summary = get_error_summary()
@@ -5276,6 +5685,9 @@ def main():
                     with _fbc2:
                         if st.button("⏭ スキップ", key="fb_skip_btn"):
                             st.session_state['_original_items'] = [dict(it) for it in edited_items]
+                            st.session_state['_fb_cache'] = []
+                            st.session_state.pop('_fb_hash', None)
+                            st.rerun()
 
             st.markdown("---")
             # ── 金額サマリー ────────────────────────────────────
@@ -5387,7 +5799,12 @@ def main():
                     })
 
                 with st.expander("📊 明細行一覧（全項目）", expanded=False):
-                    st.table(pd.DataFrame(_beta_verification_rows).set_index('No'))
+                    # 全行を削除すると空リストになる。set_index('No') が
+                    # KeyError で落ちて画面が操作不能になるため列を明示する。
+                    st.table(pd.DataFrame(
+                        _beta_verification_rows,
+                        columns=['No', '品名', '部品価格', '工賃'],
+                    ).set_index('No'))
 
                 # 合算値の一致確認
                 _verify_items = []
@@ -5484,7 +5901,7 @@ def main():
                         for a in _error_alerts:
                             st.markdown(
                                 f'<div style="background:#fef2f2;border-left:4px solid #dc2626;padding:8px 12px;margin:4px 0;font-size:13px">'
-                                f'🔴 <b>行{a["row_no"]}「{a["name"]}」</b>: '
+                                f'🔴 <b>行{a["row_no"]}「{esc_html(a["name"])}」</b>: '
                                 f'部品¥{a["parts_amount"]:,} / 工賃¥{a["wage"]:,}<br>'
                                 f'⚠️ {a["message"]}'
                                 f'</div>',
@@ -5496,7 +5913,7 @@ def main():
                             for a in _warning_alerts:
                                 st.markdown(
                                     f'<div style="background:#fffbeb;border-left:4px solid #d97706;padding:8px 12px;margin:4px 0;font-size:13px">'
-                                    f'🟡 <b>行{a["row_no"]}「{a["name"]}」</b>: '
+                                    f'🟡 <b>行{a["row_no"]}「{esc_html(a["name"])}」</b>: '
                                     f'部品¥{a["parts_amount"]:,} / 工賃¥{a["wage"]:,}<br>'
                                     f'{a["message"]}'
                                     f'</div>',
@@ -5615,6 +6032,26 @@ def main():
             else:
                 tax   = round(sub * TAX_RATE)
                 total = sub + tax + st.session_state.get('exp_exempt', 0)
+            # 費用（レッカー・代車・非課税）は合計に加算されるのに画面に
+            # 出ていなかったため、部品代＋工賃＋消費税と合計が一致せず
+            # 「計算が合っていない」ように見えていた。金額がある時だけ表示する。
+            _exp_sum_strip = (st.session_state.get('exp_towing', 0)
+                              + st.session_state.get('exp_rental', 0)
+                              + st.session_state.get('exp_exempt', 0))
+            _exp_cell = (
+                '<div class="total-sep">+</div>'
+                '<div class="total-item">'
+                '<div class="total-label">費用</div>'
+                f'<div class="total-value">¥{_exp_sum_strip:,}</div>'
+                '</div>'
+            ) if _exp_sum_strip else ''
+            _sp_cell = (
+                '<div class="total-sep">+</div>'
+                '<div class="total-item">'
+                '<div class="total-label">ショートパーツ</div>'
+                f'<div class="total-value">¥{sp:,}</div>'
+                '</div>'
+            ) if sp else ''
             st.markdown(f"""
             <div class="total-strip">
                 <div class="total-item">
@@ -5626,6 +6063,8 @@ def main():
                     <div class="total-label">工賃</div>
                     <div class="total-value">¥{calc_wages:,}</div>
                 </div>
+                {_sp_cell}
+                {_exp_cell}
                 <div class="total-sep">+</div>
                 <div class="total-item">
                     <div class="total-label">{'消費税（税込済）' if _is_tax_incl_strip else '消費税'}</div>
@@ -5672,6 +6111,10 @@ def main():
                 st.session_state['step'] = 1
                 st.session_state['vehicle_data']  = None
                 st.session_state['estimate_data'] = None
+                # 前の見積の比較元を残すと、次の見積で「訂正レポート」に
+                # 前回との差分が誤検出され、学習データに誤りが記録される
+                for _k in ('_original_items', '_fb_hash', '_fb_cache'):
+                    st.session_state.pop(_k, None)
                 st.rerun()
         with bcol2:
             # 金額差異未確認時のみボタンを無効化（分類エラーではブロックしない）
@@ -5791,7 +6234,7 @@ def main():
                     st.markdown(
                         f'<div style="background:#fef9c3;border:1px solid #ca8a04;border-radius:6px;padding:10px 14px;margin:8px 0;font-size:13px">'
                         f'✅ <b>部品・工賃区分確認済み</b> — {len(_cls_errors_s4)} 件の要確認項目が確認・承認された上でNEOを生成しました。<br>'
-                        + ''.join(f'<div style="margin-top:4px">⚠️ 行{a["row_no"]}「{a["name"]}」: 部品¥{a["parts_amount"]:,} / 工賃¥{a["wage"]:,}</div>' for a in _cls_errors_s4)
+                        + ''.join(f'<div style="margin-top:4px">⚠️ 行{a["row_no"]}「{esc_html(a["name"])}」: 部品¥{a["parts_amount"]:,} / 工賃¥{a["wage"]:,}</div>' for a in _cls_errors_s4)
                         + '</div>',
                         unsafe_allow_html=True
                     )
@@ -5884,14 +6327,19 @@ def main():
                     'pdf_parts', 'pdf_wages',
                     'policy_no', 'contractor_name',
                     'exp_towing', 'exp_rental', 'exp_exempt',
+                    # ウィジェットキー側も消さないと入力値が次の見積に残り、
+                    # 別のお客様の費用が混入する
+                    'exp_towing_input', 'exp_rental_input', 'exp_exempt_input',
                     'custom_neo_bytes', 'custom_neo_name',
                     'tax_override',
                     'classification_confirmed', 'classification_alerts',
                     'discrepancies', 'total_diff',
                     'amount_confirmed',
-                    '_original_items',
+                    '_original_items', '_fb_hash', '_fb_cache',
                     # CSV取り込み関連
                     'csv_mode', 'csv_items', '_csv_paste_saved',
+                    # PDF→NEO変換関連
+                    'pdf2neo_result', 'pdf2neo_vehicle_info',
                     # その他の残留データ
                     'use_fax_filter', 'use_rasterize', 'use_enhance', 'selected_model',
                     'short_parts_wage',
@@ -5902,8 +6350,12 @@ def main():
                 st.rerun()
         except Exception as e:
             progress.empty()
+            try:
+                _neo_wait.empty()  # 待機メッセージが残り続けるのを防ぐ
+            except Exception:
+                pass
             st.error(f"⚠️ NEO生成中にエラーが発生しました:\n\n{str(e)}")
-            st.code(traceback.format_exc())
+            print("[NEO生成エラー]", traceback.format_exc())
             if st.button("← ステップ③に戻る"):
                 st.session_state['step'] = 3
                 st.rerun()
