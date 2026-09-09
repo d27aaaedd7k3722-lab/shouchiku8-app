@@ -524,7 +524,9 @@ if __name__ == '__main__':
             if idx == -1: break
             ni = data.find(sig, idx + 16)
             sd = data[idx:ni] if ni != -1 else data[idx:]
-            tmp = os.path.join(tempfile.gettempdir(), f'neo_{os.getpid()}.db')
+            # PID固定名だと同時実行のセッション同士で衝突するため一意名にする
+            _fd, tmp = tempfile.mkstemp(suffix='.db', prefix='neo_')
+            os.close(_fd)
             try:
                 with open(tmp, 'wb') as f:
                     f.write(sd)

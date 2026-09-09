@@ -61,7 +61,10 @@ def _is_valid_addata(path: str, max_check: int = 3) -> bool:
         for entry in os.listdir(path):
             if len(entry) == 1 and entry.isalpha() and os.path.isdir(os.path.join(path, entry)):
                 letter_dirs.append(entry)
-                if len(letter_dirs) >= 1:
+                # max_check 個そろうまで集める。1個で打ち切ると、最初に
+                # 見つかった文字フォルダが空だっただけで有効なAddataを
+                # 「無効」と判定してしまう。
+                if len(letter_dirs) >= max_check:
                     break
         if not letter_dirs:
             return False

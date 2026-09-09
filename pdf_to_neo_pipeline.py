@@ -15,6 +15,7 @@ Iter2 追加要件:
 """
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import re
@@ -45,6 +46,35 @@ _PIPELINE_CACHE_MAX = 32
 # OCR 由来の括弧書き「(02)」「△500」「￥1,200」「2台」等を吸収して
 # float / int クラッシュを根絶する（BUG-1 (02) 問題の対策）
 # ============================================================
+def _clean_numeric_token(val) -> Optional[str]:
+    """数値トークンを正規化する。数値として解釈できない場合は None を返す。
+
+    以前は記号を無条件に削除していたため、'￥1,200-' が 0 に、
+    '1,000～2,000' が 10002000 に化けていた。金額が静かに壊れるより、
+    解釈できないものは呼び出し側の default に倒す方が安全。
+    """
+    s = str(val).strip()
+    if not s:
+        return None
+    s = s.translate(str.maketrans('０１２３４５６７８９．−，、～', '0123456789.-,,~'))
+    # 会計表記の括弧はマイナス
+    paren_negative = bool(re.fullmatch(r'\(\s*[^()]+\s*\)', s))
+    if paren_negative:
+        s = s[1:-1].strip()
+    is_negative = paren_negative or bool(re.match(r'^[△▲\-]', s))
+    s = re.sub(r'^[△▲\-]+', '', s)
+    # 単位・通貨・区切りを除去
+    s = re.sub(r'[個本枚セット台式時間円¥￥,\s]', '', s)
+    # 「¥1,200-」のような末尾のハイフン/長音は円マークの慣用表記
+    s = re.sub(r'[\-ー―–—]+$', '', s)
+    if not s:
+        return None
+    # ここで数値そのものになっていなければ解釈しない（範囲表記・分数など）
+    if not re.fullmatch(r'\d+(\.\d+)?', s):
+        return None
+    return ('-' + s) if is_negative else s
+
+
 def _to_int(val, default: int = 0) -> int:
     """安全な int 変換。括弧・通貨記号・全角・単位・会計表記を吸収。"""
     if val is None or val == '' or val == '*' or val == '**':
@@ -58,18 +88,11 @@ def _to_int(val, default: int = 0) -> int:
             return int(round(val))
         except (ValueError, OverflowError):
             return default
-    s = str(val).strip()
-    if not s:
-        return default
-    s = s.translate(str.maketrans('０１２３４５６７８９．−', '0123456789.-'))
-    is_negative = bool(re.match(r'^[△▲\-]', s))
-    s = re.sub(r'[個本枚セット台式時間円¥￥,，\s]', '', s)
-    s = re.sub(r'[^\d.\-]', '', s)
-    if not s or s in ('-', '.', '-.'):
+    cleaned = _clean_numeric_token(val)
+    if cleaned is None:
         return default
     try:
-        v = int(round(float(s)))
-        return -abs(v) if is_negative and v > 0 else v
+        return int(round(float(cleaned)))
     except (ValueError, OverflowError):
         return default
 
@@ -82,18 +105,11 @@ def _to_float(val, default: float = 0.0) -> float:
         return float(val)
     if isinstance(val, (int, float)):
         return float(val)
-    s = str(val).strip()
-    if not s:
-        return default
-    s = s.translate(str.maketrans('０１２３４５６７８９．−', '0123456789.-'))
-    is_negative = bool(re.match(r'^[△▲\-]', s))
-    s = re.sub(r'[個本枚セット台式時間円¥￥,，\s]', '', s)
-    s = re.sub(r'[^\d.\-]', '', s)
-    if not s or s in ('-', '.', '-.'):
+    cleaned = _clean_numeric_token(val)
+    if cleaned is None:
         return default
     try:
-        v = float(s)
-        return -abs(v) if is_negative and v > 0 else v
+        return float(cleaned)
     except (ValueError, OverflowError):
         return default
 
@@ -134,12 +150,19 @@ _COGNI_KEYWORDS = (
 )
 
 # Iter2: 正規表現（大文字小文字無視）
+# ベンダーを特定できる語だけを「コグニ系」の判定に使う。
+# 「見積番号」「見積書No」はどの見積書にも載る一般語なので、これを入れると
+# 他社の見積までコグニ扱い（モードB=完全複製）になってしまう。
 _COGNI_REGEX = re.compile(
-    # Iter R4: キーワード拡張 - 富士通ピットイン/MOTOR EYE/EDER等の他社見積システムも識別
     r"(Audatex|アウダテックス|コグニ|Cogni\s*7?|AUDADAMS|"
     r"車両見積システム|自動車補修見積システム|Cognitive\s*Seven|"
-    r"見積\s*書\s*No|見積番号|データ№|データ番号|"
-    r"DCS|FUJITSU|富士通)",
+    r"データ№|データ番号|DCS|FUJITSU|富士通)",
+    re.IGNORECASE,
+)
+
+# 「そもそも見積書らしいか」の判定用（モード選択には使わない）
+_ESTIMATE_FORM_REGEX = re.compile(
+    r"(見積\s*書\s*No|見積番号|見積書|御見積|部品\s*計|工賃\s*計|合計)",
     re.IGNORECASE,
 )
 
@@ -394,6 +417,20 @@ def decide_mode(found_or_source, source_or_addata=None) -> GenerationMode:
     return "C"
 
 
+def decide_mode_from_identify(ident: Dict[str, Any], source: str) -> GenerationMode:
+    """identify結果からモードを決める。
+
+    Addataが無い時 identify は「TOYOTA_GENERIC のテンプレで代用した」という
+    意味で found=True を返す（match_layer=3 / is_template=True）。これは
+    車種DBに当たったわけではないので、モードA（ベタ打ち）として扱う。
+    """
+    if not isinstance(ident, dict):
+        return decide_mode(False, source)
+    if ident.get("is_template") or ident.get("match_layer") == 3:
+        return "A"
+    return decide_mode(bool(ident.get("found")), source)
+
+
 # ============================================================
 # 4. 品番マーカー
 # ============================================================
@@ -544,28 +581,44 @@ def _fallback_parts_no_from_db(items: List[Dict[str, Any]],
 
 
 def _final_dedup_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Iter14: pipeline側 二重重複除去
-    同名+同金額 (正規化name + parts_amount + wage) の連続行を統合。
-    OCR内部の重複検知をすり抜けたケースを最終的に救う。
+    """ページ跨ぎで二重に読まれた明細だけを統合する。
+
+    見積書には同じ部品が同じ金額で複数行並ぶこと（クリップ2個など）が
+    普通にあるため、以前の「同名同金額なら全部まとめる」実装は正当な明細を
+    削っていた。本アプリの方針は「同一ページ内の重複行は原本通り全て保持」
+    なので、ここで落とすのは
+      - 直前の行と完全に一致（品名・品番・部品金額・工賃）し、かつ
+      - ページ番号が異なる（＝ページ境界の二重読み取り）
+    ものだけに限定する。
     """
     if not items or len(items) <= 1:
         return items
-    seen = set()
-    out = []
+
+    def _sig(it):
+        return (
+            str(it.get("name") or it.get("parts_name") or "").strip().lower(),
+            str(it.get("part_no") or it.get("parts_no") or "").strip().lower(),
+            _to_int(it.get("parts_amount") or it.get("part_price")),
+            _to_int(it.get("wage") or it.get("labor_fee")),
+            str(it.get("index_value") or "").strip(),
+        )
+
+    out: List[Dict[str, Any]] = []
     for it in items:
         if not isinstance(it, dict):
             out.append(it)
             continue
         try:
-            nm = str(it.get("name") or it.get("parts_name") or "").strip().lower()
-            pa = _to_int(it.get("parts_amount") or it.get("part_price"))
-            wg = _to_int(it.get("wage") or it.get("labor_fee"))
-            ix = str(it.get("index_value") or "").strip()
-            key = (nm, pa, wg, ix)
-            if nm and key in seen:
-                continue
-            if nm:
-                seen.add(key)
+            if out and isinstance(out[-1], dict):
+                prev = out[-1]
+                sig = _sig(it)
+                if sig[0] and sig == _sig(prev):
+                    prev_page = prev.get("page")
+                    cur_page = it.get("page")
+                    if prev_page is not None and cur_page is not None and prev_page != cur_page:
+                        logger.info("[dedup] ページ境界の重複行を統合: %s (p%s/p%s)",
+                                    sig[0], prev_page, cur_page)
+                        continue
         except Exception:
             pass
         out.append(it)
@@ -769,7 +822,8 @@ def _normalize_items_for_neo(items: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 def _call_generate_neo(template_bytes: bytes,
                        customer_info: Dict[str, Any],
-                       items: List[Dict[str, Any]]) -> bytes:
+                       items: List[Dict[str, Any]],
+                       is_beta_mode: bool = False) -> bytes:
     """app.generate_neo_file の薄ラッパ。lazy import + items正規化(Iter6)"""
     try:
         from app import generate_neo_file  # type: ignore
@@ -785,7 +839,9 @@ def _call_generate_neo(template_bytes: bytes,
         insurance_info={},
         expenses=None,
         is_tax_inclusive=False,
-        is_beta_mode=False,
+        # モードA(ベタ打ち)ではDB照合していないので、未マッチを表す ※ を
+        # 品名に付けてはいけない（付けると全品名が ※ 付きで出荷される）
+        is_beta_mode=is_beta_mode,
         merge_mode=False,
     )
     return neo_bytes
@@ -884,7 +940,8 @@ def build_neo_mode_a(items: List[Dict[str, Any]],
     """モードA: ベタ打ち (収録外)。OCR項目をそのまま転写。"""
     tpl = _load_template_bytes(template_path)
     cust = _merge_vehicle_into_customer(vehicle_info or {}, customer_info)
-    return _call_generate_neo(tpl, cust, items or [])
+    # ベタ打ち: DB照合していないため ※（DB未マッチ印）を付けない
+    return _call_generate_neo(tpl, cust, items or [], is_beta_mode=True)
 
 
 def build_neo_mode_b(items: List[Dict[str, Any]],
@@ -1048,10 +1105,18 @@ def _find_erparts_blob(files: Dict[str, bytes]) -> Optional[bytes]:
     return None
 
 
-def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """NEO bytes から AnSvEm0001.sld を取り出し、ERParts を SELECT。
-    PDF items の件数と総額を比較する。
+def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
+                           pdf_parts_total: Optional[int] = None,
+                           pdf_wage_total: Optional[int] = None) -> Dict[str, Any]:
+    """生成したNEOの明細を、見積書PDFの金額と突き合わせる。
+
+    pdf_parts_total / pdf_wage_total には、見積書に「印字されている」合計
+    （OCRのヘッダ解析結果）を渡す。渡された場合はそちらを正とする。
+    渡さない場合は items の合計と比べるが、それは「入れたものが入っている」
+    ことを確認するだけの自明な検証にしかならず、明細の取りこぼしを見逃す。
     """
+    pdf_parts_total_arg = pdf_parts_total
+    pdf_wage_total_arg = pdf_wage_total
     res = {
         "ok": False,
         "count_match": False,
@@ -1083,10 +1148,22 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]]) -> Dic
                     pdf_parts_total += int(up * qty)
             except (TypeError, ValueError):
                 pass
+        items_parts_total = pdf_parts_total
+        items_wage_total = pdf_wage_total
+        # 見積書に印字された合計が渡されていればそちらを正とする
+        if pdf_parts_total_arg is not None and _to_int(pdf_parts_total_arg) > 0:
+            pdf_parts_total = _to_int(pdf_parts_total_arg)
+            res["total_source"] = "pdf_header"
+        else:
+            res["total_source"] = "items_sum"
+        if pdf_wage_total_arg is not None and _to_int(pdf_wage_total_arg) > 0:
+            pdf_wage_total = _to_int(pdf_wage_total_arg)
         pdf_total = pdf_parts_total + pdf_wage_total
         res["pdf_parts_total"] = pdf_parts_total
         res["pdf_wage_total"] = pdf_wage_total
         res["pdf_total"] = pdf_total
+        res["items_parts_total"] = items_parts_total
+        res["items_wage_total"] = items_wage_total
 
         if not neo_bytes:
             res["error"] = "neo_bytes empty"
@@ -1232,7 +1309,9 @@ def process_pdf_to_neo(pdf_path,
                        customer_info: Optional[Dict[str, Any]] = None,
                        skip_ocr: bool = False,
                        mode_override: Optional[str] = None,
-                       model_name: Optional[str] = None) -> Dict[str, Any]:
+                       model_name: Optional[str] = None,
+                       api_key: Optional[str] = None,
+                       cache_scope: str = "") -> Dict[str, Any]:
     """E2E ディスパッチャ。
 
     - vehicle_info/items 未提供かつ skip_ocr=False かつ GEMINI_API_KEY あり → OCR
@@ -1275,14 +1354,29 @@ def process_pdf_to_neo(pdf_path,
     # Iter9: パイプライン結果キャッシュ確認
     cache_key = ""
     if pdf_bytes and not vehicle_info and not items and not skip_ocr:
-        cache_key = _pdf_md5(pdf_bytes) + f":{mode_override}:{addata_root}"
+        # テンプレートやモデルが変わったのに前回結果を返さないよう、
+        # 結果に影響する引数を全てキーに含める
+        # cache_scope には呼び出し側のセッション識別子を渡す。
+        # 同じPDFを別の利用者が処理したときに、前の利用者の解析結果や
+        # 生成済みNEO（車台番号などを含む）が返るのを防ぐ。
+        cache_key = "|".join([
+            str(cache_scope),
+            _pdf_md5(pdf_bytes),
+            str(mode_override), str(addata_root),
+            str(template_path), str(model_name),
+            _pdf_md5((ocr_text or "").encode("utf-8", "ignore")),
+        ])
         if cache_key in _PIPELINE_CACHE:
-            cached = dict(_PIPELINE_CACHE[cache_key])
+            cached = copy.deepcopy(_PIPELINE_CACHE[cache_key])
             cached["from_cache"] = True
             return cached
 
     # 1) OCR (必要時のみ)
-    api_key = os.environ.get("GEMINI_API_KEY", "")
+    # APIキーは引数で受け取る。環境変数はCLI実行時のフォールバックに限る。
+    # プロセスを全利用者で共有するホスト（Streamlit Community Cloud等）では
+    # os.environ に書くと他の利用者のセッションからも読めてしまう。
+    if not api_key:
+        api_key = os.environ.get("GEMINI_API_KEY", "")
     need_vi = vehicle_info is None
     need_items = items is None
     if (need_vi or need_items) and (not skip_ocr) and api_key and pdf_bytes:
@@ -1466,6 +1560,8 @@ def process_pdf_to_neo(pdf_path,
     items = items or []
 
     # v7: PDF表示総額と明細合算の差分を「※金額調整」行で吸収 (完全一致保証)
+    hdr_parts_total = 0
+    hdr_wage_total = 0
     if items and out.get("ocr_meta"):
         try:
             _meta = out["ocr_meta"]
@@ -1509,6 +1605,23 @@ def process_pdf_to_neo(pdf_path,
                             _meta["pdf_grand_total"] = items_total
                 except Exception:
                     pass
+            hdr_parts_total = pdf_p
+            hdr_wage_total = pdf_w
+            # 許容差(2%または1000円)の範囲内は調整行を作らないため、
+            # 差が残ったまま出荷されうる。黙って通さず警告に残す。
+            try:
+                _sum_p = sum(_to_int(it.get("parts_amount") or it.get("part_price")) for it in items)
+                _sum_w = sum(_to_int(it.get("wage") or it.get("labor_fee")) for it in items)
+                _resid_p = pdf_p - _sum_p if pdf_p > 0 else 0
+                _resid_w = pdf_w - _sum_w if pdf_w > 0 else 0
+                out["total_residual"] = {"parts": _resid_p, "wage": _resid_w}
+                if _resid_p or _resid_w:
+                    warnings.append(
+                        f"見積書の合計と明細の合計に差が残っています"
+                        f"（部品 {_resid_p:+,}円 / 工賃 {_resid_w:+,}円）。明細を確認してください。"
+                    )
+            except Exception:
+                pass
         except Exception as e:
             log.append(f"total_match 失敗: {e}")
 
@@ -1637,7 +1750,7 @@ def process_pdf_to_neo(pdf_path,
         mode = mode_override
         log.append(f"mode_override={mode}")
     else:
-        mode = decide_mode(bool(ident.get("found")), out["source"])
+        mode = decide_mode_from_identify(ident, out["source"])
     out["mode"] = mode
     log.append(f"mode={mode}")
 
@@ -1658,7 +1771,9 @@ def process_pdf_to_neo(pdf_path,
         log.append(f"NEO生成成功 size={len(neo) if neo else 0}")
         # verify
         try:
-            v = verify_neo_against_pdf(neo, items)
+            v = verify_neo_against_pdf(neo, items,
+                                       pdf_parts_total=hdr_parts_total or None,
+                                       pdf_wage_total=hdr_wage_total or None)
             out["verify"] = v
             log.append(f"verify ok={v.get('ok')} count={v.get('count_match')} total={v.get('total_match')}")
         except Exception as e:
@@ -1673,7 +1788,7 @@ def process_pdf_to_neo(pdf_path,
     if cache_key and out.get("ok") and out.get("neo_bytes"):
         if len(_PIPELINE_CACHE) >= _PIPELINE_CACHE_MAX:
             _PIPELINE_CACHE.pop(next(iter(_PIPELINE_CACHE)))
-        _PIPELINE_CACHE[cache_key] = {k: v for k, v in out.items()}
+        _PIPELINE_CACHE[cache_key] = copy.deepcopy(out)
 
     # v10.4: items を CSV bytes 化（NEO 生成に成功している場合のみ。失敗時は付けない）
     # v13+: SECTION:VERIFY / SECTION:SUMMARY を OCR メタから抽出して同梱

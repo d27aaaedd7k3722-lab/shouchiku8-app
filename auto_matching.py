@@ -907,7 +907,10 @@ class NEOExtractor:
             if idx == -1: break
             next_idx = data.find(sig, idx + 16)
             sdata = data[idx:next_idx] if next_idx != -1 else data[idx:]
-            tmp = os.path.join(tempfile.gettempdir(), f'neo_{os.getpid()}_{idx}.db')
+            # PID固定名だと同時実行のセッション同士で同じファイルを奪い合い、
+            # 他人の解析結果を読んでしまう。呼び出しごとに一意な名前にする。
+            _fd, tmp = tempfile.mkstemp(suffix='.db', prefix='neo_')
+            os.close(_fd)
             try:
                 with open(tmp, 'wb') as f: f.write(sdata)
                 conn = sqlite3.connect(tmp)

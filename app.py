@@ -474,20 +474,39 @@ def find_real_cks(data, start=424):
     return real_ck
 
 
+# 展開後サイズの上限。実データは1500明細でも約620KBなので、64MBは十分に余裕がある。
+# 上限なしで展開すると、数百KBのNEOが数百MBに膨らむ細工ファイル（展開爆弾）で
+# プロセス全体のメモリを枯渇させられる。
+MAX_DECOMPRESSED_SIZE = 64 * 1024 * 1024
+
+
 def decompress_neo(data, real_ck):
     """辞書連鎖展開でrawデータを復元"""
-    full_raw = b''
+    chunks = []
+    total = 0
     for i, ck in enumerate(real_ck):
         start = ck + 2
         end   = real_ck[i + 1] - 8 if i + 1 < len(real_ck) else len(data)
         chunk = data[start:end]
+        remaining = MAX_DECOMPRESSED_SIZE - total
+        if remaining <= 0:
+            raise ValueError(
+                f"NEOファイルの展開後サイズが上限（{MAX_DECOMPRESSED_SIZE // (1024*1024)}MB）を超えました。"
+                "ファイルが壊れているか、想定外のファイルです。"
+            )
         if i == 0:
-            raw = zlib.decompress(chunk, -15)
+            dobj = zlib.decompressobj(-15)
         else:
-            dobj = zlib.decompressobj(-15, zdict=full_raw[-32768:])
-            raw  = dobj.decompress(chunk)
-        full_raw += raw
-    return full_raw
+            dobj = zlib.decompressobj(-15, zdict=b''.join(chunks)[-32768:])
+        raw = dobj.decompress(chunk, remaining)
+        if dobj.unconsumed_tail:
+            raise ValueError(
+                f"NEOファイルの展開後サイズが上限（{MAX_DECOMPRESSED_SIZE // (1024*1024)}MB）を超えました。"
+                "ファイルが壊れているか、想定外のファイルです。"
+            )
+        chunks.append(raw)
+        total += len(raw)
+    return b''.join(chunks)
 
 
 def parse_entries(data, first_ck):
@@ -565,9 +584,24 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
     if expenses is None:
         expenses = {}
     tf = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
-    tf.write(db_bytes)
-    tf.close()
-    conn = sqlite3.connect(tf.name)
+    try:
+        tf.write(db_bytes)
+    finally:
+        tf.close()
+    # 途中で例外が出ても一時ファイル（顧客情報を含む）を残さない
+    try:
+        return _update_ansmb_impl(tf.name, items, short_parts_wage, expenses,
+                                  is_tax_inclusive, is_beta_mode)
+    finally:
+        try:
+            os.unlink(tf.name)
+        except OSError:
+            pass
+
+
+def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
+                       is_tax_inclusive, is_beta_mode):
+    conn = sqlite3.connect(_tmp_db_path)
     cur  = conn.cursor()
     cur.execute('DELETE FROM ERParts')
     # ── 塗装セクション・その他テーブルをリセット ──
@@ -855,9 +889,8 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
     ))
     conn.commit()
     conn.close()
-    with open(tf.name, 'rb') as f:
+    with open(_tmp_db_path, 'rb') as f:
         result = f.read()
-    os.unlink(tf.name)
     return result, total_parts, total_wages, grand_total
 
 
@@ -871,9 +904,23 @@ def update_em_db(db_bytes, cust, insurance_info, estimated_date, is_tax_inclusiv
     空値のフィールドはテンプレートNEOの値を保持する。
     """
     tf = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
-    tf.write(db_bytes)
-    tf.close()
-    conn = sqlite3.connect(tf.name)
+    try:
+        tf.write(db_bytes)
+    finally:
+        tf.close()
+    try:
+        return _update_em_db_impl(tf.name, cust, insurance_info, estimated_date,
+                                  is_tax_inclusive, merge_mode)
+    finally:
+        try:
+            os.unlink(tf.name)
+        except OSError:
+            pass
+
+
+def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
+                       is_tax_inclusive, merge_mode):
+    conn = sqlite3.connect(_tmp_db_path)
     cur  = conn.cursor()
     customer_name = safe_str(cust.get('customer_name', ''))
     owner_name    = safe_str(cust.get('owner_name', ''))
@@ -996,9 +1043,8 @@ def update_em_db(db_bytes, cust, insurance_info, estimated_date, is_tax_inclusiv
         print("TaxKindFlag update failed:", e)
 
     conn.close()
-    with open(tf.name, 'rb') as f:
+    with open(_tmp_db_path, 'rb') as f:
         result = f.read()
-    os.unlink(tf.name)
     return result
 
 
@@ -4025,6 +4071,34 @@ def generate_filename(cust, calc_parts, calc_wages, pdf_parts, pdf_wages,
 # ============================================================
 # PDF見積 → NEO 自動変換（pdf_to_neo_pipeline のラッパ）
 # ============================================================
+def esc_html(value) -> str:
+    """HTMLに埋め込む前のエスケープ。
+
+    車検証OCRの結果や品名など、アップロードされた文書に由来する文字列を
+    unsafe_allow_html のHTMLへ直接埋め込むと、画面の崩しやリンクの差し込みが
+    できてしまう。表示直前にこれを通す。
+    """
+    import html as _html
+    return _html.escape(str(value if value is not None else ''), quote=True)
+
+
+def _session_cache_scope() -> str:
+    """このセッション固有のキャッシュ識別子。
+
+    pdf_to_neo_pipeline のキャッシュはプロセス全体で共有されるため、
+    識別子を渡さないと、同じ見積PDFを扱った別の利用者に前の利用者の
+    解析結果や生成済みNEOが返ってしまう。
+    """
+    try:
+        scope = st.session_state.get('_pipeline_cache_scope')
+        if not scope:
+            scope = _uuid.uuid4().hex
+            st.session_state['_pipeline_cache_scope'] = scope
+        return scope
+    except Exception:
+        return _uuid.uuid4().hex
+
+
 def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=None):
     """見積書PDFから直接NEOファイルを生成する。
 
@@ -4037,7 +4111,6 @@ def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=
     """
     tmp_pdf = None
     tmp_tpl = None
-    prev_key = os.environ.get('GEMINI_API_KEY')
     try:
         try:
             import pdf_to_neo_pipeline as _pipe
@@ -4059,14 +4132,16 @@ def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=
         addata_root = find_addata_dir()
         mode_override = None if addata_root else 'A'
 
-        if api_key:
-            os.environ['GEMINI_API_KEY'] = api_key
+        # APIキーは引数で直接渡す。os.environ に書くと、プロセスを共有する
+        # 他の利用者のセッションからも読めてしまう（キーの流用・課金事故）。
         result = _pipe.process_pdf_to_neo(
             tmp_pdf,
             addata_root=addata_root or '',
             template_path=template_path,
             mode_override=mode_override,
             model_name=model_name or None,
+            api_key=api_key or None,
+            cache_scope=_session_cache_scope(),
         )
         if not isinstance(result, dict):
             return {'ok': False, 'error': 'PDF→NEO変換が想定外の値を返しました'}
@@ -4074,10 +4149,6 @@ def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=
     except Exception as e:
         return {'ok': False, 'error': f'PDF→NEO変換に失敗しました: {e}'}
     finally:
-        if prev_key is None:
-            os.environ.pop('GEMINI_API_KEY', None)
-        else:
-            os.environ['GEMINI_API_KEY'] = prev_key
         for _path in (tmp_pdf, tmp_tpl):
             if _path:
                 try:
@@ -5144,17 +5215,17 @@ def main():
         # ── 車両ストリップ ──
         veh_match_result = estimate_data.get('_veh_match_result', {}) if estimate_data else {}
         match_is_db = veh_match_result.get('is_supported', False)
-        car_name_strip = safe_str(vehicle_data.get('car_name', ''))
-        car_model_strip = safe_str(vehicle_data.get('car_model', ''))
-        engine_strip = safe_str(vehicle_data.get('engine_model', ''))
+        car_name_strip = esc_html(safe_str(vehicle_data.get('car_name', '')))
+        car_model_strip = esc_html(safe_str(vehicle_data.get('car_model', '')))
+        engine_strip = esc_html(safe_str(vehicle_data.get('engine_model', '')))
         reg_date_strip = safe_str(vehicle_data.get('car_reg_date', ''))
         if len(reg_date_strip) >= 6:
             reg_date_display = f"{reg_date_strip[:4]}/{reg_date_strip[4:6]}"
         else:
             reg_date_display = reg_date_strip
         km_strip = safe_int(vehicle_data.get('kilometer', 0))
-        type_desig = safe_str(vehicle_data.get('car_model_designation', ''))
-        cat_num = safe_str(vehicle_data.get('car_category_number', ''))
+        type_desig = esc_html(safe_str(vehicle_data.get('car_model_designation', '')))
+        cat_num = esc_html(safe_str(vehicle_data.get('car_category_number', '')))
         v_code = veh_match_result.get('vehicle_code', '')
         items_count = len(estimate_data.get('items', [])) if estimate_data else 0
 
