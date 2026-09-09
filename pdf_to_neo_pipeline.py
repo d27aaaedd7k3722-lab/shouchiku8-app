@@ -1808,7 +1808,13 @@ def process_pdf_to_neo(pdf_path,
             if pdf_g > 0:
                 _s0 = _sum_items_outtax(items)
                 _tol0 = max(int(round(pdf_g * 0.02)), 1000)
-                _disc0 = _to_int(_meta.get("discount_amount"))
+                # 値引きは、ヘッダの値と明細の値引き行の合計の大きいほうを採る。
+                # ヘッダ側を読み落としたときに 0 のまま使うと、下の残差判定が
+                # 「小計のほうが総合計より大きい」と見て税区分を取り違える。
+                _disc_rows = sum(abs(_to_int(it.get("wage", 0)))
+                                 + abs(_to_int(it.get("parts_amount", 0)))
+                                 for it in (items or []) if _is_discount_row(it))
+                _disc0 = max(_to_int(_meta.get("discount_amount")), _disc_rows)
                 _pw_net = pdf_p + pdf_w - _disc0
                 _decided = False
                 if _pw_net > 0:
@@ -1840,6 +1846,25 @@ def process_pdf_to_neo(pdf_path,
                         log.append(f"[grand_total_match] 小計対象外分で判定: "
                                    f"税抜なら{_r_ex} / 税込なら{_r_in} → "
                                    f"{'税込' if _grand_is_intax else '税抜'}")
+                        # この判定は「小計に入らない行が総合計にだけ乗っている」
+                        # 前提で書いているが、値引きを読み落とした場合や小計を
+                        # 過大に誤読した場合も残差の符号は同じ形になり、
+                        # 税込の総合計を税抜と取り違える（総額が約10%増え、
+                        # 原本に無い調整行が1本入る）。
+                        # 明細合算が反対側の解釈と行ごとの丸め差の範囲で
+                        # ぴったり一致し、選んだ側とは一致しないときだけ覆す。
+                        # 読み落としのある見積では合算がぴったりにならないので、
+                        # 「読み落としが消費税に化ける」防御はそのまま残る。
+                        _flip_tol = max(len(items or []) * 2, 100)
+                        _d_pick = abs((int(round(pdf_g / 1.10)) if _grand_is_intax
+                                       else pdf_g) - _s0)
+                        _d_other = abs((pdf_g if _grand_is_intax
+                                        else int(round(pdf_g / 1.10))) - _s0)
+                        if _d_other <= _flip_tol < _d_pick:
+                            _grand_is_intax = not _grand_is_intax
+                            log.append(f"[grand_total_match] 明細合算{_s0}が反対の"
+                                       f"解釈とぴったり一致するため覆す → "
+                                       f"{'税込' if _grand_is_intax else '税抜'}")
                 if not _decided:
                     _grand_is_intax = (abs(int(round(pdf_g / 1.10)) - _s0)
                                        < abs(pdf_g - _s0))
@@ -1982,7 +2007,9 @@ def process_pdf_to_neo(pdf_path,
                 # 行ごとの丸めで印字小計が明細合算より数円大きくなるのは普通に
                 # 起きる。下限を置かないと、1行も落としていない見積で毎回
                 # 警告が出て、本物の読み落としの警告が埋もれる。
-                _resid_floor = max(int((pdf_p + pdf_w) * 0.001), 100)
+                # 丸め差は行あたり高々1円。総額の0.1%を下限にすると、
+                # 60万円の見積で600円のクリップ1行が無警告で消える。
+                _resid_floor = max(len(items or []), 100)
                 _resid_shortfall = (_resid_p > _resid_floor or _resid_w > _resid_floor)
                 if (_resid_p or _resid_w) and (_resid_shortfall or not _grand_ok):
                     warnings.append(
