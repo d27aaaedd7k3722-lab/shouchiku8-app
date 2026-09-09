@@ -854,7 +854,18 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         
         # Addataのマスタと一致しており、ユーザーがUIで名前を意図的に上書き変更していない場合はマスタ名称と品番を採用
         parts_no = ''
-        m_level = item.get('_match_level', 99)
+        # 照合側は 'match_level' に "L1".."L4" の文字列を書く。
+        # '_match_level'（数値）は旧UIの名残。以前はこちらしか見ておらず、
+        # 既定値99が採用されて全行が「未マッチ」扱いになり、
+        # Addataに完全一致した部品まで品名の先頭に ※ が付いていた。
+        _ml_raw = item.get('_match_level', item.get('match_level'))
+        if isinstance(_ml_raw, str) and _ml_raw[:1].upper() == 'L' and _ml_raw[1:].isdigit():
+            m_level = int(_ml_raw[1:])
+        elif isinstance(_ml_raw, (int, float)):
+            m_level = int(_ml_raw)
+        else:
+            # 照合情報が無い行は「未マッチ」ではない（CSV取り込み等）
+            m_level = 0
         if m_level <= 3 and item.get('_master_name'):
             # ユーザーが編集画面でOCR名称をそのままにしていた場合のみマスタ名に置換
             # （手動で全く違う名前に直した場合はそちらを尊重する）
@@ -867,9 +878,13 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         
         # 未マッチ（またはそれに準ずる低マッチレベル）部品には先頭に「※」を付与
         # ベタ打ちモードではDB照合を行わないため※を付けない
-        if not is_beta_mode and m_level >= 4:
-            if not name.startswith('※'):
-                name = '※' + name
+        _needs_mark = (not is_beta_mode and m_level >= 4
+                       and not name.startswith('※'))
+        if _needs_mark:
+            # ※ の2バイトぶん先に詰めてから付ける。後から付けると
+            # 列幅24バイトの切り詰めで品名の末尾が余計に落ちる
+            # （「…カバー下部」が「…カバー」になり別部品に読める）。
+            name = '※' + cp932_trim(name, _ERPARTS_WIDTH['PartsName'] - 2)
         
         # 区分: work_code（Markdownパーサー保存先）または method から取得
         method = item.get('method', '') or item.get('work_code', '')
@@ -880,7 +895,10 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         parts_no = cp932_trim(parts_no, _ERPARTS_WIDTH['PartsNo'])
 
         # 品名から作業種別を自動推定（区分が空白の場合）
-        if not method:
+        # ただし「※金額調整」は自動で足した差額の行で、作業ではない。
+        # 推定に掛けると「調整」の2文字が修理系の語に当たって
+        # 「修理」区分の部品行になり、コグニセブン上で説明できない行になる。
+        if not method and not str(item.get('name', '')).startswith('※金額調整'):
             _name_for_detect = str(item.get('name', ''))
             _parts_amt = safe_int(item.get('parts_amount', 0))
             _wage_amt  = safe_int(item.get('wage', 0))
@@ -2793,10 +2811,11 @@ TASK_PROMPTS["estimate_header_totals"] = """<task_execution>
 {
   "step_by_step_reasoning": "金額がどこに記載されていたか、どのように数値を判定したかの簡潔な思考プロセス",
   "repair_shop_name": "不明",
-  "car_name": "不明",
-  "car_model": "不明",
-  "color_code": "不明",
-  "license_plate": "不明",
+  "vehicle_info": {
+    "car_name": "", "car_model": "", "engine_model": "",
+    "color_code": "", "color_name": "", "trim_code": "",
+    "grade": "", "model_year": "", "chassis_no": "", "mileage": ""
+  },
   "pdf_parts_total": 0,
   "pdf_wage_total": 0,
   "discount_amount": 0,
@@ -2809,7 +2828,7 @@ TASK_PROMPTS["estimate_header_totals"] = """<task_execution>
 TASK_PROMPTS["estimate_detail_page"] = """<task_execution>
 タスク名: detail_extraction
 
-文書上部から基本情報を抽出し、明細行を配列で抽出してください。合計行・小計行・消費税行は明細配列に含めないでください。
+文書上部から基本情報を抽出し、明細行を配列で抽出してください。合計行・小計行・消費税行、および値引き（値引/割引/サービス）行は明細配列に含めないでください（値引きは別途ヘッダから取得します）。
 
 <output_format>
 {
@@ -3429,6 +3448,38 @@ def parse_detail_json_to_items(json_text: str, page_num: int = 1) -> list:
     return items
 
 
+# Markdown表の見出し → 内部キー
+_MD_COLUMN_ALIASES = {
+    'name':         ('品名', '部品名', '作業内容', '作業内容・使用部品名', '品目', '名称'),
+    'work_code':    ('区分', '作業区分'),
+    'index_value':  ('指数', '工数'),
+    'wage':         ('技術料', '工賃', '作業工賃'),
+    'quantity':     ('数量', '個数'),
+    'parts_amount': ('部品金額', '部品代', '部品', '部品・油脂', '部品、油脂', '部品油脂'),
+    'part_no':      ('部品品番', '部品コード', '部品番号', '品番'),
+}
+
+
+def _build_md_colmap(header_cells) -> dict:
+    """Markdown表の見出し行から「内部キー → 列位置」を作る。"""
+    norm = []
+    for c in header_cells:
+        c = re.sub(r'[\s\u3000・、，]', '', str(c or ''))
+        c = re.sub(r'[（(\[【][^）)\]】]*[）)\]】]', '', c)
+        c = re.sub(r'[（(\[【].*$', '', c)
+        norm.append(c)
+    colmap = {}
+    for key, aliases in _MD_COLUMN_ALIASES.items():
+        for alias in aliases:
+            for i, c in enumerate(norm):
+                if c == alias and i not in colmap.values():
+                    colmap[key] = i
+                    break
+            if key in colmap:
+                break
+    return colmap if 'name' in colmap else {}
+
+
 def parse_markdown_to_items(md_text: str, page_num: int = 1) -> list:
     """Geminiが出力したMarkdown表をitemsリスト（JSON互換）に変換する"""
     import re
@@ -3436,12 +3487,24 @@ def parse_markdown_to_items(md_text: str, page_num: int = 1) -> list:
     row_idx = 0
 
     def to_int(s):
-        s = re.sub(r'[,，\s¥￥円△▲+\-]', '', str(s))
+        # 品番のような数値でない文字列は0にする。以前は記号を消して
+        # から int にしていたため「52119-47010」が 5,211,947,010 になった。
+        raw = str(s).strip()
+        if not raw:
+            return 0
+        if not re.fullmatch(r'[¥￥]?[\d,，\.\s△▲()（）+\-]*円?', raw):
+            return 0
+        neg = bool(re.search(r'[△▲\-]|^\(.*\)$|^（.*）$', raw))
+        s2 = re.sub(r'[,，\s¥￥円△▲+\-()（）]', '', raw)
+        if not s2:
+            return 0
         try:
-            return int(float(s))
+            v = int(float(s2))
         except Exception:
             return 0
+        return -v if neg else v
 
+    _md_colmap = {}
     for line in md_text.splitlines():
         if not line.startswith('|'):
             continue
@@ -3450,6 +3513,8 @@ def parse_markdown_to_items(md_text: str, page_num: int = 1) -> list:
             continue
         # ヘッダー行をスキップ
         if cells[0] in ('作業内容・使用部品名', '作業内容', '品名', '部品名'):
+            # 見出し行から列位置を覚える（以降の行はこれに従って読む）
+            _md_colmap = _build_md_colmap(cells)
             continue
         # 区切り行（--- のみ）をスキップ
         if re.match(r'^[-: ]*$', cells[0]) and cells[0]:
@@ -3458,13 +3523,21 @@ def parse_markdown_to_items(md_text: str, page_num: int = 1) -> list:
         if all(re.match(r'^[-:= ]*$', c) for c in cells):
             continue
 
-        name        = cells[0] if cells[0] else '不明'
-        method      = cells[1] if len(cells) > 1 else ''   # 区分
-        index_value = cells[2].strip() if len(cells) > 2 else ''  # 指数（工数）
-        wage        = to_int(cells[3]) if len(cells) > 3 else 0  # 技術料
-        qty         = to_int(cells[4]) if len(cells) > 4 else 1  # 数量
-        parts       = to_int(cells[5]) if len(cells) > 5 else 0  # 部品金額
-        part_no     = cells[6].strip() if len(cells) > 6 else ''  # 部品品番
+        # 列は見出しから引き当てる。位置決め打ちだと、画面のプロンプトが
+        # 案内する並び（品名,区分,数量,部品金額,工賃,部品コード）で
+        # 返ってきたときに全列がずれる。見出しが無ければ従来の位置。
+        def _md_cell(key, pos):
+            idx = _md_colmap.get(key, None if _md_colmap else pos)
+            if idx is None or idx >= len(cells):
+                return ''
+            return cells[idx]
+        name        = _md_cell('name', 0) or '不明'
+        method      = _md_cell('work_code', 1)
+        index_value = _md_cell('index_value', 2).strip()
+        wage        = to_int(_md_cell('wage', 3))
+        qty         = to_int(_md_cell('quantity', 4))
+        parts       = to_int(_md_cell('parts_amount', 5))
+        part_no     = _md_cell('part_no', 6).strip()
 
         if wage == 0 and parts == 0:
             continue  # 両方0は除外
@@ -3888,21 +3961,35 @@ def _self_correction_retry(api_key, file_bytes, mime_type, model_name,
     """
     calc_parts = sum(safe_int(it.get('parts_amount', 0)) for it in original_items)
     calc_wage  = sum(safe_int(it.get('wage', 0))         for it in original_items)
-    parts_diff = calc_parts - target_parts
-    wage_diff  = calc_wage  - target_wage
+    # 合計抽出プロンプトは「小計行が無い場合は0を返せ」と指示しており、
+    # 0 は「読めなかった」の意味。真値0として扱うと、その科目を
+    # 全額削除しろという指示を書いてしまう。
+    _has_parts_target = target_parts > 0
+    _has_wage_target  = target_wage  > 0
+    if not _has_parts_target and not _has_wage_target:
+        return None
+    parts_diff = (calc_parts - target_parts) if _has_parts_target else 0
+    wage_diff  = (calc_wage  - target_wage)  if _has_wage_target  else 0
 
     if (abs(parts_diff) <= SELF_CORRECTION_THRESHOLD and
             abs(wage_diff) <= SELF_CORRECTION_THRESHOLD):
         return None  # 差額が閾値以下 → 修正不要
 
-    _extra = (
-        f"【検出された誤差】\n"
-        f"- 部品合計: 計算値 ¥{calc_parts:,} ≠ PDF記載 ¥{target_parts:,} （差額 {parts_diff:+,}円）\n"
-        f"- 工賃合計: 計算値 ¥{calc_wage:,} ≠ PDF記載 ¥{target_wage:,} （差額 {wage_diff:+,}円）\n\n"
-        f"【修復指示】\n"
-        f"- 部品金額を合計{abs(parts_diff):,}円分{'追加' if parts_diff < 0 else '削減'}すること\n"
-        f"- 工賃を合計{abs(wage_diff):,}円分{'追加' if wage_diff < 0 else '削減'}すること\n"
-    )
+    _lines_err, _lines_fix = [], []
+    if _has_parts_target and abs(parts_diff) > SELF_CORRECTION_THRESHOLD:
+        _lines_err.append(f"- 部品合計: 計算値 ¥{calc_parts:,} ≠ PDF記載 ¥{target_parts:,} "
+                          f"（差額 {parts_diff:+,}円）")
+        _lines_fix.append(f"- 部品金額を合計{abs(parts_diff):,}円分"
+                          f"{'追加' if parts_diff < 0 else '削減'}すること")
+    if _has_wage_target and abs(wage_diff) > SELF_CORRECTION_THRESHOLD:
+        _lines_err.append(f"- 工賃合計: 計算値 ¥{calc_wage:,} ≠ PDF記載 ¥{target_wage:,} "
+                          f"（差額 {wage_diff:+,}円）")
+        _lines_fix.append(f"- 工賃を合計{abs(wage_diff):,}円分"
+                          f"{'追加' if wage_diff < 0 else '削減'}すること")
+    if not _lines_fix:
+        return None
+    _extra = ("【検出された誤差】\n" + "\n".join(_lines_err) + "\n\n"
+              + "【修復指示】\n" + "\n".join(_lines_fix) + "\n")
     correction_prompt = _build_prompt("estimate_validation_repair", _extra)
     try:
         from google.genai import types
@@ -3922,8 +4009,14 @@ def _self_correction_retry(api_key, file_bytes, mime_type, model_name,
         new_items  = new_result.get('items', []) or new_result.get('details', [])
         if not new_items:
             return None
-        # 呼び出し側は result['items'] しか見ないため、'details' で返ってきた
-        # 正しい修正が捨てられていた。ここで 'items' に正規化しておく。
+        # 明細抽出と同じパーサでアプリ内部キーへ正規化する。
+        # Gemini はプロンプトどおり work_or_part_name / part_price / labor_fee で
+        # 返すので、生のまま使うと合計が常に0になり、採用された場合は
+        # 品名も金額も空の行だけが .neo に並ぶ。
+        new_items = parse_detail_json_to_items(
+            json.dumps({'details': new_items}, ensure_ascii=False))
+        if not new_items:
+            return None
         new_result['items'] = new_items
         new_parts  = sum(safe_int(it.get('parts_amount', 0)) for it in new_items)
         new_wage   = sum(safe_int(it.get('wage', 0))         for it in new_items)
@@ -4012,7 +4105,8 @@ def extract_honda_cars_subtotals(file_bytes):
 
 def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
                      use_fax_filter=False, use_rasterize=False, use_enhance=True,
-                     enable_self_correction=True, progress_cb=None):
+                     enable_self_correction=True, progress_cb=None,
+                     tax_inclusive=False):
     """
     見積書をAI-OCRで解析するメイン関数。
     progress_cb: (pct: int, text: str) -> None  進捗コールバック（Noneなら使用しない）
@@ -4147,7 +4241,17 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     if _need_first_page:
         # 車両情報は1ページ目の結果を優先
         vinfo_first = first_page_data.get('vehicle_info', {})
-        vinfo_last  = totals_data.get('vehicle_info', {})
+        # 応答がトップレベルに car_name 等を返してきた場合も拾う。
+        # プロンプトの出力形式と消費側のキーがずれていた名残で、
+        # 拾わないと車両情報が丸ごと捨てられる。
+        _flat_vi = {k: totals_data.get(k) for k in
+                    ('car_name', 'car_model', 'engine_model', 'color_code',
+                     'color_name', 'trim_code', 'grade', 'model_year',
+                     'chassis_no', 'mileage')
+                    if totals_data.get(k) and str(totals_data.get(k)).strip()
+                    and str(totals_data.get(k)).strip() != '不明'}
+        vinfo_last  = dict(_flat_vi)
+        vinfo_last.update(totals_data.get('vehicle_info', {}) or {})
         merged_vinfo = {k: (vinfo_first.get(k) or vinfo_last.get(k, '')) for k in
                         set(list(vinfo_first.keys()) + list(vinfo_last.keys()))}
         totals_data['vehicle_info'] = merged_vinfo
@@ -4205,7 +4309,10 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     # 「これは全Nページ中の1ページ目です」と指示すると、2ページ目以降の
     # 明細を読ませない方向にモデルを誘導してしまう。
     result = analyze_estimate_single(
-        api_key, file_bytes, 'application/pdf', used_model, 1, 1
+        api_key, file_bytes, 'application/pdf', used_model, 1, 1,
+        # 税込表記であることをモデルに伝える。伝えないと、税込金額を
+        # 勝手に税抜へ割り戻される誤読を防ぐ指示が届かない。
+        tax_inclusive=bool(tax_inclusive)
     ) or {}
     result.setdefault('items', [])
     result.setdefault('short_parts_wage', 0)
@@ -4213,7 +4320,11 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     result['pdf_wage_total']    = target_wage  or safe_int(result.get('pdf_wage_total', 0))
     result['pdf_grand_total']   = pdf_grand    or safe_int(result.get('pdf_grand_total', 0))
     result['discount_amount']   = discount     or safe_int(result.get('discount_amount', 0))
-    result['confidence']        = safe_float(result.get('confidence', 0.5))
+    # 明細抽出は 0.9 を固定で返すため、合計抽出が返した実測値を優先する。
+    # 固定値のままだと低信頼度の警告が構造上一度も出ない。
+    _hdr_conf = safe_float(totals_data.get('confidence', 0), 0.0)
+    result['confidence']        = (_hdr_conf if _hdr_conf > 0
+                                   else safe_float(result.get('confidence', 0.5)))
     result['_fax_filtered']     = filtered_count
     result['_page_count']       = _page_count
     result['_vehicle_info']     = totals_data.get('vehicle_info', {})
@@ -4315,6 +4426,7 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
                 result['pdf_wage_total'],
             )
             if retry and retry.get('items'):
+                # retry['items'] は _self_correction_retry 内で正規化済み
                 result['items']            = validate_and_correct_items(retry['items'])
                 result['short_parts_wage'] = safe_int(retry.get('short_parts_wage', result.get('short_parts_wage', 0)))
                 _correction_rounds += 1
@@ -4342,7 +4454,13 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
 
     # ⑩ 値引きを負の工賃行として items に追加
     disc_outtax = summary.get('norm_disc', 0)
-    if disc_outtax > 0:
+    # 明細側にも値引き行が入っていると、同じ値引きが2回引かれる。
+    _has_disc_row = any(
+        re.search(r'(値引|割引)', str(it.get('name', '') or ''))
+        or safe_int(it.get('wage', 0)) < 0
+        or safe_int(it.get('parts_amount', 0)) < 0
+        for it in result['items'])
+    if disc_outtax > 0 and not _has_disc_row:
         result['items'].append({
             'name':         '値引き',
             'method':       '値引き',

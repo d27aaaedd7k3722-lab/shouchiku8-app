@@ -261,19 +261,30 @@ class AddataEngine:
         # Phase A-1: 第1層 — 型式指定 + 類別区分 (+ 初度登録優先)
         if md and cn:
             if len(lines) > 1:
-                best = None
+                # 初度登録は「期間の開始年月」で記録されるため、完全一致は
+                # ほとんどしない。一致しなければ先頭行を layer1（最高確度）
+                # として返していたため、前期型と後期型が混在する車種で
+                # 常に前期型が選ばれていた。候補が絞れないときは確度を
+                # 落として、呼び出し側がベタ打ちへ倒せるようにする。
+                _cands = []
                 for line in lines:
                     if not line.startswith('06'): continue
                     if padded_cat in line and (padded_desig in line or desig60 in line):
                         r = try_resolve(line[2:5].strip(), 1)
                         if not r: continue
-                        # reg_date が一致するレコードを最優先
                         if reg_yyyymm and reg_yyyymm in line:
                             return r, None
-                        if best is None:
-                            best = r
-                if best:
-                    return best, None
+                        _cands.append(r)
+                if _cands:
+                    _codes = {c.get('vehicle_code') for c in _cands}
+                    if len(_codes) == 1:
+                        return _cands[0], None
+                    _amb = dict(_cands[0])
+                    _amb['match_layer'] = 2
+                    _amb['ambiguous'] = sorted(x for x in _codes if x)
+                    _amb['reason'] = (f'初度登録で絞り込めず候補{len(_codes)}件: '
+                                      f'{sorted(x for x in _codes if x)}')
+                    return _amb, None
             else:
                 # 固定長レコード（改行なし）
                 for term in [desig60, padded_desig]:
@@ -294,12 +305,28 @@ class AddataEngine:
 
         # 第2層: 型式コード（既存 fast path、後方互換維持）
         if model_code:
-            mk = model_code.split('-')[-1][:5].upper()
-            for line in lines:
-                if not line.startswith('06'): continue
-                if mk in line:
-                    r = try_resolve(line[2:5].strip(), 2)
+            # 型式を5文字に切ると NCP131 が NCP130 に当たる。
+            # 切らずに、英数字が続かない位置での一致だけを見る。
+            # 候補が複数の車種に割れるときは確定させない。
+            mk = model_code.split('-')[-1].upper()
+            if mk:
+                _pat = re.compile(r'(?<![0-9A-Z])' + re.escape(mk) + r'(?![0-9A-Z])')
+                _hits = [ln for ln in lines if ln.startswith('06') and _pat.search(ln)]
+                _codes = {ln[2:5].strip() for ln in _hits}
+                _codes = {c for c in _codes if c}
+                if len(_codes) == 1:
+                    r = try_resolve(_hits[0][2:5].strip(), 2)
                     if r: return r, None
+                elif len(_codes) > 1:
+                    for _ln in _hits:
+                        r = try_resolve(_ln[2:5].strip(), 2)
+                        if r:
+                            r = dict(r)
+                            r['match_layer'] = 3
+                            r['ambiguous'] = sorted(_codes)
+                            r['reason'] = (f'型式{mk}で候補{len(_codes)}件に割れました: '
+                                           f'{sorted(_codes)}')
+                            return r, None
 
         # 第2.5層: Katashiki.DB（既存）
         if model_code:
@@ -1456,14 +1483,38 @@ MARK_PRICE_DIFF = "※部品価格相違"
 MARK_NO_DB = "※ADDATA該当なし"
 
 
-def _decorate_pno_v4(pno: str, mark: str) -> str:
-    """既存品番があれば `品番 マーク` 形式、なければマーカーのみ。"""
+# 品番欄（ERParts.PartsNo）は CP932 で18バイトしかない。
+# 「※部品価格相違」は14バイトあり、品番と並べると必ず溢れて
+# 「52119-52A50 ※部品」のように品番もマーカーも壊れる。
+# 品番欄には2文字の短い印だけを置き、詳しい文言は備考に回す。
+_PNO_MARK_SHORT = {
+    "※部品価格相違": "※価",
+    "※部品価格不一致": "※価",
+    "※ADDATA該当なし": "※無",
+    "※DB不一致": "※無",
+}
+ERPARTS_PARTS_NO_BYTES = 18
+
+
+def _decorate_pno_v4(pno: str, mark: str, max_bytes: int = ERPARTS_PARTS_NO_BYTES) -> str:
+    """既存品番があれば `品番 印` 形式、なければ印のみ。
+
+    印を付けて列幅を超えるくらいなら、品番をそのまま残す。
+    品番が壊れると発注に使えなくなるため、品番の方を優先する。
+    """
     pno = (pno or "").strip()
+    tag = _PNO_MARK_SHORT.get(mark, "※")
     if not pno:
-        return mark
-    if mark in pno:
+        return tag
+    if tag in pno or mark in pno:
         return pno  # 二重付与防止
-    return f"{pno} {mark}"
+    cand = f"{pno} {tag}"
+    try:
+        if len(cand.encode("cp932", "replace")) <= max_bytes:
+            return cand
+    except Exception:
+        pass
+    return pno
 
 
 def _list_vehicle_codes(addata_root: str) -> list[str]:
@@ -1769,8 +1820,21 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
             n = jaconv.h2z(n, kana=True, ascii=False, digit=False)
         except Exception:
             pass
-        # 左右接頭辞除去（語頭の「左 」「右 」「左」「右」）
-        n = re.sub(r'^[左右]\s*', '', n)
+        # 左右は捨てずに末尾の記号へ寄せる。捨てると「左ヘッドランプ」と
+        # 「右ヘッドランプ」が同じ文字列になり、候補の先頭（＝マスタの
+        # 並び順で先に来た方）が無条件に選ばれて、左の部品に右の品番が
+        # 入る。価格は左右同額のことが多く、L2（価格一致）になって
+        # マーカーも出ないため下流で気づけない。
+        _side = ''
+        _m_head = re.match(r'^\s*(左|右)\s*', n)
+        if _m_head:
+            _side = 'L' if _m_head.group(1) == '左' else 'R'
+            n = n[_m_head.end():]
+        if re.search(r'[（(\[]?\s*(左|Ｌ|LH|L)\s*[)）\]]?\s*$', n):
+            _side = 'L'
+        elif re.search(r'[（(\[]?\s*(右|Ｒ|RH|R)\s*[)）\]]?\s*$', n):
+            _side = 'R'
+        n = re.sub(r'[（(\[]?\s*(左|右|Ｌ|Ｒ|LH|RH)\s*[)）\]]?\s*$', '', n)
         # 同義語マップ適用（長い key 優先）
         for k in _SYN_KEYS_BY_LEN:
             if k in n:
@@ -1781,9 +1845,17 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
         for ch in (" ", "　", "・", "．", ".", ",", "（", "）", "(", ")",
                    "ー", "-", "〃", "/", "/", "\\", "．"):
             n = n.replace(ch, "")
-        return n.upper()
+        # 左右を末尾に付けて区別できるようにする
+        return (n.upper() + _side)
 
-    cache_key = (model_code, grade_code, body_code, len(master))
+    # キャッシュはプロセス共有。ルートを入れないと、部品件数が同じ
+    # 別の Addata（別利用者のアップロードや入れ替えた旧版）の索引を
+    # 使い回し、他人の品番が出荷される。
+    try:
+        _root_key = os.path.realpath(addata_root) if addata_root else ''
+    except Exception:
+        _root_key = str(addata_root or '')
+    cache_key = (_root_key, model_code, grade_code, body_code, len(master))
     cached = _NAME_INDEX_CACHE.get(cache_key)
     if cached:
         name_to_entry, norm_to_orig, master_names, master_names_norm = cached
@@ -1933,14 +2005,28 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
                 level = "L3"
                 note = f"価格差{diff_ratio:.1%}"
         elif db_price:
-            level = "L2"
+            # 単価が0や負の行（脱着・工賃だけの行など）は価格を検証できて
+            # いない。L2（価格一致）にすると、検証していない行が
+            # 「一致」として扱われ、マーカーも出ない。
+            level = "L3"
+            note = "OCR単価なし（価格未検証）"
         else:
             level = "L3"
             note = "DB価格取得不可"
 
         # マーカー付与: L3 (価格相違)、L4 (DB該当なし)
         # OCR品番優先、なければ DB品番
-        primary_pno = ocr_pno or db_pno
+        # 部品金額の無い行（工賃だけの行・経費行）にDBの品番を入れると、
+        # コグニセブン上で部品行として読める。品番は部品のある行だけ。
+        def _amt(v):
+            try:
+                return int(float(str(v).replace(',', '') or 0))
+            except (TypeError, ValueError):
+                return 0
+        _has_parts_amount = (unit_price > 0
+                             or _amt(it.get("amount")) > 0
+                             or _amt(it.get("parts_amount")) > 0)
+        primary_pno = ocr_pno or (db_pno if _has_parts_amount else "")
         if level == "L3" and db_price and unit_price > 0 and abs(unit_price - db_price) / max(db_price, 1) >= 0.02:
             marked = _decorate_pno_v4(primary_pno, MARK_PRICE_DIFF)
         else:

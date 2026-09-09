@@ -16,6 +16,7 @@ Iter2 追加要件:
 from __future__ import annotations
 
 import copy
+import hashlib
 import logging
 import os
 import re
@@ -387,7 +388,19 @@ def identify_grade_from_items(vehicle_code: str,
     if not vehicle_code or not items or not addata_root or not os.path.isdir(addata_root):
         return out
     # Iter R5: grade キャッシュ (vcode + body_code + items件数で簡易キー)
-    cache_key = f"{vehicle_code}:{body_code}:{len(items)}"
+    # プロセスは全利用者で共有される。ルートも明細の中身もキーに
+    # 入れないと、車種コードと行数が同じというだけで、別の利用者が
+    # アップロードした別の Addata で推定したグレードが再利用される。
+    try:
+        _root_sig = os.path.realpath(addata_root) if addata_root else ''
+    except Exception:
+        _root_sig = str(addata_root or '')
+    _items_sig = hashlib.sha1(
+        "\x1f".join(
+            f"{(i.get('parts_name') or i.get('name') or '')}|{i.get('unit_price') or ''}"
+            for i in (items or [])
+        ).encode('utf-8', 'replace')).hexdigest()[:16]
+    cache_key = f"{_root_sig}:{vehicle_code}:{body_code}:{len(items)}:{_items_sig}"
     if cache_key in _GRADE_CACHE:
         return dict(_GRADE_CACHE[cache_key])
     try:
@@ -709,7 +722,7 @@ def _enforce_grand_total_match(items: List[Dict[str, Any]],
         logger.info("[grand_total_match] 調整行更新 +%d (target=%d sum=%d)", diff, target_outtax, sum_outtax)
     else:
         out.append({
-            "name": "※金額調整 (PDF総額一致)",
+            "name": "※金額調整(PDF総額差)",
             "parts_name": "※金額調整",
             "parts_no": "※金額調整",
             "part_no": "※金額調整",
@@ -786,7 +799,7 @@ def _enforce_total_match(items: List[Dict[str, Any]],
 
     # 調整行を追加
     adj = {
-        "name": "※金額調整 (PDF原本との差分吸収)",
+        "name": "※金額調整(部品/工賃差)",
         "parts_name": "※金額調整",
         "parts_no": "※金額調整",
         "part_no": "※金額調整",
@@ -1272,9 +1285,11 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                         up = _to_float(r[2]) or _to_float(r[1])
                         qty = max(_to_int(r[5], 1), 1)
                         val = up * qty
-                    # コグニセブンは「空欄」を -1 で表す（工賃のみの行など）。
-                    # これを合計すると総額が 1 円ずつ狂うため 0 として扱う。
-                    if val < 0:
+                    # コグニセブンが「空欄」を表すのは -1 だけ。それ以外の
+                    # 負値（マイナスの調整行・値引き行）まで 0 に潰すと、
+                    # 総額を減らす方向の異常が検証をすり抜けて
+                    # 「PDFと一致」と報告されてしまう。
+                    if val == -1:
                         val = 0
                     neo_total += val
                 except (TypeError, ValueError):
@@ -1316,11 +1331,21 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                 res["name_match_pct"] = None
             res["neo_count"] = neo_count
             res["neo_total"] = neo_total
+            # 調整行は「読み取れなかった差額」なので、これを含めて数えると
+            # 件数も金額も必ず一致してしまい、検証が意味をなさない。
+            _adj_rows = [it for it in (items or []) if it.get("is_adjustment_row")]
+            if _adj_rows:
+                res["has_adjustment_row"] = True
+                res["pdf_count"] = max(0, res["pdf_count"] - len(_adj_rows))
             res["count_match"] = (neo_count == res["pdf_count"])
             # 税込は行ごとに税抜を逆算するため数円ずれる。行数ぶんの
             # 許容を持たせないと、正しい .neo でも不一致と判定される。
             _tol = max(1.0, float(len(items or []))) if is_tax_inclusive else 1.0
             res["total_match"] = abs(neo_total - pdf_parts_total) < _tol
+            if res.get("has_adjustment_row"):
+                # 差額を埋めた結果として一致しているだけなので、
+                # 「一致」とは報告しない。
+                res["total_match"] = False
             if not res["count_match"]:
                 res["mismatches"].append(
                     {"type": "count", "neo": neo_count, "pdf": res["pdf_count"]}
@@ -1488,7 +1513,9 @@ def process_pdf_to_neo(pdf_path,
                     from app import analyze_estimate  # type: ignore
                     _ocr_model = model_name or os.environ.get('GEMINI_MODEL', '')
                     res = analyze_estimate(api_key, pdf_bytes, "application/pdf",
-                                           model_name=_ocr_model or None)
+                                           model_name=_ocr_model or None,
+                                           # 税込表記であることをモデルに伝える
+                                           tax_inclusive=bool(is_tax_inclusive))
                     if isinstance(res, dict) and "items" in res:
                         items = res.get("items", [])
                         ocr_meta_first = res
@@ -1613,6 +1640,12 @@ def process_pdf_to_neo(pdf_path,
                         pdf_total = _to_float(ocr_meta_first.get("pdf_grand_total")
                                               or ocr_meta_first.get("grand_total")
                                               or ocr_meta_first.get("pdf_total"))
+                        if pdf_total <= 0:
+                            # 総合計を読めなかった見積書では、部品計＋工賃計で
+                            # 比べる。これをしないと、明細を大半読み落としても
+                            # 比率が0になり警告が一切出ない。
+                            pdf_total = (_to_float(ocr_meta_first.get("pdf_parts_total"))
+                                         + _to_float(ocr_meta_first.get("pdf_wage_total")))
                         items_sum = sum(
                             _to_float(it.get("line_total"))
                             or (_to_float(it.get("parts_amount")) + _to_float(it.get("wage")))
@@ -1675,9 +1708,19 @@ def process_pdf_to_neo(pdf_path,
                 # この引数は「PDFの総額を明細の基準に換算するか」を意味する。
                 # 明細が税抜なら総額(税込)を1.1で割って合わせる。
                 # 明細が税込なら総額と同じ基準なので換算しない。
+                _grand_is_intax = not is_tax_inclusive
+                # ただし総合計が税込とは限らない。見積書が税抜表記で
+                # 「合計＝部品計＋工賃計」と印字されている場合、1.1で割ると
+                # 明細が完全に正しくても約9%の減額調整行が入ってしまう。
+                _pw = pdf_p + pdf_w
+                if (_grand_is_intax and _pw > 0
+                        and abs(pdf_g - _pw) <= max(int(_pw * 0.01), 100)):
+                    log.append(f"[grand_total_match] 総合計{pdf_g}は"
+                               f"部品計+工賃計{_pw}と同額 → 税抜とみなす")
+                    _grand_is_intax = False
                 items = _enforce_grand_total_match(
                     items, pdf_g,
-                    is_tax_inclusive=not is_tax_inclusive,
+                    is_tax_inclusive=_grand_is_intax,
                     tolerance=_tol_g)
                 log.append(f"[grand_total_match] grand={pdf_g} tol={_tol_g} 適用")
             # v11.0 Phase A-4 v2: pdf_grand_total すら 0 のとき、items 合計を grand とみなして調整
@@ -1697,6 +1740,28 @@ def process_pdf_to_neo(pdf_path,
                     pass
             hdr_parts_total = pdf_p
             hdr_wage_total = pdf_w
+            # 調整行を作ったこと自体を必ず伝える。差額が大きいほど
+            # 明細の読み落としが疑われるのに、以前は警告も上限も無く、
+            # 総額だけ合った .neo が「検証OK」の表示で出荷されていた。
+            try:
+                _adj = next((it for it in items if it.get("is_adjustment_row")), None)
+                if _adj:
+                    _amt = _to_int(_adj.get("parts_amount")) + _to_int(_adj.get("wage"))
+                    _base = (pdf_p + pdf_w) or pdf_g or 1
+                    _pct = abs(_amt) / _base if _base else 0
+                    out["adjustment_amount"] = _amt
+                    out["adjustment_ratio"] = _pct
+                    warnings.append(
+                        f"明細の合算が見積書の合計と {_amt:+,}円"
+                        f"（合計の {_pct:.1%}）ずれていたため、"
+                        "「※金額調整」の行1本で差額を埋めています。"
+                        "明細の読み落としや誤読の可能性が高いので、"
+                        "生成前にプレビューで原本と1行ずつ突き合わせてください。")
+                    if _pct > 0.05:
+                        # 読み落としが大きい結果はキャッシュに残さない
+                        out["ocr_incomplete"] = True
+            except Exception:
+                pass
             # 許容差(2%または1000円)の範囲内は調整行を作らないため、
             # 差が残ったまま出荷されうる。黙って通さず警告に残す。
             try:
