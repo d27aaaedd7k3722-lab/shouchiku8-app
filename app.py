@@ -783,6 +783,13 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             WageEnabled=0, WageOutTax=0, WageInTax=0, WageTax=0
             WHERE LineNo=?""", (lno,))
     total_parts = 0
+    # 税込モードの丸め調整用
+    total_parts_intax = 0
+    total_wages_intax = 0
+    _adj_parts_line = None
+    _adj_wage_line  = None
+    _adj_parts_amount = 0
+    _adj_wage_amount  = 0
     total_wages = 0
     for i, item in enumerate(items):
         name   = item.get('name', '')
@@ -877,6 +884,17 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             wage_intax   = wage_total + wage_tax if wage_total != 0 else 0
         total_parts += parts_outtax
         total_wages += wage_outtax
+        # 税込モードでは行ごとに税抜を逆算するため、丸め誤差が積み上がって
+        # 見積書に書かれた税込総額と生成NEOの合計がずれる。合計から1回で
+        # 逆算し直せるよう、税込の合計と、差額を寄せる行を覚えておく。
+        total_parts_intax += parts_intax
+        total_wages_intax += wage_intax
+        if parts_total != 0 and abs(parts_outtax) >= abs(_adj_parts_amount):
+            _adj_parts_amount = parts_outtax
+            _adj_parts_line   = line_no
+        if wage_total != 0 and abs(wage_outtax) >= abs(_adj_wage_amount):
+            _adj_wage_amount = wage_outtax
+            _adj_wage_line   = line_no
         # コグニセブンは -1 を空白として表示する（0やNULLは「0」と表示される）
         db_parts_total = parts_outtax if parts_total != 0 else -1
         db_parts_intax = parts_intax  if parts_total != 0 else -1
@@ -1007,6 +1025,64 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
     cur.execute("""UPDATE Expense SET
         WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
         WHERE LineNo=5""", (1 if tax_exempt > 0 else 0, tax_exempt, tax_exempt, 0))
+
+    # ── 税込モードの丸め調整 ──
+    # 行ごとの逆算をそのまま足すと、見積書の税込総額と生成NEOの合計が
+    # 1〜5円ずれる（明細が増えるほど外れる）。総額から1回で逆算した値を
+    # 正とし、差額を最も金額の大きい行に寄せて、行と合計の整合を保つ。
+    if is_tax_inclusive:
+        def _outtax_from_intax(v):
+            if not v:
+                return 0
+            o = jpy_round(abs(v) / (1 + TAX_RATE))
+            return -o if v < 0 else o
+
+        # 部品と工賃を別々に丸めると、その2つの誤差がさらに積み上がる。
+        # 明細ぶんの税抜合計 S を「S + 消費税 が見積書の税込総額に一致する」
+        # ように選び直してから、部品→工賃の順に差額を割り当てる。
+        _items_intax = total_parts_intax + total_wages_intax
+        _base = _outtax_from_intax(_items_intax)
+        _best, _best_err = _base, None
+        for _off in (0, -1, 1, -2, 2):
+            _cand = _base + _off
+            _err = abs(_cand + jpy_round(_cand * TAX_RATE) - _items_intax)
+            if _best_err is None or _err < _best_err:
+                _best, _best_err = _cand, _err
+            if _err == 0:
+                break
+        _target_parts = _outtax_from_intax(total_parts_intax)
+        _target_wages = _best - _target_parts
+        # 寄せ先の行が無い側には差額を割り当てられないので、もう一方に回す
+        if _adj_parts_line is None:
+            _target_wages = _best
+            _target_parts = total_parts
+        elif _adj_wage_line is None:
+            _target_parts = _best
+            _target_wages = total_wages
+
+        for _target, _cur, _line, _col_out, _col_in, _col_tax in (
+            (_target_parts, total_parts, _adj_parts_line,
+             'PartsPriceOutTax', 'PartsPriceInTax', 'PartsPriceTax'),
+            (_target_wages, total_wages, _adj_wage_line,
+             'WageOutTax', 'WageInTax', 'WageTax'),
+        ):
+            _delta = _target - _cur
+            if _delta == 0 or _line is None:
+                continue
+            _row = cur.execute(
+                f'SELECT {_col_out}, {_col_in} FROM ERParts WHERE LineNo=?',
+                (_line,)).fetchone()
+            if not _row or _row[0] is None or _row[0] == -1:
+                continue
+            _new_out = _row[0] + _delta
+            _new_in  = _row[1]
+            cur.execute(
+                f'UPDATE ERParts SET {_col_out}=?, {_col_tax}=? WHERE LineNo=?',
+                (_new_out, _new_in - _new_out, _line))
+            if _col_out == 'PartsPriceOutTax':
+                total_parts += _delta
+            else:
+                total_wages += _delta
 
     # ── Total計算 ──
     # total_parts / total_wages は既に税抜値（is_tax_inclusive時は逆算済み）
