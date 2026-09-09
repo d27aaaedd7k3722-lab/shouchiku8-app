@@ -47,6 +47,7 @@ import json
 import io
 import re
 import sys
+import math
 import unicodedata
 import traceback
 import pandas as pd
@@ -974,8 +975,10 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         
         # 未マッチ（またはそれに準ずる低マッチレベル）部品には先頭に「※」を付与
         # ベタ打ちモードではDB照合を行わないため※を付けない
+        # 品名が空の行に ※ を付けると「※」1文字だけの明細行になる。
+        # 説明できない行がコグニセブンと帳票の両方に出るので付けない。
         _needs_mark = (not is_beta_mode and m_level >= 4
-                       and not name.startswith('※'))
+                       and name.strip() and not name.startswith('※'))
         if _needs_mark:
             # ※ の2バイトぶん先に詰めてから付ける。後から付けると
             # 列幅24バイトの切り詰めで品名の末尾が余計に落ちる
@@ -1115,11 +1118,20 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         # 指数（工数）。画面まで往復させておきながら NEO には書いていなかったため、
         # コグニセブン側では全行が指数ゼロの見積として開かれていた。
         # 単位は時間の小数（1.0 = 100WI, _addata_db_search.match_wage_by_time 参照）。
+        # 素の float() だと全角「１．５」「(0.8)」「1.5h」を落とし、
+        # 同じ行の全角金額は読めるのに指数だけ欠ける。金額と同じ正規化を通す。
+        # （auto_matching も同じ index_value を正規化して工数照合に使っている）
+        _idx_raw = _normalize_number_text(item.get('index_value', ''))
         try:
-            _idx = float(str(item.get('index_value', '') or '').strip() or 0)
+            _idx = float(_idx_raw) if _idx_raw is not None else 0.0
         except (TypeError, ValueError):
             _idx = 0.0
-        db_time = round(_idx, 2) if _idx > 0 else -1   # 未入力は -1（空欄）
+        if not math.isfinite(_idx):
+            _idx = 0.0          # 'inf' がそのままDBに入るのを防ぐ
+        # 丸めてから判定する。先に判定すると 0.001 が Time=0 として書かれ、
+        # すぐ下のコメントが戒めている「指数ゼロの見積」を自分で作ってしまう。
+        _idx = round(_idx, 2)
+        db_time = _idx if _idx > 0 else -1   # 未入力・負値は -1（空欄）
         parts_code = item.get('_master_section_code', '')  # 部品コード大区分（例: '01'）
         _branch_raw = item.get('_master_branch_code', '')  # 枝番（例: '00101', '001AA'）
         # PartsCodeSub は SQLite integer 型。数値変換できる枝番のみ整数で保存

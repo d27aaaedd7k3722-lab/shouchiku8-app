@@ -1442,10 +1442,14 @@ def match_pdf_items_to_addata(items, vehicle_info, addata_root=ADDATA_ROOT):
             it['db_price'] = db_price
             it['db_parts_no'] = db_parts_no
             it['db_work_index'] = db_widx
-            # 部品コード大区分。app.py が ERParts.PartsCode に書くために読むキーで、
-            # ここで渡さないと Addata と一致した部品まで部品コード無しの
-            # 手入力行としてコグニセブンに渡ってしまう。
-            it['_master_section_code'] = str((matched or {}).get('section_code', '') or '')
+            # 部品コード大区分。app.py が ERParts.PartsCode に書くために読むキー。
+            # FuzzyMatcher は候補が1件でもあれば matched を返すため、score で
+            # 棄却した候補（level='L4'）でも matched は真になる。無条件に書くと
+            # 「DBに無い」と ※ で宣言した行に別部品の大区分が入る（前後違いが典型）。
+            # 採用した行だけに入れる。
+            it['_master_section_code'] = (
+                str((matched or {}).get('section_code', '') or '')
+                if level != 'L4' else '')
             it['match_level'] = level
             it['match_note'] = note
             it['price_diff_pct'] = price_diff_pct
