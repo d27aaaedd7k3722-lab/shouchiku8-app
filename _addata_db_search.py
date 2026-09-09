@@ -59,8 +59,14 @@
                   Mitsubishi(C), Daihatsu(D), Subaru(F), Lexus(L), Hino(H)
 """
 import sys
-sys.stdout.reconfigure(encoding='utf-8')
-sys.stderr.reconfigure(encoding='utf-8')
+# Streamlit Cloud は標準出力をログ収集用の独自オブジェクトに差し替えるため、
+# reconfigure() が無い。無防備に呼ぶと import 時に AttributeError で落ち、
+# PDF→NEO 経路がまるごと使えなくなる。あるときだけ呼ぶ。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8')
+    except (AttributeError, ValueError, OSError):
+        pass
 
 import struct, os, glob, re
 from collections import defaultdict
