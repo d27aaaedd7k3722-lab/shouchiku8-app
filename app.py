@@ -1908,26 +1908,194 @@ def guess_manufacturer_from_vin(vin):
 
 
 # ============================================================
-# Addata / マスタ連携用関数群（一時除外）
-# → _開発資料/addata_matching.py に保存済み
-# 将来的にAddataマッチングを再統合する場合はこのファイルを参照
+# Addata / マスタ連携
 # ============================================================
+# Addata は「A〜Z の1文字フォルダ / 車種コード / *NN.DB」という配置の
+# 車種データベースで、コグニセブン本体に同梱される。これがあると
+# 部品名・品番・価格をマスタと突き合わせ、部品コードや損害コードを
+# 引き当てられる（モードB/C）。無ければベタ打ち（モードA）になる。
+#
+# 取得経路は3つ。上から順に見る。
+#   1. 画面からアップロードされた ZIP を展開したもの（本番はこれだけ）
+#   2. 環境変数 ADDATA_ROOT / st.secrets の ADDATA_ROOT
+#   3. ローカルの標準的な設置場所（Windows の C:\Addata など）
+# 本番の Streamlit Cloud は Linux で利用者のPCも見えないため、
+# 1 以外は基本的に当たらない。
+
+# アップロードされた Addata の「ルート」と「展開先ディレクトリ」。
+# ルートは ZIP の作り方によって展開先より下の階層になることがあるため、
+# 消すときは必ず展開先の方を消す（ルートの親を消すと /tmp を消しかねない）。
+_ADDATA_UPLOAD_KEY = '_addata_upload_root'
+_ADDATA_UPLOAD_BASE_KEY = '_addata_upload_base'
+# ZIP 展開の上限。壊れた/悪意ある ZIP でディスクを埋めないための歯止め。
+ADDATA_ZIP_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024   # 展開後 合計2GB
+ADDATA_ZIP_MAX_MEMBERS     = 200_000                   # ファイル数
+
+
+def _addata_is_valid(path) -> bool:
+    """Addata ルートとして妥当か（A-Z1文字フォルダ配下に *.DB があるか）。"""
+    if not path or not os.path.isdir(path):
+        return False
+    try:
+        import addata_locator as _loc
+        return bool(_loc._is_valid_addata(path))
+    except Exception:
+        return False
+
+
+def extract_addata_zip(zip_bytes: bytes, dest_dir: str) -> tuple:
+    """Addata の ZIP を dest_dir に安全に展開し、(ルートパス, 説明) を返す。
+
+    ルートが見つからない場合は (None, 理由) を返す。
+    ZIP の中身は利用者が持ち込む外部データなので、
+    パス抜け（zip slip）・容量爆弾・シンボリックリンクを弾く。
+    """
+    import zipfile
+    dest_real = os.path.realpath(dest_dir)
+    total = 0
+    count = 0
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for info in zf.infolist():
+                count += 1
+                if count > ADDATA_ZIP_MAX_MEMBERS:
+                    return (None, f'ZIP内のファイル数が多すぎます（{ADDATA_ZIP_MAX_MEMBERS:,}件を超過）')
+                # シンボリックリンクは展開しない（外部を指しうる）
+                if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                    continue
+                if info.is_dir():
+                    continue
+                total += info.file_size
+                if total > ADDATA_ZIP_MAX_TOTAL_BYTES:
+                    return (None, 'ZIPの展開後サイズが大きすぎます（2GBを超過）')
+                # 展開先が dest_dir の外に出ないことを実パスで確認する
+                target = os.path.realpath(os.path.join(dest_real, info.filename))
+                if not (target == dest_real or target.startswith(dest_real + os.sep)):
+                    return (None, f'ZIP内に不正なパスが含まれています: {info.filename}')
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(info) as _s, open(target, 'wb') as _d:
+                    while True:
+                        chunk = _s.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        _d.write(chunk)
+    except zipfile.BadZipFile:
+        return (None, 'ZIPファイルとして読み取れません')
+    except Exception as e:
+        return (None, f'ZIPの展開に失敗しました: {e}')
+
+    # 展開結果から Addata ルートを探す。ZIP の作り方によって
+    # 直下だったり Addata/ で1階層包まれていたりするため両方見る。
+    if _addata_is_valid(dest_real):
+        return (dest_real, 'ZIP直下')
+    try:
+        for entry in sorted(os.listdir(dest_real)):
+            cand = os.path.join(dest_real, entry)
+            if _addata_is_valid(cand):
+                return (cand, entry)
+            # もう1階層だけ潜る（OneDrive等で余計な親が付く場合）
+            if os.path.isdir(cand):
+                for sub in sorted(os.listdir(cand)):
+                    cand2 = os.path.join(cand, sub)
+                    if _addata_is_valid(cand2):
+                        return (cand2, os.path.join(entry, sub))
+    except OSError:
+        pass
+    return (None, 'Addataの構造（A〜Zの1文字フォルダ／車種コード／*.DB）が見つかりません')
+
+
+def _discard_uploaded_addata():
+    """アップロードされた Addata の展開先を消し、セッションから外す。
+
+    消すのは mkdtemp で作った展開先そのものだけにする。ルートの親を
+    たどって消すと、ZIPが直下構造だったときに /tmp ごと消してしまう。
+    """
+    base = st.session_state.pop(_ADDATA_UPLOAD_BASE_KEY, None)
+    st.session_state.pop(_ADDATA_UPLOAD_KEY, None)
+    st.session_state.pop('_addata_upload_label', None)
+    st.session_state.pop('_addata_zip_id', None)
+    if base and os.path.isdir(base) and os.path.basename(base).startswith('addata_'):
+        import shutil as _sh
+        _sh.rmtree(base, ignore_errors=True)
+
 
 def find_addata_dir():
-    """Addataフォルダ探索スタブ（Addata機能無効化中）"""
+    """Addata ルートを返す。見つからなければ None。"""
+    # 1. この画面でアップロードされたもの
+    try:
+        up = st.session_state.get(_ADDATA_UPLOAD_KEY)
+        if up and _addata_is_valid(up):
+            return up
+    except Exception:
+        pass
+    # 2. 環境変数 / secrets（Docker・Cloud Run で外部ボリュームを渡す場合）
+    for _env in (os.environ.get('ADDATA_ROOT'), _secret_addata_root()):
+        if _env and _addata_is_valid(_env):
+            return _env
+    # 3. ローカルの標準的な設置場所
+    try:
+        import addata_locator as _loc
+        found = _loc.find_addata()
+        if found and _addata_is_valid(found):
+            return found
+    except Exception:
+        pass
     return None
+
+
+def _secret_addata_root():
+    """st.secrets の ADDATA_ROOT（未設定でも例外にしない）。"""
+    try:
+        return st.secrets.get('ADDATA_ROOT', '')
+    except Exception:
+        return ''
+
 
 def find_ka06_path(addata_base):
-    """KA06_ALL.DBパス探索スタブ（Addata機能無効化中）"""
-    return None
+    """KA06_ALL.DB（車種マスタ）のパス。無ければ None。"""
+    if not addata_base:
+        return None
+    p = os.path.join(addata_base, 'COM', 'KA06_ALL.DB')
+    return p if os.path.exists(p) else None
+
 
 def identify_vehicle(addata_base, vehicle_data):
-    """車両特定スタブ（Addata機能無効化中）"""
-    return {'match_layer': 3, 'is_supported': False, 'reason': 'Addata disabled'}
+    """車検証情報から Addata の車種コードを特定する。"""
+    if not addata_base:
+        return {'match_layer': 3, 'is_supported': False, 'reason': 'Addata未検出'}
+    try:
+        from auto_matching import identify_vehicle_wrapper
+    except Exception as e:
+        return {'match_layer': 3, 'is_supported': False,
+                'reason': f'車種特定モジュールを読み込めません: {e}'}
+    try:
+        return identify_vehicle_wrapper(addata_base, vehicle_data or {})
+    except Exception as e:
+        return {'match_layer': 3, 'is_supported': False,
+                'reason': f'車種特定に失敗しました: {e}'}
 
-def match_parts_with_addata(items, addata_folder):
-    """部品マッチングスタブ（Addata機能無効化中）"""
-    return (items, False)
+
+def match_parts_with_addata(items, addata_folder, vehicle_info=None):
+    """明細を Addata マスタと突き合わせる。(items, 照合できたか) を返す。
+
+    照合できなかった場合は元の items をそのまま返す。ここで例外を
+    投げると NEO 生成まるごとが失敗するので、必ず握って戻す。
+    """
+    if not items or not addata_folder:
+        return (items, False)
+    try:
+        from auto_matching import match_pdf_items_to_addata
+    except Exception:
+        return (items, False)
+    try:
+        matched = match_pdf_items_to_addata(items, vehicle_info or {}, addata_folder)
+    except Exception:
+        return (items, False)
+    if isinstance(matched, tuple):
+        matched = matched[0]
+    if not isinstance(matched, list) or not matched:
+        return (items, False)
+    return (matched, True)
 
 
 def complement_vehicle_info_with_gemini(api_key, model_code, current_car_name, current_engine):
@@ -4321,13 +4489,66 @@ def main():
             help="Gemini APIで実際に利用可能なモデルを自動検出（提供終了モデルは除外）。Flash=高速・コスパ良好、Pro=高精度"
         )
         st.markdown("---")
-        st.markdown("**🗂 DBパス設定**")
+        st.markdown("**🗂 Addata（車種データベース）**")
         addata_status = find_addata_dir()
         if addata_status:
-            st.success(f"Addata検出済み")
+            _ka06 = find_ka06_path(addata_status)
+            st.success("Addata検出済み")
             st.caption(addata_status)
+            st.caption(("車種マスタ KA06_ALL.DB あり" if _ka06
+                        else "※ COM/KA06_ALL.DB が無いため車種の自動特定はできません"))
+            if st.button("🗑️ Addataを解除", key='addata_clear_btn'):
+                _discard_uploaded_addata()
+                st.rerun()
         else:
-            st.warning("Addataフォルダ未検出")
+            st.warning("Addataフォルダ未検出（ベタ打ちモードで生成します）")
+
+        with st.expander("Addataを読み込む", expanded=not addata_status):
+            st.caption(
+                "Addata があると、部品名・品番・価格をコグニセブンのマスタと"
+                "突き合わせて部品コードや損害コードを引き当てます。"
+                "無い場合はベタ打ち（モードA）で生成します。"
+            )
+            st.caption(
+                "このアプリはクラウド上で動いているため、お使いのPCの "
+                "C:\\Addata を直接読むことはできません。ZIPにして"
+                "アップロードしてください。"
+            )
+            st.caption(
+                "ZIPの中身は「A〜Zの1文字フォルダ ／ 車種コード ／ *.DB」の構造。"
+                "車種の自動特定には COM/KA06_ALL.DB も必要です。"
+                "全体が大きい場合は、対象車種のフォルダと COM だけでも動きます。"
+            )
+            _addata_zip = st.file_uploader(
+                "Addata の ZIP",
+                type=['zip'],
+                key='addata_zip_upload',
+                help="展開後 2GB まで。セッション内でのみ保持し、他の利用者からは見えません。",
+            )
+            # 同じファイルで再実行するたびに展開し直さないよう、
+            # 何を展開済みかを名前とサイズで覚えておく。別のZIPが
+            # 選ばれたら、前の展開先を消してから入れ替える。
+            _zip_id = (f'{_addata_zip.name}:{_addata_zip.size}'
+                       if _addata_zip is not None else None)
+            if _zip_id and st.session_state.get('_addata_zip_id') != _zip_id:
+                _discard_uploaded_addata()
+                with st.spinner("Addataを展開しています…"):
+                    _dest = tempfile.mkdtemp(prefix='addata_')
+                    try:
+                        _root, _why = extract_addata_zip(_addata_zip.getvalue(), _dest)
+                    except Exception as _e:
+                        _root, _why = None, f'展開に失敗しました: {_e}'
+                if _root:
+                    st.session_state[_ADDATA_UPLOAD_BASE_KEY] = _dest
+                    st.session_state[_ADDATA_UPLOAD_KEY] = _root
+                    st.session_state['_addata_upload_label'] = _why
+                    st.session_state['_addata_zip_id'] = _zip_id
+                    st.rerun()
+                else:
+                    import shutil as _sh
+                    _sh.rmtree(_dest, ignore_errors=True)
+                    st.session_state['_addata_zip_id'] = _zip_id
+                    st.error(f"❌ {_why}")
         st.markdown("---")
         st.header("🔬 精度オプション")
         use_fax_filter = st.checkbox(
