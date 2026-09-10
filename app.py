@@ -63,6 +63,18 @@ TEMPLATE_FILENAME = "template_toyota.neo"
 TEMPLATE_PATH     = os.path.join(SCRIPT_DIR, TEMPLATE_FILENAME)
 ANALYSIS_LOG_PATH = os.path.join(SCRIPT_DIR, "analysis.log")
 TAX_RATE          = 0.10
+
+# 日本標準時（JST）。Streamlit Community Cloud のコンテナは日本時間ではないため、
+# datetime.datetime.now() をそのまま使うと、NEO に書く見積日・作成日が
+# 日本の日付より1日前になることがある（本番で実際に発生していた）。
+# 夏時間が無い固定オフセットなので、tzdata に依存しない timezone で表す。
+JST = datetime.timezone(datetime.timedelta(hours=9))
+
+
+def now_jst():
+    """日本時間の現在日時（タイムゾーン付き）。日付・時刻を出すときは必ずこれを使う。"""
+    return datetime.datetime.now(JST)
+
 # ヘッダXML <CarRegistedDateEra> の元号コード。
 # 【実機確認が必要】この対応は日本のシステムで一般的な並び順によるもので、
 # コグニセブンの実機で確認できていない。テンプレート原本は初度登録が
@@ -1820,7 +1832,7 @@ def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mo
         'CarNoSeries':   car_serial,
         'Total':         grand_total,
         # 作成日を更新しないと、どの見積にもテンプレート作成時の日付が残る
-        'CreatedDate':   datetime.datetime.now().strftime('%Y/%m/%d'),
+        'CreatedDate':   now_jst().strftime('%Y/%m/%d'),
         # 事故・保険情報。DBに書くのと同じ値をヘッダXMLにも書かないと、
         # 過去のNEOをテンプレートに使ったとき前の案件の値が残ってしまう。
         'AcceptNo':      cp932_trim(ins.get('accept_no', ''), 37),
@@ -1993,7 +2005,7 @@ def generate_annote(rows):
 
 def repack_neo(orig_data, files, mgmt, entries):
     """更新済みファイルをNEOバイナリに再パック"""
-    now     = datetime.datetime.now()
+    now     = now_jst()
     now_dos = datetime_to_dos(now)
     entry_names  = [e['name'] for e in entries if e['name'] in files]
     missing_names = [name for name in files.keys() if name not in entry_names]
@@ -2063,7 +2075,7 @@ def generate_neo_file(template_data, customer_info, items, short_parts_wage, ins
     full_raw     = decompress_neo(template_data, real_ck)
     mgmt, entries = parse_entries(template_data, real_ck[0])
     files        = extract_files(full_raw, entries)
-    estimated_date = datetime.datetime.now().strftime('%Y%m%d')
+    estimated_date = now_jst().strftime('%Y%m%d')
     normalized_items = items or []
     files['AnSMB.txt'], total_parts, total_wages, grand_total, _annote_rows = update_ansmb(
         files['AnSMB.txt'], normalized_items, short_parts_wage,
@@ -2783,7 +2795,7 @@ def generate_discrepancy_report_pdf(discrepancies, total_diff, vehicle_info):
         v_str = f"対象車両: {vehicle_info.get('car_name', '')} {vehicle_info.get('car_model', '')} (車台番号: {vehicle_info.get('car_serial_no', '')})"
         elements.append(Paragraph(v_str, styles['JapaneseNormal']))
 
-    date_str = f"出力日時: {datetime.datetime.now().strftime('%Y/%m/%d %H:%M:%S')}"
+    date_str = f"出力日時: {now_jst().strftime('%Y/%m/%d %H:%M:%S')}"
     elements.append(Paragraph(date_str, styles['JapaneseNormal']))
     elements.append(Spacer(1, 10 * mm))
 
@@ -2902,7 +2914,7 @@ def generate_beta_discrepancy_report_pdf(estimate_data, calc_parts, calc_wages, 
         elements.append(Paragraph(v_str, styles['JapaneseNormal']))
     
     import datetime
-    date_str = f"出力日時: {datetime.datetime.now().strftime('%Y/%m/%d %H:%M:%S')}"
+    date_str = f"出力日時: {now_jst().strftime('%Y/%m/%d %H:%M:%S')}"
     elements.append(Paragraph(date_str, styles['JapaneseNormal']))
     elements.append(Spacer(1, 5 * 2.83))
 
@@ -4898,7 +4910,7 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
 
     # ── 解析ログをファイルに書き出し ──────────────────────────────────────────
     try:
-        _ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        _ts = now_jst().strftime('%Y-%m-%d %H:%M:%S')
         # 追記のみで際限なく育つため、一定サイズを超えたら作り直す
         try:
             if os.path.exists(ANALYSIS_LOG_PATH) and \
@@ -5442,7 +5454,7 @@ def main():
         """, unsafe_allow_html=True)
         st.markdown("---")
         st.caption(f"消費税率: {int(TAX_RATE * 100)}%（固定）")
-        st.caption(f"見積日: {datetime.datetime.now().strftime('%Y/%m/%d')}（自動）")
+        st.caption(f"見積日: {now_jst().strftime('%Y/%m/%d')}（自動）")
 
     # セッション状態初期化
     for key, default in [

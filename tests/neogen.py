@@ -1,9 +1,12 @@
+# ROOT は zz_h.py と同じ決め方（XROOT があればそのツリー）。
+# 開発環境の絶対パスを直書きすると、他のPCでは 1 本もテストが動かない。
 import sys, os, sqlite3, tempfile, json
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.environ.get("XROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, ROOT)
+os.chdir(ROOT)
 import app
 
-TPL = open('/home/user/shouchiku8-app/template_toyota.neo','rb').read()
+TPL = open(os.path.join(ROOT, "template_toyota.neo"), "rb").read()
 
 def gen(items, cust=None, ins=None, sp=0, expenses=None, incl=False, beta=True):
     return app.generate_neo_file(TPL, cust or {}, items, sp, ins or {}, expenses or {}, incl, beta)

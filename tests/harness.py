@@ -1,5 +1,8 @@
-import ast, re, sys, types
-src = open('/home/user/shouchiku8-app/app.py', encoding='utf-8').read()
+# ROOT は zz_h.py と同じ決め方（XROOT があればそのツリー）。
+# 開発環境の絶対パスを直書きすると、他のPCでは 1 本もテストが動かない。
+import ast, os, re, sys, types
+ROOT = os.environ.get("XROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+src = open(os.path.join(ROOT, "app.py"), encoding="utf-8").read()
 tree = ast.parse(src)
 lines = src.split('\n')
 want_fn = {'_normalize_number_text','safe_int','parse_csv_to_items','_is_total_row_name',

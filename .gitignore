@@ -33,3 +33,9 @@ deploy_hf.py
 keys.txt
 result.json
 match_output*.txt
+
+# tests/ 直下の .py は上の一時ファイルパターンから除外する。
+# analyze_*.py に当たって tests/analyze_real_neo.py が commit されず、
+# 引き継ぎ書 §6 と tests/README.md が参照するスクリプトが
+# リポジトリから丸ごと消えていた（2026-09-10 発見）。
+!tests/*.py
