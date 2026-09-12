@@ -322,10 +322,13 @@ def _inspect(path: str, out_json: str = '') -> int:
         if p.get('coat') and fc in (1, 2, 3, 4) and _coat_code(p.get('coat', '')) not in (0, fc):
             warn.append(f"塗装 ★見積の塗膜 {p.get('coat')}（={_coat_code(p.get('coat', ''))}）と車両色 {car.get('ColorCode')} の 66.DB 塗膜 {fc} が違う（生成器は 66.DB を優先する）")
         pi = PaintIndex(nb.engine.root, car_code, body=car.get('BodyCode', ''))  # 20.DB はボディで面積が違う行を持つ
-        n_p = len(p['panels'])
+        from estimate_to_neo import is_manual_panel
+        _man = [x for x in p['panels'] if is_manual_panel(x)]
+        n_p = len(p['panels']) - len(_man)  # 手入力の塗装行（部品コード無し）は枚数に数えない
         print(f"6. 塗装: 塗料 {paint_c} 塗膜 {coat_c} 高機能 {hf_c} 枚数 {n_p} 車形 {car.get('CarFormCode')}")
         for _pn in p['panels']:            # 先にボディ別の行を引いて、選べなかったパネルを拾う
-            pi.panel(str(_pn.get('code', '')))
+            if not is_manual_panel(_pn):
+                pi.panel(str(_pn.get('code', '')))
         for _u in getattr(pi, 'body_unresolved', []):
             if _u.get('areas'):   # 同じコードに面積の違う行が複数（ADDATA 全車種で 258 組）
                 warn.append(f"塗装 ★パネル {_u['code']}: 20.DB に面積の違う行が複数ある"
@@ -336,6 +339,15 @@ def _inspect(path: str, out_json: str = '') -> int:
             warn.append(f"塗装 ★パネル {_u['code']}: ボディ {_u['body']} 用の行を選べなかった（{_c}）。"
                         '面積＝塗装指数が実機とずれることがあるので、見積書の dm² と突き合わせる')
         for pnl in p['panels']:
+            if is_manual_panel(pnl):
+                _mk = "'#'" if _given(pnl.get('index')) else "'*'"  # 生成器: 指数あり '#'（Manual 1）/ 工賃だけ '*'（Manual 2）
+                print(f"   （手入力の塗装行）{pnl.get('name', '')}: 指数 {pnl.get('index', '-')} 工賃 {pnl.get('wage', '-')}（標準なし・{_mk}。材料代の対象）")
+                _w, _t = int(pnl.get('wage') or 0), _given(pnl.get('index'))
+                if _w and _t and labor and _w != r10(int(round(float(_t) * 10)) * labor / 10):
+                    warn.append(f"塗装 ★手入力の塗装行 {pnl.get('name', '')}: 工賃 {_w} が 指数 {_t} × 単価 {labor} と違う（実案件 NEO の指数付き手入力行は 指数 × 単価。読み取りを確かめる）")
+                if _given(pnl.get('index')) is None and not int(pnl.get('wage') or 0):
+                    warn.append(f"塗装 ★手入力の塗装行 {pnl.get('name', '')}: 指数も工賃も無い")
+                continue
             code = str(pnl.get('code', ''))
             try:
                 st = pi.standard_times(code, hf_c, n_p, paint_c)
@@ -368,7 +380,7 @@ def _inspect(path: str, out_json: str = '') -> int:
                     print('      ' + msg)
                     warn.append(msg)
         try:
-            base_std = pi.base_time(str(car.get('CarFormCode')), paint_c, coat_c, hf_c, n_p)
+            base_std = pi.base_time(str(car.get('CarFormCode')), paint_c, coat_c, hf_c, n_p) if n_p else None  # 部品コードのあるパネルが 0 枚なら加算基礎の標準は無い
         except Exception:
             base_std = None
         b = p.get('base') or {}

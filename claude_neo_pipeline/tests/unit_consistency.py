@@ -1207,6 +1207,85 @@ def test_scratch_high_function_paint():
         raise AssertionError('知らない高機能塗装を通してしまった')
 
 
+def _paint_db(neo):
+    ck = _nc.find_real_cks(neo); dec = _nc.decompress_neo(neo, ck); _m, entries = _nc.parse_entries(neo, ck[0]); files = _nc.extract_files(dec, entries)
+    t = tempfile.NamedTemporaryFile(delete=False, suffix='.sld'); t.write(files['AnSvEm0001.sld']); t.close()
+    return t.name
+
+
+def test_manual_paint_rows_are_disposal_9():
+    """手入力の塗装行（外板パネル画面の「行追加」= PaintingPanel.DisposalCode 9。実案件 NEO 354 本・631 行。2026-09-13）:
+    部品コード空・面積と標準欄 -1・指数あり '#'/Manual 1・工賃だけ '*'/Manual 2/Time -1・SortNo 15・AddedFrom 1・部品コードのあるパネルの後ろに入力順。
+    塗装工賃計と材料代の対象に入り、加算基礎の枚数には数えない。手入力の塗装行だけの追加では加算基礎に '*' は付かない"""
+    veh = {'model_code': 'NHP170', 'serial_no': '', 'desig': '19020', 'category': '0005', 'reg_date': 'R2.2', 'color_code': '209'}
+    items = [{'code': '0600', 'name': 'ﾌｰﾄﾞ', 'method': '取替', 'qty': 1, 'price': 30000}]
+    coded = {'code': '0600', 'name': 'ﾌ-ﾄﾞ', 'method': '取替'}
+    base_paint = {'paint': '2K', 'coat': '2コートパール', 'hf': 'しない', 'material_rate': 20}
+    neo0, _ = NeoBuilder().build(dict(BASE, vehicle=veh, items=items, paint=dict(base_paint, panels=[coded])), veh, labor_rate=7360, est_date='20260913', insurance={})
+    p0 = _paint_db(neo0); em0 = sqlite3.connect(p0)
+    plan0 = tuple(em0.execute('SELECT BaseTime, BaseTimeStandard, BaseWageOutTax, BaseWageByManual FROM PaintingPlan').fetchone())
+    tot0 = tuple(em0.execute('SELECT TimeTotalPanel, WageTotalPanelOutTax FROM PaintingTotal').fetchone())
+    em0.close(); os.unlink(p0)
+    # 手入力の塗装行は部品コード昇順の並べ替えに巻き込まれず、コードのあるパネル（入力は後ろ）の後に入力順で並ぶ
+    panels = [{'manual': True, 'name': '左右ﾙｰﾌｻｲﾄﾞ', 'index': 4.0, 'method': '修理'}, {'name': 'Rrﾎﾞﾃﾞ-ﾌﾛｱ', 'wage': 12000}, coded]
+    neo, rep = NeoBuilder().build(dict(BASE, vehicle=veh, items=items, paint=dict(base_paint, panels=panels)), veh, labor_rate=7360, est_date='20260913', insurance={})
+    p = _paint_db(neo); em = sqlite3.connect(p)
+    rows = em.execute('SELECT RecordNo, LineNo, PartsCode, DisposalCode, DisposalName, PanelName, Time, WageOutTax, WageByManual, Manual, AddedFrom, SortNo,'
+                      ' PanelArea, PrepareArea, PaintingArea, TimeStandardNew, TimeStandardHF, WageStandardNewOutTax, MaterialOutTax, PanelCode, ButtonNo FROM PaintingPanel ORDER BY RecordNo').fetchall()
+    plan = tuple(em.execute('SELECT BaseTime, BaseTimeStandard, BaseWageOutTax, BaseWageByManual FROM PaintingPlan').fetchone())
+    tot = tuple(em.execute('SELECT TimeTotalPanel, WageTotalPanelOutTax, WageTotalOutTax, MaterialTotalOutTax FROM PaintingTotal').fetchone())
+    em.close(); os.unlink(p)
+    assert [r[2] for r in rows] == ['0600', '', ''] and [r[0] for r in rows] == [1, 2, 3] and [r[1] for r in rows] == [0, 1, 2], rows
+    assert rows[1][3:12] == (9, '修理', '左右ﾙｰﾌｻｲﾄﾞ', 4.0, 29440, '#', 1, 1, 15), rows[1]
+    assert rows[2][3:12] == (9, '', 'Rrﾎﾞﾃﾞ-ﾌﾛｱ', -1, 12000, '*', 2, 1, 15), rows[2]
+    assert all(v == -1 for v in rows[1][12:]) and all(v == -1 for v in rows[2][12:]), rows
+    assert plan == plan0, (plan, plan0)  # 加算基礎は部品コードのあるパネル 1 枚で数え、'*' も付かない
+    assert abs(tot[0] - (tot0[0] + 4.0)) < 0.05 and tot[1] == tot0[1] + 29440 + 12000, (tot, tot0)
+    assert tot[3] == round(tot[2] * 20 / 100 / 10) * 10, tot  # 材料代の対象に入る
+    # 手入力の塗装行だけ: 加算基礎の標準は無い（-1）。バンパ加算基礎も付かない
+    neo2, _ = NeoBuilder().build(dict(BASE, vehicle=veh, items=items, paint=dict(base_paint, panels=[{'name': 'Rrｹﾞ-ﾄﾊﾟﾈﾙ', 'index': 2.0}])), veh, labor_rate=7360, est_date='20260913', insurance={})
+    p2 = _paint_db(neo2); em2 = sqlite3.connect(p2)
+    plan2 = tuple(em2.execute('SELECT BaseTime, BaseTimeStandard, BaseWageOutTax, BaseWageByManual, BumperBaseTime FROM PaintingPlan').fetchone())
+    tot2 = tuple(em2.execute('SELECT TimeTotalPanel, WageTotalPanelOutTax, TimeTotal FROM PaintingTotal').fetchone())
+    em2.close(); os.unlink(p2)
+    assert plan2 == (-1, -1, -1, '', -1), plan2
+    assert tot2 == (2.0, 14720, 2.0), tot2
+    # 見積に加算基礎があれば手入力 '#'（標準 -1）
+    neo3, _ = NeoBuilder().build(dict(BASE, vehicle=veh, items=items, paint=dict(base_paint, panels=[{'name': 'Rrｹﾞ-ﾄﾊﾟﾈﾙ', 'index': 2.0}], base={'index': 2.5})), veh, labor_rate=7360, est_date='20260913', insurance={})
+    p3 = _paint_db(neo3); em3 = sqlite3.connect(p3)
+    plan3 = tuple(em3.execute('SELECT BaseTime, BaseTimeStandard, BaseWageOutTax, BaseWageByManual FROM PaintingPlan').fetchone())
+    em3.close(); os.unlink(p3)
+    assert plan3 == (2.5, -1, 18400, '#'), plan3
+    # 名称は入力のまま（全角カナも長音も直さない）、20 バイトで切るだけ
+    neo6, _ = NeoBuilder().build(dict(BASE, vehicle=veh, items=items, paint=dict(base_paint, panels=[{'name': 'リヤボデーフロアパネル', 'index': 2.0}])), veh, labor_rate=7360, est_date='20260913', insurance={})
+    p6 = _paint_db(neo6); em6 = sqlite3.connect(p6)
+    n6 = em6.execute('SELECT PanelName FROM PaintingPanel WHERE DisposalCode = 9').fetchone()[0]
+    em6.close(); os.unlink(p6)
+    assert n6 == 'リヤボデーフロアパネ', n6
+    # 手入力の塗装行だけでもブースの標準（BOOTH.DB。枚数と無関係）は引く（Codex 指摘）
+    neo5, _ = NeoBuilder().build(dict(BASE, vehicle=veh, items=items, paint=dict(base_paint, panels=[{'name': 'Rrｹﾞ-ﾄﾊﾟﾈﾙ', 'index': 2.0}], booth={'use': True})), veh, labor_rate=7360, est_date='20260913', insurance={})
+    p5 = _paint_db(neo5); em5 = sqlite3.connect(p5)
+    b5 = tuple(em5.execute('SELECT BoothFlag, BoothTime, BoothTimeStandard FROM PaintingPlan').fetchone())
+    em5.close(); os.unlink(p5)
+    assert b5[0] == 1 and b5[1] > 0 and b5[1] == b5[2], b5
+    # 指数と工賃の両方があり 工賃 ≠ 指数 × 単価: 見積の工賃のまま（行の金額は動かさない）で、知らせる
+    nb = NeoBuilder()
+    neo4, _ = nb.build(dict(BASE, vehicle=veh, items=items, paint=dict(base_paint, panels=[coded, {'name': 'Rrｹﾞ-ﾄﾊﾟﾈﾙ', 'index': 2.0, 'wage': 15000}])), veh, labor_rate=7360, est_date='20260913', insurance={})
+    p4 = _paint_db(neo4); em4 = sqlite3.connect(p4)
+    r4 = tuple(em4.execute('SELECT Time, WageOutTax, WageByManual FROM PaintingPanel WHERE DisposalCode = 9').fetchone())
+    em4.close(); os.unlink(p4)
+    assert r4 == (2.0, 15000, '#'), r4
+    assert any('手入力の塗装行' in n_ and '14,720' in n_ for n_ in nb._paint_notes), nb._paint_notes
+    # 指数も工賃も無い・名称が無い手入力の塗装行は止める
+    for bad in ({'name': 'ﾙｰﾌｻｲﾄﾞ'}, {'manual': True, 'index': 2.0}):
+        try:
+            NeoBuilder().build(dict(BASE, vehicle=veh, items=items, paint=dict(base_paint, panels=[coded, bad])), veh, labor_rate=7360, est_date='20260913', insurance={})
+        except ValueError as ex:
+            assert '手入力の塗装行' in str(ex), str(ex)
+        else:
+            raise AssertionError(f'{bad} が通ってしまった')
+
+
 def test_com_tables_follow_the_addata_in_use():
     """毎月変わる COM の表（DATAUP / Katashiki）は使っている ADDATA の COM.CAB から読む（同梱の写しは予備）"""
     import com_tables

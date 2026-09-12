@@ -153,6 +153,27 @@ def test_sealing_without_length_is_still_sealing():
         assert 'm' not in p['sealing'], f'{nm}: 印字の無い長さを作っている（{p["sealing"]}）'
 
 
+def test_unmatched_body_part_becomes_manual_paint_row():
+    """20.DB のパネルに無い部位（ルーフサイド等）は 手入力の塗装行（panels[].manual。DisposalCode 9・材料代の対象）、
+    工程の名前（アンダーコート・内板調色 …）は 追加項目（paint.other。材料代の対象外）"""
+    p = _draft(_base_reading([{'name': '左 ﾌﾛﾝﾄﾄﾞｱﾊﾟﾈﾙ 取替', 'wage': 20000},
+                              {'name': 'Rrﾎﾞﾃﾞｰﾌﾛｱ 修理', 'index': 3.0, 'wage': 24000},
+                              {'name': 'ｱﾝﾀﾞｰｺｰﾄ', 'wage': 5000},
+                              {'name': '内板調色', 'wage': 3000}]))['paint']
+    man = [x for x in p['panels'] if x.get('manual')]
+    assert len(man) == 1 and man[0]['name'] == 'Rrﾎﾞﾃﾞｰﾌﾛｱ' and man[0]['method'] == '修理' and man[0]['index'] == 3.0 and man[0]['wage'] == 24000, man
+    assert sorted(o['name'] for o in p.get('other') or []) == sorted(['ｱﾝﾀﾞｰｺｰﾄ', '内板調色']), p.get('other')
+    assert p['panels'][0].get('code') and not p['panels'][0].get('manual'), p['panels'][0]
+    notes = _draft(_base_reading([{'name': '左 ﾌﾛﾝﾄﾄﾞｱﾊﾟﾈﾙ 取替', 'wage': 20000}, {'name': 'ﾙｰﾌｻｲﾄﾞ 修理', 'wage': 6000}]))['_draft_notes']
+    assert any('名前が近いだけ' in n for n in notes), notes  # 近いだけの対応付けは知らせる
+
+
+def test_manual_paint_row_needs_a_matched_panel():
+    """20.DB のパネルに 1 行も対応付けできないときは、全部を手入力の塗装行にせず従来どおり一括計上（名前の書き方が違う書式の疑い）"""
+    p = _draft(_base_reading([{'name': 'Rrﾎﾞﾃﾞｰﾌﾛｱ 修理', 'wage': 24000}, {'name': 'ｽﾃｯﾌﾟ', 'wage': 6000}]))['paint']
+    assert 'panels' not in p and p.get('total') == 30000, p
+
+
 def _auto_reading(items, total):
     return {'source': 't', 'issuer': 't', 'est_date': '20260910', 'format': 'A',
             'vehicle': dict(VEH), 'customer': {}, 'insurance': {}, 'labor_rate': 8000,

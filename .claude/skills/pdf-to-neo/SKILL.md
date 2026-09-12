@@ -192,7 +192,7 @@ PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/make_neo.py "<NE
 ```
 
 - `pages/` が reading.json より新しければ先に `reading_pages.py merge`、続けて `reading_check.py`（紙上検算: ページ/ブロック小計・数量×単価・費用の集計先・左右・工賃丸め・消費税丸め・工場プロファイル）が走り、**FAIL があれば止まる**（reading を直す。理由が説明できるときだけ `--skip-check`）
-- `draft_estimate.py` が reading.json から estimate.json を作り、`_draft_notes`（名称照合で決めた行・左右分割・板金ランク・採用した装備・paint.other に落ちた塗装行・manual にした行）を表示する。**必ず読む**
+- `draft_estimate.py` が reading.json から estimate.json を作り、`_draft_notes`（名称照合で決めた行・左右分割・板金ランク・採用した装備・追加項目（paint.other）と手入力の塗装行にした塗装行・manual にした行）を表示する。**必ず読む**
 - 続けて `inspect_estimate.py` の突合せ（★ 要確認）と `run_case.py` の検算が出る。全部 OK なら「合格」
 - 生成後に **装備監査**（`option_audit.py`）が走る。生成器が選んだ装備で決まる標準品番と印字品番を突き合わせ、「装備 X を追加/除外すると一致する行が増える」行があれば ★ で出る。装備の取り違いは合計を変えずに標準品番・指数だけを変えるので、合計一致だけでは見つからない。★ が出たら 10.DB の装備名と見積の注記で採否を決め、採るなら reading の `hints.eva_codes` に書いて再実行
 - `report.md` ができる（不合格でも書かれるので、合格の行と合わせて読む）（車両・合計表・手入力行・判断点・要確認・印字の印との照合・紙上検算・装備監査）。**報告はこれを元に書く**。コグニ印刷（書式 A）で右端の印（$ # *）を flags に写しておくと、生成 NEO の印との差が出る（差ゼロ = コグニで作ったのと同じ書式）

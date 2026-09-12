@@ -30,7 +30,7 @@ skill_env.apply()  # ADDATA / NEO_check / 雛形 の場所を環境変数に（P
 FILES = skill_env.FILES  # リポジトリ root（ジャンクション経由・別フォルダからの実行でも解決）
 sys.path.insert(0, os.path.join(FILES, 'claude_neo_pipeline'))
 
-from estimate_to_neo import _code4, AddataParts, BUMPER_DISPOSAL, DISPOSAL, NeoBuilder, bankin_time, material_default, r10, BUMPER_ONLY_KEYS  # noqa: E402
+from estimate_to_neo import _code4, AddataParts, BUMPER_DISPOSAL, DISPOSAL, NeoBuilder, bankin_time, material_default, r10, BUMPER_ONLY_KEYS, is_manual_panel  # noqa: E402
 from paint_index import PaintIndex  # noqa: E402
 
 BANKIN_YES = {'A': [1, 1, 1], 'B': [1, 0, 0], 'C': [0, 0, 0]}
@@ -315,6 +315,12 @@ def infer_labor_rate(rows: list[dict]) -> int:
     cands = sorted(cands)
     best = max(cands, key=lambda c: (rate_score(pairs, c), c % 100 == 0, c % 50 == 0, -abs(c - 10000)))
     return best
+
+
+# 塗装の「追加項目」（PaintingOther。材料代の対象外）に入れる工程の名前（NFKC 後の全角カナで照合）。
+# 実案件 NEO 7,002 本の追加項目の名前: アンダーコート 149・内板調色 63・チッピング 25・ヒンジ 30・レールカバー 14・フューエルリッド 12・ホースメント 10・ホイルハウス 5 …（2026-09-13）。
+# 「シーリング材料費」「…材」「…剤」「…費用」のような材料・費用の行も部位ではないのでこちら（ボデーシーリングの作業は先に paint.sealing へ分けてある）
+_ADD_ITEM_RE = re.compile(r'アンダ[ー\-]?コ|内板|調色|チッピング|ヒンジ|ホ[ー\-]?スメント|インナ|レ[ー\-]?ルカバ|フ[ュユ][ー\-]?エルリ[ッツ]ド|ホイ[ー\-]?ルハウス|加算|下地|シ[ー\-]リング|材|剤|費')
 
 
 class Drafter:
@@ -733,6 +739,10 @@ class Drafter:
                 f'★ 塗装パネル「{text}」: 同じ名前の候補が複数ある（'
                 + ' / '.join(f"{p['code']} 面積 {p['area']}" for p in top[:4])
                 + f"）。{top[0]['code']} を採った。見積書の dm² と違うなら reading の name をコグニのパネル名に直す")
+        if best_s < 0.8:
+            # 名前が近いだけ（例 'ﾙｰﾌｻｲﾄﾞ' → 'L ｻｲﾄﾞｼﾙﾊﾟﾈﾙ' が 0.6 台）。20.DB に無い部位なら手入力の塗装行にするのが正しい（判断規則 10-20）
+            self.notes.append(f"★ 塗装パネル「{text}」→ {top[0]['code']} {top[0]['name'].strip()}: 名前が近いだけ（一致度 {best_s:.2f}）。"
+                              "違う部位なら reading の name を直すか、estimate.json で手入力の塗装行（manual: true）にする")
         return top[0]
 
     def _put_special(self, out: dict, key: str, rec: dict, name: str) -> None:
@@ -756,6 +766,7 @@ class Drafter:
                 out['total'] = sum(int(float(_num(l.get('wage')) or 0)) for l in lines)
             return out
         panels, other = list(out.get('panels') or []), list(out.get('other') or [])
+        auto_manual: list = []  # 下書きが作った手入力の塗装行（rec, 見積の名前）
         for ln in lines:
             name = _hw_kana(ln.get('name') or '')
             t = float(_num(ln['index'])) if _num(ln.get('index')) != '' else None
@@ -819,8 +830,37 @@ class Drafter:
                         rec['wage'] = w
                     panels.append(rec)
                     continue
-            other.append({k: v for k, v in (('name', name), ('index', t), ('wage', w)) if v is not None})
-            self.notes.append(f'塗装 {name}: 20.DB のパネルに対応付けできず paint.other にした（パネルなら reading の name をコグニ名に）')
+            if _ADD_ITEM_RE.search(n) or (t is None and w is None):
+                # 工程の名前（アンダーコート・内板調色・チッピング・ヒンジ …）は「追加項目」（材料代の対象外）。実案件 NEO の追加項目の名前から
+                other.append({k: v for k, v in (('name', name), ('index', t), ('wage', w)) if v is not None})
+                self.notes.append(f'塗装 {name}: 工程の名前なので 追加項目（paint.other。材料代の対象外）にした')
+                continue
+            # 部位の名前なのに 20.DB のパネルに無い（ルーフサイド・リヤボデーフロア・テールゲート …）: 人はコグニの外板パネル画面で
+            # 「行追加」して手入力する（PaintingPanel の手入力の塗装行。材料代の対象）。実案件 NEO 354 本・631 行（2026-09-13）
+            # 名称は半角カナ（_hw_kana 済みの name）で渡す。コグニで行追加する人の入力は半角カナが大半（実案件 NEO 209 行中 約 95%、長音は 'ｰ' が多い）。
+            # 工場の印字（全角のことがある）そのままより、人が打つ形に寄せる。生成器は渡された名称を直さずに書く
+            mm2 = re.match(r'^(.*?)\s*(取替|新品|交換|修正|修理)\s*(?:1/[123])?$', name)
+            rec_m = {'manual': True, 'name': (mm2.group(1).strip() if mm2 and mm2.group(1).strip() else name)}
+            if mm2:
+                rec_m['method'] = '取替' if mm2.group(2) in ('取替', '新品', '交換') else '修理'
+            if t is not None:
+                rec_m['index'] = t
+            if w is not None:
+                rec_m['wage'] = w
+            panels.append(rec_m)
+            auto_manual.append((rec_m, name, bool(m)))
+        if auto_manual and all(is_manual_panel(x) for x in panels):
+            # 20.DB のパネルに 1 行も対応付けできなかった: 名前の書き方がコグニと違う書式の可能性が高いので、全部を手入力の塗装行にはせず
+            # 従来どおり一括計上（paint.total）に戻す（下の else 節。行は追加項目の扱いで落とす）
+            for rec_m, name, _hm in auto_manual:
+                panels.remove(rec_m)
+                other.append({'name': name, **{k: rec_m[k] for k in ('index', 'wage') if k in rec_m}})
+        else:
+            for _rec, name, had_method in auto_manual:
+                self.notes.append(f'塗装 {name}: ' + ('20.DB のパネルに無い部位なので' if had_method else
+                                                      '修理方法（取替/修理）の印字が無く 20.DB のパネルに対応付けていないので')
+                                  + ' 手入力の塗装行（外板パネルの行追加。材料代の対象）にした。工程（追加項目）なら reading の name に工程名を、'
+                                  '20.DB のパネルなら 取替/修理 を書く')
         if panels:
             out['panels'] = panels
             if other:

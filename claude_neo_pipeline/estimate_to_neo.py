@@ -147,6 +147,12 @@ def guideline_material_rate(paint: int, coat: int, hf: int) -> Optional[float]:
         return None
 
 
+def is_manual_panel(pnl: dict) -> bool:
+    """塗装パネルの「手入力の塗装行」（部品コードの無い行。コグニの外板パネル画面で「行追加」して名称・指数を手で入れた行 = PaintingPanel.DisposalCode 9）。
+    `manual: true` か、部品コード（code）が空の行"""
+    return bool(_flag(pnl.get('manual'), 'paint.panels[].manual')) or not str(pnl.get('code') or '').strip()
+
+
 def default_material_rate(paint: int, coat: int, hf: int) -> Optional[float]:
     """材料代割合の既定値（見積書に材料代も割合も無いとき）。
     1) SHOUCHIKU ガイドライン表の 6500〜 列（guideline_material_rate。この PC に表があるとき）
@@ -2142,7 +2148,10 @@ class NeoBuilder:
             if _hf_in not in _hf_map:  # 知らない高機能塗装を黙って「しない」にしない（加算基礎・材料代割合・パネル加算が変わる）
                 raise ValueError(f"paint.hf は {sorted(set(HF_CODE) - {'ｽｸﾗｯﾁ'})} のいずれか（{pd.get('hf')!r}）")
             hf = _hf_map[_hf_in]
-            panels = pd['panels']; n_p = len(panels)
+            panels = [p_ for p_ in pd['panels'] if not is_manual_panel(p_)]   # 部品コードのある外板パネル（20.DB）
+            man_panels = [p_ for p_ in pd['panels'] if is_manual_panel(p_)]  # 手入力の塗装行（DisposalCode 9）
+            # 加算基礎の枚数・単体塗/複数塗の判定は部品コードのあるパネルだけで数える（手入力の塗装行は数えない。実案件 NEO 60/60・16/16。2026-09-13）
+            n_p = len(panels); n_rows = n_p + len(man_panels)
             pcols = [r[1] for r in cur.execute('PRAGMA table_info(PaintingPanel)')]
             notes = []
             def t3(v):
@@ -2219,11 +2228,43 @@ class NeoBuilder:
                     rec[f'WageStandard{key}OutTax'], rec[f'WageStandard{key}InTax'], rec[f'WageStandard{key}Tax'] = t3(wstd(tv))
                 cur.execute(f"INSERT INTO PaintingPanel ({','.join(pcols)}) VALUES ({','.join('?' * len(pcols))})", [rec[c] for c in pcols])
                 panel_wage += w; panel_time += t
+            # 手入力の塗装行（外板パネル画面の「行追加」。部品コード無し・名称と指数を手で入れた行 = DisposalCode 9）。
+            # 実案件 NEO 354 本・631 行（2026-09-13）: 部品コード空・DisposalName 空（修理方法を選んだ行は '修理'/'取替'）・面積と標準欄はすべて -1・
+            # 指数あり → 工賃 = 指数 × 単価、工賃印 '#'・Manual 1 / 工賃だけ → Time -1・工賃印 '*'・Manual 2。AddedFrom 1・SortNo 15・名称は入力のまま（詰めない）。
+            # 部品コードのあるパネルの後ろに入力順で並ぶ。塗装工賃計（材料代の対象）に入り、加算基礎の枚数には数えない
+            for j, pnl in enumerate(man_panels):
+                # 名称は入力のまま（コグニは行追加の名称を直さない。実案件 NEO 209 行: 半角カナが大半だが 全角カナ 3・前後空白 4・長音 'ｰ' と '-' の両方がある）。20 バイトで切るだけ
+                nm = _fit(str(pnl.get('name') or ''), 20)
+                t = float(pnl.get('index') or 0)
+                w = _money(pnl.get('wage'), f"手入力の塗装行 {nm} の工賃")
+                if t > 0 and not w and rate:
+                    w = rp(t)
+                elif t > 0 and w and rate and w != rp(t):
+                    # 実案件 NEO の指数付き手入力行は 工賃 = r10(指数 × 単価)。見積の工賃は動かさない（行の金額を合計合わせで動かさない原則）が、知らせる
+                    notes.append(f"手入力の塗装行 {nm}: 工賃 {w:,} が 指数 {t:g} × 単価 {rate:,} = {rp(t):,} と違う（見積の工賃のまま '#' で書く。読み取りを確かめる）")
+                if t <= 0 and not w:
+                    raise ValueError(f'手入力の塗装行 {nm or "(名称なし)"}: 指数（index）か工賃（wage）が要る')
+                if not nm.strip():
+                    raise ValueError('手入力の塗装行に名称（name）が無い（コグニの外板パネル画面に出る名前）')
+                m_ = unicodedata.normalize('NFKC', str(pnl.get('method') or '')).strip()
+                rec = {c: '' for c in pcols}
+                rec.update({'RecordNo': n_p + j + 1, 'LineNo': n_p + j, 'PartsCode': '', 'DisposalCode': 9,
+                            'DisposalName': ('取替' if m_ in ('取替', '新品', '交換') else ('修理' if m_ in ('修理', '修正') else '')),
+                            'PanelName': nm, 'PrepareArea': -1, 'PanelArea': -1, 'PaintingArea': -1, 'PaintingAreaName': '',
+                            'Time': t if t > 0 else -1, 'TimeStandardNew': -1, 'TimeStandard1': -1, 'TimeStandard2': -1, 'TimeStandard3': -1, 'TimeStandardHF': -1,
+                            'WageOutTax': w, 'WageInTax': tax_of(w)[0], 'WageTax': tax_of(w)[1],
+                            'WageByManual': '#' if t > 0 else '*', 'MaterialOutTax': -1, 'MaterialInTax': -1, 'MaterialTax': -1, 'MaterialByManual': '',
+                            'PanelDivision': -1, 'PanelTypeDivision': -1, 'PanelCode': -1, 'SortNo': 15, 'ButtonNo': -1, 'Provisional': 0,
+                            'AddedFrom': 1, 'Manual': 1 if t > 0 else 2})
+                for key in ('New', '1', '2', '3', 'HF'):
+                    rec[f'WageStandard{key}OutTax'] = rec[f'WageStandard{key}InTax'] = rec[f'WageStandard{key}Tax'] = -1
+                cur.execute(f"INSERT INTO PaintingPanel ({','.join(pcols)}) VALUES ({','.join('?' * len(pcols))})", [rec[c] for c in pcols])
+                panel_wage += w; panel_time += (t if t > 0 else 0)
             _pp = [dict(zip(pcols, r)) for r in cur.execute('SELECT * FROM PaintingPanel ORDER BY RecordNo')]
             # 「パネル追加」（AddedFrom 1）した行が 1 枚でもあると、コグニは加算基礎数値の工賃印を '*' にして保存する
             # （実機 NEO: cogni_P1 = 2601 パネル追加 → BaseWageByManual '*'、w90_real 2026-09-12 = 4801 パネル追加 → '*'。
             #   パネル追加の無い実機 27 本はすべて ''。値は標準のままでも印だけ '*'）
-            _any_added = any(int(x.get('AddedFrom') or 0) == 1 for x in _pp)
+            _any_added = any(int(x.get('AddedFrom') or 0) == 1 and int(x.get('DisposalCode') or 0) != 9 for x in _pp)  # 手入力の塗装行だけなら付かない（実案件 NEO 241/245）
             # 関門: AddedFrom 0（W/S 連動）の塗装パネルは、必ず明細（ERParts）に同じ部品コードの
             # 取替/修理/板金行があること。コグニは塗装ページを開くと連動行を明細から作り直すので、
             # 明細に無い連動行は **開いた瞬間に消える**（2026-09-11 実機 W90 ハイエース: 4801 が消え、
@@ -2237,19 +2278,21 @@ class NeoBuilder:
                     + ' を W/S 連動（AddedFrom 0）で書こうとしている。明細に同じ部品コードの取替/修理/板金行が無いので、'
                       'コグニで塗装ページを開くとこの行は消え、塗装計がその分不足する。'
                       'パネル追加（AddedFrom 1・工賃印 \'*\'）で書くか、明細の部品コードと塗装パネルのコードを揃える（判断規則 10-17）')
-            if _pp and [x['PartsCode'] for x in _pp] != sorted(x['PartsCode'] for x in _pp):
+            _order = lambda x: (int(x.get('DisposalCode') or 0) == 9, '' if int(x.get('DisposalCode') or 0) == 9 else str(x['PartsCode']))  # noqa: E731  手入力の塗装行は最後（入力順のまま。sorted は安定）
+            if _pp and [_order(x) for x in _pp] != sorted(_order(x) for x in _pp):
                 cur.execute('DELETE FROM PaintingPanel')
-                for n_, rec_ in enumerate(sorted(_pp, key=lambda x: str(x['PartsCode'])), start=1):  # コグニは塗装パネル行を部品コード昇順で保存する（工場 NEO 5 本・再検索 C06）
+                for n_, rec_ in enumerate(sorted(_pp, key=_order), start=1):  # コグニは塗装パネル行を部品コード昇順で保存する（工場 NEO 5 本・再検索 C06）
                     rec_['RecordNo'] = n_; rec_['LineNo'] = n_ - 1  # LineNo は 0 始まり（再検索 C06: 0,1,2,3,4）
                     cur.execute(f"INSERT INTO PaintingPanel ({','.join(pcols)}) VALUES ({','.join('?' * len(pcols))})", [rec_[c] for c in pcols])
             booth = pd.get('booth') or {}; base = pd.get('base') or {}; bb = sb = None  # 標準値は取れないことがある（汎用車種・CHM の無い車種）
             bt = float(booth.get('index') or 0); st = float(base.get('index') or 0)
             if pi and form:
-                sb = pi.base_time(form, paint_c, coat_c, hf, n_p)
-                if base.get('index') is None and sb is not None:
-                    st = sb
-                elif sb is not None and abs(sb - st) > 0.05:
-                    notes.append(f'加算基礎数値 見積 {st} / 標準 {sb}')
+                if n_p > 0:  # 部品コードのあるパネルが 0 枚（手入力の塗装行だけ・バンパだけ）なら加算基礎の標準は無い（ブースは枚数と無関係なので下で引く）
+                    sb = pi.base_time(form, paint_c, coat_c, hf, n_p)
+                    if base.get('index') is None and sb is not None:
+                        st = sb
+                    elif sb is not None and abs(sb - st) > 0.05:
+                        notes.append(f'加算基礎数値 見積 {st} / 標準 {sb}')
                 bb = pi.booth_time(form, paint_c, coat_c, hf)  # None = 表に無い、0.0 = 高機能塗装でブース加算なし
                 if booth.get('index') is None and bb:
                     bt = bb
@@ -2264,13 +2307,20 @@ class NeoBuilder:
             st_std = sb if sb is not None else st
             bw_std = rp(bt_std) if bt_std is not None else bw   # 標準が 0.0 でも見積工賃で埋めない（0 は「加算なし」という有効値）
             sw_std = rp(st_std) if st_std is not None else sw
-            _bumper_only = (n_p == 0)
+            _bumper_only = (n_rows == 0)  # 外板パネルの行が 1 行も無い（手入力の塗装行があればバンパ加算基礎は付かない。実案件 NEO）
+            _base_manual_only = (n_p == 0 and n_rows > 0)  # 手入力の塗装行だけ: 加算基礎の標準は無い（BaseTimeStandard -1）。見積に加算基礎があれば手入力 '#' で書く
+            if _base_manual_only and not (base.get('index') or base.get('wage')):
+                st = st_std = 0.0; sw = sw_std = 0
             if _bumper_only:
                 # 外板パネルが無い（バンパだけ塗装）: 加算基礎数値は無し（PaintingPlan.Base* = -1・印 ''）。代わりにバンパ加算基礎（BAN.DB）を BumperBase* に書く
                 # （実機 2026-09-12 w66d_real: 0010 新品 2.0 + バンパ加算 0.5、TimeTotalBumper 2.5、Base* -1）。合計には 0 として扱う
                 st = st_std = 0.0; sw = sw_std = 0
-            _base_vals = ((-1, -1, -1, -1, -1, -1, -1, -1, '') if _bumper_only
-                          else (st, st_std, *t3(sw), *t3(sw_std), ('*' if ((sw and sw != sw_std) or _any_added) else '')))
+            if _bumper_only or (_base_manual_only and not st and not sw):
+                _base_vals = (-1, -1, -1, -1, -1, -1, -1, -1, '')
+            elif _base_manual_only:  # 手入力の塗装行だけで、見積に加算基礎がある（実案件 NEO: 標準 -1・印 '#'）
+                _base_vals = (st if st else -1, -1, *t3(sw), -1, -1, -1, '#')
+            else:
+                _base_vals = (st, st_std, *t3(sw), *t3(sw_std), ('*' if ((sw and sw != sw_std) or _any_added) else ''))
             paint_name = {1: '速乾', 3: '２Ｋ', 4: '水性'}.get(paint_c, '２Ｋ')
             cur.execute('UPDATE PaintingPlan SET Paint=?, PaintName=?, HFPainting=?, HFPaintingName=?, BoothFlag=?, BoothTime=?, BoothTimeStandard=?, '
                         'BoothWageOutTax=?, BoothWageInTax=?, BoothWageTax=?, BoothWageStandardOutTax=?, BoothWageStandardInTax=?, BoothWageStandardTax=?, BoothWageByManual=?, '

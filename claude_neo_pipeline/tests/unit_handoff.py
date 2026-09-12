@@ -173,7 +173,7 @@ def test_handoff_claims_about_the_generator():
         ('AddedFrom は明細にあるかだけで決まる', "'AddedFrom': 0 if (is_bankin or linked) else 1" in src),
         ('連動判定に修理方法を使う', 'linked = disp_pnl in linked_disp' in src),
         ('違反を止める関門 _linked_ng', '_linked_ng' in src),
-        ('塗装パネルは部品コード昇順', "sorted(_pp, key=lambda x: str(x['PartsCode']))" in src),
+        ('塗装パネルは部品コード昇順（手入力の塗装行は後ろ）', "sorted(_pp, key=_order)" in src and "'' if int(x.get('DisposalCode') or 0) == 9 else str(x['PartsCode'])" in src),
         ('加算基礎の標準値は ADDATA 値', 'st_std = sb if sb is not None else st' in src),
         ('真偽値の厳密読み取り _flag', 'def _flag(' in src),
         ('握り潰しの控え silent_errors', 'silent_errors' in src),
