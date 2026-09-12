@@ -1,0 +1,18 @@
+4810 d1 Time: 0.4 vs -1
+4810 d1 WageByManual: '#' vs ''
+4810 d1 WageOutTax: 2940 vs -1
+PaintingPlan.BaseTime: 3.1 vs 3
+PaintingPlan.BaseWageInTax: 25102 vs 24288
+PaintingPlan.BaseWageOutTax: 22820 vs 22080
+PaintingPlan.BaseWageTax: 2282 vs 2208
+PaintingTotal.TimeTotal: 11.4 vs 11.3
+PaintingTotal.TimeTotalPanel: 6.2 vs 6.200000000000001
+PaintingTotal.TotalInTax: 167767 vs 166953
+PaintingTotal.TotalOutTax: 152515 vs 151775
+PaintingTotal.TotalTax: 15252 vs 15178
+PaintingTotal.WageTotalInTax: 96349 vs 95535
+PaintingTotal.WageTotalOutTax: 87590 vs 86850
+PaintingTotal.WageTotalTax: 8759 vs 8685
+合計 547311 vs 543263
+2971 d0 PartsNo: '91560-S9A-A01' vs '91560-SZW-003    '
+PaintingPlan.BaseWageByManual: '*' vs ''

@@ -1,0 +1,13 @@
+4802 d2 OrderFlag: '' vs '0'
+0600 d2 OrderFlag: '' vs '0'
+2300 d2 OrderFlag: '' vs '0'
+5800 d2 OrderFlag: '' vs '0'
+4600 d2 OrderFlag: '' vs '0'
+PaintingTotal.TimeTotalPanel: 11.4 vs 11.399999999999999
+PaintingTotal.TimeTotal: 14.6 vs 14.599999999999998
+PP 0600.SortNo: 1 vs 2
+PP 5800.PrepareArea: 50 vs 48
+PP 2300.SortNo: 1 vs 2
+PP 4600.SortNo: 1 vs 2
+PP 4802.SortNo: 1 vs 2
+PP 5800.SortNo: 1 vs 2

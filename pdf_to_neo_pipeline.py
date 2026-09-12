@@ -1070,7 +1070,8 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]]) -> Dic
             cur = conn.cursor()
             rows = cur.execute(
                 "SELECT PartsNo, PartsUnitPriceOutTax, PartsUnitPriceInTax, "
-                "PartsPriceOutTax, PartsPriceInTax, PartsCount FROM ERParts"
+                "PartsPriceOutTax, PartsPriceInTax, PartsCount, WageOutTax "
+                "FROM ERParts"
             ).fetchall()
             conn.close()
             neo_count = len(rows)
@@ -1080,13 +1081,23 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]]) -> Dic
                 try:
                     in_tax = _to_float(r[4])
                     out_tax = _to_float(r[3])
-                    val = in_tax if in_tax > 0 else out_tax
+                    # pdf_total は税抜(parts_amount + wage)なので税抜を優先する。
+                    # 税込を優先していたため部品だけ税込・工賃は税抜という
+                    # 混在合計になり比較が成立していなかった（不具合修正）。
+                    val = out_tax if out_tax > 0 else in_tax
                     if val <= 0:
                         # 単価×数量で代替
                         up = _to_float(r[2]) or _to_float(r[1])
                         qty = max(_to_int(r[5], 1), 1)
                         val = up * qty
-                    neo_total += val
+                    if val > 0:
+                        neo_total += val
+                    # 工賃も加算する。pdf_total は parts_amount + wage の合計なので、
+                    # 部品代だけを積むと total_match が永久に False になっていた（不具合修正）。
+                    # コグニセブンは未設定を -1 で表すため 0 以下は無視する。
+                    wage = _to_float(r[6])
+                    if wage > 0:
+                        neo_total += wage
                 except (TypeError, ValueError):
                     pass
             # name_match_pct (Iter4改良): PartsNo+PartsName両方で総合一致率
@@ -1094,8 +1105,14 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]]) -> Dic
                 import difflib
                 pdf_keys = []
                 for it in (items or []):
-                    pno = str(it.get("parts_no") or "").strip()
-                    pnm = str(it.get("parts_name") or "").strip()
+                    # 本アプリの items は part_no / name キーを使う。
+                    # parts_no / parts_name だけを見ていたため pdf_keys が常に空になり、
+                    # name_match_pct が必ず 0.0 になっていた（不具合修正）。
+                    pno = str(it.get("parts_no") or it.get("part_no") or "").strip()
+                    pnm = str(it.get("parts_name") or it.get("name") or "").strip()
+                    # 品番に付く「※ADDATA該当なし」等のマーカーは NEO 側には残らないため除去
+                    if "※" in pno:
+                        pno = pno.split("※", 1)[0].strip()
                     if pno or pnm:
                         pdf_keys.append((pno, pnm))
                 # NEO の PartsNo も読み出し
@@ -1581,8 +1598,11 @@ def process_pdf_to_neo(pdf_path,
 
     # 5) NEO生成
     if not (vehicle_info or items):
+        # NEO を1バイトも生成できていないので ok=True は誤り。
+        # 呼び出し側が成功と誤認し、空ファイルをダウンロードさせていた（不具合修正）。
         log.append("vehicle_info/items 共に空のため NEO生成スキップ")
-        out["ok"] = True
+        warnings.append("PDFから車両情報・明細のどちらも取得できませんでした（NEO未生成）")
+        out["ok"] = False
         return out
 
     try:
@@ -1601,7 +1621,10 @@ def process_pdf_to_neo(pdf_path,
             log.append(f"verify ok={v.get('ok')} count={v.get('count_match')} total={v.get('total_match')}")
         except Exception as e:
             warnings.append(f"verify失敗: {e}")
-        out["ok"] = True
+        # 空バイトを成功扱いにしない（不具合修正）
+        out["ok"] = bool(neo)
+        if not neo:
+            warnings.append("NEOファイルが空で生成されました")
     except Exception as e:
         warnings.append(f"NEO生成失敗: {e}")
         out["neo_bytes"] = None

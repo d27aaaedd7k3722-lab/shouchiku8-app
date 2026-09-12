@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Addata汎用データベース検索エンジン
+"""Addata汎用データベース検索エンジン（**旧アプリ用**）
 任意の車種コードから部品コード・部品名称・部品番号・部品価格・作業指数を取得
+
+**このファイルは現行の NEO 生成器が実行時に使っている**（claude_neo_pipeline/estimate_to_neo.py の
+AddataParts.__init__ が LCG / _read_seed / load_11db / load_12db / load_15db を呼ぶ）。消すと動かない。
+
+ただし **バイト位置の「仕様」としては claude_neo_pipeline 側が正**。
+load_83db / get_all_parts などの検索系は旧アプリ用で NEO 生成では呼ばれず、
+スライス位置が ADDATA_REVERSE_LOOKUP_SPEC.md と食い違う箇所がある
+（83.DB の名称 18B・品番 15B、12.DB の名称 30B）。**ここを読んで ADDATA の仕様を推測しないこと**。
+各 DB の正しい読み方は claude_neo_pipeline/ 側（AddataParts / paint_index /
+addata_vehicle_resolver）を見る。2026-09-12 追記。
 
 使用方法:
     engine = AddataSearchEngine('C:\\Addata')
@@ -88,7 +98,13 @@ class AddataSearchEngine:
     HEADER_15 = 104      # *15.DB header = 104 bytes
     BLOCK_15 = 19        # *15.DB block = 19 bytes
 
-    def __init__(self, addata_root: str = r'C:\Addata'):
+    def __init__(self, addata_root: str = ''):
+        # 既定は「その場で解決」（PC ごとに ADDATA の場所が違うので C:\Addata 決め打ちにしない）
+        if not addata_root:
+            import sys as _sys
+            _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'claude_neo_pipeline'))
+            from addata_vehicle_resolver import find_addata_root
+            addata_root = find_addata_root()
         self.root = addata_root
         self._cache = {}
 

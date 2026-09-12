@@ -1,0 +1,11 @@
+2700 d0 OrderFlag: '' vs '*'
+4600 d0 OrderFlag: '' vs '0'
+4600 d0 Time: 4 vs 11.7
+4600 d0 TimeStandard: 4 vs 11.7
+4600 d0 WageFileTime: '4' vs '11.7'
+4600 d0 WageOutTax: 388000 vs 1134900
+4600 d0 WageStandardOutTax: 388000 vs 1134900
+4800 d0 OrderFlag: '' vs '0'
+PP 4801.SortNo: 1 vs 7
+PaintingTotal.TimeTotalPanel: 7.6 vs 7.6000000000000005
+合計 2229029 vs 3050619

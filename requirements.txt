@@ -1,10 +1,15 @@
+streamlit==1.55.0
 pandas==2.3.3
+numpy
 google-genai==1.68.0
+anthropic
 reportlab
 jaconv
 Levenshtein
 python-dotenv
 Pillow
 pdf2image
+pypdf
 pypdfium2
 PyMuPDF
+opencv-python-headless

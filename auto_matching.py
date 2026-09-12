@@ -1638,16 +1638,26 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
         body_code = 0
     # body_code が未指定なら OCR car_model から推定 (例 "3DHB" → 3DHB から body 推定は複雑)
     # 現状は ADDATA 側で勝手に補完してくれるので無指定で進める
-    if not grade_code:
+    # Priority 4 (Wave 2): grade_code 既知でも PDFGradeIdentifier で再投票
+    # ENABLE_PRIORITY4=0 で無効化可能 / confidence は 0-100 スケール
+    _ENABLE_P4 = os.environ.get("ENABLE_PRIORITY4", "1") != "0"
+    _P4_CONF   = int(os.environ.get("P4_CONFIDENCE_THRESHOLD", "50"))
+    if _ENABLE_P4 or not grade_code:
         try:
             from _grade_identifier import PDFGradeIdentifier  # type: ignore
             ident = PDFGradeIdentifier(engine, model_code, body_code=body_code)
-            try:
-                r = ident.identify(items) if hasattr(ident, "identify") else {}
-            except TypeError:
-                r = ident.identify() if hasattr(ident, "identify") else {}
+            for _it in items:
+                _nm = (_it.get("parts_name") or _it.get("name") or "").strip()
+                _pr = _it.get("unit_price") or 0
+                _pn = str(_it.get("parts_no") or _it.get("part_no") or "").strip()
+                if _nm:
+                    ident.add_part(_nm, _pr, _pn)
+            r = ident.identify()
             if isinstance(r, dict):
-                grade_code = r.get("grade_code") or r.get("grade") or ""
+                voted_gc   = r.get("grade_code") or r.get("grade") or ""
+                confidence = int(r.get("confidence", 0))
+                if voted_gc and (not grade_code or confidence >= _P4_CONF):
+                    grade_code = voted_gc
         except Exception:
             pass
 
@@ -1793,11 +1803,16 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
     color_code = (vehicle_info or {}).get("color_code") or ""
 
     # アクション → DisposalCode
+    # NEO 体系 (NEO_GENERATION_SPEC §5-3 / app.py:708-715 と一致):
+    #   0=取替, 1=脱着, 2=修理(調整/点検含む), 5=分解調整, 6=板金/塗装
+    # v5 で実 NEO (04011103.neo 124行中 8行が code=6) で確証 (2026-05-03)
+    # 注意: scripts/step1_pdf_parser.py 等の「中間 CSV 体系」(板金=3) とは別軸
     _disposal_map = {
         "取替": 0, "交換": 0, "取換": 0,
         "脱着": 1, "取外": 1, "取付": 1, "組付": 1,
-        "修理": 2, "補修": 2, "板金": 2, "塗装": 2,
-        "調整": 2, "点検": 2,
+        "修理": 2, "補修": 2, "調整": 2, "点検": 2,
+        "板金": 6, "鈑金": 6, "塗装": 6,
+        "ペイント": 6, "ワックス": 6, "加算": 6, "ブース": 6,
     }
 
     # v11.0: pipeline の _to_int/_to_float ヘルパーを利用 (括弧書き等の OCR 異常吸収)

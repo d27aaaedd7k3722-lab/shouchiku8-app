@@ -568,18 +568,22 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
         # 特殊行を ERParts への書き出しから除外する。これらはコグニセブン側で
         # PaintingTotal/Painting* テーブルから自動算出されるべきもの。
         # 注: 合計金額には影響しない（_enforce_total_match で別途吸収済み）。
-        # name と part_no の両方で判定する（「※ADDATA該当なし」は part_no 側に入る場合あり）
+        # name と part_no の両方で判定する
         _erparts_skip_patterns = (
-            "※ADDATA該当なし",
             "塗装費用計", "塗装工賃計", "塗装材料代計", "追加塗装費用計",
             "ブース加算", "加算基礎数値",
             "2コートソリッドルーフ", "２コートソリッドルーフ",
             "ボデーシーリング", "防錆ワックス",
             "下塗り塗料代", "塗装色番加算",
         )
-        # 「※部品価格相違」は正常な部品行の part_no 末尾にもぶら下がるため
-        # name 側のみで判定（part_no 側ヒットは過剰削除になる）
-        _erparts_skip_name_only = ("※部品価格相違",)
+        # 「※部品価格相違」「※ADDATA該当なし」は正常な部品行の part_no 末尾にも
+        # ぶら下がるため name 側のみで判定（part_no 側ヒットは過剰削除になる）。
+        # 特に「※ADDATA該当なし」は auto_matching / pdf_to_neo_pipeline が
+        # part_no にのみ付与するマーカーで、name には決して入らない。
+        # ここで part_no 側も見ていたため、Addata 未接続時に全部品行が
+        # ERParts から消え、部品ゼロの NEO が出力されていた（不具合修正）。
+        # マーカー自体は後段の split("※") で PartsNo から除去される。
+        _erparts_skip_name_only = ("※部品価格相違", "※ADDATA該当なし")
         for i, item in enumerate(items):
             name   = item.get('name', '')
             # v13 Phase 2: 特殊行は ERParts から除外。name か part_no のどちらかに
@@ -2308,7 +2312,10 @@ v12 厳密抽出ルール（必須）:
     "customer_name": "文字列",
     "car_type": "文字列",
     "registration_number": "文字列",
-    "model_code": "文字列"
+    "model_code": "文字列",
+    "model_designation": "型式指定番号(数字のみ。なければ空文字)",
+    "category_number": "類別区分番号(数字のみ。なければ空文字)",
+    "first_reg_date": "初度登録年月 YYYYMM00形式(なければ空文字)"
   },
   "details": [
     {
@@ -2355,9 +2362,10 @@ TASK_PROMPTS["estimate_unified"] = """<task_execution>
 - 値引き額 → discount_amount
 - ページ小計は総合計に使わない。最終ページの最終総合計を採用
 
-【車両情報抽出ルール】
-- 1ページ目ヘッダ部分から抽出
-- 型式指定番号(model_designation)・類別区分番号(category_number)・初度登録(first_reg_date) は **NEO生成必須キー**
+【車両情報抽出ルール（NEO生成必須 — 3キーは絶対に取り逃し禁止）】
+- **型式指定番号 (model_designation)**: 見積書上部ヘッダの「型式指定」「型指定」「型式指定番号」等のラベル隣。4〜6桁の数字（例: 18164, 10203）。記載なければ "" を返す。文字列や単語は絶対に入れない
+- **類別区分番号 (category_number)**: 「類別」「類別区分」等のラベル隣。3〜4桁の数字（例: 0010, 1234）。記載なければ "" を返す。文字列は絶対に入れない
+- **初度登録年月 (first_reg_date)**: 「初度登録」「初年度登録」等のラベル隣。和暦（令和X年Y月）または西暦（YYYY年M月）を YYYYMM00 形式に変換して返す（例: 令和6年9月 → 20240900）。記載なければ "" を返す。"confidence" 等の日付でない文字列は絶対に入れない
 
 <output_format>
 {
@@ -2985,11 +2993,13 @@ def parse_vehicle_from_text(text: str) -> dict:
                 if val:
                     result[key] = val
                 break
-    # 初度登録年月: 和暦→YYYYMM00 自動変換
+    # 初度登録年月: 和暦→YYYYMM00 自動変換 + 無効値バリデーション
     if 'car_reg_date' in result:
         rd = result['car_reg_date']
         # 既にYYYYMM00形式ならそのまま
-        if not re.match(r'^\d{8}$', rd):
+        if re.match(r'^\d{8}$', rd):
+            pass
+        else:
             # 和暦変換 (令和X年Y月 → 20XXMM00)
             _era_map = {'令和': 2018, '平成': 1988, '昭和': 1925, '大正': 1911}
             m = re.search(r'(令和|平成|昭和|大正)\s*(\d+)\s*年\s*(\d+)\s*月', rd)
@@ -2998,6 +3008,16 @@ def parse_vehicle_from_text(text: str) -> dict:
                 year = era_base + int(m.group(2))
                 month = int(m.group(3))
                 result['car_reg_date'] = f'{year:04d}{month:02d}00'
+            else:
+                # 西暦パターン (YYYY年M月 または YYYYMM)
+                m2 = re.search(r'(\d{4})\s*年\s*(\d{1,2})\s*月', rd)
+                if m2:
+                    year = int(m2.group(1))
+                    month = int(m2.group(2))
+                    result['car_reg_date'] = f'{year:04d}{month:02d}00'
+                else:
+                    # 有効な日付パターンでない ("confidence" 等の混入を排除)
+                    del result['car_reg_date']
     return result
 
 
@@ -3152,6 +3172,35 @@ def parse_csv_to_items(csv_text: str) -> list:
                 continue
         merged.append(item)
     return merged
+
+
+def _extract_basic_info_from_detail_response(json_text: str) -> dict:
+    """estimate_detail_page レスポンスから basic_info（型式指定・類別・初度登録）を抽出する。
+    3キーすべてが空または不正な場合は空dictを返す。
+    """
+    import json as _json
+    text = json_text.strip()
+    text = re.sub(r'^```json\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^```\s*$', '', text, flags=re.MULTILINE)
+    m = re.search(r'\{.*\}', text, re.DOTALL)
+    if not m:
+        return {}
+    try:
+        data = _json.loads(m.group(0))
+    except Exception:
+        return {}
+    bi = data.get('basic_info', {}) or {}
+    result = {}
+    md = str(bi.get('model_designation', '') or '').strip()
+    cn = str(bi.get('category_number', '') or '').strip()
+    fd = str(bi.get('first_reg_date', '') or '').strip()
+    if md and re.match(r'^\d+$', md):
+        result['model_designation'] = md
+    if cn and re.match(r'^\d+$', cn):
+        result['category_number'] = cn
+    if fd and re.match(r'^\d{8}$', fd):
+        result['first_reg_date'] = fd
+    return result
 
 
 def parse_detail_json_to_items(json_text: str, page_num: int = 1) -> list:
@@ -3310,7 +3359,8 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
                     items = parse_detail_json_to_items(response_text, page_num)
                     if not items:
                         items = parse_markdown_to_items(response_text, page_num)
-                    return {'items': items, 'discount_amount': 0, 'confidence': 0.95}
+                    _bi = _extract_basic_info_from_detail_response(response_text)
+                    return {'items': items, 'discount_amount': 0, 'confidence': 0.95, '_basic_info': _bi}
                 if attempt < 2:
                     import time; time.sleep(1)
                     continue
@@ -3351,10 +3401,13 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
                 # JSONパースが空ならMarkdownフォールバック
                 if not items:
                     items = parse_markdown_to_items(response.text, page_num)
+                # basic_info（型式指定番号・類別区分・初度登録）を抽出してフォールバック用に返す
+                _bi = _extract_basic_info_from_detail_response(response.text)
                 return {
                     'items':           items,
                     'discount_amount': 0,
                     'confidence':      0.9,
+                    '_basic_info':     _bi,
                 }
             if attempt < 2:
                 import time; time.sleep(1)
@@ -3977,9 +4030,11 @@ def global_dedup_items(items):
         pass0.append(it)
 
     # Pass1: 正規化name + (parts, wage) による重複除去（全角/半角の表記ゆれを吸収）
-    seen_exact = set()
+    # 近接行（12行以内）のみ除去対象。遠方の同名同額行は別部品として保持。
+    # → AI がページ境界の先行行を再出力するケースを除去しつつ、正規の左右対称部品等を保護する
+    seen_exact = {}  # key → last accepted list-index
     pass1 = []
-    for it in pass0:
+    for idx, it in enumerate(pass0):
         name  = to_halfwidth_katakana(str(it.get('name', ''))).strip()
         parts = safe_int(it.get('parts_amount', 0))
         wage  = safe_int(it.get('wage', 0))
@@ -3987,9 +4042,9 @@ def global_dedup_items(items):
             pass1.append(it)
             continue
         key = (name, parts, wage)
-        if key in seen_exact:
-            continue
-        seen_exact.add(key)
+        if key in seen_exact and (idx - seen_exact[key]) <= 12:
+            continue  # 12行以内の近接重複 → 除去
+        seen_exact[key] = idx
         pass1.append(it)
 
     # Pass2: 「不明」行 vs 名前付き行の同一金額重複除去
@@ -4491,7 +4546,13 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     result['confidence']        = safe_float(result.get('confidence', 0.5))
     result['_fax_filtered']     = filtered_count
     result['_page_count']       = _page_count
-    result['_vehicle_info']     = totals_data.get('vehicle_info', {})
+    _vinfo = dict(totals_data.get('vehicle_info', {}) or {})
+    # 詳細OCR の basic_info で空欄を補完（型式指定・類別区分・初度登録が合計欄ページに無い場合）
+    _detail_bi = result.get('_basic_info', {})
+    for _bk in ('model_designation', 'category_number', 'first_reg_date'):
+        if _detail_bi.get(_bk) and not _vinfo.get(_bk):
+            _vinfo[_bk] = _detail_bi[_bk]
+    result['_vehicle_info']     = _vinfo
     result['_repair_shop_name'] = totals_data.get('repair_shop_name', '')
     # Iter22-23: customer_info 抽出 (顧客名・受付番号・住所 等)
     result['customer_info']     = totals_data.get('customer_info', {}) or {}
@@ -6153,20 +6214,31 @@ NEOでは1行に部品代・工賃を同時格納可能。
                 est_vinfo = estimate_data.get('_vehicle_info', {})
                 if est_vinfo and vehicle_data is not None:
                     MERGE_MAP = {
-                        'car_name':      'car_name',
-                        'car_model':     'car_model',
-                        'engine_model':  'engine_model',
-                        'color_code':    'color_code',
-                        'color_name':    'body_color',
-                        'trim_code':     'trim_code',
-                        'grade':         'grade',
-                        'chassis_no':    'car_serial_no',
-                        'mileage':       'kilometer',
+                        'car_name':           'car_name',
+                        'car_model':          'car_model',
+                        'engine_model':       'engine_model',
+                        'color_code':         'color_code',
+                        'color_name':         'body_color',
+                        'trim_code':          'trim_code',
+                        'grade':              'grade',
+                        'chassis_no':         'car_serial_no',
+                        'mileage':            'kilometer',
+                        'model_designation':  'car_model_designation',
+                        'category_number':    'car_category_number',
+                        'first_reg_date':     'car_reg_date',
                     }
                     supplemented = []
                     for est_key, veh_key in MERGE_MAP.items():
                         est_val = est_vinfo.get(est_key, '')
-                        if est_val and not vehicle_data.get(veh_key):
+                        if not est_val:
+                            continue
+                        # first_reg_date は YYYYMM00 形式のみ受け付ける（"confidence" 等の誤出力を除外）
+                        if est_key == 'first_reg_date' and not re.match(r'^\d{8}$', str(est_val)):
+                            continue
+                        # model_designation / category_number は数字のみ許可
+                        if est_key in ('model_designation', 'category_number') and not re.match(r'^\d+$', str(est_val)):
+                            continue
+                        if not vehicle_data.get(veh_key):
                             vehicle_data[veh_key] = est_val
                             supplemented.append(veh_key)
                     if supplemented:

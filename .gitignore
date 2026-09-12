@@ -2,8 +2,9 @@
 .env
 .streamlit/secrets.toml
 
-# Claude Code / harness 作業フォルダ
-.claude/
+# Claude Code / harness 作業フォルダ（.claude/skills/ だけは共有スキルとして追跡する）
+.claude/*
+!.claude/skills/
 .cache/
 .venv_local/
 _harness_run_*/
@@ -28,6 +29,7 @@ benchmark_csv.py
 phase2_benchmark.py
 *.csv
 *.neo
+*.pdf
 
 # 引き継ぎ書（顧客情報含む）
 引き継ぎ書_*.md
@@ -43,7 +45,7 @@ SHOUCHIKU8_*.docx
 引き継ぎ書_*.docx
 
 # 一時マニュアル (デプロイ不要)
-CLAUDE.md
+# CLAUDE.md は Claude Code が最初に読む案内なので追跡する（2026-09-12。以前は ignore していたので別 PC に届いていなかった）
 Cloud_Run*.md
 デプロイ手順書.md
 デプロイ手順.md
@@ -88,3 +90,32 @@ deploy_hf.py
 keys.txt
 result.json
 match_output*.txt
+
+# claude_neo_pipeline の参照データと雛形 NEO は配布に必要なので追跡する（*.db / *.neo の除外より優先）
+!claude_neo_pipeline/reference/
+!claude_neo_pipeline/reference/*.DB
+!claude_neo_pipeline/reference/*.db
+!claude_neo_pipeline/reference/*.sld
+!claude_neo_pipeline/reference/template.neo
+!template_toyota.neo
+# ↑ 旧 Streamlit アプリ（このフォルダの古いコピー）の雛形 NEO。顧客情報が無いことを 2026-09-12 に確認済み（Customer 空・明細 0 行）
+# 実 NEO 由来のもの（旧雛形・全テーブルダンプ）は手元専用。追跡も配布もしない
+claude_neo_pipeline/reference/template_04011103.neo
+claude_neo_pipeline/reference/neo_04011103_reference.json
+
+# 配布 zip（make_bundle.py の出力）は追跡しない
+pdf-to-neo_bundle_*.zip
+
+# --- 2026-09-08 整理: スキルと生成器を追跡対象にする ---
+.codex/
+claude_neo_pipeline/out/
+claude_neo_pipeline/STATUS_*.md
+*.~ne
+# テストは追跡する（上の test_*.py 除外より優先。実 NEO（*.neo）と案件データは含めない）
+!.claude/skills/pdf-to-neo/scripts/tests/test_*.py
+# スキルの道具は追跡する（上の find_*.py 除外より優先）
+!.claude/skills/pdf-to-neo/scripts/*.py
+!claude_neo_pipeline/tests/test_*.py
+起動.bat.bak
+# 工場プロファイル（取引先名を含む）は NEO_check/_profiles に置く。reference には戻さない（2026-09-12）
+.claude/skills/pdf-to-neo/reference/factory_profiles.json
