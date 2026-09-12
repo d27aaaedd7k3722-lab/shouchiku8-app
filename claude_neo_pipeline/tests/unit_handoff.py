@@ -65,7 +65,7 @@ _NOT_IN_REPO = {
 }
 # 配布 zip（BUNDLE_README.md がある展開先）には入れない開発機専用のもの: 実機 NEO・案件フォルダを前提にする検証一式
 _BUNDLE = os.path.exists(os.path.join(ROOT, 'BUNDLE_README.md'))
-_DEV_ONLY = {'claude_neo_pipeline/tests/verify_all.sh', 'claude_neo_pipeline/tests/audit_cogni_files.py'}  # make_bundle が実際に落とす相対パスだけ
+_DEV_ONLY = {'claude_neo_pipeline/tests/verify_all.sh', 'claude_neo_pipeline/tests/audit_cogni_files.py', 'claude_neo_pipeline/tests/corpus_scan.py'}  # make_bundle が実際に落とす相対パスだけ
 
 
 def _dev_only_in_bundle(path: str) -> bool:
