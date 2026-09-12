@@ -21,7 +21,8 @@ sys.path.insert(0, HERE); sys.path.insert(0, ROOT)
 import neo_container as nc
 from addata_vehicle_resolver import AddataVehicleResolver, to_halfwidth, parse_reg_date, _xor_text
 from _addata_db_search import AddataSearchEngine
-from paint_index import PaintIndex, PAINT_CODE, COAT_CODE, HF_CODE, floor10
+from paint_index import PaintIndex, PAINT_CODE, COAT_CODE, HF_CODE, HF_NAME, floor10
+import com_tables  # noqa: E402  ADDATA の COM.CAB を版ごとに展開して読む（DATAUP・Katashiki は毎月変わる）
 import neo_header as nh
 LICENSE_ID = os.environ.get('COGNI_LICENSE_ID', 'G0141016')  # 管理領域に書くライセンス ID（このPCのコグニ）
 
@@ -108,9 +109,57 @@ def _fit(s: str, n: int) -> str:
         return b[:n - 1].decode('cp932', 'ignore')
 
 
+def _guideline_path() -> str:
+    """SHOUCHIKU 見積ガイドライン（社内の参考値。git・配布 zip の外）: 環境変数 PDF_TO_NEO_GUIDELINE → <NEO_CHECK_ROOT>/_reference/shouchiku_guideline.json"""
+    p = os.environ.get('PDF_TO_NEO_GUIDELINE') or ''
+    if p:
+        return p
+    root = os.environ.get('NEO_CHECK_ROOT') or ''
+    if not root:
+        try:
+            with open(os.path.join(os.path.expanduser('~'), '.claude', 'pdf-to-neo.local.json'), encoding='utf-8-sig') as fh:
+                root = str((json.load(fh) or {}).get('NEO_CHECK_ROOT') or '')
+        except (OSError, ValueError):
+            root = ''
+    root = root or os.path.join(os.path.expanduser('~'), 'Documents', 'NEO_check')
+    return os.path.join(root, '_reference', 'shouchiku_guideline.json')
+
+
+def guideline_material_rate(paint: int, coat: int, hf: int) -> Optional[float]:
+    """ガイドラインの塗装材料代割合表（塗料 × クリヤー × 塗膜 × 対応単価）の既定列（default_band、既定 6500〜）の値。
+    実案件 NEO 4,933 本（Z:\ドキュメント、2025-12〜2026-09）の 83% がこの列の値だった（工賃単価によらず 6500〜 列。表のオレンジ枠）。
+    表が無い・該当しない組合せ（速乾・フッ素）は None"""
+    p = _guideline_path()
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, encoding='utf-8-sig') as fh:
+            g = json.load(fh).get('material_rate') or {}
+        bands = [int(x) for x in g.get('bands') or []]
+        band = int(g.get('default_band') or 6500)
+        idx = max(i for i, b in enumerate(bands) if b <= band)
+        pk = {3: '2K', 4: '水性'}.get(int(paint)); hk = {0: '標準', 2: '耐擦傷性', 3: 'スクラッチシールド'}.get(int(hf))
+        ck = {1: 'ソリッド', 2: 'メタリック', 3: '2P', 4: '3P'}.get(int(coat))
+        v = ((g.get(pk) or {}).get(hk) or {}).get(ck) if (pk and hk and ck) else None
+        val = float(v[idx]) if isinstance(v, list) and len(v) > idx else None
+        return val if (val is not None and 0 < val <= 100) else None  # 表の値が壊れていたら使わない（コグニ既定へ。Codex 指摘）
+    except Exception:  # noqa: BLE001  表の形が違う → コグニ既定へ
+        return None
+
+
 def default_material_rate(paint: int, coat: int, hf: int) -> Optional[float]:
-    """材料代割合の既定値 = コグニ環境 DB AudaData/AnUsrTblPnt.sld MaterialRate(Paint 0 速乾/2 ２Ｋ/3 水性 = PaintingPlan.Paint−1, Coat = PaintingPlan.Coat−1, HFPainting 0-3) / 100
-    N-ONE 実験（2026-09-04）: ２Ｋ×２コートパール で しない 15% / フッ素 25% / 耐スリ傷 18% と一致"""
+    """材料代割合の既定値（見積書に材料代も割合も無いとき）。
+    1) SHOUCHIKU ガイドライン表の 6500〜 列（guideline_material_rate。この PC に表があるとき）
+    2) コグニ環境 DB AudaData/AnUsrTblPnt.sld MaterialRate(Paint 0 速乾/2 ２Ｋ/3 水性 = PaintingPlan.Paint−1, Coat = PaintingPlan.Coat−1, HFPainting 0-3) / 100
+       （N-ONE 実験 2026-09-04: ２Ｋ×２コートパール で しない 15% / フッ素 25% / 耐スリ傷 18%。コグニで何も変えないときの値）"""
+    g = guideline_material_rate(paint, coat, hf)
+    if g is not None:
+        return g
+    return cogni_default_material_rate(paint, coat, hf)
+
+
+def cogni_default_material_rate(paint: int, coat: int, hf: int) -> Optional[float]:
+    """コグニで何も変えないときの材料代割合（この PC のコグニ設定の写し reference/AnUsrTblPnt.sld）"""
     p = os.path.join(HERE, 'reference', 'AnUsrTblPnt.sld')
     if not os.path.exists(p):
         return None
@@ -1469,9 +1518,11 @@ class NeoBuilder:
         """COM.CAB の DATAUP.DB（XOR 0xff の CSV 'C10,201305'）から車種データ更新年月を引く。無ければ ''（コグニも '' を書く）"""
         if not car_code:
             return ''
-        if not hasattr(self, '_dataup'):
-            self._dataup = {}
-            for cand in (os.path.join(self.resolver.root, 'COM', 'DATAUP.DB'), os.path.join(HERE, 'reference', 'DATAUP.DB')):  # 使用中の ADDATA に展開済みならそれを優先
+        _ver = com_tables.version(self.resolver.root)
+        if not hasattr(self, '_dataup') or getattr(self, '_dataup_ver', None) != _ver or getattr(self, '_dataup_src', None) != 'cache':  # ADDATA（COM.CAB）が更新されたら読み直す。CAB の展開から読めていないときも毎回やり直す（予備で固定しない。Codex 指摘）
+            self._dataup = {}; self._dataup_ver = _ver
+            for cand in (com_tables.com_path(self.resolver.root, 'DATAUP.DB'),):  # 使用中の ADDATA の COM.CAB（展開キャッシュ）→ 同梱の予備。毎月の ADDATA 更新で変わる表（2026-09-12）
+                self._dataup_src = com_tables._src().get('DATAUP.DB')
                 if os.path.exists(cand):
                     try:
                         t = bytes(x ^ 0xFF for x in open(cand, 'rb').read()).decode('cp932', 'replace')
@@ -1481,6 +1532,8 @@ class NeoBuilder:
                     except Exception:
                         pass
                     break
+        if getattr(self, '_dataup_src', None):  # 2 回目以降のビルドでも、どこから読んだ表かを記録し直す（予備なら ★）
+            com_tables._src()['DATAUP.DB'] = self._dataup_src
         return self._dataup.get(str(car_code).upper(), '')
 
     def generic_vehicle(self, v: dict) -> dict:
@@ -2084,7 +2137,11 @@ class NeoBuilder:
                     raise ValueError(f'paint.paint は {list(PAINT_CODE)} のいずれか（{pv}）')
                 paint_c = PAINT_CODE[pn_]
             coat_c = self._coat[0] if self._coat else COAT_CODE.get(unicodedata.normalize('NFKC', pd.get('coat') or ''), 2)
-            hf = HF_CODE.get(pd.get('hf', 'しない'), 0)
+            _hf_in = unicodedata.normalize('NFKC', str(pd.get('hf') or 'しない')).strip()
+            _hf_map = {unicodedata.normalize('NFKC', k): v for k, v in HF_CODE.items()}
+            if _hf_in not in _hf_map:  # 知らない高機能塗装を黙って「しない」にしない（加算基礎・材料代割合・パネル加算が変わる）
+                raise ValueError(f"paint.hf は {sorted(set(HF_CODE) - {'ｽｸﾗｯﾁ'})} のいずれか（{pd.get('hf')!r}）")
+            hf = _hf_map[_hf_in]
             panels = pd['panels']; n_p = len(panels)
             pcols = [r[1] for r in cur.execute('PRAGMA table_info(PaintingPanel)')]
             notes = []
@@ -2219,7 +2276,7 @@ class NeoBuilder:
                         'BoothWageOutTax=?, BoothWageInTax=?, BoothWageTax=?, BoothWageStandardOutTax=?, BoothWageStandardInTax=?, BoothWageStandardTax=?, BoothWageByManual=?, '
                         'BaseTime=?, BaseTimeStandard=?, BaseWageOutTax=?, BaseWageInTax=?, BaseWageTax=?, BaseWageStandardOutTax=?, BaseWageStandardInTax=?, BaseWageStandardTax=?, BaseWageByManual=?, '
                         'MaterialRateType=1, MaterialRate=?, CalculateLevel_Panel=1, CalculateLevel_Base=1, CalculateLevel_Bumper=1',
-                        (paint_c, paint_name, hf, pd.get('hf', 'しない'), 1 if booth_on else 0, bt if booth_on else -1, bt_std if booth_on else -1,
+                        (paint_c, paint_name, hf, HF_NAME.get(hf, 'しない'), 1 if booth_on else 0, bt if booth_on else -1, bt_std if booth_on else -1,
                          *(t3(bw) if booth_on else (-1, -1, -1)), *(t3(bw_std) if booth_on else (-1, -1, -1)), ('*' if (bw and bw != bw_std) else ''),
                          *_base_vals, float(pd.get('material_rate') or default_material_rate(paint_c, coat_c, hf) or 26)))
             bumper_w = 0; bumper_t = 0.0; bumper_ws = {'fb': 0, 'rb': 0}
@@ -2394,6 +2451,10 @@ class NeoBuilder:
             if not paint_material:
                 paint_material = material_default(wage_total_p, mr)
                 mat_auto_rate = mr
+                if pd.get('material_rate') in (None, ''):  # 見積に材料代も割合も無い → 既定の割合で計算した（どの表の値かを残す）
+                    _src = ('ガイドライン表の 6500〜 列' if guideline_material_rate(paint_c, coat_c, hf) is not None
+                            else 'この PC のコグニ既定（ガイドライン表が無い）')
+                    notes.append(f'材料代割合 {mr:g}%（見積に材料代も割合も無い → {_src}）')
             mt_in, mt_tax = tax_of(paint_material)
             pt_all = wage_total_p + paint_material; pt_in, pt_tax = tax_of(pt_all)
             cur.execute('UPDATE PaintingTotal SET TimeTotalPanel=?, TimeTotalBumper=?, TimeTotalFrame=0, TimeTotalEtcetera=?, TimeTotalOther=0, TimeTotal=?, '
@@ -2817,6 +2878,7 @@ class NeoBuilder:
               est_date: Optional[str] = None, insurance: Optional[dict] = None) -> tuple[bytes, dict]:
         labor_rate = _money(labor_rate, 'labor_rate（レバーレート）') or None  # '8,000' のような写し方でも受ける
         token = set_wage_unit(_money(estimate.get('wage_round'), 'wage_round（工賃の丸め単位）') or 10)  # 工賃丸め単位（工場のコグニ設定。100 円丸めの工場あり）。この build の間だけ有効
+        com_tables.reset_sources()  # このビルドで COM の表をどこから読んだか（予備を使ったら run_case が ★）
         try:
             return self._build_inner(estimate, vehicle_inputs, hints, labor_rate, est_date, insurance)
         finally:
@@ -3222,6 +3284,9 @@ class NeoBuilder:
                 _bu.append(_u)   # 明細の名称引きで使った一時インスタンスの控えも集める
         report['paint_body_unresolved'] = _bu
         report['silent_errors'] = list(self.silent_errors)
+        if getattr(self.resolver, '_kata_src', None):
+            com_tables._src()['Katashiki.DB'] = self.resolver._kata_src
+        report['com_stale'] = com_tables.stale_reference_used()  # 毎月変わる COM 表を同梱の予備から読んだ（ADDATA の版とずれている可能性）
         # ファイルの CarEVA に実際に書いた装備（FVA が Z 始まりの車は Z を落としてある）。
         # report['eva'] は内部の照合用（Z を含む）なので、人に見せる「装備」はこちらを使う（Codex 4 周目）
         report['eva_write'] = list(eva_write)

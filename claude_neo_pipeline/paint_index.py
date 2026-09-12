@@ -26,8 +26,9 @@ from typing import Optional
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAINT_CODE = {'速乾': 1, '速乾ウレタン': 1, '２Ｋ': 3, '2K': 3, '水性': 4}
 COAT_CODE = {'ソリッド': 1, 'メタリック': 2, '２コートパール': 3, '2コートパール': 3, '３コートパール': 4, '3コートパール': 4}
-HF_CODE = {'しない': 0, 'フッ素': 1, '耐スリ傷': 2}
-HF_KIND = {0: 'B', 1: 'F', 2: 'T'}  # T_KEI_3 / BOOTH の種別列（S は未使用の高機能区分）
+HF_CODE = {'しない': 0, 'フッ素': 1, '耐スリ傷': 2, 'スクラッチ': 3, 'スクラッチシールド': 3, 'ｽｸﾗｯﾁ': 3}
+HF_NAME = {0: 'しない', 1: 'フッ素', 2: '耐スリ傷', 3: 'ｽｸﾗｯﾁ'}  # PaintingPlan.HFPaintingName（実 NEO の書き方。スクラッチは半角）
+HF_KIND = {0: 'B', 1: 'F', 2: 'T', 3: 'S'}  # T_KEI_3 / BOOTH の種別列。S = スクラッチ（実案件 NEO 100 本で HFPainting 3 'ｽｸﾗｯﾁ'。2026-09-12）
 COAT_CLASS_BUMPER = {1: 1, 2: 2, 3: 3, 4: 4}  # 23.DB 第 8 列 = PaintingPlan.Coat（1 ソリッド / 2 メタリック / 3 2コートパール / 4 3コートパール）。実機 J52: ソリッド 1.1=行1、2コートパール 1.3=行3、3コートパール 1.5=行4（2026-09-05）
 
 
@@ -55,6 +56,12 @@ class PaintIndex:
         self.root = root
         self.car = car
         self.car_dir = os.path.join(root, car[0], car)
+        if com_dir is None:  # 使用中の ADDATA の COM.CAB を展開したもの（ADDATA の月次更新に追従）。展開できなければ同梱の予備
+            try:
+                import com_tables
+                com_dir = com_tables.com_dir(root)
+            except Exception:  # noqa: BLE001
+                com_dir = None
         self.com_dir = com_dir or os.path.join(HERE, 'reference')
         self.panels = self._load_20()
         self.chm_rows, self.chm_base = self._load_chm()
@@ -480,6 +487,11 @@ class PaintIndex:
         F_S に該当行が無いときは経験式 floor10(0.3 + 0.01×面積)"""
         if not hf:
             return 0.0
+        if int(hf) == 3:
+            # スクラッチの加算は COM/Scrach.DB（車形・塗料・区分ごとの係数）で決まるが式が未同定
+            # （実案件 NEO 369 パネルで 耐スリ傷/フッ素の式・経験式のどれとも 2 割しか合わない。HANDOFF §8）。
+            # 分からない値で埋めないので None を返し、呼び出し側は見積書の指数（index）を要求する
+            return None
         form = self.form_codes()[0]
         if form and pn:
             kind = {1: 'F', 2: 'T'}.get(int(hf), 'T')
@@ -517,6 +529,9 @@ class PaintIndex:
         add = self.hf_time(pn['area'], hf, pn, paint)
         single = n_panels <= 1
         res = {'panel': pn, 'chm': row, 'hf': add}
+        if add is None:  # 高機能加算が求まらない（スクラッチ）: 標準指数は無しとして扱う（呼び出し側が index を要求し、手入力 # で書く）
+            res.update({'new': None, 's1': None, 's2': None, 's3': None})
+            return res
         if row:
             new = row['new_single'] if single and row['new_single'] is not None else row['new_multi']
             r11 = row['r11']
@@ -530,6 +545,8 @@ class PaintIndex:
 
     def _com_rows(self, name: str) -> list[list[str]]:
         p = os.path.join(self.com_dir, name)
+        if not os.path.exists(p):
+            p = os.path.join(HERE, 'reference', name)  # 展開キャッシュに無い表は同梱の予備
         if not os.path.exists(p):
             return []
         return [[x.strip() for x in l.split(',')] for l in _xor_lines(p)]

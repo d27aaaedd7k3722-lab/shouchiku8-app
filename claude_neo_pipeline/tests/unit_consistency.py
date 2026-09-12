@@ -1076,7 +1076,7 @@ def test_bumper_only_paint_writes_bumper_base():
     import sqlite3
     veh = {'model_code': 'NHP170', 'serial_no': '', 'desig': '19020', 'category': '0005', 'reg_date': 'R2.2', 'color_code': '209'}
     est = dict(BASE, vehicle=veh, items=[{'code': '0010', 'name': 'F ﾊﾞﾝﾊﾟｶﾊﾞｰ', 'method': '取替', 'qty': 1, 'price': 58700}],
-               paint={'paint': '2K', 'coat': '2コートパール', 'hf': 'しない', 'panels': [], 'bumper_front': {'method': '新品', 'color': '一色'}})
+               paint={'paint': '2K', 'coat': '2コートパール', 'hf': 'しない', 'panels': [], 'bumper_front': {'method': '新品', 'color': '一色'}, 'material_rate': 15})  # 実機はコグニ既定 15% のまま
     neo, rep = NeoBuilder().build(est, veh, labor_rate=97000, est_date='20260912', insurance={})
     ck = _nc.find_real_cks(neo); dec = _nc.decompress_neo(neo, ck); _m, entries = _nc.parse_entries(neo, ck[0]); files = _nc.extract_files(dec, entries)
     t = tempfile.NamedTemporaryFile(delete=False, suffix='.sld'); t.write(files['AnSvEm0001.sld']); t.close()
@@ -1145,6 +1145,86 @@ def test_run_case_warns_known_unresolved_combination():
     assert run_case._warn_known_unresolved(est), '4600+4800 で警告が出ない'
     assert not run_case._warn_known_unresolved({'items': [{'code': '4600', 'method': '取替'}, {'code': '2700', 'method': '取替'}]})
     assert not run_case._warn_known_unresolved({'items': [{'code': '4600', 'method': '修理'}, {'code': '4800', 'method': '取替'}]})
+
+
+def test_material_rate_default_uses_guideline_when_present():
+    """材料代割合の既定 = ガイドライン表の既定列（default_band）。表が無ければコグニ既定（AnUsrTblPnt）"""
+    import json, tempfile
+    import estimate_to_neo as e_
+    # 値は合成のダミー（実際の社内表の値はリポジトリに入れない）。列の選び方と塗料・クリヤー・塗膜の対応だけを確かめる
+    g = {'material_rate': {'bands': [1000, 2000, 3000], 'default_band': 2000,
+                           '2K': {'標準': {'ソリッド': [1, 2, 3], 'メタリック': [4, 5, 6], '2P': [7, 8, 9], '3P': [10, 11, 12]},
+                                  '耐擦傷性': {'2P': [13, 14, 15]}, 'スクラッチシールド': {'2P': [16, 17, 18]}},
+                           '水性': {'標準': {'2P': [19, 20, 21]}}}}
+    d = tempfile.mkdtemp(prefix='guide_'); p = os.path.join(d, 'g.json')
+    json.dump(g, open(p, 'w', encoding='utf-8'), ensure_ascii=False)
+    old = os.environ.get('PDF_TO_NEO_GUIDELINE'); os.environ['PDF_TO_NEO_GUIDELINE'] = p
+    try:
+        assert e_.default_material_rate(3, 3, 0) == 8.0           # 2K 2P 標準 の既定列（2000〜 = 2 列目）
+        assert e_.default_material_rate(3, 3, 2) == 14.0          # 耐スリ傷 = 耐擦傷性
+        assert e_.default_material_rate(3, 3, 3) == 17.0          # スクラッチ = スクラッチシールド
+        assert e_.default_material_rate(4, 3, 0) == 20.0          # 水性
+        assert e_.default_material_rate(3, 3, 1) == e_.cogni_default_material_rate(3, 3, 1)  # フッ素は表に無い → コグニ既定
+        g['material_rate']['2K']['標準']['メタリック'] = [4, 6500, 6]  # 壊れた値（割合でない）は使わない
+        json.dump(g, open(p, 'w', encoding='utf-8'), ensure_ascii=False)
+        assert e_.default_material_rate(3, 2, 0) == e_.cogni_default_material_rate(3, 2, 0)
+        os.environ['PDF_TO_NEO_GUIDELINE'] = os.path.join(d, 'none.json')
+        assert e_.default_material_rate(3, 3, 0) == e_.cogni_default_material_rate(3, 3, 0)  # 表が無い PC
+    finally:
+        if old is None:
+            os.environ.pop('PDF_TO_NEO_GUIDELINE', None)
+        else:
+            os.environ['PDF_TO_NEO_GUIDELINE'] = old
+
+
+def test_scratch_high_function_paint():
+    """高機能塗装 スクラッチ（HFPainting 3 'ｽｸﾗｯﾁ'）: 加算基礎は T_KEI_3 の S 列、パネル加算は式が未同定なので標準なし（index 必須）。
+    知らない高機能塗装の名前は黙って「しない」にせず止める（実案件 NEO 100 本で 3 を確認。2026-09-12）"""
+    import paint_index as pi_
+    assert pi_.HF_CODE['スクラッチ'] == 3 and pi_.HF_KIND[3] == 'S' and pi_.HF_NAME[3] == 'ｽｸﾗｯﾁ'
+    root = NeoBuilder().engine.root
+    p = pi_.PaintIndex(root, 'W66', body='10')
+    st = p.standard_times('0600', 3, 2, 3)
+    assert st is not None and st['new'] is None and st['s1'] is None, st
+    form = p.form_codes()[0]
+    assert p.base_time(form, 3, 3, 3, 2) is not None
+    veh = {'model_code': 'NHP170', 'serial_no': '', 'desig': '19020', 'category': '0005', 'reg_date': 'R2.2', 'color_code': '209'}
+    est = dict(BASE, vehicle=veh, items=[{'code': '0600', 'name': 'ﾌｰﾄﾞ', 'method': '取替', 'qty': 1, 'price': 30000}],
+               paint={'paint': '2K', 'coat': '2コートパール', 'hf': 'スクラッチシールド', 'material_rate': 30,
+                      'panels': [{'code': '0600', 'name': 'ﾌ-ﾄﾞ', 'method': '取替', 'index': 2.9}]})
+    neo, rep = NeoBuilder().build(est, veh, labor_rate=7280, est_date='20260912', insurance={})
+    ck = _nc.find_real_cks(neo); dec = _nc.decompress_neo(neo, ck); _m, entries = _nc.parse_entries(neo, ck[0]); files = _nc.extract_files(dec, entries)
+    t = tempfile.NamedTemporaryFile(delete=False, suffix='.sld'); t.write(files['AnSvEm0001.sld']); t.close()
+    em = sqlite3.connect(t.name)
+    plan = em.execute('SELECT HFPainting, HFPaintingName FROM PaintingPlan').fetchone()
+    em.close(); os.unlink(t.name)
+    assert tuple(plan) == (3, 'ｽｸﾗｯﾁ'), tuple(plan)
+    try:
+        NeoBuilder().build(dict(est, paint=dict(est['paint'], hf='セラミック')), veh, labor_rate=7280, est_date='20260912', insurance={})
+    except ValueError as ex:
+        assert 'paint.hf' in str(ex), str(ex)
+    else:
+        raise AssertionError('知らない高機能塗装を通してしまった')
+
+
+def test_com_tables_follow_the_addata_in_use():
+    """毎月変わる COM の表（DATAUP / Katashiki）は使っている ADDATA の COM.CAB から読む（同梱の写しは予備）"""
+    import com_tables
+    root = NeoBuilder().engine.root
+    d = com_tables.com_dir(root)
+    if not d:
+        print('   skip test_com_tables_follow_the_addata_in_use（この PC では COM.CAB を展開できない）')
+        return
+    assert os.path.isfile(os.path.join(d, 'DATAUP.DB')) and os.path.isfile(os.path.join(d, 'Katashiki.DB'))
+    assert com_tables.com_path(root, 'DATAUP.DB').startswith(d)
+    assert com_tables.com_path('', 'DATAUP.DB').endswith(os.path.join('reference', 'DATAUP.DB'))  # ADDATA が無ければ予備
+    com_tables.reset_sources(); com_tables.com_path('', 'DATAUP.DB')
+    assert com_tables.stale_reference_used() == ['DATAUP.DB']  # 予備を使ったら報告される
+    com_tables.reset_sources(); com_tables.com_path(root, 'DATAUP.DB')
+    assert com_tables.stale_reference_used() == []
+    import tempfile as _t
+    fake = _t.mkdtemp(prefix='com_part_'); open(os.path.join(fake, 'DATAUP.DB'), 'wb').write(b'x')
+    assert not com_tables._ok(fake)  # DATAUP だけの部分展開は揃ったとみなさない
 
 
 if __name__ == '__main__':

@@ -409,19 +409,37 @@ class AddataVehicleResolver:
             }
         return out
 
-    @lru_cache(maxsize=None)
     def katashiki(self) -> list[tuple[str, str, str, str, str, str]]:
         """COM.CAB 内 Katashiki.DB: (CarCode, 年式, ボディ, グレード, 駆動+エンジン, 型式)。
         CAB 未展開時は空。展開済みなら scratch/comcab または COM/ から読む。"""
         here = os.path.dirname(os.path.abspath(__file__))
-        for p in (os.path.join(self.root, 'COM', 'Katashiki.DB'), os.environ.get('KATASHIKI_DB', ''), os.path.join(here, 'reference', 'Katashiki.DB')):
+        try:
+            import com_tables as _ct
+            _ver = _ct.version(self.root)
+        except Exception:  # noqa: BLE001
+            _ver = None
+        _hit = getattr(self, '_kata_cache', None)
+        if _hit is not None and _hit[0] == _ver and getattr(self, '_kata_src', None) == 'cache':  # 版が同じで CAB の展開から読めていれば前回のものを使う（予備・ばら置きは毎回やり直す。Codex 指摘）
+            return _hit[1]
+        try:
+            import com_tables  # 使用中の ADDATA の COM.CAB を展開して読む（Katashiki.DB は毎月の ADDATA 更新で新型式が増える。2026-09-12）
+            _cab = com_tables.com_path(self.root, 'Katashiki.DB')
+            _cab_src = com_tables._src().get('Katashiki.DB')  # com_path が記録した読み先（cache / loose / reference）
+        except Exception:  # noqa: BLE001
+            _cab = ''; _cab_src = ''
+        # COM.CAB の展開（いまの ADDATA の版）を最優先。ばらの COM/Katashiki.DB は前の月の展開が残っていることがある（Codex 指摘）
+        for p in (_cab if 'reference' not in str(_cab) else '', os.path.join(self.root, 'COM', 'Katashiki.DB'), os.environ.get('KATASHIKI_DB', ''), os.path.join(here, 'reference', 'Katashiki.DB')):
             if p and os.path.exists(p):
+                self._kata_src = ('reference' if os.path.normcase(os.path.dirname(os.path.abspath(p))) == os.path.normcase(os.path.join(here, 'reference'))
+                                  else ((_cab_src or 'loose') if p == _cab else 'loose'))  # com_path の記録をそのまま使う。CAB の展開以外（予備・ばら置き・環境変数）なら run_case が ★
                 rows = []
                 for l in _xor_text(p).splitlines():
                     if len(l) >= 11 and re.match(r'^[A-Z][0-9A-Z]{2}', l):
                         yr = l[3:5].strip() or '00'
                         rows.append((l[0:3], yr.zfill(2), l[5:7], l[7], l[8:10], l[10:].strip()))
+                self._kata_cache = (_ver, rows)
                 return rows
+        self._kata_cache = (_ver, [])
         return []
 
     def model_code_for(self, car: str, year: str, body: str, grade: str, four_wd: bool, fva: str) -> str:

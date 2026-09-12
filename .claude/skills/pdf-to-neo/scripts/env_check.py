@@ -97,6 +97,10 @@ def main() -> int:
     env = skill_env.resolve(save=False)
     _mat_good, _mat_detail = _material_table_check(env)
     row('材料代割合表', _mat_good, _mat_detail, required=False)
+    _g = os.path.join(env.get('NEO_CHECK_ROOT') or '', '_reference', 'shouchiku_guideline.json')
+    row('見積ガイドライン', os.path.isfile(os.environ.get('PDF_TO_NEO_GUIDELINE') or _g),
+        ('ある（材料代割合の既定 = ガイドライン表の 6500〜 列）' if os.path.isfile(os.environ.get('PDF_TO_NEO_GUIDELINE') or _g)
+         else f'無い（{_g}）。材料代割合の既定がコグニ既定になる。開発機の NEO_check/_reference からコピーする'), required=False)
     row('ADDATA', bool(env['ADDATA_ROOT']), env['ADDATA_ROOT'] or 'C:\\Addata 等が見つからない → --addata で指定')
     if env['ADDATA_ROOT']:
         def _count_makers():  # ネットワーク上の ADDATA だと listdir が返らないことがあるので時間制限つき

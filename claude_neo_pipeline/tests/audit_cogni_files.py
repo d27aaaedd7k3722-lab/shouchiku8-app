@@ -208,6 +208,10 @@ def main() -> int:
         mat_reset0 = (g_tabs['PaintingPlan'] and c_tabs['PaintingPlan'] and g_tabs['PaintingPlan'][0].get('MaterialRate') != c_tabs['PaintingPlan'][0].get('MaterialRate'))
         if gt.get('Total') != ct.get('Total') and not mat_reset0:
             msgs.append(f"合計 {gt.get('Total')} vs {ct.get('Total')}")
+        _pd_est = est.get('paint') if isinstance(est.get('paint'), dict) else {}
+        if mat_reset0 and _pd_est.get('material_rate') in (None, '') and (_pd_est.get('panels') or _pd_est.get('bumper_front') or _pd_est.get('bumper_rear')):  # 材料代が計上される見積だけ（塗装の無い見積の割合は金額に効かない）
+            # 見積が材料代を指定していないのに割合が違う = 生成器の既定値と実機の既定値の食い違い。合計の差を隠さない（2026-09-12）
+            msgs.append(f"PaintingPlan.MaterialRate: {g_tabs['PaintingPlan'][0].get('MaterialRate')} vs {c_tabs['PaintingPlan'][0].get('MaterialRate')}（見積に材料代割合の指定なし）")
         gi: dict = {}
         for r in sorted(g_rows, key=lambda x: int(x.get('LineNo') or 0)):
             gi.setdefault((r['PartsCode'], int(r.get('DisposalCode') or 0)), []).append(r)

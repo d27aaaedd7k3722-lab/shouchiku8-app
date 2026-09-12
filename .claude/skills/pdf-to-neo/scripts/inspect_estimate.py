@@ -68,7 +68,12 @@ def _coat_code(v) -> int:
 def _hf_code(v) -> int:
     if isinstance(v, int):
         return v
-    return HF_CODE.get(str(v or 'しない').strip(), 0)
+    import unicodedata as _u
+    m = {_u.normalize('NFKC', k): c for k, c in HF_CODE.items()}
+    k = _u.normalize('NFKC', str(v or 'しない')).strip()
+    if k not in m:  # 生成器と同じく、知らない高機能塗装を「しない」として検査しない（Codex 指摘）
+        raise ValueError(f"paint.hf は {sorted(set(HF_CODE) - {'ｽｸﾗｯﾁ'})} のいずれか（{v!r}）")
+    return m[k]
 
 
 def _given(v):

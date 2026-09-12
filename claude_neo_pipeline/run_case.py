@@ -249,6 +249,8 @@ def main(path: str, out: str = ''):
     # 前後・左右の食い違いは ref の取り違えそのもの。検算自身を不合格にする
     side_ng = _check_side_front_rear(est, rep)
     _report_weak_matches(est, rep)
+    for _cs in rep.get('com_stale') or []:
+        print(f'  ★ {_cs} を使っている ADDATA の COM.CAB から読めず、同梱の予備かばら置きの古い表を使った。WorkCodeUpdateDate・型式の照合が ADDATA の月と合わない可能性がある')
     for _se in rep.get('silent_errors') or []:   # 「失敗しても続ける」箇所が実際に失敗した（黙って別の結果になっている）
         print(f'  ★ {_se}')
     for _u in rep.get('paint_body_unresolved') or []:   # 20.DB はボディごとに面積の違う行を持つ
