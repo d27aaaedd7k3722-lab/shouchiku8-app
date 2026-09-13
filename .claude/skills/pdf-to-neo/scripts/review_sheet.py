@@ -26,9 +26,10 @@ HEAD = ('No', '重要度', '区分', 'ページ', '明細No', '見積の名称',
 
 
 def collect(est: dict, rows: Optional[list] = None, inspect_warn: Optional[list] = None, check: Optional[dict] = None,
-            audit_lines: Optional[list] = None, run_out: str = '') -> list[dict]:
-    """確認箇所を集める。戻り値は dict（level, kind, page, row, name, code, text）のリスト（重要度順）"""
-    out: list[dict] = []
+            audit_lines: Optional[list] = None, run_out: str = '', extra: Optional[list] = None) -> list[dict]:
+    """確認箇所を集める。戻り値は dict（level, kind, page, row, name, code, text）のリスト（重要度順）。
+    extra は intent_check.py の結果など、行番号が NEO の明細 No（RecordNo）で入っているもの（そのまま足す）"""
+    out: list[dict] = [{k: e.get(k, '') for k in ('level', 'kind', 'page', 'row', 'name', 'code', 'text')} for e in (extra or [])]
     items = est.get('items') or []
     rows = rows or []
     aligned = len(rows) == len(items)

@@ -132,7 +132,8 @@ def write_report(case: str, est: dict, rep: dict, rows: list[dict], inspect_json
     return path
 
 
-def write_review(case: str, name: str, est: dict, rows: list[dict], rep: dict, inspect_json: str, check: Optional[dict], audit_lines: Optional[list], run_out: str) -> str:
+def write_review(case: str, name: str, est: dict, rows: list[dict], rep: dict, inspect_json: str, check: Optional[dict], audit_lines: Optional[list], run_out: str,
+                 extra: Optional[list] = None) -> str:
     """確認箇所シート（xlsx）を案件フォルダに書く。書いたパスを返す（review_sheet.py）"""
     import review_sheet
     warn: list = []
@@ -144,7 +145,7 @@ def write_review(case: str, name: str, est: dict, rows: list[dict], rep: dict, i
     sys.path.insert(0, os.path.join(FILES, 'claude_neo_pipeline'))
     import run_case  # noqa: E402  失敗したらシート生成の失敗として不合格にする（明細 No がずれたシートを渡さない。Codex 指摘）
     ordered = run_case._rows_in_source_order(rows)  # リサイクル置換で末尾へ動いた行も見積の並びに戻す
-    entries = review_sheet.collect(est, ordered, warn, check, audit_lines, run_out)
+    entries = review_sheet.collect(est, ordered, warn, check, audit_lines, run_out, extra=extra)
     return review_sheet.write(os.path.join(case, f'{name}_確認箇所.xlsx'), entries, est, ordered, rep)
 
 
@@ -220,14 +221,15 @@ def main() -> int:
     # 3) 生成・検算
     name = a.name or os.path.basename(case)
     neo = os.path.join(case, f'{name}.neo')
-    def _stat(p_: str):
-        try:
-            st_ = os.stat(p_)
-            return (st_.st_mtime_ns, st_.st_size, getattr(st_, 'st_ino', 0))
-        except OSError:
-            return None
-    neo_before = _stat(neo)  # 実行前の <name>.neo（前回の合格分）。今回 run_case が書き換えたときだけ、不合格なら隔離する（Codex 指摘）
-    rc, out = run([os.path.join(FILES, 'claude_neo_pipeline', 'run_case.py'), est_path, neo], FILES)
+    ng_path = os.path.splitext(neo)[0] + '.ng.neo'
+    # run_case はまず仮の名前に書き、make_neo の関門（照合率・意図との突き合わせ・確認箇所シート）を全部通ったときだけ <name>.neo に置き換える。
+    # 前回の合格 <name>.neo は、今回が不合格なら一切触らない（Codex 指摘: run_case が直接 <name>.neo を上書きすると前回分を失う）
+    stage = os.path.join(case, f'.{name}.staging.neo')
+    stage_ng = os.path.splitext(stage)[0] + '.ng.neo'   # run_case の検算で落ちたときに run_case が置く名前
+    for p_ in (stage, stage_ng):
+        if os.path.exists(p_):
+            os.remove(p_)   # 前回の実行が途中で落ちた残り（自分の仮ファイルだけ）
+    rc, out = run([os.path.join(FILES, 'claude_neo_pipeline', 'run_case.py'), est_path, stage], FILES)
     print('== run_case ==')
     print(out.rstrip())
     est = json.load(open(est_path, encoding='utf-8-sig'))
@@ -303,10 +305,26 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             print('装備監査で例外（合否には影響しない）:', e)
 
+    # 5) できあがった NEO を読み戻して、下書きの意図（estimate.json）と 1 行ずつ突き合わせる（intent_check.py）。
+    #    行数・部品コード・数量・金額・工賃・明細コメントの有無が違えば不合格。名称や顧客名が欄で切れたものは確認箇所シートの 要確認
+    intent: dict = {'hard': [], 'soft': []}
+    if ok and os.path.exists(stage):
+        try:
+            import intent_check
+            intent = intent_check.check(est, stage)
+            print(f"== 意図との突き合わせ == {intent['rows']} 行 / 食い違い {len(intent['hard'])} / 要確認 {len(intent['soft'])}")
+            for e in (intent['hard'] + intent['soft'])[:30]:
+                print(f"  [{e['kind']}] 明細 {e['row']} {e['name']} {e['text']}")
+        except Exception as e:  # noqa: BLE001  読み戻せない NEO は納品しない
+            intent = {'hard': [{'level': '要確認', 'kind': '意図との突き合わせ', 'page': '', 'row': '', 'name': '', 'code': '',
+                                'text': f'生成した NEO を読み戻せなかった: {type(e).__name__}: {e}'}], 'soft': []}
+            print('意図との突き合わせで例外:', type(e).__name__, e)
+    intent_ng = bool(intent['hard'])
+    ok = ok and not intent_ng
     review_path = ''
     if rep:
         try:
-            review_path = write_review(case, name, est, rows, rep, inspect_json, check, audit_lines, out)
+            review_path = write_review(case, name, est, rows, rep, inspect_json, check, audit_lines, out, intent['hard'] + intent['soft'])
             print('確認箇所シート:', review_path)
         except Exception as e:  # noqa: BLE001
             print('確認箇所シートの生成で例外:', type(e).__name__, e)
@@ -315,16 +333,16 @@ def main() -> int:
     if not ok:
         # run_case が合格して <name>.neo を置いたあとに make_neo 側の関門（低照合率・確認箇所シート…）で落ちたときも、
         # 納品物の名前の NEO を残さない（run_case と同じく .ng.neo に隔離。アプリが組でない NEO を拾わないように。Codex 指摘）
-        ng_path = os.path.splitext(neo)[0] + '.ng.neo'
-        neo_for_report = ng_path if os.path.exists(ng_path) else neo  # run_case の検算で落ちたときは run_case が .ng.neo に置いている
-        if os.path.exists(neo) and _stat(neo) != neo_before:
+        neo_for_report = ''
+        src_ng = stage if os.path.exists(stage) else (stage_ng if os.path.exists(stage_ng) else '')
+        if src_ng:
             try:
-                os.replace(neo, ng_path)
+                os.replace(src_ng, ng_path)
                 neo_for_report = ng_path
-                print('不合格なので NEO を隔離した:', ng_path)
+                print('不合格なので NEO は', ng_path, 'に置いた（中身の確認用。前回の', os.path.basename(neo), 'はそのまま）')
             except OSError as e:
-                neo_for_report = neo
-                print('不合格の NEO を隔離できなかった（手で消すか名前を変える）:', neo, e)
+                neo_for_report = src_ng
+                print('不合格の NEO を .ng.neo に置けなかった:', src_ng, e)
         if not a.no_report and rep:
             try:
                 write_report(case, est, rep, rows, inspect_json, out, marks, neo_for_report, '', check, audit_lines)  # 不合格の報告は実際に残った NEO（.ng.neo）を指す（Codex 指摘）
@@ -341,7 +359,14 @@ def main() -> int:
             _why.append('見積の名称と照合先で前後・左右が食い違う（ref の取り違え。判断規則 10-9）')
         if review_ng:
             _why.append('確認箇所シートが作れなかった（上の例外を直す。判断規則 10-22）')
+        if intent_ng:
+            _why.append('できあがった NEO が下書きの意図と違う（行数・部品コード・数量・金額・工賃・コメント。上の「意図との突き合わせ」）')
         print('不合格: ' + ' / '.join(_why or ['理由不明']) + '。reading/estimate を直して再実行'); return 1
+
+    # 全部の関門を通った: 仮の NEO を <name>.neo に置き換える（ここで初めて納品物の名前になる）
+    os.replace(stage, neo)
+    if os.path.exists(ng_path):
+        print('（前回の不合格分', os.path.basename(ng_path), 'が残っている。今回は合格なので使わない）')
 
     # 5) 納品コピー
     delivered = ''

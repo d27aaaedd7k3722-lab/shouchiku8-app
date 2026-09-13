@@ -1737,7 +1737,7 @@ class NeoBuilder:
                             sec_used = sec_pdf; work_code = (sec_used or '').ljust(10)[:10]
             if dcode in (2, 6):
                 work_code = ''  # 板金(6)/修理(2) 行の WorkCode は空欄（工場 NEO の板金 7 行・修理 13 行、コグニ再検索 C-HR 3500 板金 '#'。取替(K) 行の区分を流用しない）
-            name_disp = display_name(std_name) if std_name else hw(re.sub(r'S$', 'ｽ', it.get('name', '')))
+            name_disp = display_name(std_name) if std_name else hw(re.sub(r'(?<=[ｦ-ﾟ])S$', 'ｽ', it.get('name', '')))  # 半角カナの末尾の 'S' だけ 'ｽ' に（OCR の読み違い）。英字の品名 'SPL. S' は直さない（2026-09-13 ベンツ）
             if it.get('name') and ('左' in it['name'] or '右' in it['name']) and name_disp and name_disp[0] not in '左右':
                 name_disp = ('左' if '左' in it['name'] else '右') + name_disp
             is_sub = pprice > 0 and wage == 0 and dcode == 0 and ref is not None  # 手入力行（部品コード無し）には付属部品の 2 スペース接頭辞を付けない（コグニ実機 2026-09-08）

@@ -44,7 +44,7 @@ python .claude/skills/pdf-to-neo/scripts/make_neo.py <作業フォルダ> --name
 
 - 作業フォルダに `reading.json`（または `pages/header.json` + `pages/page_N.json`）を置いて呼ぶ
 - 出てくるもの: `<name>.neo` / `<name>_確認箇所.xlsx`（openpyxl が無い環境では `<name>_確認箇所.csv`）/ `report.md` / `estimate.json` / `inspect.json` / `reading_check.json`
-- 終了コード 0 = 合格。1 = 不合格（検算差・未照合・前後左右の食い違い・低照合率・確認箇所シートが作れない・例外）。
+- 終了コード 0 = 合格。1 = 不合格（検算差・未照合・前後左右の食い違い・低照合率・できあがった NEO が下書きの意図と違う（`intent_check.py`）・確認箇所シートが作れない・例外）。
   **この実行で作った NEO は、不合格なら `<name>.ng.neo` に隔離される**（run_case の検算で落ちたときも、make_neo 側の関門で落ちたときも）
 - ただし**前回の実行で合格した `<name>.neo` は消されずに残る**。アプリは要求ごとに新しい作業フォルダ（一時フォルダ）で呼び、
   **終了コード 0 のときだけ** `<name>.neo` と確認箇所シート（`<name>_確認箇所.xlsx` か `.csv`。拡張子を決め打ちしない）を組で渡す（ファイルがあるかどうかで合否を判断しない）
@@ -59,7 +59,10 @@ python .claude/skills/pdf-to-neo/scripts/make_neo.py <作業フォルダ> --name
 | 下書き | `draft_estimate.Drafter(reading).build()` | estimate（`_draft_notes` と確認点 `_review` 付き） |
 | 突合せ | `inspect_estimate.main(estimate_path, out_json)` | 戻り値は終了コード（0/1）。要確認（★）は `out_json` の `warnings` に書かれる |
 | 生成・検算 | `run_case.main(estimate_path, out_neo)`（CLI は `run_case.py <estimate.json> <out.neo>`） | 戻り値 True = 合格（NEO を `out_neo` に置く）/ False（`.ng.neo` に隔離）。検算 11 項目と ★ は標準出力。**`NeoBuilder().build()` は NEO のバイト列と行を返すだけで検算・関門を通らないので、合否には使わない** |
-| 確認箇所シート | `review_sheet.collect(est, rows, inspect_warn, check, audit_lines, run_out)` → `review_sheet.write(path, entries, est, rows, rep)`（rows は `run_case._rows_in_source_order(rep['rows'])` で見積の並びに戻したもの） | xlsx（openpyxl が無ければ .csv）のパス |
+| 意図との突き合わせ | `intent_check.check(estimate, neo_path)` | `{'hard': [...], 'soft': [...], 'rows'}`。hard が 1 件でもあれば不合格（make_neo と同じ） |
+| 確認箇所シート | `review_sheet.collect(est, rows, inspect_warn, check, audit_lines, run_out, extra=hard+soft)` → `review_sheet.write(path, entries, est, rows, rep)`（rows は `run_case._rows_in_source_order(rep['rows'])` で見積の並びに戻したもの） | xlsx（openpyxl が無ければ .csv）のパス |
+
+| 答え合わせ（任意・納品後） | `neo_compare.compare(neo_compare.load(納品した.neo), neo_compare.load(確報に使った.neo))` → `neo_compare.report(res)` | `{'rows', 'matched', 'diffs', 'only_mine', 'only_other', 'style', 'totals'}`。合否には使わない（振り返り用。判断規則 10-24） |
 
 B で組むときも、**合否の判定は `make_neo.py` の `main()` と同じ条件**にすること（部分的に真似ると関門が抜ける）。
 
@@ -76,6 +79,7 @@ B で組むときも、**合否の判定は `make_neo.py` の `main()` と同じ
   - `reference/reading_schema.md`（出力の形。**短縮記法** `code|name|method|parts_no|index|qty|price|wage|flags|comment`）
   - `reference/format_catalog.md`（書式ごとの写し方。書式 F の「〃 交換工賃」「作業区分空欄」など）
   - `SKILL.md` 手順 4 の「ページを写す順番と自己チェック」8 項目
+  - 手入力の行で名称が 24 バイトを超えるときは `neo_name`（判断規則 10-23）
 - 車検証・速報（あれば）: 型式・車台番号・型式指定・類別・初度登録・カラー
 
 ### 3-2. LLM にさせないこと（判断はプログラムがする）

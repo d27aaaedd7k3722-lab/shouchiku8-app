@@ -35,7 +35,7 @@ skill_env.apply()  # ADDATA / NEO_check / 雛形 の場所を環境変数に（P
 FILES = skill_env.FILES  # リポジトリ root（ジャンクション経由・別フォルダからの実行でも解決）
 sys.path.insert(0, os.path.join(FILES, 'claude_neo_pipeline'))
 
-from estimate_to_neo import _code4, AddataParts, BUMPER_DISPOSAL, DISPOSAL, NeoBuilder, bankin_time, material_default, r10, BUMPER_ONLY_KEYS, is_manual_panel  # noqa: E402
+from estimate_to_neo import _code4, _fit, AddataParts, BUMPER_DISPOSAL, DISPOSAL, NeoBuilder, bankin_time, hw, material_default, r10, BUMPER_ONLY_KEYS, is_manual_panel  # noqa: E402
 from paint_index import PaintIndex  # noqa: E402
 
 BANKIN_YES = {'A': [1, 1, 1], 'B': [1, 0, 0], 'C': [0, 0, 0]}
@@ -194,6 +194,48 @@ METHOD_NAME = {0: '取替', 1: '脱着', 2: '修理', 3: '脱着修理', 4: '点
 
 
 ROW_FIELDS = ('code', 'name', 'method', 'parts_no', 'index', 'qty', 'price', 'wage', 'flags', 'comment')
+
+
+PARTS_NAME_BYTES = 24   # ERParts.PartsName TEXT(24)（コグニの明細の名称欄。cp932 のバイト数）
+TEXT30_BYTES = 30       # 顧客名・工場名など（Customer.Name1 / Insurance.ConsultantFactory / 管理領域）
+COMPANY_ABBR = (('株式会社', '(株)'), ('有限会社', '(有)'), ('合同会社', '(同)'), ('合資会社', '(資)'), ('合名会社', '(名)'),
+                ('一般社団法人', '(一社)'), ('一般財団法人', '(一財)'), ('医療法人', '(医)'), ('社会福祉法人', '(福)'))
+
+
+def _cp932_len(s) -> int:
+    return len(str(s or '').encode('cp932', 'replace'))
+
+
+def shorten_name(name: str, max_bytes: int = PARTS_NAME_BYTES) -> str:
+    """NEO の名称欄（cp932 で max_bytes バイト）に入らない手入力行の名称を、意味をなるべく残して短くする。
+    入るならそのまま。句読点・括弧を半角 → 空白を詰める → 末尾の括弧書きを外す → それでも長ければバイト数で切る（2026-09-13 ベンツ: 作業名 13 行が途中で切れていた）"""
+    t = hw(str(name or '')).strip()
+    if _cp932_len(t) <= max_bytes:
+        return t
+    t = t.translate(str.maketrans({'、': ',', '。': '.', '（': '(', '）': ')', '　': ' ', '・': '･', '，': ','}))
+    if _cp932_len(t) > max_bytes:
+        t = re.sub(r'\s+', '', t)
+    while _cp932_len(t) > max_bytes and re.search(r'\([^()]*\)\s*$', t):
+        t = re.sub(r'\([^()]*\)\s*$', '', t).rstrip()
+    return _fit(t, max_bytes)
+
+
+def abbr_company(s: str, max_bytes: int = TEXT30_BYTES) -> str:
+    """会社名が欄（cp932 で max_bytes バイト）に入らないとき、株式会社 → (株) のように略す（コグニで人が打つ形）。入るならそのまま"""
+    t = str(s or '')
+    if _cp932_len(t) <= max_bytes:
+        return t
+    for a, b in COMPANY_ABBR:
+        t = t.replace(a, b)
+    if _cp932_len(t) > max_bytes:
+        t = t.translate(str.maketrans({'（': '(', '）': ')', '　': ' '}))
+    m = re.match(r'^(.*?)\s*((?:TEL\s*)?[0-9０-９][0-9０-９\-－]{8,})$', t)
+    if _cp932_len(t) > max_bytes and m:  # 「工場名 電話番号」: 電話番号は残し、名前の側を詰める（電話番号が途中で切れると使えない）
+        name_, tel = m.group(1).strip(), m.group(2)
+        room = max_bytes - _cp932_len(tel) - 1
+        if room >= 8:
+            t = f'{_fit(name_, room).rstrip()} {tel}'
+    return t
 
 
 NEO_COMMENT_RE = re.compile(r'^\s*(NEO|ＮＥＯ)\s*[:：]\s*', re.I)
@@ -749,6 +791,8 @@ class Drafter:
             if row.get('neo_comment'):  # NEO の明細コメント（見積書に印字された備考など、コグニの画面に出したいものだけ）
                 item['comment'] = str(row['neo_comment'])
             item['_page'] = row.get('_page') or ''
+            if row.get('neo_name'):  # NEO の名称欄（24 バイト）に入れる短い名前（手入力行のみ効く。見積の印字は確認箇所シートに残す）
+                item['_neo_name'] = str(row['neo_name'])
             for _e in row.get('_revs') or []:  # 「〃 交換工賃」をまとめた記録をこの行の明細に結び付ける（確認箇所シートの明細 No）
                 _e['_item'] = item
             if row.get('bankin'):  # 板金ランクを reading で明示したとき（下の自動判定より優先。judgment_rules 5）
@@ -902,7 +946,44 @@ class Drafter:
             self._labor_from_wages(out)
         for it in out:
             it.pop('_bankin_area', None)
+            self._fit_manual_name(it)
         return out
+
+    def _fit_texts(self, d: dict, keys: tuple, label: str) -> dict:
+        """顧客名・工場名など 30 バイトの欄に入らない会社名を (株) 等に略す（入らないまま渡すと生成器が途中で切る）。略しても入らなければ要確認"""
+        out = dict(d)
+        for k in keys:
+            v = str(out.get(k) or '')
+            if not v or _cp932_len(v) <= TEXT30_BYTES:
+                continue
+            a = abbr_company(v)
+            if a != v:
+                out[k] = a
+                self._rev('判断', f'{label}の欄', f'{k}「{v}」は {TEXT30_BYTES} バイトの欄に入らないので「{a}」に略した')
+            if _cp932_len(a) > TEXT30_BYTES:
+                self._rev('要確認', f'{label}の欄', f'{k}「{a}」は {TEXT30_BYTES} バイトの欄に入らず、NEO では「{_fit(a, TEXT30_BYTES)}」まで。短い表記を reading に書く')
+        return out
+
+    def _fit_manual_name(self, it: dict) -> None:
+        """手入力行（部品コード無し）の名称は見積の印字がそのまま NEO の名称欄（24 バイト）に入る。入らないときは
+        reading の neo_name（人が付けた短い名前）か、shorten_name の自動短縮にして、印字の全文を確認箇所シートに残す"""
+        short = it.pop('_neo_name', None)
+        if it.get('code') and not it.get('manual'):
+            return  # 部品コードのある行の名称は ADDATA の標準名称になる
+        full = str(it.get('name') or '')
+        if short:
+            s_hw = hw(short).strip()
+            if _cp932_len(s_hw) > PARTS_NAME_BYTES:
+                raise ValueError(f'reading の neo_name {short!r} が NEO の名称欄 {PARTS_NAME_BYTES} バイトに入らない（{_cp932_len(s_hw)} バイト）。もっと短くする')
+            if s_hw != hw(full).strip():
+                it['name'] = s_hw; it['_full_name'] = full
+                self._rev('判断', '名称の短縮', f'NEO の名称欄は {PARTS_NAME_BYTES} バイトなので reading の neo_name「{s_hw}」にした（見積の印字「{full}」）', item=it)
+            return
+        if _cp932_len(hw(full).strip()) > PARTS_NAME_BYTES:
+            s_auto = shorten_name(full)
+            it['name'] = s_auto; it['_full_name'] = full
+            self._rev('要確認', '名称の短縮', f'見積の印字「{full}」は NEO の名称欄 {PARTS_NAME_BYTES} バイトに入らないので「{s_auto}」に自動で短くした。'
+                      '意味が通らなければ reading の行に neo_name（24 バイト以内）を書く', item=it)
 
     def _labor_from_wages(self, items: list[dict]) -> None:
         """指数の列が無く技術料だけの書式（書式 F）でレートが決まらないとき: 技術料を 0.1 刻みの指数で説明できるレート（guess_labor_rate）を挙げ、
@@ -1412,7 +1493,8 @@ class Drafter:
         expenses = self.expenses()
         est: dict = {
             'source': self.rd.get('source', ''), 'issuer': self.rd.get('issuer', ''), 'est_date': self.rd.get('est_date', ''),
-            'vehicle': self.vehicle, 'customer': self.rd.get('customer') or {}, 'insurance': self.rd.get('insurance') or {},
+            'vehicle': self.vehicle, 'customer': self._fit_texts(self.rd.get('customer') or {}, ('name', 'owner_name', 'user_name'), '顧客'),
+            'insurance': self._fit_texts(self.rd.get('insurance') or {}, ('factory',), '保険'),
             'labor_rate': self.labor,
         }
         if getattr(self, 'wage_round', 10) != 10:
