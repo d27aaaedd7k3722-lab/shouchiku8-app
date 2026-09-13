@@ -373,6 +373,107 @@ def test_bumper_only_paint_keeps_detail():
         assert 'panels' not in p3 and 'bumper_front' not in p3 and p3.get('total'), (extra, p3)
 
 
+
+J87_READING = {'source': 't', 'issuer': 't', 'est_date': '20260913', 'format': 'F', 'vehicle': dict(VEH), 'customer': {}, 'insurance': {}, 'labor_rate': 8000,
+               'paint': {}, 'expenses': [], 'totals': {}}
+
+
+def _j87(rows: list) -> dict:
+    return _draft(dict(J87_READING, blocks=[{'title': '', 'page': 2, 'rows': rows}]))
+
+
+def test_quantity_from_price():
+    """数量 1 のまま複数個分の金額（標準単価の整数倍）が印字された小物は数量を直す。金額はそのまま（判断規則 10-21。2026-09-13 亮平さん指示）"""
+    e = _j87(['0178|Fｲﾝﾅﾌｪﾝﾀﾞｸﾘｯﾌﾟ|取替|||1|1850|||'])
+    it = e['items'][0]
+    assert it['qty'] == 10 and it['price'] == 1850, it
+    rv = [r for r in e['_review'] if r['kind'] == '数量']
+    assert rv and rv[0]['level'] == '判断' and rv[0]['row'] == 1 and rv[0]['page'] == 2, e['_review']
+    e2 = _j87(['0178|Fｲﾝﾅﾌｪﾝﾀﾞｸﾘｯﾌﾟ|取替|||1|185|||'])  # 標準どおりなら何もしない
+    assert e2['items'][0]['qty'] == 1 and not [r for r in e2['_review'] if r['kind'] == '数量'], e2['_review']
+    e3 = _j87(['0178|Fｲﾝﾅﾌｪﾝﾀﾞｸﾘｯﾌﾟ|取替|||1|200|||'])   # 倍数でなければ数量は変えない（標準価格と違う行として確認箇所へ）
+    assert e3['items'][0]['qty'] == 1, e3['items'][0]
+    d = de.Drafter(dict(J87_READING, blocks=[]))
+    d.QTY_FROM_PRICE_UNIT_MAX = 100   # 高い部品の倍数一致は自動で直さず 要確認 に挙げるだけ（ここでは閾値を下げて確かめる）
+    d.rd = dict(J87_READING, blocks=[{'title': '', 'page': 2, 'rows': ['0178|Fｲﾝﾅﾌｪﾝﾀﾞｸﾘｯﾌﾟ|取替|||1|1850|||']}])
+    e4 = d.build()
+    assert e4['items'][0]['qty'] == 1 and any(r['kind'] == '数量の可能性' and r['level'] == '要確認' for r in e4['_review']), e4['_review']
+
+
+def test_quantity_from_price_without_code_or_context():
+    """部品コードも部位の文脈も別名辞書も効かない行でも、価格整合（標準の 2.2 倍超）で落とさず数量で合わせる"""
+    d = de.Drafter(dict(J87_READING, blocks=[{'title': '', 'rows': ['|Fｲﾝﾅﾌｪﾝﾀﾞｸﾘｯﾌﾟ|取替|||1|1850|||']}]))
+    d._alias_ref = lambda *a, **k: (None, '')   # 別名辞書が無い PC・辞書に無い名称
+    it = d.build()['items'][0]
+    assert it.get('code') and not it.get('manual') and it['qty'] == 10, it
+
+
+def test_comment_goes_to_review_not_to_neo():
+    """reading の comment は NEO の明細コメントにしない（確認箇所シートへ）。「要確認:」で始まるメモは 要確認"""
+    e = _j87(['0178|Fｲﾝﾅﾌｪﾝﾀﾞｸﾘｯﾌﾟ|取替|||1|185|||要確認: 数量が読めない', '0178|Fｲﾝﾅﾌｪﾝﾀﾞｸﾘｯﾌﾟ|取替|||1|185|||NEO:※再使用'])
+    a, b = e['items']
+    assert 'comment' not in a and a.get('_memo'), a
+    assert b.get('comment') == '※再使用', b
+    rv = [r for r in e['_review'] if r['kind'] == '転記メモ']
+    assert len(rv) == 1 and rv[0]['level'] == '要確認' and rv[0]['text'].startswith('数量が読めない'), rv
+
+
+def test_ditto_wage_row_is_merged():
+    """「〃 交換工賃」（技術料だけの続き行）は直前の部品の行にまとめる。「〃（モデリスタ）」は直前の名称を補った別の行"""
+    e = _j87([{'name': 'Fｲﾝﾅﾌｪﾝﾀﾞｸﾘｯﾌﾟ', 'method': '取替', 'qty': 1, 'price': 185},
+              {'name': '〃 交換工賃', 'wage': 2400},
+              {'name': '〃（ﾓﾃﾞﾘｽﾀ）', 'method': '取替', 'qty': 1, 'price': 9000, 'manual': True}])
+    assert len(e['items']) == 2, e['items']
+    assert e['items'][0].get('wage') == 2400, e['items'][0]
+    assert e['items'][1]['name'].startswith('Fｲﾝﾅﾌｪﾝﾀﾞｸﾘｯﾌﾟ') and 'ﾓﾃﾞﾘｽﾀ' in e['items'][1]['name'], e['items'][1]
+    mg = [r for r in e['_review'] if r['kind'] == '行のまとめ']
+    assert mg and mg[0]['row'] == 1 and mg[0]['page'] == 2, e['_review']  # 確認箇所シートの明細 No・ページ
+
+
+def test_small_part_with_large_wage_is_flagged():
+    """1,000 円以下の小物に 1 万円以上の技術料は 要確認（別の行の工賃の写し間違い・工場の書き間違いの疑い）"""
+    e = _j87(['0178|Fｲﾝﾅﾌｪﾝﾀﾞｸﾘｯﾌﾟ|取替|||1|185|19200||'])
+    assert any(r['kind'] == '小物に大きな工賃' and r['level'] == '要確認' for r in e['_review']), e['_review']
+
+
+def _w73_available() -> bool:
+    try:
+        return de.Drafter(dict(J87_READING, vehicle=dict(W73), blocks=[])).car.get('CarCode') == 'W73'
+    except Exception:  # noqa: BLE001  ADDATA に車種が無い・読めない
+        return False
+
+
+W73 = {'model_code': '3BA-VJA300W', 'serial_no': 'VJA300-4126281', 'desig': '20152', 'category': '0069', 'reg_date': 'R5.12', 'color_code': '090'}
+
+
+def test_price_fixes_the_part_code():
+    """品番の無い行で標準単価が合わないとき、名称の近い部品のうち単価が合う（割り切れる）ものへ直す（2026-09-13 ランクル 300: 人が直した行を自動で同じ結果に）"""
+    rd = dict(J87_READING, vehicle=dict(W73), labor_rate=12000,
+              blocks=[{'title': '', 'rows': ['|ﾗｼﾞｴｰﾀｻｲﾄﾞ(ﾛﾜ)|取替|||1|7000|||', '|左Frﾄﾞｱﾄﾘﾑﾎﾞｰﾄﾞｸﾘｯﾌﾟ|取替|||1|720|||']}])
+    if not _w73_available():
+        print('   skip test_price_fixes_the_part_code（この ADDATA に W73 が無い）')
+        return
+    e = _draft(rd)
+    a, b = e['items']
+    assert a['code'] == '0085' and a['qty'] == 1, a            # ﾗｼﾞｴ-ﾀｸﾞﾘﾙ(ﾛﾜ) 7,000 円（名称近似だと 0077 ｻｲﾄﾞｸﾞﾘﾙ 3,490 円）
+    assert b['code'] == '2565' and b['qty'] == 8, b            # LFﾄﾞｱﾄﾘﾑﾎﾞ-ﾄﾞｸﾘﾂﾌﾟ 90 円 × 8（辞書だとｱｳﾀﾐﾗ-ｽｸﾘﾕ）
+    assert sum(1 for r in e['_review'] if r['kind'] == '部品コード') == 2, e['_review']
+
+
+def test_labor_rate_from_standard_index():
+    """技術料だけの書式でレートが決まらない（6,000 / 12,000 の両方で説明できる）とき、技術料 ÷ レートが ADDATA の標準指数と一致する行の多いレートを採る"""
+    rows = ['|Frﾊﾞﾝﾊﾟｰｶﾊﾞｰ(塗装済み)|取替|||1|34300|49200||', '|ﾌｰﾄﾞ|取替|||1|79100|7200||', '|左 ﾌｰﾄﾞﾋﾝｼﾞ|取替|||1|2360|1200||',
+            '|右 ﾌｰﾄﾞﾋﾝｼﾞ|取替|||1|2360|1200||', '|左 ｽﾃｯﾌﾟﾊﾟﾈﾙ|脱着|||||2400||']
+    rd = dict(J87_READING, vehicle=dict(W73), blocks=[{'title': '', 'rows': rows}])
+    rd.pop('labor_rate')
+    if not _w73_available():
+        print('   skip test_labor_rate_from_standard_index（この ADDATA に W73 が無い）')
+        return
+    e = _draft(rd)
+    assert e['labor_rate'] == 12000, e['labor_rate']
+    assert any(r['kind'] == 'レバーレート' and r['level'] == '判断' for r in e['_review']), e['_review']
+
+
 if __name__ == '__main__':
     fails = 0
     for name, fn in sorted(globals().items()):

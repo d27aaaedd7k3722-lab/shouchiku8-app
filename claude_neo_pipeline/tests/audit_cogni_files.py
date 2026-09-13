@@ -339,6 +339,17 @@ def check_ansmb_base() -> int:
 if __name__ == '__main__' and '--ansmb' in sys.argv:
     sys.exit(check_ansmb_all() if '--all' in sys.argv else check_ansmb_base())
 
+# 部品価格適応日（Car.PartsPriceDate / CarSearch.nm_PartsPriceDate、YYMMDD）は ADDATA の版で決まる（コグニも保存した時点の版を書く）。
+# 実機 NEO を保存したときより新しい ADDATA で生成すると必ず違うので、「生成側が新しい日付」のときだけ差にしない（2026-09-13 ADDATA 2026/09 更新で 22 本がこの列だけ違った）
+PRICE_DATE_COLS = {('Car', 'PartsPriceDate'), ('CarSearch', 'nm_PartsPriceDate')}
+_price_date_newer: set = set()
+
+
+def _newer_price_date(t: str, col: str, gen, cog) -> bool:
+    import re as _re
+    return (t, col) in PRICE_DATE_COLS and all(isinstance(v, str) and _re.fullmatch(r'\d{6}', v) for v in (gen, cog)) and gen > cog
+
+
 def _full_diff(gen_path: str, cog_path: str) -> list:
     """neo_diff と同じ範囲（両 SQLite の全テーブル + 付随ファイル）を比べ、差分メッセージを返す"""
     A = neo_diff.load(gen_path); B = neo_diff.load(cog_path)
@@ -370,6 +381,8 @@ def _full_diff(gen_path: str, cog_path: str) -> list:
             for i, (x, y) in enumerate(zip(ra, rb)):
                 for kk in common:
                     if x[kk] != y[kk] and not _same_float(x[kk], y[kk]):
+                        if _newer_price_date(t, kk, x[kk], y[kk]):
+                            _price_date_newer.add(os.path.basename(cog_path)); continue
                         out.append('%s[%d].%s: %r vs %r' % (t, i, kk, x[kk], y[kk]))
     for fn in EXTRA_FILES:
         fa = A['files'].get(fn, b''); fb = B['files'].get(fn, b'')
@@ -418,6 +431,8 @@ def check_full() -> int:
     if done == 0:
         print('** 全ファイル比較: 比べられる実機 NEO が 1 本も無いので行っていない **')
         return 1 if require else 0
+    if _price_date_newer:
+        print('   （部品価格適応日だけ新しい ADDATA の日付: %d 本。実機 NEO を保存したときより ADDATA が新しいため。差にしない）' % len(_price_date_newer))
     print('--- 全ファイル一致（そのまま保存） %d / %d 本' % (done - ng, done)
           + ('（実機ファイルの無い %d 本は未実施）' % len(missing) if missing else ''))
     return 1 if (ng or (missing and require)) else 0

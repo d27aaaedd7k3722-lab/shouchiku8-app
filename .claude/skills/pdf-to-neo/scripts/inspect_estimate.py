@@ -443,7 +443,7 @@ def _inspect(path: str, out_json: str = '') -> int:
             per_line = sum(int(w * rate / 100.0 + 0.5) for w in wages) + int((wage_total_p - sum(wages)) * rate / 100.0 + 0.5)  # 工場書式によくある行ごと 1 円四捨五入（内訳が無い残りは 1 行扱い）
             print(f"   材料代: 工賃計 {wage_total_p} × {rate}% = コグニ既定(10円四捨五入) {lump} / 行ごと1円四捨五入 {per_line} / 見積 {p.get('material')}"
                   + ('' if (int(p.get('material') or 0) or None) in (None, lump, per_line) else ' ★どちらとも違う（読み取りか割合を確認）'))
-            if (int(p.get('material') or 0) or None) not in (None, lump, per_line):
+            if (int(p.get('material') or 0) or None) not in (None, lump, per_line) and not flag(p.get('auto_panels'), 'paint.auto_panels'):  # auto_panels は材料代で工場の一式に合わせる設計（10-15）
                 warn.append(f"塗装 ★材料代 {p.get('material')} がコグニ既定 {lump} とも行ごと丸め {per_line} とも違う（割合 {rate}% か読み取りを確認）")
             if int(p.get('material') or 0) and int(p['material']) != lump:
                 print("      → コグニ既定値と違う。paint.material に見積値を入れると PaintingTotal は '*'（手入力）で保持される")

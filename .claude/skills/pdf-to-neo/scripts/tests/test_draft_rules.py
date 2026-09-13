@@ -22,6 +22,18 @@ def test_note_flag_keeps_comment():
     assert 'price' not in a and 'wage' not in a, a
 
 
+def test_comment_is_a_memo_and_neo_prefix_is_a_neo_comment():
+    """comment は転記メモ（NEO に書かない）。見積書に印字された明細コメントは 'NEO:' を付ける（全角 ＮＥＯ： も可）。dict 行は neo_comment（2026-09-13）"""
+    a = de.expand_row('0010|ﾊﾞﾝﾊﾟ|取替||1.0|1|1000|8000||NEO:※JAS在庫使用')
+    assert a.get('neo_comment') == '※JAS在庫使用' and 'comment' not in a, a
+    b = de.expand_row('0010|ﾊﾞﾝﾊﾟ|取替||1.0|1|1000|8000||ＮＥＯ：ﾊﾞﾝﾊﾟｰ交換に含む')
+    assert b.get('neo_comment') == 'ﾊﾞﾝﾊﾟｰ交換に含む', b  # 本文の半角カナは写したまま
+    c = de.expand_row('0010|ﾊﾞﾝﾊﾟ|取替||1.0|1|1000|8000||名称だけだと別の部品に寄るので指定')
+    assert c.get('comment') == '名称だけだと別の部品に寄るので指定' and 'neo_comment' not in c, c
+    d = de.expand_row({'name': 'ﾊﾞﾝﾊﾟ', 'neo_comment': '※再使用', 'comment': 'メモ'})
+    assert d.get('neo_comment') == '※再使用' and d.get('comment') == 'メモ', d
+
+
 def test_note_flag_without_comment():
     a = de.expand_row('|ｸﾘｱﾗﾝｽｿﾅｰ|||||||N|')
     assert a == {'note': 'ｸﾘｱﾗﾝｽｿﾅｰ'}, a

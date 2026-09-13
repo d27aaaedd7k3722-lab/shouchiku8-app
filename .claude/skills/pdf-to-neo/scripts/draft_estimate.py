@@ -11,7 +11,12 @@ reading.json の形は reference/reading_schema.md。Claude（人）は PDF を�
   - 装備（hints.eva_codes）: 見積の品番が、この車のグレードでその装備レターの行にしか無いとき採用（11.DB / 13.DB / 83.DB）
   - 塗装行の解釈（パネル名 → 20.DB コード、修正 1/3 → ratio、加算基礎数値 → base、バンパ 取替 → bumper_front 新品 …）
   - 費用の kind（見積書のどの合計に入っているか）、レバーレートの逆算、totals の補完
+  - 数量 1 のまま複数個分の金額が印字された小物（クリップ 1,300 円 = 標準 100 円 × 13 個）は数量を直す（金額はそのまま。判断規則 10-21）
+  - 品番の無い行で標準単価が合わないとき、名称の近い部品のうち単価が合うものへ部品コードを直す（判断規則 10-21）
+  - 「〃 交換工賃」の行（技術料だけの続き行）は直前の部品の行にまとめる。技術料だけの書式でレートが決まらないときは ADDATA の標準指数で絞る
 決めきれなかった点は `_draft_notes` と標準出力に出す（inspect_estimate.py が同じ点を ★ で再掲する）。
+人が確かめる点（転記メモ・数量や部品コードを直した行・価格の食い違い）は `_review` に集め、make_neo.py が確認箇所シート（xlsx）にする。
+reading の `comment` は転記メモなので NEO には書かない（NEO の明細コメントに出すのは `neo_comment` だけ）。
 """
 from __future__ import annotations
 
@@ -191,9 +196,28 @@ METHOD_NAME = {0: '取替', 1: '脱着', 2: '修理', 3: '脱着修理', 4: '点
 ROW_FIELDS = ('code', 'name', 'method', 'parts_no', 'index', 'qty', 'price', 'wage', 'flags', 'comment')
 
 
+NEO_COMMENT_RE = re.compile(r'^\s*(NEO|ＮＥＯ)\s*[:：]\s*', re.I)
+
+
+def _split_neo_comment(d: dict) -> dict:
+    """comment 欄の先頭が 'NEO:' なら、それは見積書に印字された明細コメント（コグニの明細コメントとして NEO に書く）→ neo_comment に移す。
+    それ以外の comment は転記メモ（NEO には書かず確認箇所シートへ。2026-09-13 亮平さん指示）"""
+    c = str(d.get('comment') or '')
+    m = NEO_COMMENT_RE.match(c)  # 全角の ＮＥＯ： も受ける。本文は写したまま（NFKC を掛けると半角カナが全角に変わる）
+    if m:
+        d['neo_comment'] = c[m.end():].strip()
+        d.pop('comment', None)
+    return d
+
+
 def expand_row(row) -> dict:
     """reading.json の行は dict か、'code|name|method|parts_no|index|qty|price|wage|flags|comment' の文字列（転記の手間を減らす短縮記法）。
-    空欄は空文字。flags: M=manual、R=reserve、N=注記行（name を note にする）。数値は int/float に変換"""
+    空欄は空文字。flags: M=manual、R=reserve、N=注記行（name を note にする）。数値は int/float に変換。
+    comment は転記メモ（NEO に書かない）。見積書に印字された明細コメントは 'NEO:※JAS在庫使用' のように先頭に NEO: を付ける（dict 行は neo_comment でも可）"""
+    return _split_neo_comment(_expand_row(row))
+
+
+def _expand_row(row) -> dict:
     if isinstance(row, dict):
         d_ = dict(row)
         fl = _nfkc(str(d_.pop('flags', '') or '')).upper()
@@ -361,6 +385,113 @@ class Drafter:
         self.year = str(self.car.get('YearCode', ''))
         self.eva_votes: dict[str, set[str]] = {}
         self.eva_veto: set[str] = set()
+        self.review: list[dict] = []   # 確認箇所（make_neo.py が xlsx にする）。{'level', 'kind', 'page', 'name', 'code', 'text', '_item'}
+        self._price_index: Optional[dict] = None
+
+    # ------------------------------------------------------------------ 確認箇所
+    def _rev(self, level: str, kind: str, text: str, row: Optional[dict] = None, item: Optional[dict] = None, code: str = '') -> None:
+        """確認箇所を 1 件足す。level は 要確認（人が見て決める）/ 判断（下書きが決めた。根拠を残す）/ 参考"""
+        row = row or {}
+        self.review.append({'level': level, 'kind': kind, 'page': row.get('_page') or '', 'name': str(row.get('name') or (item or {}).get('name') or ''),
+                            'code': code or str((item or {}).get('code') or ''), 'text': text, '_item': item})
+
+    # ------------------------------------------------------------------ 価格で数量・部品コードを合わせる（判断規則 10-21）
+    def _std_unit(self, ref: int, pn: str = '') -> int:
+        """この車の条件（グレード・FVA・装備・年式・ボディ）で生成器が選ぶ 11.DB 変種の標準単価。無ければ 0"""
+        ctx = {'grade': self.grade, 'fva': self.fva, 'eva': set((self.rd.get('hints') or {}).get('eva_codes') or ()), 'year': self.year, 'body': self.body}
+        try:
+            v, _ = self.parts.variant(ref, pn, ctx)
+            return int((v or {}).get('price') or 0)
+        except Exception:  # noqa: BLE001  変種が読めない ref は価格では判断しない
+            return 0
+
+    def _refs_by_price(self) -> dict:
+        if self._price_index is None:
+            idx: dict = {}
+            for ref, vs in self.parts.by_ref.items():
+                for v in vs:
+                    try:
+                        pr = int(v.get('price') or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if pr > 0 and '-' in str(v.get('parts_no') or ''):
+                        idx.setdefault(pr, set()).add(ref)
+            self._price_index = idx
+        return self._price_index
+
+    def _name_sim(self, name: str, ref: int, side: str) -> float:
+        """見積の名称と ref の 12.DB 名称の近さ（左右を外して比べる）。左右が食い違う・左右の無い見積名に左右付き部品は -1"""
+        n0 = re.sub(r'^[LR](?=[^A-Z])', '', self.parts.norm_name(name))
+        best = -1.0
+        for n20 in self.parts.name20_by_ref.get(ref, ()):
+            s20 = _side20(n20)
+            if (side and s20 and s20 != side) or (not side and s20):
+                continue
+            c = self.parts.norm_name(n20)
+            c1 = re.sub(r'^[LR](?=[^A-Z])', '', c) if s20 else c
+            s = difflib.SequenceMatcher(None, c1, n0).ratio()
+            s -= 0.3 * sum(1 for w in SMALL_WORDS if w in c1 and w not in n0)  # 候補にだけある小物語（クリップ等）は別部品
+            best = max(best, s)
+        return best
+
+    QTY_FROM_PRICE_MAX = 99   # 数量として読み替える上限（これより多い倍数は偶然の一致とみなす）
+    QTY_FROM_PRICE_UNIT_MAX = 3000  # 数量を自動で読み替えるのは標準単価がこれ以下の小物だけ（それより高い部品の倍数一致は 要確認 に挙げるだけ。Codex 指摘）
+
+    def _price_fit(self, ref: int, why: str, name: str, side: str, price: int, qty: int, pn: str, may_switch: bool, ctx_block: str) -> tuple[int, str, int, str]:
+        """印字の金額が標準単価 × 数量と合わない行を、(1) 単価の合う別の ref（名称が近いもの）へ直すか、
+        (2) 数量 1 のまま複数個分の金額なら数量を直す。戻り値 (ref, why, qty, 何をしたか)。何もしなければ最後は ''"""
+        self._price_check = ''
+        if price <= 0 or qty <= 0:
+            return ref, why, qty, ''
+        u0 = self._std_unit(ref, pn)
+        if not u0 or price == u0 * qty:
+            return ref, why, qty, ''
+        s0 = self._name_sim(name, ref, side)
+        colored = ref in (self.raw83 or {})  # 色別部品は色で単価が変わるので数量の読み替えはしない
+        n0 = price // u0 if (qty == 1 and price % u0 == 0) else 0
+        div_ok = (not colored) and 2 <= n0 <= self.QTY_FROM_PRICE_MAX and u0 <= self.QTY_FROM_PRICE_UNIT_MAX
+        self._price_check = (f'金額 {price:,} 円が標準単価 {u0:,} 円のちょうど {n0} 倍。数量 {n0} の可能性がある（標準単価 {self.QTY_FROM_PRICE_UNIT_MAX:,} 円を超える部品なので自動では直さない）'
+                             if (not colored and 2 <= n0 <= self.QTY_FROM_PRICE_MAX and u0 > self.QTY_FROM_PRICE_UNIT_MAX) else '')
+        blk0 = self.parts.block_of(ref)
+        exact = []
+        if may_switch and price % qty == 0:
+            unit_in = price // qty
+            for r in self._refs_by_price().get(unit_in, ()):
+                if r == ref:
+                    continue
+                s = self._name_sim(name, r, side)
+                if s >= 0.6 and self._std_unit(r) == unit_in:
+                    exact.append((round(s, 3), 1 if self.parts.block_of(r) in (blk0, ctx_block) else 0, -r, r))
+        exact.sort(reverse=True)
+        if exact:
+            s_e, same_blk, _, r_e = exact[0]
+            if div_ok:   # 数量の読み替えもできる: 同じ部位で名称が同等以上のときだけ単価の合う部品を採る
+                take = bool(same_blk) and s_e >= s0
+            else:        # 読み替えできない: 名称が近くない採用（s0 < 0.9）か、同じ名前の別部品（s_e >= 0.95）なら採る
+                take = s0 < 0.9 or s_e >= 0.95
+            if take:
+                return r_e, f'単価一致({price // qty:,} 円・名称 {s_e:.2f}) ← {why}', qty, f'部品コード {ref:04d} → {r_e:04d}（単価 {price // qty:,} 円が一致）'
+        if div_ok:
+            return ref, why, n0, f'数量 1 → {n0}（金額 {price:,} ÷ 標準単価 {u0:,}）'
+        if may_switch and qty == 1 and s0 < 0.9:  # 名称の弱い採用で単価も合わない: 名称がほぼ同じで単価が金額を割り切る部品（ドアトリムボードクリップ 720 = 90 × 8）
+            best = None
+            for r, n20s in self.parts.name20_by_ref.items():
+                if r == ref or r in (self.raw83 or {}):
+                    continue
+                s = self._name_sim(name, r, side)
+                if s < 0.85:
+                    continue
+                u = self._std_unit(r)
+                if u and price % u == 0 and (price // u == 1 or (2 <= price // u <= self.QTY_FROM_PRICE_MAX and u <= self.QTY_FROM_PRICE_UNIT_MAX)):  # 数量を変えるのは小物だけ（Codex 指摘）
+                    key = (round(s, 3), 1 if self.parts.block_of(r) in (blk0, ctx_block) else 0, -r)
+                    if best is None or key > best[0]:
+                        best = (key, r, u)
+            if best is not None:
+                _k, r_b, u_b = best
+                n_b = price // u_b
+                return r_b, f'単価の倍数一致({u_b:,} 円 × {n_b}・名称 {_k[0]:.2f}) ← {why}', n_b, (
+                    f'部品コード {ref:04d} → {r_b:04d}' + (f'、数量 1 → {n_b}' if n_b > 1 else '') + f'（金額 {price:,} = 標準単価 {u_b:,} × {n_b}）')
+        return ref, why, qty, ''
 
     # ------------------------------------------------------------------ 明細
     def _refs_in_block(self, block: str) -> list[int]:
@@ -510,6 +641,36 @@ class Drafter:
                 for ch in l:
                     self.eva_veto.add(ch)
 
+    DITTO_RE = re.compile(r'^[〃″”"]\s*|^同上\s*')
+    DITTO_WAGE_RE = re.compile(r'^(交換|取替|取付|脱着|組替)?\s*(工賃|技術料)$')
+
+    def _merge_ditto(self, rows: list[dict]) -> list[dict]:
+        """「〃 交換工賃」（直前の部品の工賃だけを次の行に印字する書式）を直前の行にまとめる。
+        「〃（モデリスタ）」のように金額のある続き行は、直前の名称を補った別の行にする"""
+        out: list[dict] = []
+        for r in rows:
+            nm = _nfkc(str(r.get('name') or '')).strip()
+            if out and self.DITTO_RE.match(nm) and out[-1].get('_block_title') == r.get('_block_title'):
+                rest = self.DITTO_RE.sub('', nm).strip()
+                prev = out[-1]
+                price = _num(r.get('price'))
+                if self.DITTO_WAGE_RE.match(rest) and price in ('', '0'):
+                    w = _num(r.get('wage'))
+                    if w not in ('', '0'):
+                        pw = _num(prev.get('wage'))
+                        prev['wage'] = int(float(w)) + (int(float(pw)) if pw not in ('', '0') else 0)
+                        self._rev('判断', '行のまとめ', f'「{r.get("name")}」の技術料 {int(float(w)):,} 円を直前の「{prev.get("name")}」の工賃にまとめた'
+                                  + (f'（この行にも工賃 {int(float(pw)):,} 円があったので合算）' if pw not in ('', '0') else ''), row=prev)
+                        prev.setdefault('_revs', []).append(self.review[-1])  # 明細 No を付けるため、この行から作る item に後で結び付ける
+                    for _k in ('comment', 'neo_comment'):  # 続き行の転記メモ・印字コメントも落とさない（Codex 指摘）
+                        if r.get(_k):
+                            prev[_k] = '。'.join(x for x in (str(prev.get(_k) or ''), str(r[_k])) if x)
+                    continue
+                if rest:
+                    r = dict(r, name=re.sub(r'\s+', '', _nfkc(str(prev.get('name') or ''))) + rest)
+            out.append(r)
+        return out
+
     def items(self) -> list[dict]:
         out: list[dict] = []
         rows_flat: list[dict] = []
@@ -520,7 +681,8 @@ class Drafter:
                 if row.get('note') and not row.get('name'):
                     self.notes.append(f"注記【{title}】{row['note']}")
                     continue
-                rows_flat.append(dict(row, _block_title=title))
+                rows_flat.append(dict(row, _block_title=title, _page=blk.get('page') or ''))
+        rows_flat = self._merge_ditto(rows_flat)
         # 真偽値欄はここで 1 回だけ正規化する。レート推定・丸め判定も生値を見るので、
         # 行ループの中で直すだけでは届かない（Codex 指摘）
         for _r in rows_flat:
@@ -581,8 +743,16 @@ class Drafter:
             # それ以外（工賃列の無い書式、脱着/修理/板金で工賃が読めない行）は wage を省略し、生成器の標準指数に任せる
             if index is not None and float(index) > 0:
                 item['index'] = float(index)
-            if row.get('comment'):
-                item['comment'] = row['comment']
+            if row.get('comment'):  # 転記メモ（人が確かめる点）。NEO の明細コメントには書かず確認箇所シートへ
+                item['_memo'] = str(row['comment'])
+                _cm = str(row['comment'])
+                _need = bool(re.match(r'^\s*(要確認|★|確認)', _cm)) or '?' in _cm or '？' in _cm  # 「要確認: …」「★…」や読めない印（?）は人が決める点
+                self._rev('要確認' if _need else '参考', '転記メモ', re.sub(r'^\s*(要確認|★)\s*[:：]?\s*', '', _cm) if _need else _cm, row=row, item=item)
+            if row.get('neo_comment'):  # NEO の明細コメント（見積書に印字された備考など、コグニの画面に出したいものだけ）
+                item['comment'] = str(row['neo_comment'])
+            item['_page'] = row.get('_page') or ''
+            for _e in row.get('_revs') or []:  # 「〃 交換工賃」をまとめた記録をこの行の明細に結び付ける（確認箇所シートの明細 No）
+                _e['_item'] = item
             if row.get('bankin'):  # 板金ランクを reading で明示したとき（下の自動判定より優先。judgment_rules 5）
                 item['bankin'] = row['bankin']
             if row.get('recycle'):  # リサイクル部品（estimate_schema items.recycle）
@@ -638,17 +808,40 @@ class Drafter:
                 if aref is not None and (ref is None or (ref != aref and sim < 0.9 and same_block)):  # 既に候補がある行は、辞書のコードが同じ部位ブロックのときだけ置き換える
                     self.notes.append(f'{awhy}: {name}' + (f'（名称近似 {ref} {"/".join(sorted(self.parts.name20_by_ref.get(ref, ())))} より辞書を優先）' if ref is not None else ''))
                     ref, why = aref, awhy
+            if ref is None and not code_in and price > 0 and qty == 1 and dcode == 0:
+                # 数量 1 のまま複数個分の金額（クリップ 1,300 円 = 100 円 × 13）は、find_ref の価格整合（標準の 2.2 倍超は別部品）で落ちる。
+                # 価格を外して名称で引き直し、標準単価の整数倍（小物）なら採る（数量は下の _price_fit が直す。Codex 指摘）
+                ref_np, why_np = self.parts.find_ref('', pn, name, context_block=ctx_block, price=None, qty=None, year=self.year)
+                if ref_np is not None and ref_np not in (self.raw83 or {}):
+                    u_np = self._std_unit(ref_np, pn)
+                    if u_np and u_np <= self.QTY_FROM_PRICE_UNIT_MAX and price % u_np == 0 and 2 <= price // u_np <= self.QTY_FROM_PRICE_MAX:
+                        ref, why = ref_np, f'{why_np}（金額が標準単価 {u_np:,} 円の {price // u_np} 倍）'
             if ref is None:
                 self.notes.append(f'未照合: {name} {pn}（manual にした。ADDATA にある品目なら code を指定）')
                 item['manual'] = True
                 out.append(item)
                 continue
+            if 0 < price <= 1000 and dcode == 0 and wage is not None and wage >= 10000:
+                # 1,000 円以下の小物に 1 万円以上の技術料（2026-09-13 ランクル: エンジンサービスラベル 200 円に 19,200 円 = 次の行の工賃と同額）
+                self._rev('要確認', '小物に大きな工賃', f'部品代 {price:,} 円の行に技術料 {wage:,} 円。別の行の工賃を写し間違えていないか、工場の書き間違いでないか確かめる（印字どおりに入れた）', row=row, item=item)
+            if price > 0 and dcode == 0 and not row.get('reserve') and not row.get('recycle'):
+                ref0 = ref
+                ref, why, qty2, did = self._price_fit(ref, why, name_raw, side, price, qty, pn, may_switch=not (code_in or pn), ctx_block=ctx_block)
+                if getattr(self, '_price_check', '') and not did:
+                    self._rev('要確認', '数量の可能性', self._price_check, row=row, item=item)
+                if did:
+                    if qty2 != qty:
+                        item['qty'] = qty = qty2
+                        item['_qty_from_price'] = True
+                    self.notes.append(f'{name_raw}: {did}')
+                    self._rev('判断', '数量' if ref == ref0 else '部品コード', did, row=row, item=item, code=f'{ref:04d}')
             if not code_in and not pn and '辞書' not in (why or ''):  # 品番も部品コードも無い行（汎用小物など）は名称だけが根拠なので必ず見せる
                 self.notes.append(f'名称だけで決めた: {name} → {ref} '
                                   + '/'.join(sorted(self.parts.name20_by_ref.get(ref, ()))) + f'（{why}）。品番が無いので別の部品を選んでいないか確かめる')
             elif '名称近似' in why or 'ブロック内' in why:
                 self.notes.append(f"名称照合で決定: {name} → {ref} {'/'.join(sorted(self.parts.name20_by_ref.get(ref, ())))}（{why}）")
-            ctx_block = self.parts.block_of(ref) or ctx_block
+            if '単価' not in (why or '').split(' ← ')[0]:  # 単価で別部位の ref に直した行（同じ品番の小物が別ブロックにある）は、後続行の部位文脈を動かさない
+                ctx_block = self.parts.block_of(ref) or ctx_block
             used.add(ref)
             item['code'] = f'{ref:04d}'
             item['_ref_why'] = why  # どうやって ref を決めたか。run_case が「名称近似 × 価格不一致」を絞るのに使う
@@ -685,7 +878,7 @@ class Drafter:
             has_labor = bool(item.get('wage')) or bool(item.get('index'))
             if not side and left_only and qty >= 2 and qty % 2 == 0 and ref in self.parts.pair_right and has_labor:
                 self.notes.append(f'左右分割せず: {name} ×{qty} は工賃/指数があるので 1 行のまま（左右に分けるなら reading で 2 行に）')
-            if not side and left_only and qty >= 2 and qty % 2 == 0 and ref in self.parts.pair_right and not has_labor:
+            if not side and left_only and qty >= 2 and qty % 2 == 0 and ref in self.parts.pair_right and not has_labor and not item.get('_qty_from_price'):
                 rref = self.parts.pair_right[ref]
                 half = qty // 2
                 unit = price // qty if qty else 0
@@ -697,10 +890,54 @@ class Drafter:
                 left['name'] = '左' + re.sub(r'^(右|左)\s*', '', name)
                 right['name'] = '右' + re.sub(r'^(右|左)\s*', '', name)
                 out.extend([left, right])
+                for _e in self.review:  # この行に付けた確認箇所は分割後の左の行に結び付ける（明細 No が消えないように。Codex 指摘）
+                    if _e.get('_item') is item:
+                        _e['_item'] = left
                 self.notes.append(f'左右分割: {name} ×{qty} → {ref}（左）×{half} + {rref}（右 {"/".join(rn)}）×{half}')
                 continue
             out.append(item)
+        if not labor and not self.generic and not _money_or(self.rd.get('labor_rate'), name='labor_rate'):
+            self._labor_from_wages(out)
         return out
+
+    def _labor_from_wages(self, items: list[dict]) -> None:
+        """指数の列が無く技術料だけの書式（書式 F）でレートが決まらないとき: 技術料を 0.1 刻みの指数で説明できるレート（guess_labor_rate）を挙げ、
+        複数あれば「技術料 ÷ レート が ADDATA の標準指数と一致する行」の多いレートを採る（2026-09-13 ランクル: 6,000 / 12,000 → 標準一致 12,000）"""
+        from guess_labor_rate import guess
+        rows = [it for it in items if it.get('wage') and not it.get('manual') and it.get('code')]
+        wages = sorted({int(it['wage']) for it in rows if int(it['wage']) > 0})
+        if not wages:
+            return
+        hits = [r for r, _ in guess(wages, unit=self.wage_round or 10)]
+        if not hits:
+            self._rev('要確認', 'レバーレート', f'技術料 {len(wages)} 種類を 0.1 刻みの指数で説明できるレートが無い。速報の工賃単価か工場に確かめて reading の labor_rate に書く')
+            return
+        pick, why = hits[0], ''
+        if len(hits) > 1:
+            eva = set((self.rd.get('hints') or {}).get('eva_codes') or ())
+            present = [(int(it['code']), _dcode(it.get('method') or '', it.get('price') or 0, it.get('wage'))) for it in items if it.get('code') and not it.get('manual')]
+            score = {}
+            for rate in hits:
+                n = 0
+                for it in rows:
+                    try:
+                        st = self.parts.cogni_standard(int(it['code']), _dcode(it.get('method') or '', it.get('price') or 0, it.get('wage')), self.grade, self.fva, eva, self.year, present, self.body)
+                    except Exception:  # noqa: BLE001  標準が引けない行は数えない
+                        st = None
+                    if st and st.get('time') and abs(float(st['time']) - int(it['wage']) / rate) < 0.005:
+                        n += 1
+                score[rate] = n
+            ranked = sorted(hits, key=lambda r_: -score[r_])
+            if score[ranked[0]] >= 2 and (len(ranked) < 2 or score[ranked[0]] > score[ranked[1]]):
+                pick = ranked[0]
+                why = '（候補 ' + ' / '.join(f'{r_:,} 円: 標準指数と一致 {score[r_]} 行' for r_ in ranked[:4]) + '）'
+            else:
+                self._rev('要確認', 'レバーレート', '技術料からのレートの候補が複数あり、ADDATA の標準指数でも決まらない（候補 ' + ' / '.join(f'{r_:,}' for r_ in hits[:6])
+                          + ' 円）。速報の工賃単価か工場に確かめて reading の labor_rate に書く')
+                return
+        self.labor = pick
+        self.notes.append(f'レバーレート {pick:,} 円: 技術料を 0.1 刻みの指数で説明できるレート{why}')
+        self._rev('判断', 'レバーレート', f'{pick:,} 円（技術料だけの書式。技術料 ÷ レートが 0.1 刻みの指数になるレート{why}）')
 
     # ------------------------------------------------------------------ 塗装
     def _panel_code(self, text: str) -> Optional[dict]:
@@ -1216,6 +1453,8 @@ class Drafter:
         tt = self.apply_target_total(est)  # 生成器の実計算で材料代を決める（discount/frame を含めた後）
         est['totals'] = tt if tt else self.totals(items, paint, expenses)
         est['_draft_notes'] = self.notes
+        pos = {id(it): i + 1 for i, it in enumerate(items)}
+        est['_review'] = [dict({k: v for k, v in r.items() if k != '_item'}, row=pos.get(id(r.get('_item')), '')) for r in self.review]
         return est
 
 

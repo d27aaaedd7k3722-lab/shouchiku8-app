@@ -14,7 +14,9 @@
   - 装備監査: 生成器が選んだ装備で決まる標準品番と印字品番を突き合わせ、別の装備なら一致する行があれば ★ で警告（option_audit.py）
   - 印の照合: reading の行に印字の印（$ # * / 短縮記法の flags 列）があれば、生成 NEO の WageByManual と突き合わせて違いを表示（コグニ印刷の再現度）
   - 報告文: <案件フォルダ>/report.md に 車両・合計表・手入力行・判断点・要確認 をまとめる（亮平さんへの報告の下書き）
-  - 合格し --deliver があれば <deliver>/<name>_claude.neo にコピー（既存ファイルは上書きせず _2, _3 … を付ける）
+  - 確認箇所シート: <案件フォルダ>/<name>_確認箇所.xlsx（転記メモ・数量や部品コードを直した行・標準価格と違う行・手入力の行・★）。
+    NEO の明細コメントには人向けのメモを書かず、このシートで渡す（review_sheet.py。openpyxl が無ければ CSV）
+  - 合格し --deliver があれば <deliver>/<name>_claude.neo と <name>_claude_確認箇所.xlsx にコピー（既存ファイルは上書きせず _2, _3 … を付ける）
   - 合格したら工場の設定（レート・丸め・書式・費用の集計先）を <NEO_CHECK_ROOT>/_profiles/factory_profiles.json に記録（PC ごと・git に入れない。--no-profile で記録しない）
 終了コード: 0 合格 / 1 不合格（検算差・未照合・例外）
 """
@@ -128,6 +130,22 @@ def write_report(case: str, est: dict, rep: dict, rows: list[dict], inspect_json
     open(tmp, 'w', encoding='utf-8').write('\n'.join(L) + '\n')
     os.replace(tmp, path)
     return path
+
+
+def write_review(case: str, name: str, est: dict, rows: list[dict], rep: dict, inspect_json: str, check: Optional[dict], audit_lines: Optional[list], run_out: str) -> str:
+    """確認箇所シート（xlsx）を案件フォルダに書く。書いたパスを返す（review_sheet.py）"""
+    import review_sheet
+    warn: list = []
+    if inspect_json and os.path.exists(inspect_json):
+        try:
+            warn = json.load(open(inspect_json, encoding='utf-8-sig')).get('warnings') or []
+        except Exception as e:  # noqa: BLE001  壊れていてもシートは作る
+            warn = [f'inspect.json を読めなかった: {type(e).__name__}: {e}']
+    sys.path.insert(0, os.path.join(FILES, 'claude_neo_pipeline'))
+    import run_case  # noqa: E402  失敗したらシート生成の失敗として不合格にする（明細 No がずれたシートを渡さない。Codex 指摘）
+    ordered = run_case._rows_in_source_order(rows)  # リサイクル置換で末尾へ動いた行も見積の並びに戻す
+    entries = review_sheet.collect(est, ordered, warn, check, audit_lines, run_out)
+    return review_sheet.write(os.path.join(case, f'{name}_確認箇所.xlsx'), entries, est, ordered, rep)
 
 
 def main() -> int:
@@ -278,6 +296,15 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             print('装備監査で例外（合否には影響しない）:', e)
 
+    review_path = ''
+    if rep:
+        try:
+            review_path = write_review(case, name, est, rows, rep, inspect_json, check, audit_lines, out)
+            print('確認箇所シート:', review_path)
+        except Exception as e:  # noqa: BLE001
+            print('確認箇所シートの生成で例外:', type(e).__name__, e)
+    review_ng = not review_path  # 確認点は NEO ではなくシートで渡す（判断規則 10-22）。シートが作れなければ不合格（Codex 指摘）
+    ok = ok and not review_ng
     if not ok:
         if not a.no_report and rep:
             try:
@@ -293,6 +320,8 @@ def main() -> int:
             _why.append('ADDATA 照合率が低い（明細を手入力にしすぎ。判断規則 10-7）')
         if side_ng:
             _why.append('見積の名称と照合先で前後・左右が食い違う（ref の取り違え。判断規則 10-9）')
+        if review_ng:
+            _why.append('確認箇所シートが作れなかった（上の例外を直す。判断規則 10-22）')
         print('不合格: ' + ' / '.join(_why or ['理由不明']) + '。reading/estimate を直して再実行'); return 1
 
     # 5) 納品コピー
@@ -303,14 +332,38 @@ def main() -> int:
         dst_dir = os.path.abspath(a.deliver)
         if not os.path.isdir(dst_dir):
             print('納品先が無い:', dst_dir); return 1
+        if not review_path or not os.path.exists(review_path):
+            # 確認点は NEO の明細コメントではなくシートで渡す（判断規則 10-22）。シートが無いまま NEO だけ納品すると確認点が届かない
+            print('確認箇所シートが作れなかったので納品しない（上の例外を直して再実行）'); return 1
         base = f'{name}_claude'
-        dst = os.path.join(dst_dir, base + '.neo')
-        k = 2
-        while os.path.exists(dst):
-            dst = os.path.join(dst_dir, f'{base}_{k}.neo'); k += 1
-        shutil.copy2(neo, dst)
+        ext_r = os.path.splitext(review_path)[1] if review_path else ''
+        stem, k = base, 2
+        # NEO と確認箇所シートは同じ番号で揃える（どちらかが既にあれば次の番号）。既存ファイルは上書きしない
+        while os.path.exists(os.path.join(dst_dir, stem + '.neo')) or (review_path and os.path.exists(os.path.join(dst_dir, f'{stem}_確認箇所{ext_r}'))):
+            stem = f'{base}_{k}'; k += 1
+        dst = os.path.join(dst_dir, stem + '.neo')
+        dst_r = os.path.join(dst_dir, f'{stem}_確認箇所{ext_r}')
+        # 両方を納品先の一時名にコピーしてから名前を付ける。途中で失敗したら自分が作った一時ファイルとシートだけ片付ける
+        # （NEO だけ・シートだけが納品先に残らないように。既存ファイルは触らない。Codex 指摘）
+        tmp_n = os.path.join(dst_dir, f'.{stem}.{os.getpid()}.neo.tmp')
+        tmp_r = os.path.join(dst_dir, f'.{stem}.{os.getpid()}.review.tmp')
+        placed: list = []
+        try:
+            shutil.copy2(neo, tmp_n)
+            shutil.copy2(review_path, tmp_r)
+            os.rename(tmp_r, dst_r); placed.append(dst_r)
+            os.rename(tmp_n, dst); placed.append(dst)
+        except Exception:
+            for p_ in [tmp_n, tmp_r] + placed:
+                try:
+                    if os.path.exists(p_):
+                        os.remove(p_)
+                except OSError:
+                    pass
+            raise
         delivered = dst
         print('納品:', dst)
+        print('納品（確認箇所シート）:', dst_r)
     if check and not a.no_profile and os.path.exists(reading):  # 合格した案件の工場設定を記録（reading_check が FAIL なしのときだけ書く）
         rc, out2 = run([os.path.join(HERE, 'reading_check.py'), reading, '--save-profile', '--quiet'], FILES)
         line = next((l for l in out2.splitlines() if '工場プロファイル' in l), '')
