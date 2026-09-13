@@ -463,14 +463,12 @@ class Drafter:
                 if s >= 0.6 and self._std_unit(r) == unit_in:
                     exact.append((round(s, 3), 1 if self.parts.block_of(r) in (blk0, ctx_block) else 0, -r, r))
         exact.sort(reverse=True)
-        if exact:
-            s_e, same_blk, _, r_e = exact[0]
-            if div_ok:   # 数量の読み替えもできる: 同じ部位で名称が同等以上のときだけ単価の合う部品を採る
-                take = bool(same_blk) and s_e >= s0
-            else:        # 読み替えできない: 名称が近くない採用（s0 < 0.9）か、同じ名前の別部品（s_e >= 0.95）なら採る
-                take = s0 < 0.9 or s_e >= 0.95
-            if take:
-                return r_e, f'単価一致({price // qty:,} 円・名称 {s_e:.2f}) ← {why}', qty, f'部品コード {ref:04d} → {r_e:04d}（単価 {price // qty:,} 円が一致）'
+        # 採ってよい候補だけに絞ってから最良を選ぶ（先頭 1 件だけ見ると、別ブロックの先頭に隠れた同じブロックの候補を取り逃がす。Codex 指摘）
+        #   数量の読み替えもできる行: 同じ部位で名称が同等以上の候補だけ / 読み替えできない行: 名称が近くない採用（s0 < 0.9）なら全候補、そうでなければ同じ名前（0.95 以上）の候補だけ
+        ok_exact = [x for x in exact if ((x[1] and x[0] >= s0) if div_ok else (s0 < 0.9 or x[0] >= 0.95))]
+        if ok_exact:
+            s_e, _same_blk, _, r_e = ok_exact[0]
+            return r_e, f'単価一致({price // qty:,} 円・名称 {s_e:.2f}) ← {why}', qty, f'部品コード {ref:04d} → {r_e:04d}（単価 {price // qty:,} 円が一致）'
         if div_ok:
             return ref, why, n0, f'数量 1 → {n0}（金額 {price:,} ÷ 標準単価 {u0:,}）'
         if may_switch and qty == 1 and s0 < 0.9:  # 名称の弱い採用で単価も合わない: 名称がほぼ同じで単価が金額を割り切る部品（ドアトリムボードクリップ 720 = 90 × 8）
@@ -840,7 +838,9 @@ class Drafter:
                                   + '/'.join(sorted(self.parts.name20_by_ref.get(ref, ()))) + f'（{why}）。品番が無いので別の部品を選んでいないか確かめる')
             elif '名称近似' in why or 'ブロック内' in why:
                 self.notes.append(f"名称照合で決定: {name} → {ref} {'/'.join(sorted(self.parts.name20_by_ref.get(ref, ())))}（{why}）")
-            if '単価' not in (why or '').split(' ← ')[0]:  # 単価で別部位の ref に直した行（同じ品番の小物が別ブロックにある）は、後続行の部位文脈を動かさない
+            _moved_by_price = '単価' in (why or '').split(' ← ')[0]
+            if not _moved_by_price or not ctx_block or self.parts.block_of(ref) == ctx_block:
+                # 単価で**別の部位ブロック**の ref に直した行（同じ品番の小物が別ブロックにある）だけは、後続行の部位文脈を動かさない（同じブロック・文脈が空なら通常どおり更新。Codex 指摘）
                 ctx_block = self.parts.block_of(ref) or ctx_block
             used.add(ref)
             item['code'] = f'{ref:04d}'
@@ -870,6 +870,8 @@ class Drafter:
                         self.notes.append(f'板金 {name} {area}d㎡ 指数 {t} → ランク {hit}')
                     else:
                         self.notes.append(f"板金 {name} {area}d㎡ 指数 {t} は BANKIN.DB のどのランクとも違う → '#' 手入力")
+                elif area and t is None and wage:
+                    item['_bankin_area'] = area  # レートがまだ決まっていない（技術料だけの書式）。_labor_from_wages でレートが決まったらランクを引き直す
                 elif area is None:
                     self.notes.append(f"板金 {name}: 損傷面積が読めない → '#' 手入力（面積が分かれば bankin を付ける）")
             # 左右分割: 左右指定の無い名称で左 ref に数量 2n
@@ -898,6 +900,8 @@ class Drafter:
             out.append(item)
         if not labor and not self.generic and not _money_or(self.rd.get('labor_rate'), name='labor_rate'):
             self._labor_from_wages(out)
+        for it in out:
+            it.pop('_bankin_area', None)
         return out
 
     def _labor_from_wages(self, items: list[dict]) -> None:
@@ -908,7 +912,14 @@ class Drafter:
         wages = sorted({int(it['wage']) for it in rows if int(it['wage']) > 0})
         if not wages:
             return
-        hits = [r for r, _ in guess(wages, unit=self.wage_round or 10)]
+        hits, unit = [], self.wage_round or 10
+        for unit in ((self.wage_round,) if (self.wage_round or 10) != 10 else (10, 100)):  # 工賃の丸め単位も分からないので 10 円 → 100 円の順に試す（Codex 指摘）
+            hits = [r for r, _ in guess(wages, unit=unit)]
+            if hits:
+                break
+        if hits and unit != (self.wage_round or 10):
+            self.wage_round = unit
+            self.notes.append(f'工賃の丸め単位 {unit} 円（技術料が 0.1 刻みの指数 × レートの {unit} 円丸めでだけ説明できる）→ estimate.wage_round')
         if not hits:
             self._rev('要確認', 'レバーレート', f'技術料 {len(wages)} 種類を 0.1 刻みの指数で説明できるレートが無い。速報の工賃単価か工場に確かめて reading の labor_rate に書く')
             return
@@ -938,6 +949,17 @@ class Drafter:
         self.labor = pick
         self.notes.append(f'レバーレート {pick:,} 円: 技術料を 0.1 刻みの指数で説明できるレート{why}')
         self._rev('判断', 'レバーレート', f'{pick:,} 円（技術料だけの書式。技術料 ÷ レートが 0.1 刻みの指数になるレート{why}）')
+        for it in items:  # レートが決まる前に面積だけ分かっていた板金行のランクを引き直す（Codex 指摘）
+            area = it.pop('_bankin_area', None)
+            if not area or it.get('bankin') or not it.get('wage'):
+                continue
+            t = round(float(it['wage']) / pick, 2)
+            hit = next((rk for rk in 'ABC' if bankin_time(area, rk) is not None and abs(bankin_time(area, rk) - t) < 0.005), None)
+            if hit:
+                it['bankin'] = {'area': area, 'yes': BANKIN_YES[hit]}
+                self.notes.append(f"板金 {it.get('name')} {area}d㎡ 指数 {t} → ランク {hit}（レート決定後）")
+            else:
+                self.notes.append(f"板金 {it.get('name')} {area}d㎡ 指数 {t} は BANKIN.DB のどのランクとも違う → '#' 手入力")
 
     # ------------------------------------------------------------------ 塗装
     def _panel_code(self, text: str) -> Optional[dict]:

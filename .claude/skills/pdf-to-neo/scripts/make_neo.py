@@ -14,9 +14,9 @@
   - 装備監査: 生成器が選んだ装備で決まる標準品番と印字品番を突き合わせ、別の装備なら一致する行があれば ★ で警告（option_audit.py）
   - 印の照合: reading の行に印字の印（$ # * / 短縮記法の flags 列）があれば、生成 NEO の WageByManual と突き合わせて違いを表示（コグニ印刷の再現度）
   - 報告文: <案件フォルダ>/report.md に 車両・合計表・手入力行・判断点・要確認 をまとめる（亮平さんへの報告の下書き）
-  - 確認箇所シート: <案件フォルダ>/<name>_確認箇所.xlsx（転記メモ・数量や部品コードを直した行・標準価格と違う行・手入力の行・★）。
+  - 確認箇所シート: <案件フォルダ>/<name>_確認箇所.xlsx（openpyxl が無ければ .csv）（転記メモ・数量や部品コードを直した行・標準価格と違う行・手入力の行・★）。
     NEO の明細コメントには人向けのメモを書かず、このシートで渡す（review_sheet.py。openpyxl が無ければ CSV）
-  - 合格し --deliver があれば <deliver>/<name>_claude.neo と <name>_claude_確認箇所.xlsx にコピー（既存ファイルは上書きせず _2, _3 … を付ける）
+  - 合格し --deliver があれば <deliver>/<name>_claude.neo と <name>_claude_確認箇所.xlsx（または .csv）にコピー（既存ファイルは上書きせず _2, _3 … を付ける）
   - 合格したら工場の設定（レート・丸め・書式・費用の集計先）を <NEO_CHECK_ROOT>/_profiles/factory_profiles.json に記録（PC ごと・git に入れない。--no-profile で記録しない）
 終了コード: 0 合格 / 1 不合格（検算差・未照合・例外）
 """
@@ -220,6 +220,13 @@ def main() -> int:
     # 3) 生成・検算
     name = a.name or os.path.basename(case)
     neo = os.path.join(case, f'{name}.neo')
+    def _stat(p_: str):
+        try:
+            st_ = os.stat(p_)
+            return (st_.st_mtime_ns, st_.st_size, getattr(st_, 'st_ino', 0))
+        except OSError:
+            return None
+    neo_before = _stat(neo)  # 実行前の <name>.neo（前回の合格分）。今回 run_case が書き換えたときだけ、不合格なら隔離する（Codex 指摘）
     rc, out = run([os.path.join(FILES, 'claude_neo_pipeline', 'run_case.py'), est_path, neo], FILES)
     print('== run_case ==')
     print(out.rstrip())
@@ -306,9 +313,21 @@ def main() -> int:
     review_ng = not review_path  # 確認点は NEO ではなくシートで渡す（判断規則 10-22）。シートが作れなければ不合格（Codex 指摘）
     ok = ok and not review_ng
     if not ok:
+        # run_case が合格して <name>.neo を置いたあとに make_neo 側の関門（低照合率・確認箇所シート…）で落ちたときも、
+        # 納品物の名前の NEO を残さない（run_case と同じく .ng.neo に隔離。アプリが組でない NEO を拾わないように。Codex 指摘）
+        ng_path = os.path.splitext(neo)[0] + '.ng.neo'
+        neo_for_report = ng_path if os.path.exists(ng_path) else neo  # run_case の検算で落ちたときは run_case が .ng.neo に置いている
+        if os.path.exists(neo) and _stat(neo) != neo_before:
+            try:
+                os.replace(neo, ng_path)
+                neo_for_report = ng_path
+                print('不合格なので NEO を隔離した:', ng_path)
+            except OSError as e:
+                neo_for_report = neo
+                print('不合格の NEO を隔離できなかった（手で消すか名前を変える）:', neo, e)
         if not a.no_report and rep:
             try:
-                write_report(case, est, rep, rows, inspect_json, out, marks, neo, '', check, audit_lines)
+                write_report(case, est, rep, rows, inspect_json, out, marks, neo_for_report, '', check, audit_lines)  # 不合格の報告は実際に残った NEO（.ng.neo）を指す（Codex 指摘）
             except Exception as e:  # noqa: BLE001
                 print('報告文の生成で例外:', e)
         _why = []
