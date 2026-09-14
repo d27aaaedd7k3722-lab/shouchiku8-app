@@ -2886,9 +2886,11 @@ class NeoBuilder:
         gin = _date8(ins.get('garage_in', '')); gout = _date8(ins.get('garage_out', ''))
         giera, giey = nc.get_era_info(gin) if gin else ('令和', ''); goera, goey = nc.get_era_info(gout) if gout else ('令和', '')
         cur.execute('''UPDATE Insurance SET PolicyNo=?,ContractorName=?,AgencyName=?,AccidentDate=?,AccidentEra=?,AccidentEraYear=?,PresenceDate=?,PresenceEra=?,PresenceEraYear=?,
-                       AgreedDate='00000000',AgreedEra='令和',AgreedEraYear='',RepairDays=?,TimelyPriceOutTax=-1,TimelyPriceInTax=-1,TimelyPriceTax=-1,AdjusterName=?,AdjusterPost='',ConsultantName='',ConsultantFactory=?''',
+                       AgreedDate='00000000',AgreedEra='令和',AgreedEraYear='',RepairDays=?,TimelyPriceOutTax=-1,TimelyPriceInTax=-1,TimelyPriceTax=-1,AdjusterName=?,AdjusterPost=?,ConsultantName='',ConsultantFactory=?''',
                     (_fit(ins.get('policy_no', ''), 20), _fit(ins.get('contractor', ''), 20), _fit(ins.get('agency', ''), 20), acc, aera, aey, pre, pera, pey,
-                     _int_or(ins.get('repair_days'), -1), _fit(ins.get('adjuster', ''), 20), _fit(ins.get('factory', ''), 30)))
+                     _int_or(ins.get('repair_days'), -1), _fit(ins.get('adjuster', ''), 20),
+                     _fit(ins.get('adjuster_post', ''), 20),   # アジャスターの支店・所属（速報報告書の「支店」。2026-09-14）
+                     _fit(ins.get('factory', ''), 30)))
         eera, eey = nc.get_era_info(est_date)
         cur.execute("UPDATE FileInfo SET EstimatedDate=?,EstimatedEra=?,EstimatedEraYear=?,AcceptNo=?,GarageInDate=?,GarageInEra=?,GarageInEraYear=?,"
                     "GarageOutDate=?,GarageOutEra=?,GarageOutEraYear=?,Note1='',Note2='',Note3=''",

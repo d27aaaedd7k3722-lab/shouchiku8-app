@@ -59,6 +59,7 @@
 | customer.owner_name / user_name | **NEO の所有者欄・使用者欄に入るのはこの 2 つだけ**。`owner` は車検証の所有者を控えるメモで NEO には書かれない（コグニ運用では所有者欄に顧客名を入れることが多い。実機 cogni_R1/R2）。所有者を出したい案件だけ `owner_name` に書く |
 | insurance.company / policy_no / contractor / accident_date / presence_date / factory | 案件フォルダ名（損保）・速報 PDF。分からない項目は空文字。`factory` は「工場名 電話番号」 |
 | insurance.accept_no / agency / adjuster / garage_in / garage_out / repair_days | 事故受付番号（FileInfo.AcceptNo・XML・AnSvMail）／代理店（Insurance.AgencyName）／アジャスター（Insurance.AdjusterName・XML）／入庫日・出庫日（YYYYMMDD → FileInfo.GarageIn*/GarageOut*。XML には書かない: 実機 178 本で日付があっても空）／修理日数（Insurance.RepairDays、無ければ -1）。無ければ従来どおり空（2026-09-14） |
+| insurance.adjuster_post | アジャスターの支店・所属（速報報告書の「支店」「サービスセンター」）。NEO の Insurance.AdjusterPost（20 バイト）。分からなければ空文字（2026-09-14） |
 
 ## items（明細行、見積書の並び順で）
 
