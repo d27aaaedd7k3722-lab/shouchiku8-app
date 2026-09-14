@@ -82,6 +82,12 @@ def main() -> int:
           f"番兵 00000000 → 雛形どおり {f['GarageInEra']!r} {f['GarageInEraYear']!r} {f['GarageOutEraYear']!r}")
     check(i['AccidentDate'] == '00000000' and str(i['AccidentEraYear']) == '', f"番兵 00000000（事故日） {i['AccidentEraYear']!r}")
 
+    # 改元の境界日: 2019-04-30 入庫は平成 31 年、2019-05-01 事故は令和元年（年だけで分けると狂う。Codex 指摘 2026-09-14）
+    i, f, xml, mail = build({'garage_in': '20190430', 'garage_out': '20190501', 'accident_date': '20190501'}, 'era')
+    check(f['GarageInEra'] == '平成' and str(f['GarageInEraYear']) == '0031' and f['GarageOutEra'] == '令和' and str(f['GarageOutEraYear']) == '0001',
+          f"改元境界 GarageIn/Out {f['GarageInEra']!r} {f['GarageInEraYear']!r} / {f['GarageOutEra']!r} {f['GarageOutEraYear']!r}")
+    check(i['AccidentEra'] == '令和' and str(i['AccidentEraYear']) == '0001', f"改元境界 Accident {i['AccidentEra']!r} {i['AccidentEraYear']!r}")
+
     # 引数 insurance= を渡したときはそちらが優先（make_neo.py など既存の呼び出し元の経路）
     i, f, xml, mail = build({'accept_no': 'IGNORED'}, 'explicit', explicit={'accept_no': 'B-0002', 'adjuster': '引数側'})
     check(f['AcceptNo'] == 'B-0002' and i['AdjusterName'] == '引数側', f"引数 insurance= が優先 {f['AcceptNo']!r} {i['AdjusterName']!r}")
