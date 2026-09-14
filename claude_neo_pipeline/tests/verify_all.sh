@@ -15,6 +15,7 @@ run 'unit manual rows (cogni 2026-09-08)' bash -c 'set -o pipefail; PYTHONIOENCO
 run 'unit settings (cogni 2026-09-08)' bash -c 'set -o pipefail; PYTHONIOENCODING=utf-8 python "$0/unit_settings.py" | tail -2' "$SP"
 run 'unit insurance (受付番号・代理店・アジャスター・入出庫日)' bash -c 'set -o pipefail; PYTHONIOENCODING=utf-8 python "$0/unit_insurance.py" | tail -2' "$SP"
 run 'unit era (元号は改元日で分ける)' bash -c 'set -o pipefail; PYTHONIOENCODING=utf-8 python "$0/unit_era.py" | tail -2' "$SP"
+run 'unit era (元号は改元日で分ける)' bash -c 'set -o pipefail; PYTHONIOENCODING=utf-8 python "$0/unit_cab.py" | tail -2' "$SP"
 run 'unit link/absorb (cogni 2026-09-08 H1-H7/G1)' bash -c 'set -o pipefail; PYTHONIOENCODING=utf-8 python "$0/unit_link_absorb.py" | tail -2' "$SP"
 run 'AnSMB 142 桁一致 (そのまま保存 25 本・実案件を含む)' bash -c 'set -o pipefail; PYTHONIOENCODING=utf-8 python "$0/audit_cogni_files.py" --ansmb | tail -1' "$SP"
 run 'unit guards (入力の境界)' bash -c 'set -o pipefail; PYTHONIOENCODING=utf-8 python "$0/unit_guards.py" | tail -1' "$SP"
