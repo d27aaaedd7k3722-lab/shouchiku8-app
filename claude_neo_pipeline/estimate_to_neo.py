@@ -206,6 +206,12 @@ BUMPER_ONLY_KEYS = ('paint', 'coat', 'hf', 'panels', 'bumper_front', 'bumper_rea
 PAINT_DETAIL_KEYS = ('bumper_front', 'bumper_rear', 'wax', 'door_sash', 'stripe', 'low_cover', 'two_coat_solid', 'two_tone')  # パネル別指数（paint.panels）のときだけ書ける項目。frame / sealing / other は一括計上でも可
 
 
+def is_bumper_only_paint(p: dict) -> bool:
+    """外板パネルが無くバンパだけ塗る詳細塗装（panels: [] + bumper_*、キーは許可リストだけ）か。NeoBuilder の判定と同じ（検算側が同じ関数を使う）"""
+    return (isinstance(p.get('panels'), list) and not p.get('panels') and any(p.get(k) for k in ('bumper_front', 'bumper_rear'))
+            and all(k in BUMPER_ONLY_KEYS or str(k).startswith('_') for k in p))
+
+
 def _code4(v) -> str:
     """部品コードを 4 桁の文字列にする。10 / '10' / '0010' / 10.0 のどれで書かれても同じに扱う"""
     if v is None or v == '':
@@ -3254,7 +3260,7 @@ class NeoBuilder:
         _pd0 = estimate.get('paint') or {}
         # パネルが 1 枚も無くバンパだけ塗る見積（`panels: []` + bumper_front/rear）も塗装詳細として扱う（実機 2026-09-12 w66d_real: 加算基礎数値 -1、BAN.DB のバンパ加算基礎）
         _bumper_only0 = (isinstance(_pd0.get('panels'), list) and not _pd0.get('panels') and any(_pd0.get(k) for k in ('bumper_front', 'bumper_rear'))
-                        and all(k in BUMPER_ONLY_KEYS for k in _pd0))  # 許可リスト外のキー（sealing / frame / other / 付加塗装 / base / booth …）が混じる組合せは実機未確認なので従来どおり止める（Codex 指摘）
+                        and all(k in BUMPER_ONLY_KEYS or str(k).startswith('_') for k in _pd0))  # _ で始まる下書きの内部キー（_total_from_lines 等）は読まない  # 許可リスト外のキー（sealing / frame / other / 付加塗装 / base / booth …）が混じる組合せは実機未確認なので従来どおり止める（Codex 指摘）
         self._paint_detail = _pd0 if (_pd0.get('panels') or _bumper_only0) else None
         if not self._paint_detail:
             extra = [k for k in PAINT_DETAIL_KEYS if (estimate.get('paint') or {}).get(k)]
