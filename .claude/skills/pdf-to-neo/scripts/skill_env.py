@@ -130,15 +130,20 @@ def is_addata_partial(p: str) -> bool:
         return False
 
 
+def partial_flag() -> bool:
+    """ADDATA_ROOT_PARTIAL=1: 環境変数 ADDATA_ROOT に「COM ＋ 必要な車種フォルダだけ」の部分コピーを渡していると宣言している。
+    このときは環境変数以外（設定ファイル・既定パス・自動検出）に決して落とさない（別の Addata で黙って作らない = fail closed）"""
+    return (os.environ.get('ADDATA_ROOT_PARTIAL') or '').strip().lower() in ('1', 'true', 'yes')
+
+
 def is_addata_or_partial(p: str) -> bool:
     """環境変数 ADDATA_ROOT の検証。ADDATA_ROOT_PARTIAL=1 のときは、環境変数 ADDATA_ROOT そのものに限って部分コピーも採る。
     設定ファイルや自動検出の候補は is_addata() のまま（部分コピーを拾って別の版で作らない）。
     旗が無いと部分コピーは弾かれて自動検出に落ちる ＝ 開発機では C:\Addata に化け、Cloud では見つからず失敗する（2026-09-14 Codex 43）"""
     if is_addata(p):
         return True
-    flag = (os.environ.get('ADDATA_ROOT_PARTIAL') or '').strip().lower() in ('1', 'true', 'yes')
     env = os.environ.get('ADDATA_ROOT') or ''
-    return flag and bool(env) and os.path.normcase(os.path.abspath(p)) == os.path.normcase(os.path.abspath(env)) and is_addata_partial(p)
+    return partial_flag() and bool(env) and os.path.normcase(os.path.abspath(p)) == os.path.normcase(os.path.abspath(env)) and is_addata_partial(p)
 
 
 def addata_version(p: str) -> str:
@@ -492,7 +497,12 @@ def resolve(save: bool = False) -> dict:
                 return v
         return detect() or ''
     out['COGNI_BIN'] = pick('COGNI_BIN', os.path.isfile, find_cogni)
-    out['ADDATA_ROOT'] = pick('ADDATA_ROOT', is_addata_or_partial, lambda: find_addata(out['COGNI_BIN']))  # COM だけ残った古いコピー等は不採用（ADDATA_ROOT_PARTIAL=1 の環境変数だけ部分コピー可）
+    if partial_flag():
+        # 部分 Addata を渡すと宣言している: 環境変数が無効なら空にする（設定ファイル・自動検出に落ちて別の Addata で作らない）
+        env_root = os.environ.get('ADDATA_ROOT') or ''
+        out['ADDATA_ROOT'] = env_root if (env_root and _bounded(lambda: is_addata_or_partial(env_root), 3.0, False)) else ''
+    else:
+        out['ADDATA_ROOT'] = pick('ADDATA_ROOT', is_addata, lambda: find_addata(out['COGNI_BIN']))  # COM だけ残った古いコピー等は不採用
     out['NEO_CHECK_ROOT'] = os.environ.get('NEO_CHECK_ROOT') or cfg.get('NEO_CHECK_ROOT') or os.path.join(os.path.expanduser('~'), 'Documents', 'NEO_check')
     # 雛形 NEO はリポジトリ同梱のものを毎回その場で解決する（設定ファイルには保存しない: 別 PC やフォルダ移動で古い絶対パスが残るのを防ぐ）。環境変数だけ上書き可
     out['NEO_TEMPLATE'] = os.environ.get('NEO_TEMPLATE') or ''

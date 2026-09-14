@@ -576,6 +576,21 @@ def test_partial_root_only_with_flag():
         got2 = skill_env.resolve().get('ADDATA_ROOT')
         assert os.path.normcase(os.path.abspath(got2 or '')) != os.path.normcase(os.path.abspath(part)), \
             '旗なしの resolve() が部分コピーを採ってしまう'
+        # 旗ありで環境変数が無効（COM が届いていない）: 自動検出・既定パスに落とさず空（fail closed）
+        os.environ['ADDATA_ROOT_PARTIAL'] = '1'
+        os.environ['ADDATA_ROOT'] = os.path.join(ROOT, 'nothing')
+        got3 = skill_env.resolve().get('ADDATA_ROOT')
+        assert got3 == '', f'旗ありで無効な環境変数なのに {got3!r} に落ちた（別の Addata で黙って作る）'
+        sys.path.insert(0, os.path.join(skill_env.FILES, 'claude_neo_pipeline'))
+        import addata_vehicle_resolver as _avr
+        try:
+            _avr.find_addata_root()
+            raise AssertionError('resolver の find_addata_root() が旗ありで無効な環境変数から既定パス・探索に落ちた')
+        except FileNotFoundError:
+            pass
+        os.environ['ADDATA_ROOT'] = part
+        assert os.path.normcase(os.path.abspath(_avr.find_addata_root())) == os.path.normcase(os.path.abspath(part)), \
+            'resolver が部分コピー（COM あり）の環境変数を採らない'
     finally:
         for k, v in keep.items():
             if v is None:
