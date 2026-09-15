@@ -3131,7 +3131,7 @@ class NeoBuilder:
         vals = {'CustomerName1': _fit(cust.get('name', ''), 30), 'CustomerName2': '', 'AdjusterName': _fit(ins.get('adjuster', ''), 20), 'AcceptNo': _fit(ins.get('accept_no', ''), 37), 'TicketNo': _fit(ins.get('policy_no', ''), 20),   # DB と同じ欄幅
                 'AccidentDate': (f'{_acc8[:4]}/{_acc8[4:6]}/{_acc8[6:8]}' if _acc8 else ''),
                 'CarNo': f'{dep}{div}{biz}{ser}', 'CarName': car.get('CarNameByUser', ''), 'CarMouldNo': car.get('ps_CarMouldNo', ''), 'CarKindNo': car.get('ps_CarKindNo', ''),
-                'ColorCode': car.get('ColorCode', ''), 'OwnerName': cust.get('owner_name', cust.get('name', '')), 'UserName': cust.get('user_name', '同上'),
+                'ColorCode': car.get('ColorCode', ''), 'OwnerName': _fit(cust.get('owner_name', cust.get('name', '')), 20), 'UserName': _fit(cust.get('user_name', '同上'), 20),   # DB と同じ欄幅（XML だけ切っていなかった。2026-09-15 アプリのレビュー）
                 'CreatedDate': f'{est_date[:4]}/{est_date[4:6]}/{est_date[6:8]}', 'GarageInDate': '', 'GarageOutDate': '', 'CarSerialNo': car.get('ps_CarSerialNo', ''),
                 'CarTermEraDate': '', 'Kilometrage': str(cust.get('kilometer') or ''), 'CarRegistedDate': (f'{reg[:4]}/{reg[4:6]}' if reg else ''),
                 'ii_CustomerName': _fit(ins.get('contractor', ''), 20), 'ii_PresenceDate': '', 'ii_AgreedDate': '', 'ii_RepairDays': '', 'ii_TimePrice': '',

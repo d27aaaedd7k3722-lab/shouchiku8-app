@@ -54,6 +54,16 @@ def test_xml_and_ini_values_are_literal():
     assert nc.replace_ini_value(ini, 'Key', '\\1a\r\nX=2') == 'Key=\\1a X=2\r\nNext=1'
 
 
+def test_xml_owner_user_fit_like_db():
+    """XML の所有者名・使用者名も DB と同じ 20 バイトで切る（XML だけ 50 バイトのまま出ていた。2026-09-15 アプリのレビュー）"""
+    from estimate_to_neo import NeoBuilder
+    xml = '<OwnerName></OwnerName><UserName></UserName><CustomerName1></CustomerName1>'.encode('cp932')
+    out = NeoBuilder.build_xml(xml, {}, {'name': 'ア' * 25, 'owner_name': 'イ' * 25, 'user_name': 'ウ' * 25}, {}, 0, '20260915').decode('cp932')
+    assert '<OwnerName>' + 'イ' * 10 + '</OwnerName>' in out, out
+    assert '<UserName>' + 'ウ' * 10 + '</UserName>' in out, out
+    assert '<CustomerName1>' + 'ア' * 15 + '</CustomerName1>' in out, out
+
+
 def test_split_address_text_known_shape():
     assert split_address_text('福岡県北九州市小倉北区検証町1-2-3') == ('福岡県', '北九州市', '小倉北区検証町1-2-3')
     assert split_address_text('東京都千代田区丸の内1-1') == ('東京都', '千代田区', '丸の内1-1')
