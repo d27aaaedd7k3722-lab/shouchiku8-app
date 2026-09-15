@@ -1144,7 +1144,15 @@ class Drafter:
         if not wages:
             return
         hits, unit = [], self.wage_round or 10
-        for unit in ((self.wage_round,) if (self.wage_round or 10) != 10 else (10, 100)):  # 工賃の丸め単位も分からないので 10 円 → 100 円の順に試す（Codex 指摘）
+        if (self.wage_round or 10) != 10:
+            units = (self.wage_round,)
+        elif any(w % 10 for w in wages):
+            # 10 円の倍数でない技術料（13,716 = 1.8 × 7,620）がある = 工場のコグニは 1 円単位の設定。10 円 / 100 円丸めでは
+            # どのレートでも説明できず、レートが決まらないまま生成器が 100 円刻みの推定（7,600）で作ってしまう（2026-09-15 スペーシア FAX 見積）
+            units = (1,)
+        else:
+            units = (10, 100)   # 工賃の丸め単位も分からないので 10 円 → 100 円の順に試す（Codex 指摘）
+        for unit in units:
             hits = [r for r, _ in guess(wages, unit=unit)]
             if hits:
                 break
