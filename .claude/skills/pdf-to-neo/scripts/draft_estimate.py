@@ -1015,7 +1015,9 @@ class Drafter:
                                   + '/'.join(sorted(self.parts.name20_by_ref.get(ref, ()))) + f'（{why}）。品番が無いので別の部品を選んでいないか確かめる')
             elif '名称近似' in why or 'ブロック内' in why:
                 self.notes.append(f"名称照合で決定: {name} → {ref} {'/'.join(sorted(self.parts.name20_by_ref.get(ref, ())))}（{why}）")
-            _moved_by_price = '単価' in (why or '').split(' ← ')[0]
+            # 工賃・指数のある主作業の行は、単価で決めた（残した）行でも部位の文脈を動かす（後に続く付属の小物はその部位のもの。
+            # 左ﾌﾛﾝﾄﾌｪﾝﾀﾞﾊﾟﾈﾙ 取替の後のｸﾘｯﾌﾟ ×12 がフードのｸﾘｯﾌﾟになっていた。2026-09-15 アプリの実機テスト）
+            _moved_by_price = '単価' in (why or '').split(' ← ')[0] and not ((wage or 0) > 0 or (index or 0) > 0)
             if not _moved_by_price or not ctx_block or self.parts.block_of(ref) == ctx_block:
                 # 単価で**別の部位ブロック**の ref に直した行（同じ品番の小物が別ブロックにある）だけは、後続行の部位文脈を動かさない（同じブロック・文脈が空なら通常どおり更新。Codex 指摘）
                 ctx_block = self.parts.block_of(ref) or ctx_block
