@@ -3078,7 +3078,7 @@ class NeoBuilder:
                        AgreedDate='00000000',AgreedEra='令和',AgreedEraYear='',RepairDays=?,TimelyPriceOutTax=-1,TimelyPriceInTax=-1,TimelyPriceTax=-1,AdjusterName=?,AdjusterPost=?,ConsultantName='',ConsultantFactory=?''',
                     (_fit(ins.get('policy_no', ''), 20), _fit(ins.get('contractor', ''), 20), _fit(ins.get('agency', ''), 20), acc, aera, aey, pre, pera, pey,
                      _int_or(ins.get('repair_days'), -1), _fit(ins.get('adjuster', ''), 20),
-                     _fit(ins.get('adjuster_post', ''), 20),   # アジャスターの支店・所属（速報報告書の「支店」。2026-09-14）
+                     _fit(ins.get('adjuster_post', ''), 40),   # アジャスターの支店・所属（速報報告書の「支店」。2026-09-14）。列は TEXT(40)（アプリの旧経路と同じ幅。2026-09-15）
                      _fit(ins.get('factory', ''), 30)))
         eera, eey = nc.get_era_info(est_date)
         cur.execute("UPDATE FileInfo SET EstimatedDate=?,EstimatedEra=?,EstimatedEraYear=?,AcceptNo=?,GarageInDate=?,GarageInEra=?,GarageInEraYear=?,"
