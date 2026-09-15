@@ -1160,7 +1160,11 @@ class Drafter:
             self.wage_round = unit
             self.notes.append(f'工賃の丸め単位 {unit} 円（技術料が 0.1 刻みの指数 × レートの {unit} 円丸めでだけ説明できる）→ estimate.wage_round')
         if not hits:
-            self._rev('要確認', 'レバーレート', f'技術料 {len(wages)} 種類を 0.1 刻みの指数で説明できるレートが無い。速報の工賃単価か工場に確かめて reading の labor_rate に書く')
+            odd = [w for w in wages if w % 10]
+            tried = ' / '.join(f'{u} 円' for u in units)
+            self._rev('要確認', 'レバーレート', f'技術料 {len(wages)} 種類を 0.1 刻みの指数で説明できるレートが無い（試した丸め単位 {tried}'
+                      + (f'。10 円の倍数でない技術料 {", ".join(f"{w:,}" for w in odd[:4])} があるので 1 円丸めだけを試した。写し間違いなら直す' if odd else '')
+                      + '）。速報の工賃単価か工場に確かめて reading の labor_rate に書く')
             return
         pick, why = hits[0], ''
         if len(hits) > 1:
