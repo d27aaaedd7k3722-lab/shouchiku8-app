@@ -842,7 +842,7 @@ class Drafter:
         if self.wage_round != 10:
             self.notes.append(f'工賃の丸め単位 {self.wage_round} 円（印字の工賃が指数×レートの {self.wage_round} 円丸めと一致）→ estimate.wage_round')
         has_wage_col = any(r.get('wage') is not None or r.get('index') is not None for r in rows_flat)  # 工賃列のある書式か
-        has_index_col = any(r.get('index') is not None for r in rows_flat)  # 指数列のある書式か（コグニ印刷は工賃だけ）
+        has_index_col = any(_num(r.get('index')) != '' for r in rows_flat)  # 指数列のある書式か（コグニ印刷は工賃だけ）。空欄（''・'-'）は行の読み取りと同じく「指数なし」
         ctx_block = ''
         used: set[int] = set()
         cur_title = None
@@ -894,16 +894,20 @@ class Drafter:
             elif has_wage_col and dcode == 0 and price > 0 and index is None:
                 item['wage'] = 0  # 工賃列のある書式で工賃も指数も空の部品行 = 付属部品（工賃なし）
             # それ以外（工賃列の無い書式、脱着/修理/板金で工賃が読めない行）は wage を省略し、生成器の標準指数に任せる
-            if index is None and not has_index_col and '#' in str(row.get('mark') or '') and labor and int(item.get('wage') or 0) > 0:
+            if index is None and not has_index_col and '#' in str(row.get('mark') or '') and int(item.get('wage') or 0) > 0:
                 # コグニ印刷で指数の列が無い書式の `#`（手入力指数）行: 指数を工賃から起こす。
                 # 起こさないと生成器は「工賃だけ手入力」（Time -1・印 `*`）になり、コグニの印字（`#`・指数あり）と食い違う。
                 # `*`（工賃だけ手入力）の行は起こさない（3800 ﾗｲｾﾝｽﾌﾟﾚｰﾄ脱着修正 12,000 = 1.5 も `*` のまま）
-                _x = index_from_wage(int(item.get('wage') or 0), labor, self.wage_round)
-                if _x:
+                _x = index_from_wage(int(item.get('wage') or 0), labor, self.wage_round) if labor else None
+                if _x is not None:
                     index = _x
-                    self.notes.append(f'{name_raw}: 印字の印 # （手入力指数）だが指数の列が無い書式なので、指数 {_x:g} = 工賃 {int(item["wage"]):,} ÷ レート {labor:,} として写した')
+                    self.notes.append(f'{name_raw}: 印字の印 # （手入力指数）なので、指数 {_x:g} = 工賃 {int(item["wage"]):,} ÷ レート {labor:,} を 0.1 刻みに丸めた値として写した'
+                                      f'（{_x:g} × {labor:,} を {self.wage_round} 円丸めで戻すと印字の工賃に一致。この書式には指数の列が無い）')
+                elif not labor:
+                    item['_index_from_mark'] = True   # レートが技術料から後で決まる書式: レート確定後に起こす（_labor_from_wages の最後）
                 else:
-                    self.notes.append(f'{name_raw}: 印字の印 # （手入力指数）だが、工賃 {int(item.get("wage") or 0):,} がレート {labor:,} の 0.1 刻みで割り切れないので指数を起こさない（工賃だけ手入力の行になる）')
+                    self.notes.append(f'{name_raw}: 印字の印 # （手入力指数）だが、工賃 {int(item.get("wage") or 0):,} はレート {labor:,} × 0.1 刻みの指数'
+                                      f'（{self.wage_round} 円丸め）では作れないので指数を起こさない（工賃だけ手入力の行になる）')
             if index is not None and float(index) > 0:
                 item['index'] = float(index)
             if row.get('comment'):  # 転記メモ（人が確かめる点）。NEO の明細コメントには書かず確認箇所シートへ
@@ -1221,6 +1225,16 @@ class Drafter:
         self.labor = pick
         self.notes.append(f'レバーレート {pick:,} 円: 技術料を 0.1 刻みの指数で説明できるレート{why}')
         self._rev('判断', 'レバーレート', f'{pick:,} 円（技術料だけの書式。技術料 ÷ レートが 0.1 刻みの指数になるレート{why}）')
+        for it in items:  # レートが決まる前に印 `#` だけ分かっていた行の指数を起こす（指数の列が無く技術料だけの書式）
+            if not it.pop('_index_from_mark', False) or it.get('index'):
+                continue
+            x_ = index_from_wage(int(it.get('wage') or 0), pick, self.wage_round)
+            if x_ is not None:
+                it['index'] = x_
+                self.notes.append(f"{it.get('name')}: 印字の印 # （手入力指数）なので、指数 {x_:g} = 工賃 {int(it.get('wage') or 0):,} ÷ レート {pick:,}（レート決定後）")
+            else:
+                self.notes.append(f"{it.get('name')}: 印字の印 # （手入力指数）だが、工賃 {int(it.get('wage') or 0):,} はレート {pick:,} × 0.1 刻みの指数"
+                                  f"（{self.wage_round} 円丸め）では作れないので指数を起こさない（工賃だけ手入力の行になる）")
         for it in items:  # レートが決まる前に面積だけ分かっていた板金行のランクを引き直す（Codex 指摘）
             area = it.pop('_bankin_area', None)
             if not area or it.get('bankin') or not it.get('wage'):
