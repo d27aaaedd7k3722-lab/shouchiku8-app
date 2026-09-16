@@ -408,6 +408,22 @@ def rate_score(pairs: list[tuple[float, int]], rate: int) -> int:
     return sum(1 for t, w in pairs if w in (_round(round(t * rate, 2), 10), _round(round(t * rate, 2), 100)))
 
 
+def index_from_wage(wage: int, labor: int, wage_round: int = 10) -> float | None:
+    """指数の列が無い書式（コグニ印刷）で `#`（手入力指数）の印が付いた行の指数を、印字の工賃から起こす。
+    指数 = 工賃 ÷ レート が 0.1 刻みで、その指数から工賃を丸め直すと印字の工賃に戻るときだけ返す（戻らなければ None）。
+    コグニは手入力指数の行に `#`、工賃だけ手入力の行に `*` を印字するので、`#` の行はコグニ側に指数がある（2026-09-16 シエンタ）"""
+    if not wage or wage <= 0 or not labor or labor <= 0:
+        return None
+    u = max(1, int(wage_round or 10))
+    x = round(wage / labor, 1)
+    if x <= 0:
+        return None
+    y = round(x * labor, 2)
+    if int(y // u + (1 if (y % u) >= u / 2 else 0)) * u != int(wage):
+        return None
+    return x
+
+
 def infer_labor_rate(rows: list[dict]) -> int:
     """レバーレートの推定: 各行の wage/index を候補にし、候補ごとに「指数×候補を 10 円または 100 円で丸めると印字工賃に一致する行数」を数えて最多の候補を選ぶ
     （100 円丸めの工場では 0.25h → 2,800 なので単純な wage/index = 11,200 が混ざる。全行を説明できる 11,000 を選ぶ）
@@ -826,6 +842,7 @@ class Drafter:
         if self.wage_round != 10:
             self.notes.append(f'工賃の丸め単位 {self.wage_round} 円（印字の工賃が指数×レートの {self.wage_round} 円丸めと一致）→ estimate.wage_round')
         has_wage_col = any(r.get('wage') is not None or r.get('index') is not None for r in rows_flat)  # 工賃列のある書式か
+        has_index_col = any(r.get('index') is not None for r in rows_flat)  # 指数列のある書式か（コグニ印刷は工賃だけ）
         ctx_block = ''
         used: set[int] = set()
         cur_title = None
@@ -877,6 +894,16 @@ class Drafter:
             elif has_wage_col and dcode == 0 and price > 0 and index is None:
                 item['wage'] = 0  # 工賃列のある書式で工賃も指数も空の部品行 = 付属部品（工賃なし）
             # それ以外（工賃列の無い書式、脱着/修理/板金で工賃が読めない行）は wage を省略し、生成器の標準指数に任せる
+            if index is None and not has_index_col and '#' in str(row.get('mark') or '') and labor and int(item.get('wage') or 0) > 0:
+                # コグニ印刷で指数の列が無い書式の `#`（手入力指数）行: 指数を工賃から起こす。
+                # 起こさないと生成器は「工賃だけ手入力」（Time -1・印 `*`）になり、コグニの印字（`#`・指数あり）と食い違う。
+                # `*`（工賃だけ手入力）の行は起こさない（3800 ﾗｲｾﾝｽﾌﾟﾚｰﾄ脱着修正 12,000 = 1.5 も `*` のまま）
+                _x = index_from_wage(int(item.get('wage') or 0), labor, self.wage_round)
+                if _x:
+                    index = _x
+                    self.notes.append(f'{name_raw}: 印字の印 # （手入力指数）だが指数の列が無い書式なので、指数 {_x:g} = 工賃 {int(item["wage"]):,} ÷ レート {labor:,} として写した')
+                else:
+                    self.notes.append(f'{name_raw}: 印字の印 # （手入力指数）だが、工賃 {int(item.get("wage") or 0):,} がレート {labor:,} の 0.1 刻みで割り切れないので指数を起こさない（工賃だけ手入力の行になる）')
             if index is not None and float(index) > 0:
                 item['index'] = float(index)
             if row.get('comment'):  # 転記メモ（人が確かめる点）。NEO の明細コメントには書かず確認箇所シートへ
