@@ -667,6 +667,12 @@ class Checker:
         ok_sub = cmp('課税小計', sub, t.get('taxable'))
         g_sub = _int(t.get('taxable'))
         base = g_sub if (g_sub is not None and not ok_sub) else sub  # 課税小計が印字と違うときは、税の丸めは印字の課税小計で判定する（原因を分けるため）
+        if g_sub is None and _tax_slack:
+            # 税込を割り戻した案件で課税小計の印字が無いと、積み上げに丸めが乗っていて消費税の丸め方を取り違える
+            # （四捨五入の工場を「切り捨て」と誤判定し、Setting.tx_ArrangeFlag の違う NEO になる）。印字から出す
+            _gt, _gx = _int(t.get('total')), _int(t.get('tax'))
+            if _gt is not None and _gx is not None and _gt - _gx - ex_by['taxfree'] > 0:
+                base = _gt - _gx - ex_by['taxfree']
         tax_modes = {'四捨五入': (base * 10 + 50) // 100, '切り捨て': base * 10 // 100, '切り上げ': -(-base * 10 // 100)}
         g_tax = _int(t.get('tax'))
         if g_tax is not None:
