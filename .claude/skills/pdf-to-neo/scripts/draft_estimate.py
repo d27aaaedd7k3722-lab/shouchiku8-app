@@ -1437,6 +1437,8 @@ class Drafter:
                 _n_oth = int(_oth.group(1)) if _oth else 0
                 if (_n_roof or _n_oth) and ('ソリッド' in _coat or not _coat):  # 塗膜がソリッドのときだけ（生成器の関門と同じ）
                     rec = {'roof': 1 if _n_roof else 0, 'count': _n_oth}
+                    if t is None and w:   # 指数の印字が無い書式（コグニ印刷）: 工賃 ÷ レートが 0.1 刻みに乗るときだけ起こす
+                        t = index_from_wage(w, getattr(self, 'labor', 0) or 0, getattr(self, 'wage_round', 10) or 10)
                     if t is not None:
                         rec['index'] = t
                     if w is not None:
