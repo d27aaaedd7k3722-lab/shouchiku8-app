@@ -594,9 +594,11 @@ class Drafter:
         t = t.translate(str.maketrans('ｧｨｩｪｫｬｭｮｯ', 'ｱｲｳｴｵﾔﾕﾖﾂ'))
         return re.sub(r'[\s\-ｰー‐･・]', '', t).upper()
 
-    def _truncated_name_ref(self, name: str, side: str, price: int, qty: int):
+    def _truncated_name_ref(self, name: str, side: str, price: int, qty: int, cur_ref=None):
         """名前が途中で切れて印字された行（協定見積書は名称を 10 文字ほどで切る: 「Rrエンブレム（ＦＲＥＥ」「Rrウインドシールドガラ」）を、
-        ADDATA の名前との**前方一致**で引く。候補が複数なら単価がちょうど合うものだけ、1 つなら閉じていない括弧（切れた証拠）があるときだけ採る。
+        ADDATA の名前との**前方一致**で引く。候補が複数なら単価がちょうど合うものだけ、1 つなら閉じていない括弧（切れた証拠）があるときか、
+        今の候補（cur_ref: 名称近似）の名前が印字より短く印字の続きの字を持たない（印字は名前を削るだけで足さない = 今の候補は別部品）うえに
+        金額がこの候補の標準単価で割り切れるときだけ採る。
         （2026-09-19 本番検証: 括弧の中身を落とす名称近似で、FREED・HYBRID の 2 行とも ｴﾝﾌﾞﾚﾑ(H) に、ガラスファスナがガラス本体に当たった）"""
         k = self._prefix_key(name)
         if len(k) < 6:
@@ -619,7 +621,20 @@ class Drafter:
         if len(cands) == 1:
             # 候補が 1 つだけのときは、閉じていない括弧（切れた証拠）があるときだけ採る。単価が合うだけでは採らない
             # （切れていない普通の略称を別部品へ飛ばさない。Codex 指摘）
-            return (next(iter(cands)), '名前が途中で切れた印字の前方一致（閉じていない括弧。候補 1 つ）') if opened else None
+            only = next(iter(cands))
+            if opened:
+                return only, '名前が途中で切れた印字の前方一致（閉じていない括弧。候補 1 つ）'
+            # 例外: 今の候補の名前が印字の途中までしか無い（印字にだけ続きの字がある）なら、今の候補は印字の部品ではない。
+            # そのうえで金額がこの候補の標準単価の 1〜99 倍なら採る（Rrﾗｲｾﾝｽﾌﾟﾚｰﾄｸ 370 円: 名称近似は Rﾗｲｾﾝｽﾌﾟﾚ-ﾄ（標準 0 円）、
+            # 前方一致は Rﾗｲｾﾝｽﾌﾟﾚ-ﾄｸﾘﾂﾌﾟ 185 円 × 2。2026-09-20 本番 フリード協定見積）
+            u = self._std_unit(only)
+            if cur_ref is not None and cur_ref != only and u and price > 0 and price % u == 0 and 1 <= price // u <= self.QTY_FROM_PRICE_MAX:
+                cks = {self._prefix_key(n) for n in self.parts.name20_by_ref.get(cur_ref, ())}
+                cu = self._std_unit(cur_ref)
+                if cks and all(c and k.startswith(c) and k != c for c in cks) and not (cu and price % cu == 0):
+                    return only, (f'名前が途中で切れた印字の前方一致（候補 1 つ・標準単価 {u:,} 円 × {price // u}。'
+                                  f'名称近似の {cur_ref:04d} は名前が印字の途中までしか無い）')
+            return None
         if unit:   # 候補が複数: 単価がちょうど合う 1 つだけを採る
             hit = [r for r in cands if self._std_unit(r) == unit]
             if len(hit) == 1:
@@ -1032,6 +1047,20 @@ class Drafter:
                         grp_unknown.add(_sd)
                 out.append(item)
                 continue
+            _mp = re.sub(r'[\s・･/／]', '', _nfkc(str(row.get('method') or ''))).replace('鈑', '板')
+            if (_mp and price <= 0 and index is None and not pn and not str(row.get('code') or '').strip()
+                    and _mp not in _DISPOSAL_N and not any(k in _mp for k in _DISPOSAL_N if len(k) >= 2)):
+                # コグニの区分に無い修理方法（再封印・施工・再発行 …）の作業行は、工場のコグニでも部品コードの無い手入力行
+                # （実案件 NEO 300 本の DisposalCode -1 の 1,400 行は PartsCode がすべて空。NEO_FILE_SPEC_COMPLETE）。
+                # 部品を当てると区分が既定名に、名前が部品名に変わる（リヤナンバー 再封印 12,000 が ｶﾊﾞｰ 脱着 に化けた。2026-09-20 本番 フリード協定見積。
+                # 読み手が M を付けた回は印字どおりだった = 読み取りの揺れで NEO が変わっていた）
+                item['manual'] = True
+                self.notes.append(f'{name_raw}: 修理方法「{row.get("method")}」はコグニの区分に無い = 工場のコグニでも手入力の作業行なので、部品を照合せず手入力行にした')
+                _sd = _side_of(name_raw) or _side_of(row.get('_block_title') or '')
+                if _sd and ((wage or 0) > 0):
+                    grp_unknown.add(_sd)
+                out.append(item)
+                continue
             # ref 決定
             side = _side_of(name_raw) or _side_of(row.get('_block_title') or '')  # 行に左右が無ければブロック見出し（【右 フロントフェンダー】）の左右
             if not side and re.match(r'^[LR](?![A-Za-z])[ァ-ヶｦ-ﾟ]', _nfkc(name_raw).strip()):  # 'Rドア' は右かリヤか決められない（監査 15）
@@ -1084,10 +1113,17 @@ class Drafter:
                     # 頭が長く同じ名前どうし（Rrｳｲﾝﾄﾞｼｰﾙﾄﾞｶﾞﾗｽ ←→ ｳｲﾝﾄﾞｼ-ﾙﾄﾞﾉｽﾞﾙ は 0.77）で別部品に化け、
                     # 工賃 19,550 の「ガラス脱着」が「ノズル」になっていた（2026-09-19 フリード）。
                     # 部品の行と、指数の印字がある作業行は今までどおり（部位の文脈で左右・枝番を直すのが効くため。
-                    # JPN タクシーの ﾙｰﾑﾊﾟｰﾃｨｼｮﾝﾊﾟﾈﾙ 0.4 / ｸｫｰﾀｳｲﾝﾄﾞ 1.5 はブロック内照合が正しい）
+                    # JPN タクシーの ﾙｰﾑﾊﾟｰﾃｨｼｮﾝﾊﾟﾈﾙ 0.4 はブロック内照合が正しい。ｸｫｰﾀｳｲﾝﾄﾞ(ｻｲﾄﾞ、ｵﾍﾟﾗ) 脱着 1.5 は、2026-09-20 に
+                    # 標準指数を確かめたら名称一致の 6100 L ｸｵ-ﾀｳｲﾝﾄﾞ が標準 1.5 ちょうどで、ブロック内の 2717 ﾄﾞｱｸｵ-ﾀｳｲﾝﾄﾞW/S は標準なし
+                    # = 名称一致が正しかった。下の「名前が完全に一致する部品は弱い候補で替えない」で直る）
                     _g = AddataParts._why_score(re.sub(r'^語順入替「.*?」\s*', '', why or ''))
                     if price <= 0 and wage and index is None and _g > s2:
                         why = f'{why}（ブロック内の候補 {ref2} は {s2:.2f} で弱いので替えない）'
+                    elif _g >= 1.0 and '候補）' not in (why or '') and s2 < 0.8:
+                        # 名前が完全に一致する部品（候補 1 つ）は、名前の違うブロック内の弱い候補（0.8 未満）で置き換えない。
+                        # 前の行の部位に引っ張られ、ﾄﾞｱﾗｲﾆﾝｸﾞｸﾘﾂﾌﾟ（名称一致）が Rﾗｲｾﾝｽﾌﾟﾚ-ﾄｸﾘﾂﾌﾟ（0.55）に化けた（2026-09-20 本番 フリード協定見積）。
+                        # 同じ名前が部位ごとにある小物（「（N 候補）」）と、ブロック内に同じ名前がある行（0.8 以上）は今までどおり部位の文脈を優先
+                        why = f'{why}（ブロック内の候補 {ref2} は名前が違い {s2:.2f} と弱いので替えない）'
                     else:
                         why = f'ブロック内名称照合({s2:.2f}) ← 全体照合は {ref}'
                         ref = ref2
@@ -1121,7 +1157,7 @@ class Drafter:
                     if u_np and u_np <= self.QTY_FROM_PRICE_UNIT_MAX and price % u_np == 0 and 2 <= price // u_np <= self.QTY_FROM_PRICE_MAX:
                         ref, why = ref_np, f'{why_np}（金額が標準単価 {u_np:,} 円の {price // u_np} 倍）'
             if not pn and not code_in and (ref is None or AddataParts._why_score(re.sub(r'^語順入替「.*?」\s*', '', why or '')) < 1.0):
-                _tr = self._truncated_name_ref(name_raw, side, price, qty)
+                _tr = self._truncated_name_ref(name_raw, side, price, qty, cur_ref=ref)
                 if _tr is not None and _tr[0] != ref:
                     self.notes.append(f'{name}: {_tr[1]}' + (f'（名称近似の {ref:04d} より優先）' if ref is not None else ''))
                     ref, why = _tr[0], _tr[1]
@@ -1133,6 +1169,10 @@ class Drafter:
                 if _hint:
                     self._rev('要確認', '未照合の候補', f'ADDATA に単価が同じ部品がある: {_hint}。同じ部品なら reading の code に書く（違えば手入力のまま）', row=row, item=item)
                 item['manual'] = True
+                if not str(row.get('method') or '').strip() and price <= 0:
+                    # 修理方法の印字が無い工賃だけの行（塗装費用・諸費用を明細に手入力する工場）は、手入力行の区分を空のまま
+                    # （コグニは DisposalCode -1。読み手が M を付けた場合と同じ形。付けない回は「取替」になっていた。2026-09-20 本番 フリード協定見積）
+                    item['method'] = ''
                 out.append(item)
                 continue
             if 0 < price <= 1000 and dcode == 0 and wage is not None and wage >= 10000:
