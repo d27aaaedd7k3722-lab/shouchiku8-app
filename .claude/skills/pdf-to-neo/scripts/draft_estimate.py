@@ -255,6 +255,10 @@ def _dcode(method: str, price, wage) -> int:
 
 METHOD_NAME = {0: '取替', 1: '脱着', 2: '修理', 3: '脱着修理', 4: '点検調整', 5: '分解調整', 6: '板金'}
 
+# 部品にならない手続きの語（実案件 NEO の手入力行 DisposalCode -1 の自由な区分から。NEO_FILE_SPEC_COMPLETE）。
+# 工賃だけの行の名前に付いていれば、部品を照合せず手入力行にする（「リヤナンバー再封印」が ｶﾊﾞｰ 脱着 に化けないように）
+NONCOGNI_WORK_WORDS = ('再封印', '封印', '再発行', '充填', '施工')
+
 
 ROW_FIELDS = ('code', 'name', 'method', 'parts_no', 'index', 'qty', 'price', 'wage', 'flags', 'comment')
 
@@ -976,6 +980,14 @@ class Drafter:
                 if _bk in row:
                     row[_bk] = _flag(row[_bk], f'rows[].{_bk}')
             name_raw = str(row.get('name') or '')
+            _code_p = _nfkc(str(row.get('code') or '')).strip()
+            if row.get('manual') and not self.generic and re.fullmatch(r'\d{4}(?:\s*-\s*\d{1,2})?', _code_p):
+                # 部品コードが印字された行は手入力行ではない（コグニの手入力行は部品コードが空。NEO_FILE_SPEC_COMPLETE）。
+                # 読み手が印字の印 `*`（手入力金額）を M と写した回があり、部品コードのある 5 行が部品コード無しの行になった
+                # （2026-09-20 手元の実読み取り サンプル初期見積。前の回は `*` と写して部品コードが付いた = 読み取りの揺れ）
+                self.notes.append(f'{name_raw}: 部品コード {_code_p} が印字された行に M（手入力）が付いていた。コグニの手入力行は部品コードが空なので、'
+                                  'M を外して部品コードで作った（印字の印 * の写し違いとみる）')
+                row['manual'] = False
             name = _clean_name(name_raw)
             method = str(row.get('method') or ('' if row.get('manual') else '取替'))  # 手入力行で修理方法が空欄なら空のまま（コグニは DisposalCode -1 で保存。実機 2026-09-08）
             qty = int(float(_num(row.get('qty')) or 1))
@@ -1048,14 +1060,21 @@ class Drafter:
                 out.append(item)
                 continue
             _mp = re.sub(r'[\s・･/／]', '', _nfkc(str(row.get('method') or ''))).replace('鈑', '板')
-            if (_mp and price <= 0 and index is None and not pn and not str(row.get('code') or '').strip()
-                    and _mp not in _DISPOSAL_N and not any(k in _mp for k in _DISPOSAL_N if len(k) >= 2)):
+            _noncogni = bool(_mp) and _mp not in _DISPOSAL_N and not any(k in _mp for k in _DISPOSAL_N if len(k) >= 2)
+            # 区分の欄が空で、手続きの語が名前に付いた行（「リヤナンバー再封印」。工場の見積は区分の列が無いか名前に続けて印字する）も同じ
+            # （名前だけ見て部品に当てると ｶﾊﾞｰ 脱着 などに化ける。Codex 指摘）。語は部品にならない手続きだけ（「作業」のような広い語は入れない）
+            _work_in_name = (not _mp) and any(w in _nfkc(name_raw) for w in NONCOGNI_WORK_WORDS)
+            if ((_noncogni or _work_in_name) and price <= 0 and index is None and not pn
+                    and not str(row.get('code') or '').strip()):
                 # コグニの区分に無い修理方法（再封印・施工・再発行 …）の作業行は、工場のコグニでも部品コードの無い手入力行
                 # （実案件 NEO 300 本の DisposalCode -1 の 1,400 行は PartsCode がすべて空。NEO_FILE_SPEC_COMPLETE）。
                 # 部品を当てると区分が既定名に、名前が部品名に変わる（リヤナンバー 再封印 12,000 が ｶﾊﾞｰ 脱着 に化けた。2026-09-20 本番 フリード協定見積。
                 # 読み手が M を付けた回は印字どおりだった = 読み取りの揺れで NEO が変わっていた）
                 item['manual'] = True
-                self.notes.append(f'{name_raw}: 修理方法「{row.get("method")}」はコグニの区分に無い = 工場のコグニでも手入力の作業行なので、部品を照合せず手入力行にした')
+                if not _mp:   # 区分の印字が無い行は、手入力行の区分も空のまま（コグニは DisposalCode -1。「取替」にしない）
+                    item['method'] = ''
+                self.notes.append(f'{name_raw}: ' + (f'修理方法「{row.get("method")}」' if _noncogni else '名前の手続きの語（再封印 など）')
+                                  + 'はコグニの区分に無い = 工場のコグニでも手入力の作業行なので、部品を照合せず手入力行にした')
                 _sd = _side_of(name_raw) or _side_of(row.get('_block_title') or '')
                 if _sd and ((wage or 0) > 0):
                     grp_unknown.add(_sd)
@@ -2173,7 +2192,12 @@ class Drafter:
         （2026-09-16 シエンタ: 空欄 3 行に標準 6.6h / 6.4h / 0.3h が入り +106,400 円）"""
         want = self._printed_wage()
         rows_w, ex_w = self._wage_sums(items, expenses)
-        if want <= 0 or want not in (rows_w, rows_w + ex_w):
+        # 印字の工賃計（小計の工賃列）が塗装・材料・内板骨格まで含む書式もある（コグニ印刷: 明細工賃 + 塗装工賃計 + 材料代。
+        # 読み手が作業計でなくその額を写した回だけ空欄が標準指数で埋まり +106,400 円で止まった。2026-09-20 手元の実読み取り）。
+        # 紙上検算（reading_check）の同じ判定と**同じ集合**で「ぴったり一致」を見る（数え方を共有しないと片方だけ通る。Codex 指摘）
+        from reading_check import wage_total_alternatives  # noqa: E402  reading_check が draft_estimate を読むので中で import する
+        cands = wage_total_alternatives(rows_w, self.rd) | {rows_w + ex_w}
+        if want <= 0 or want not in cands:
             return
         blanks = [it for it in items
                   if it.get('wage') is None and it.get('index') is None

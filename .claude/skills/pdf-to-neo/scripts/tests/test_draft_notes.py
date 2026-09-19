@@ -586,6 +586,37 @@ def test_blank_wage_is_zero_when_printed_total_matches():
     assert has(est['_draft_notes'], '工賃欄が空欄'), est['_draft_notes']
 
 
+def test_printed_code_with_m_is_not_a_manual_row():
+    """部品コードが印字された行の M（手入力）は外す（コグニの手入力行は部品コードが空）。2026-09-20 手元の実読み取り:
+    読み手が印字の印 * を M と写し、部品コードのある 5 行が部品コード無しの行になった。コードの無い M 行は今までどおり手入力"""
+    rd = {'source': 't', 'issuer': '', 'est_date': '20260909', 'format': 'A', 'labor_rate': 8000, 'vehicle': dict(VEH),
+          'blocks': [{'title': 'テスト', 'rows': ['0010|Fﾊﾞﾝﾊﾟﾌｪｲｽ|取替|||1|50000|4000|M|', '|ﾅﾝﾊﾞｰﾌﾟﾚｰﾄﾛｯｸﾎﾞﾙﾄｽﾃｯｶｰ|取替|||1|1000||M|']}],
+          'paint': {}, 'expenses': [], 'totals': {}}
+    est = de.Drafter(rd).build()
+    a, b = est['items']
+    assert a.get('code') == '0010' and not a.get('manual') and a.get('method') == '取替', a
+    assert has(est['_draft_notes'], 'M を外して部品コードで作った'), est['_draft_notes']
+    assert b.get('manual') and not b.get('code'), b
+
+
+def test_blank_wage_is_zero_when_the_total_includes_paint_and_frame():
+    """印字の工賃計が 明細 + 塗装工賃 + 内板骨格 の書式（コグニ印刷の小計の工賃列）でも、ぴったり一致なら空欄は 0 円。
+    2026-09-20 手元の実読み取り: 読み手が作業計でなく工賃計 634,360（= 明細 360,800 + 塗装 191,360 + 内骨 51,200 + 費用 31,000）を
+    写した回だけ、空欄 3 行が標準指数で埋まり +106,400 円で止まった。1 円でも合わなければ今までどおり空欄のまま"""
+    def est(wage_total):
+        rd = {'source': 't', 'issuer': '', 'est_date': '20260909', 'format': 'A', 'labor_rate': 8000, 'vehicle': dict(VEH),
+              'blocks': [{'title': 'テスト', 'rows': ['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||', '0400|左ﾍｯﾄﾞﾗｲﾄ|脱着||||||']}],
+              'paint': {'lines': [{'name': '塗装費用', 'wage': 40000}]},
+              'frame': {'basic': True, 'basic_wage': 28000, 'items': []},
+              'expenses': [], 'totals': {'wage': wage_total}}
+        return de.Drafter(rd).build()
+    e = est(8000 + 40000 + 28000)
+    assert [it.get('wage') for it in e['items']] == [8000, 0], e['items']
+    assert has(e['_draft_notes'], '工賃欄が空欄'), e['_draft_notes']
+    e = est(8000 + 40000 + 28000 + 1)
+    assert 'wage' not in e['items'][1], e['items'][1]
+
+
 def test_blank_price_is_zero_when_printed_total_matches():
     """部品計が印字の部品代の合計と一致する見積: 部品代の空欄は 0 円（生成器の標準価格で埋めない）。
     2026-09-16 シエンタ（Gemini）: 金額の印字が無い「リヤフロアクロスメンバー 基本内」に標準価格が入り部品計が +9,400 円"""
@@ -702,7 +733,8 @@ def test_agreed_estimate_rows_do_not_depend_on_manual_flags():
     区分の無い工賃だけの行は手入力行（区分は印字どおり）にする"""
     veh = {'model_code': 'GB8', 'serial_no': 'GB8-0000001', 'desig': '19367', 'category': '0015', 'reg_date': 'R5.12', 'color_code': 'NH883P'}
     rows = ['|Rrライセンスプレートク|取替||||370||*|', '|ドアライニングクリツプ|取替||||2775||*|',
-            '|リヤナンバー|再封印|||||12000|*|', '|塗装費用||||||94664|*|', '|Rrパネル|修理|||||5950|*|']
+            '|リヤナンバー|再封印|||||12000|*|', '|塗装費用||||||94664|*|', '|Rrパネル|修理|||||5950|*|',
+            '|リヤナンバー再封印||||||9000|*|']   # 区分の欄が空で、手続きの語が名前に付いた形（Codex 指摘）
     rd = {'source': 't', 'issuer': '', 'est_date': '20260919', 'format': 'F', 'labor_rate': 8500, 'vehicle': veh,
           'blocks': [{'title': '', 'rows': rows}], 'paint': {}, 'expenses': [], 'totals': {}}
     if not _has_car('J55'):   # ADDATA にこの車種（J55）が無い PC では見ない（それ以外の失敗は落とす。例外を飲み込むと本当の退行を見逃す。Codex 指摘）
@@ -715,6 +747,7 @@ def test_agreed_estimate_rows_do_not_depend_on_manual_flags():
     assert got[2][:3] == ('', '再封印', True), got
     assert got[3][:3] == ('', '', True), got
     assert got[4][:3] == ('4600', '修理', False), got                          # コグニの区分の作業行は今までどおり照合する
+    assert got[5][:3] == ('', '', True), got                                    # 名前に「再封印」: 照合せず手入力行・区分は印字どおり空
 
 
 if __name__ == '__main__':
