@@ -549,10 +549,10 @@ class Checker:
                 self.warn(f"費用 {e.get('name')}: in={e.get('in')!r} は既知の語彙（{', '.join(IN_KNOWN)}）に無い。draft は部品計以外を工賃扱いにする")
 
     def _check_parts_expense_side(self, parts_sum: int, ex_parts: int, printed: Optional[int], tol: int, disc_parts: int = 0) -> None:
-        """部品計に入れた費用（in=部品計）が、印字の部品計に本当に入っているか。
-        明細だけで印字の部品計に合い、費用を足すと合わないなら、費用の集計先（in）の読み違い。
-        （2026-09-19 本番検証: 工賃の列にある写真代 800 を in=部品計 にした読み取りが、税込の丸め幅に紛れて通り、
-        NEO の部品計が印字より 800 円多くなった。合計は同じなので最後の検算でも出ない）
+        """部品計に入れた費用（in=部品計）が、印字の部品計に入っていないときに**注意**を出す（止めない）。
+        印字の部品計が「部品の列の費用」を含まない書式は実在する（回帰の 2 案件。正解 NEO でも費用は費用画面の部品欄に別に入る）ので、
+        これだけでは読み違いと決められない。ただ、工賃の列に刷られた費用を in=部品計 と読むと、費用画面の部品欄・工賃欄が入れ替わる
+        （2026-09-19 本番検証: 工賃の列の写真代 800 を in=部品計 と読んだ。合計は同じなので検算では出ない）。
         部品値引（discount.parts。負の値）が部品計に反映される書式もあるので、値引あり・なしの両方で比べる（Codex 指摘）"""
         if not ex_parts or printed is None:
             return
@@ -561,8 +561,8 @@ class Checker:
         with_ex = any(abs(b + ex_parts - printed) <= tol for b in bases)
         if without and not with_ex:
             names = ' / '.join(f"{e.get('name')} {_int(e.get('amount')) or 0:,}" for e in self.rd.get('expenses') or [] if _in_kind(e) == 'parts')
-            self.fail(f'費用（{names}）は in=部品計 だが、印字の部品計 {printed:,} は明細だけ（{parts_sum:,}）で合い、'
-                      f'費用を足すと {parts_sum + ex_parts:,} でずれる。費用の集計先（in）を印字の列で写し直す（工賃の列なら 作業計）')
+            self.warn(f'費用（{names}）は in=部品計 だが、印字の部品計 {printed:,} は明細だけ（{parts_sum:,}）で合う（費用を足すと {parts_sum + ex_parts:,}）。'
+                      '部品の列に刷られた費用なら問題ない。工賃（技術料）の列に刷られているなら in=作業計（費用画面の部品欄・工賃欄が入れ替わる）')
 
     # ------------------------------------------------------------------ 6. 合計欄と設定の推定
     def check_totals(self, labor: int, wage_round: int) -> None:

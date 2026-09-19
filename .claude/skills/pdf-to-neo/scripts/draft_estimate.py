@@ -2214,9 +2214,13 @@ class Drafter:
         items = est.get('items') or []
         rows_parts = sum(int(it.get('price') or 0) for it in items if not it.get('reserve'))
         ex_parts = sum(int(e.get('amount') or 0) for e in (est.get('expenses') or []) if e.get('kind') == 'parts')
-        gap = rows_parts + ex_parts - printed_parts
         frac = self.unit_fraction_rows(items)
-        if not (printed_parts and printed_total and frac and 0 < gap <= min(len(frac), self.UNIT_FRACTION_MAX_YEN)):
+        _lim = min(len(frac), self.UNIT_FRACTION_MAX_YEN) if frac else 0
+        # 印字の部品計が「部品の列の費用」を含む書式と含まない書式の両方がある（含まない書式で費用込みの差を見ると、
+        # 802 円のように費用分ふくらんで許容を外れ、+2 円の端数差で不合格になった。2026-09-19 本番検証のフリード）
+        gaps = [g for g in (rows_parts + ex_parts - printed_parts, rows_parts - printed_parts) if 0 < g <= _lim]
+        gap = gaps[0] if gaps else 0
+        if not (printed_parts and printed_total and frac and gap):
             return
         import copy
         probe = copy.deepcopy(est)

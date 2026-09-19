@@ -133,22 +133,23 @@ def test_same_pn_same_side_with_different_codes_is_not_a_duplicate():
     assert has(r3['warn'], 'が同じブロックの'), r3['warn']
 
 
-def test_parts_expense_must_be_inside_printed_parts_total():
-    """in=部品計 の費用は、印字の部品計に入っていなければならない。明細だけで部品計が合うなら集計先の読み違い
-    （2026-09-19 本番検証: 工賃の列の写真代 800 を部品計にした読み取りが税込の丸め幅に紛れて通り、NEO の部品計が 800 円多くなった）"""
-    assert not has(run(BASE)['fail'], 'は in=部品計 だが'), '印字の部品計に費用が入っている正しい読み取りを止めている'
+def test_parts_expense_outside_printed_parts_total_is_a_warning():
+    """in=部品計 の費用が印字の部品計に入っていないときは注意だけ（止めない）。印字の部品計が部品の列の費用を含まない書式は実在する
+    （回帰の 2 案件）。工賃の列の費用を in=部品計 と読んだときは費用画面の部品欄・工賃欄が入れ替わるので知らせる（2026-09-19 本番検証）"""
+    assert not has(run(BASE)['warn'], 'は in=部品計 だが'), '印字の部品計に費用が入っている正しい読み取りに注意を出している'
     rd = copy.deepcopy(BASE)
     rd['totals']['parts'] = 93000            # 印字の部品計は明細だけ（ショートパーツ 2,000 は入っていない）
     r = run(rd)
-    assert has(r['fail'], 'ショートパーツ 2,000）は in=部品計 だが'), r['fail']
+    assert has(r['warn'], 'ショートパーツ 2,000）は in=部品計 だが'), r['warn']
+    assert not has(r['fail'], 'は in=部品計 だが'), r['fail']
     rd2 = copy.deepcopy(BASE)                 # 部品値引 -3,000 が部品計に入る書式: 印字 90,000 = 明細 93,000 − 3,000（費用は入っていない）
     rd2['discount'] = {'parts': -3000}
     rd2['totals']['parts'] = 90000
-    assert has(run(rd2)['fail'], 'ショートパーツ 2,000）は in=部品計 だが'), run(rd2)['fail']
-    rd3 = copy.deepcopy(rd2)                  # 値引も費用も入った正しい部品計 92,000 = 93,000 − 3,000 + 2,000 は止めない
+    assert has(run(rd2)['warn'], 'ショートパーツ 2,000）は in=部品計 だが'), run(rd2)['warn']
+    rd3 = copy.deepcopy(rd2)                  # 値引も費用も入った正しい部品計 92,000 = 93,000 − 3,000 + 2,000 は何も言わない
     rd3['totals']['parts'] = 92000
     r3 = run(rd3)
-    assert not has(r3['fail'], 'は in=部品計 だが') and not has(r3['fail'], '合計欄 部品計'), r3['fail']   # 合計欄の部品計も「明細 + 費用 − 値引」で合う（Codex 指摘）
+    assert not has(r3['warn'], 'は in=部品計 だが') and not has(r3['fail'], '合計欄 部品計'), (r3['fail'], r3['warn'])   # 合計欄の部品計も「明細 + 費用 − 値引」で合う（Codex 指摘）
 
 
 def test_page_subtotal_may_include_the_frame_section():
