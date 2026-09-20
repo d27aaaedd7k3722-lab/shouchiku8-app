@@ -548,6 +548,9 @@ def material_mode(total_wage: int, material: int, rate=None):
     return None
 
 
+# 「塗装材料代」「材料代」「材料費」のように**材料代そのもの**を刷る行（追加項目ではなく材料代に入れる。2026-09-20）。
+# 「シーリング材料費」のように前に工程の名前が付く行は追加項目のままにする（名前が丸ごとこれのときだけ）
+_MATERIAL_LINE_RE = re.compile(r'^(塗装|ﾍﾟｲﾝﾄ)?材料(代|費)$|^ﾏﾃﾘｱﾙ(代|費)$')
 _ADD_ITEM_RE = re.compile(r'アンダ[ー\-]?コ|内板|調色|チッピング|ヒンジ|ホ[ー\-]?スメント|インナ|レ[ー\-]?ルカバ|フ[ュユ][ー\-]?エルリ[ッツ]ド|ホイ[ー\-]?ルハウス|加算|下地|シ[ー\-]リング|材|剤|費')
 
 
@@ -1625,6 +1628,7 @@ class Drafter:
             self._material_from_lines(out, lines)   # 汎用車種・塗装行を組み立てない経路でも材料代は合わせる（検算と同じ条件にする）
             return self._paint_input_type(out)
         panels, other = list(out.get('panels') or []), list(out.get('other') or [])
+        mat_line = 0   # 「塗装材料代」の行の額（追加項目にせず材料代に入れる。2026-09-20）
         n_other0 = len(other)   # ここから後ろが塗装行から追加項目にした行（前は転記の paint.other）
         auto_manual: list = []  # 下書きが作った手入力の塗装行（rec, 見積の名前）
         _tcs_used: set = set()  # 2 コートソリッド加算の「ルーフ以外 N 枚」に使った行
@@ -1740,6 +1744,13 @@ class Drafter:
                         rec['wage'] = w
                     panels.append(rec)
                     continue
+            if _MATERIAL_LINE_RE.search(n):
+                # 「塗装材料代」「材料費」の行は**材料代**（追加項目ではない）。工賃の列に刷る工場があり、
+                # 追加項目にすると材料代と二重に計上されて合計が合わなくなる
+                # （2026-09-20 実案件: 塗装材料代 46,390 が 追加項目 ＋ 割合計算の材料代 で二重になり不合格）
+                mat_line += int(w or 0)
+                self.notes.append(f'塗装 {name}: 材料代の行なので材料代に入れた（追加項目にはしない）')
+                continue
             if _ADD_ITEM_RE.search(n) or (t is None and w is None):
                 # 工程の名前（アンダーコート・内板調色・チッピング・ヒンジ …）は「追加項目」（材料代の対象外）。実案件 NEO の追加項目の名前から
                 other.append({k: v for k, v in (('name', name), ('index', t), ('wage', w)) if v is not None})
@@ -1772,6 +1783,18 @@ class Drafter:
                                                       '修理方法（取替/修理）の印字が無く 20.DB のパネルに対応付けていないので')
                                   + ' 手入力の塗装行（外板パネルの行追加。材料代の対象）にした。工程（追加項目）なら reading の name に工程名を、'
                                   '20.DB のパネルなら 取替/修理 を書く')
+        if mat_line:
+            # 「塗装材料代」の行は材料代そのもの。すでに材料代（印字の材料計・paint.material）があるときは
+            # **同じ額の別の書き方**なので足さない（足すと二重計上になる）。無いときだけこの行の額を材料代にする
+            _cur_mat = int(float(_num(out.get('material')) or 0))
+            _printed_mat = int(float(_num((self.rd.get('totals') or {}).get('material')) or 0))
+            if not _cur_mat and not _printed_mat:
+                out['material'] = mat_line
+                self.notes.append(f'材料代 {mat_line:,} 円は「塗装材料代」の行（合計欄に材料計の印字が無いのでこの行を材料代にした）')
+            elif (_cur_mat or _printed_mat) != mat_line:
+                self.notes.append(f'★ 「塗装材料代」の行 {mat_line:,} 円と、材料計の印字 {(_cur_mat or _printed_mat):,} 円が違う。'
+                                  '材料代は印字の材料計を使った（どちらが正しいか見積書で確かめる）')
+                self._rev('要確認', '材料代', f'「塗装材料代」の行 {mat_line:,} 円と材料計の印字 {(_cur_mat or _printed_mat):,} 円が違う')
         if panels:
             out['panels'] = panels
             if other:
