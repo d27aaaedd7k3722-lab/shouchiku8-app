@@ -34,6 +34,16 @@ def test_forced_actual_folds_details():
         assert k not in got, (k, got)
 
 
+def test_forced_actual_does_not_double_count_other():
+    """塗装行から作った total は追加項目の工賃をすでに含むので、畳むときに足し直さない（二重計上しない）"""
+    rd = {'paint': {'input_type': '実額'}, 'totals': {}}
+    out = {'total': 200000, '_total_from_lines': 30000, 'lines': [{'name': '塗装費用', 'wage': 170000}],
+           'other': [{'name': '塗装費用', 'wage': 30000}]}
+    got = _D(rd)._paint_input_type(out)
+    assert got.get('total') == 200000, got     # 30,000 を足し直さない
+    assert 'other' not in got and '_total_from_lines' not in got, got
+
+
 def test_forced_actual_restores_material_from_totals():
     """費用割合モードで額を落としていたら、印字の材料代（合計欄）を戻す（実額は割合を持てない）"""
     rd = {'paint': {'actual': True}, 'totals': {'material': 19226}}

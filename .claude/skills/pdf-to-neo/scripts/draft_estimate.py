@@ -487,6 +487,16 @@ _PAINT_FRAME_OPT = {'engine_room': {1: 'ラジエータサポート 両側新品
                     'rear_floor': {1: '1 台小修正', 2: '1 台大修正'}}
 
 
+def _is_wage_only(e: dict) -> bool:
+    """塗装パネルの候補が「工賃の行」だけでできているか（ｸｵ-ﾀﾊﾟﾈﾙ(ｺｳﾁﾝ) のように、本体とは別コードで工賃だけ立てた行）。
+    実案件ではこの行から塗装パネルは起きない（本体の行で 1 枚起きる）"""
+    rows = e.get('rows') or []
+    if not rows:
+        return False
+    return all(re.search(r'コウチン|工賃', _nfkc(_hw_kana(str(r.get('name') or '')))) or not int(r.get('price') or 0)
+               for r in rows)
+
+
 def paint_frame_line(n: str):
     """塗装明細の 1 行が「内板骨格塗装」（コグニの塗装画面 内板骨格タブ = PaintingFrame）か。戻り値 (欄, 区分) か None。
     コグニの欄は 4 つで、指数は COM/NAIKOKUA.DB（車形別）:
@@ -1881,6 +1891,10 @@ class Drafter:
             return out
         tot = int(float(_num(out.get('total')) or 0))
         oth = sum(int(float(_num((o or {}).get('wage')) or 0)) for o in (out.get('other') or []) if isinstance(o, dict))
+        if '_total_from_lines' in out:
+            # 塗装行から作った total は、追加項目にした行の工賃を**すでに含んでいる**（1624 行の註）。
+            # ここで足すと二重計上になる（印字の塗装工賃計から作った total のときだけ足す）
+            oth = 0
         mat = int(float(_num(out.get('material')) or 0))
         if not mat:   # 費用割合モードに切り替えて額を落としていたら、印字の材料代を戻す（実額は割合を持てない）
             mat = int(float(_num((self.rd.get('totals') or {}).get('material')) or 0))
@@ -1988,17 +2002,36 @@ class Drafter:
                 # 同じパネルを複数枚。どちらも自動では起こせない。黙って 1 枚にすると塗装工賃が過少になり、
                 # その差を fit_paint_total が材料代へ移してしまう
                 qty_over.append(f"{code} {it.get('name', '')}（数量 {qty}）")
+            _row = {'name': str(it.get('name') or ''), 'price': int(float(it.get('price') or 0) or 0)}
             e = cands.get(pnl['code'])
             if e is None:
-                cands[pnl['code']] = {'pnl': pnl, 'area': area, 'methods': [mth], 'codes': [code]}
+                cands[pnl['code']] = {'pnl': pnl, 'area': area, 'methods': [mth], 'codes': [code], 'rows': [_row]}
             else:
                 e['methods'].append(mth)
+                e['rows'].append(_row)
                 if code not in e['codes']:
                     e['codes'].append(code)
         if qty_over:
             self._back_to_lump(paint, '数量 2 以上の塗装対象行があるので自動では起こせない（'
                                       + ' / '.join(qty_over[:4]) + '）。左右は 1 行ずつに分ける（判断規則 10-3）')
             return
+        # 同じ部位に 2 つの部品コードがある（本体 4801 と 工賃の行 4802「ｸｵ-ﾀﾊﾟﾈﾙ(ｺｳﾁﾝ)」など）:
+        # コグニは 1 部位 1 枚しか起こさない。実案件 1,800 本の集計では「(ｺｳﾁﾝ)」の明細行から塗装パネルが起きるのは
+        # 取替で 17%（15/88）だけで、起きなかった 166 行のうち 162 行は同じ部位の本体コードが起きていた。
+        # 2 枚起こすと塗装工賃がパネル 1 枚分多くなる（2026-09-20 の集計で発見）
+        for pcode in sorted(cands):
+            for other in [c for c in sorted(cands) if c != pcode and c[:3] == pcode[:3]]:
+                e, o = cands.get(pcode), cands.get(other)
+                if e is None or o is None:
+                    continue
+                keep, drop = ((o, e) if (_is_wage_only(e) and not _is_wage_only(o)) else (e, o))
+                if not _is_wage_only(drop):
+                    keep['methods'] += drop['methods']   # 工賃だけの行（金額の無い ｺｳﾁﾝ 行）の修理方法は採らない
+                keep['rows'] += drop['rows']
+                keep['codes'] += [c for c in drop['codes'] if c not in keep['codes']]
+                cands.pop(drop['pnl']['code'], None)
+                self.notes.append(f"paint.auto_panels: 同じ部位の塗装パネル {pcode} と {other} は 1 枚にまとめた"
+                                  f"（明細 {' / '.join(keep['codes'])}）。コグニも 1 部位 1 枚しか起こさない")
         panels = []
         for pcode, e in cands.items():
             # 同じパネルに取替行があれば塗装も「取替」（コグニは取替パネルを新品塗装で計上する）
