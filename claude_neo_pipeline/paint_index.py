@@ -74,6 +74,8 @@ class PaintIndex:
             hh_ = os.path.join(os.environ.get('WINDIR', ''), 'hh.exe')
             print(f'★ 塗装指数表（CHM）を展開できない: {self.car}。修正塗装の標準指数が取れないので '
                   f'paint.panels[].index を見積書の値で書くこと（{hh_} が使えるか確認）')
+        self._r87: Optional[dict] = None   # <car>87.DB（パネル別の塗り数値。溶剤系。収録のある車種だけ）
+        self._r97: Optional[dict] = None   # <car>97.DB（同・水性）
         self._chm_water: Optional[list[dict]] = None  # 水性ページ（CHM「車種別補修塗装指数（水性）」）は要求時に読む
 
     # ------------------------------------------------------------ 20.DB: 塗装パネルマスタ
@@ -521,6 +523,63 @@ class PaintIndex:
             out[key] = None if (not abn or abn == (0, 0)) else self._r1((abn[1] + abn[0] * Sn / 1000) * C2 / 100000 + self._hju(div, typ, int(math.ceil(Sn / 3 - 1e-9))))
         return out
 
+    def _load_87(self, water: bool = False) -> dict:
+        """パネル別の塗り数値の表: **<car>87.DB（溶剤系）/ <car>97.DB（水性）**。
+        XOR 0xff の CSV で 車種, 年式群, ボディ, グレード, EVA, 部品コード, 取替複数塗, 取替単体塗, 修正1/1, 1/2, 1/3, 高機能塗装…（各 ×100）。
+        87.DB は ADDATA 2026/08 で 1,307 車種中 27 車種（日産 P/Q 系 = COM/S_Est.DB の 2 桁目が 1・2）だけが持つ。
+        97.DB（水性）はもっと多くの車種が持ち、**値は CHM の水性ページと一致する**（J87 ボンネット 1.2/1.6/2.1/1.6/1.5 で確認）。
+        97.DB は列が 1 つ多く（高機能らしき値が 2 つ）、どちらがどの高機能塗装かは未同定なので、
+        **水性では塗り数値だけを使い、高機能加算は CHM・係数表に任せる**。
+        0000 は CHM の '-' と同じ「収録なし」なので None にする（ロッカパネル等の 1/2・1/3。Codex 指摘）"""
+        key = '_r97' if water else '_r87'
+        if getattr(self, key, None) is not None:
+            return getattr(self, key)
+        out: dict = {}
+        p = os.path.join(self.car_dir, self.car + ('97' if water else '87') + '.DB')
+        if os.path.exists(p):
+            for l in _xor_lines(p):
+                f = [x.strip() for x in l.split(',')]
+                if len(f) < 12 or not f[5].isdigit():
+                    continue
+                vals = [(int(x) / 100.0 if (x.isdigit() and int(x)) else None) for x in f[6:13]]   # 97.DB は 1 列多い（7 列目 = 水性の高機能塗装）
+                out.setdefault(f[5], []).append({'body': f[2], 'grade': f[3], 'eva': f[4], 'vals': vals})
+        setattr(self, key, out)
+        return out
+
+    def panel87(self, code: str, paint: int = 3) -> Optional[dict]:
+        """87.DB（溶剤）/ 97.DB（水性）の行を CHM 表の行と同じ形で返す（無ければ None）。
+        ボディ専用行 → 共通行（'00'）の順で選び、どちらも無ければ使わない（他ボディの値を当てない）"""
+        water = int(paint or 0) == 4
+        rows = self._load_87(water).get(str(code).zfill(4))
+        if not rows:
+            return None
+        b = '%02d' % self.body_code if self.body_code else ''
+        pick = next((r for r in rows if b and r['body'] == b), None) or next((r for r in rows if r['body'] in ('00', '')), None)
+        if pick is None:
+            return None
+        v = pick['vals'] + [None] * 7
+        # 高機能塗装: 溶剤表（87.DB）は 6 列目、水性表（97.DB）は **7 列目**（6 列目は別の値で、実案件では 0 や 1 段小さい値）。
+        # 実案件 NEO の水性 × 耐スリ傷 40 行で 7 列目が一致（6 列目は 0000 の行が 12 行ある）
+        return {'no': 0, 'name': '', 'area': None, 'new_multi': v[0], 'new_single': v[1],
+                'r11': v[2], 'r12': v[3], 'r13': v[4], 'hf': (v[6] if water else v[5]),
+                'src': '97.DB' if water else '87.DB'}
+
+    def car_hf_kind(self) -> Optional[int]:
+        """この車種で使う高機能塗装の種類を COM/S_Est.DB から引く（2 = 耐スリ傷 / 3 = スクラッチ）。分からなければ None。
+
+        S_Est.DB は 1 行 1 車種（`C10 00       50` = 車種コード・ボディ・2 桁）。**2 桁目が高機能塗装の種類**で、
+        実案件 NEO 1,800 本の突き合わせでは `x0` の車は耐スリ傷 250 件・`x1` の車はスクラッチ 27 件（例外 2 件）。
+        1 桁目（0/1/2/5/6）は用途未同定（汎用車種は 00）。2026-09-21 に同定"""
+        for l in self._com_rows('S_Est.DB'):
+            if not l or not l[0]:
+                continue
+            t = l[0]
+            if t[:3].strip().upper() == str(self.car).upper():
+                v = t[-2:].strip()
+                if len(v) == 2 and v.isdigit():
+                    return {0: 2, 1: 3}.get(int(v[1]))
+        return None
+
     def _scrach_time(self, form: str, paint: int, pn: dict, area: int) -> Optional[float]:
         """スクラッチ（高機能塗装 3）のパネル別加算: COM/Scrach.DB。
         行は `車形, 塗料, 'S', PanelDivision, PanelTypeDivision, PanelCode, A…, B…` で、
@@ -551,7 +610,21 @@ class PaintIndex:
         （分からない値で埋めず、呼び出し側が見積書の指数を要求する）"""
         if not hf:
             return 0.0
-        if pn:  # CHM の高機能列（面積が一致する行だけ採る。近似で拾った別パネルの値は使わない）
+        # 車種の表（87/97.DB・CHM）の高機能列は「**その車種の**高機能塗装」の値。見積の指定が車種の種類
+        # （COM/S_Est.DB の 2 桁目）と食い違うときは使わない —— 加算基礎（T_KEI_3 の T 列 / S 列）と
+        # ちぐはぐな値になるので、種類ごとの式（F_S / Scrach.DB）で出す（Codex 指摘 2026-09-21）
+        _kind_ok = self.car_hf_kind() in (None, int(hf))
+        if _kind_ok and pn and pn.get('code'):  # 87.DB / 97.DB（収録のある車種だけ。CHM より優先）
+            # 溶剤表（87.DB）の高機能列を先に見る: スクラッチの車（日産 P/Q 系）は水性の見積でもこの値だった
+            # （実案件 P31 3100: 実測 0.9 = 87.DB。97.DB の 7 列目は 1.1）
+            r87 = self.panel87(pn['code'], 3)
+            if r87 and r87.get('hf') is not None:
+                return r87['hf']
+            if int(paint or 0) == 4:
+                r97 = self.panel87(pn['code'], 4)
+                if r97 and r97.get('hf') is not None:
+                    return r97['hf']
+        if _kind_ok and pn:  # CHM の高機能列（面積が一致する行だけ採る。近似で拾った別パネルの値は使わない）
             row = self.chm_row_for(pn, paint)
             if row and row.get('hf') is not None and row.get('area') == pn.get('area'):
                 return row['hf']
@@ -588,9 +661,13 @@ class PaintIndex:
         pn = self.panel(code)
         if not pn:
             return None
-        row = self.chm_row_for(pn, paint)
-        if row is None or row.get('area') != pn['area']:  # CHM に無い／面積が合わないパネルは係数表の式で補う。補えなければ None（呼び出し側が index を要求）
-            row = self.formula_times(pn, str(paint))
+        row = self.panel87(pn['code'], paint)   # 87.DB（溶剤）/ 97.DB（水性）→ CHM → 係数表 の順。**解決後のパネルコード**で引く（Codex 指摘）
+        if row is not None:
+            row = dict(row, area=pn['area'], name=pn['name'].strip())
+        else:
+            row = self.chm_row_for(pn, paint)
+            if row is None or row.get('area') != pn['area']:  # CHM に無い／面積が合わないパネルは係数表の式で補う。補えなければ None（呼び出し側が index を要求）
+                row = self.formula_times(pn, str(paint))
         add = self.hf_time(pn['area'], hf, pn, paint)
         single = n_panels <= 1
         res = {'panel': pn, 'chm': row, 'hf': add}

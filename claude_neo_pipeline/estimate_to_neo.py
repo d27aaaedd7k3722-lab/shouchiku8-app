@@ -2442,11 +2442,20 @@ class NeoBuilder:
             rate = int(getattr(self, '_labor_rate', 0) or 0)
             paint_c = paint_code_of(pd)   # 1 速乾 / 3 ２Ｋ / 4 水性（名前でもコードでも受ける）
             coat_c = self._coat[0] if self._coat else COAT_CODE.get(unicodedata.normalize('NFKC', pd.get('coat') or ''), 2)
+            _hf_warn = ''   # 高機能塗装の種類が車種と食い違うときの知らせ（notes ができてから入れる。Codex 指摘）
             _hf_in = unicodedata.normalize('NFKC', str(pd.get('hf') or 'しない')).strip()
             _hf_map = {unicodedata.normalize('NFKC', k): v for k, v in HF_CODE.items()}
             if _hf_in not in _hf_map:  # 知らない高機能塗装を黙って「しない」にしない（加算基礎・材料代割合・パネル加算が変わる）
                 raise ValueError(f"paint.hf は {sorted(set(HF_CODE) - {'ｽｸﾗｯﾁ'})} のいずれか（{pd.get('hf')!r}）")
             hf = _hf_map[_hf_in]
+            if hf in (2, 3) and pi is not None:
+                # その車種でメーカーが指定している高機能塗装（COM/S_Est.DB の 2 桁目）と食い違っていたら知らせる。
+                # 耐スリ傷（T）とスクラッチ（S）は 加算基礎（T_KEI_3）もパネル加算も別の表なので、取り違えると金額が変わる
+                _hk = pi.car_hf_kind()
+                if _hk and _hk != hf:
+                    _nm = {2: '耐スリ傷', 3: 'ｽｸﾗｯﾁ'}
+                    _hf_warn = (f'★ 高機能塗装: 見積は {_nm.get(hf)} だが、この車種は {_nm.get(_hk)}（ADDATA の S_Est.DB）。'
+                                '取り違えると加算基礎（T_KEI_3）もパネル加算も別の表になるので、見積書の表記を確かめる')
             hf_panels = [p_ for p_ in pd['panels'] if is_hf_only_panel(p_)]   # 高機能塗装だけの行（DisposalCode 7）
             panels = [p_ for p_ in pd['panels'] if not is_manual_panel(p_) and not is_hf_only_panel(p_)]   # 部品コードのある外板パネル（20.DB）
             man_panels = [p_ for p_ in pd['panels'] if is_manual_panel(p_) and not is_hf_only_panel(p_)]  # 手入力の塗装行（DisposalCode 9）
@@ -2455,6 +2464,8 @@ class NeoBuilder:
             n_p = len(panels); n_rows = n_p + len(man_panels) + len(hf_panels)
             pcols = [r[1] for r in cur.execute('PRAGMA table_info(PaintingPanel)')]
             notes = []
+            if _hf_warn:
+                notes.append(_hf_warn)
             if unicodedata.normalize('NFKC', str(((estimate or {}).get('paint') or {}).get('input_type') or '')).strip() == '実額'                     or _truthy(((estimate or {}).get('paint') or {}).get('actual')):
                 # 実額は総額 1 つだけの欄で、パネル・加算基礎・材料計を持てない。パネルがあるのに指定されたら黙って捨てない
                 notes.append('paint.input_type「実額」は塗装パネルのある見積では使えないので、指数（パネル別）のままにした'

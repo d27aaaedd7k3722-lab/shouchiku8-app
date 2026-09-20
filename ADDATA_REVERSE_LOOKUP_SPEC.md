@@ -410,9 +410,7 @@ plain = bytes(a ^ b for a, b in zip(cipher, keystream))
 | 76.DB | ◎ | CHM ページ索引（塗り数値・車種別補修塗装指数・作業別ページ） |
 | 79.DB | ○ | `car,1,1,1,TOSO1` 塗装ワークシート TIF セット指定（COM/TOSOWS.CAB TOSO1-7.TIF） |
 | 83.DB | ◎ | 色別部品価格（LCG、201B ブロック。§11-9。カラーコード → 品番・価格・名称 '(ﾄｿｳｽﾞﾐ)'） |
-| 87.DB | ○ | パネル別塗り数値（TimeChangePanelMulti/Single, TimeRepairPanel1/2/3, TimePaintScrach, WageDivision）。新しい車種のみ収録、無い車は CHM 表と同値 |
-| 89.DB | ○ | 連動作業（前提脱着）定義 = コグニ「作業項目確認」の提案元（§11-6。K/D 行 → 脱着部品＋側 L/R） |
-| N_KEI.DB | ○ | 内板骨格 部位区分 → 関連部品コード（NkPartsCode → PartsCode 列挙） |
+| 87.DB / 97.DB | ◎ | パネル別塗り数値 **溶剤系 / 水性**（`車種, 年式群, ボディ, グレード, EVA, 部品コード, 取替複数塗, 取替単体塗, 修正1/1, 1/2, 1/3, 高機能塗装[, 水性の高機能塗装]` ×100。XOR 0xff の CSV）。87.DB は ADDATA 2026/08 で 1,307 車種中 **27 車種**（日産 P/Q 系 = S_Est の 2 桁目が 1・2）、97.DB はもっと多くの車種が持ち **値は CHM の水性ページと一致**する。`0000` は CHM の '-' と同じ「収録なし」。97.DB は列が 1 つ多く、**7 列目が水性の高機能塗装**（実案件の水性 × 耐スリ傷 40 行で一致。6 列目は 0 の行がある）。**生成器は CHM・係数表より優先して使う**（2026-09-21。高機能塗装のパネル加算が 89% → **99%**、スクラッチは 82/82）。ボディ専用行 → 共通行（'00'）の順で選び、どちらも無ければ使わない |
 | 00LTB.CHM | ◎ | 塗装指数ヘルプ（塗り数値表。hh.exe -decompile） |
 | IMG.CAB / WS.CAB | ○ | 部位イラスト BMP / ワークシート TIF（FP/HP/MP） |
 
@@ -428,10 +426,10 @@ plain = bytes(a ^ b for a, b in zip(cipher, keystream))
 | KATB140 / 150 / 230 | ○ | メーカー記号 / 部位グループ名（A フロントボデー…）/ 型式一覧 |
 | DATAUP.DB | ◎ | 車種データ更新年月（CarCode, YYYYMM。XOR 0xff の CSV、797 行）= **NEO Car.WorkCodeUpdateDate の出所（新規作成時）**（コグニ生成 NEO 9 本で 9/9 一致、収録の無い車種は ''。既存 NEO の再保存では既存値を温存。生成器 `dataup_date()`、reference/DATAUP.DB） |
 | SK_TBL.DB | ○ | 旧版 CHM 台帳（車名・年版・ファイル名） |
-| S_Est.DB | ○ | 車種, YearCode, PanelPaintingTimes, PanelHFPaintingTimes（`W69 00 10`）: 算出方式フラグ。10 = T_KEI 式＋F_S（595 車）、11/12 = 87.DB 収録、20 = 別版（W64 等）、50/60/00 = 旧版 |
+| S_Est.DB | ◎ | 車種, YearCode, PanelPaintingTimes, PanelHFPaintingTimes（`W69 00 10`）: 算出方式フラグ。10 = T_KEI 式＋F_S（595 車）、11/12 = 87.DB 収録、20 = 別版（W64 等）、50/60/00 = 旧版。**2 桁目（高機能塗装の算出方式）は実案件 1,800 本で高機能塗装の種類と対応する**: `x0` の車は 耐スリ傷 250 件・`x1` の車は スクラッチ 27 件（例外 2 件）。生成器 `PaintIndex.car_hf_kind()` が引いて、見積の高機能塗装と食い違うときに ★ で知らせる（2026-09-21） |
 | T_KEI_1.DB | ◎ | 塗り数値の係数（CarFormCode, PanelDivision, PanelTypeDivision, DisposalCode K=取替/S=修正, PaintingArea 9=取替/1-3=修正 1/n, Paint, PanelAreaMin/Max, CoefficientA（面積係数）, CoefficientB（固定分））。式 §11-6 |
 | T_KEI_2 | ◎ | CarFormCode, PanelDivision, C1=291（単体塗）, C2=216（複数塗・修正・高機能）の換算係数（全車形同値） |
-| T_KEI_4 | × | 2 行×6 定数。塗り数値の式には不要（用途未同定） |
+| T_KEI_4 | × | 2 行×6 定数（`000305,073758,000502,033917,000032,000100` / `000499,077349,000502,033917,000032,000135`）。塗り数値の式には不要。33917 ≒ 0.339 が下処理面積の係数の候補だが、実機の値は `round(切上(面積×割合)×0.345)` に合う（W66 のルーフ 287 だけ例外で、その 1 枚は ちょうど 1/3）。2 行の違い（305/499・73758/77349・100/135）は **溶剤/水性ではない**（実案件 1,762 パネルで 下処理面積の比は 溶剤 0.350 / 水性 0.344 でほぼ同じ）。用途未同定 |
 | T_KEI_3.DB | ◎ | 加算基礎数値（§11-4） |
 | BOOTH.DB | ◎ | ブース加算 |
 | BAN_FUKA.DB | ◎ | 板金付加作業（RTTI: MakerCode, PartsCode, ShapeModifyTime, WorkName, Comment）: 部品コード別、例 2300 トリム.サービスホールカバー脱着 0.30。時間 0 の '*' 付きは手加算の案内 |
@@ -440,7 +438,7 @@ plain = bytes(a ^ b for a, b in zip(cipher, keystream))
 | N_KEI.DB / N_KIHON.DB / NAIKOKUA.DB / WNAIKOKUA.DB / naikokub.DB | ◎ | 内板骨格修正（部位区分 A/B/C 指数・基本修正 3.5h）/ 内板骨格塗装（No 01-09 指数、溶剤/水性）/ 名称 |
 | fukaetc.DB | ◎ | 付加塗装の係数（§11-8: 2コートソリッド / ドアサッシュ / ストライプ / シーリング / ワックス / 低隠蔽性 …）。実機で 8 行すべて確認（§11-8 の表、2026-09-06 夕） |
 | 2TONE.DB / W2TONE.DB | ◎ | 2 トーン加算（上部塗膜×下部塗膜×枚数 1-5、溶剤/水性）。実機一致 |
-| SIRU / HJU_SS / H_N_SSZ / Scrach | △ | RTTI 列名: SIRU(CarFormCode, DoorType, Paint, Coat, DisposalCode, Time1, Time2, Material=低隠蔽性), HJU_SS(PanelDivision, PanelTypeDivision, PreparePanel, PrepareTimeA/B/PrepareTime/PrepareTimeK), H_N_Ssz(CarFormCode, FormCode1, FormCode2, PanelCode, PrepareTime, Material, FinishCode), Scrach(CarFormCode, Paint, HFPainting, PanelDivision, PanelTypeDivision, PanelCode, CoefficientA, CoefficientB)。実機: 低隠蔽性 1 パネル 0.5h |
+| SIRU / HJU_SS / H_N_SSZ / Scrach | △/△/△/◎ | RTTI 列名: SIRU(CarFormCode, DoorType, Paint, Coat, DisposalCode, Time1, Time2, Material=低隠蔽性), HJU_SS(PanelDivision, PanelTypeDivision, PreparePanel, PrepareTimeA/B/PrepareTime/PrepareTimeK), H_N_Ssz(CarFormCode, FormCode1, FormCode2, PanelCode, PrepareTime, Material, FinishCode), Scrach(CarFormCode, Paint, HFPainting, PanelDivision, PanelTypeDivision, PanelCode, CoefficientA, CoefficientB)。実機: 低隠蔽性 1 パネル 0.5h。**Scrach.DB は 2026-09-21 に解読・実装**: CoefficientA = 7 列目の先頭 4 桁（全行 2105）、CoefficientB = 8 列目の先頭 4 桁 ÷ 10（224.0 / 279.0 / 344.0）。式は F_S と同じ `round1((B + A×面積/1000) × C2/100000)`、行は (PanelDivision, PanelTypeDivision, PanelCode) 一致 → (9,9,9) の汎用行。実案件のスクラッチ 82 パネルで 78 行が一致（残り 4 行は 87.DB を優先して解決）。各列の残りの桁（…7456 / …164451）は全行共通で用途未同定 |
 | HYOJI3.DB / SOZAI.DB / ALL_SEL.DB / BLC_REL.DB / ILLIDX_A.DB | ○ | 表示名 / 素材コード表（01 アルミニウム / 02 樹脂。車種 67.DB が参照） / 全選択ブロック / ブロック関連 / イラスト索引 |
 | PNTG*.CAB | ○ | 塗装パネル図（車形 xx × yy）: BMP + ボタン座標 TXT |
 | E_GWS0x.CAB / TOSOWS.CAB | ○ | 画面解像度別の背景 BMP / 塗装ワークシート TIF |
