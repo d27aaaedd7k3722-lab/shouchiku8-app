@@ -487,14 +487,16 @@ _PAINT_FRAME_OPT = {'engine_room': {1: 'ラジエータサポート 両側新品
                     'rear_floor': {1: '1 台小修正', 2: '1 台大修正'}}
 
 
+def _is_wage_row(r: dict) -> bool:
+    """明細の行が「工賃の行」か（ｸｵ-ﾀﾊﾟﾈﾙ(ｺｳﾁﾝ) のように、本体とは別の部品コードで工賃だけ立てた行）。
+    **名前で決める** —— 部品代 0 は修理・板金の本体行でも普通なので、それだけでは工賃の行と決められない（Codex 指摘）"""
+    return bool(re.search(r'コウチン|工賃', _nfkc(_hw_kana(str(r.get('name') or '')))))
+
+
 def _is_wage_only(e: dict) -> bool:
-    """塗装パネルの候補が「工賃の行」だけでできているか（ｸｵ-ﾀﾊﾟﾈﾙ(ｺｳﾁﾝ) のように、本体とは別コードで工賃だけ立てた行）。
-    実案件ではこの行から塗装パネルは起きない（本体の行で 1 枚起きる）"""
+    """塗装パネルの候補が「工賃の行」だけでできているか。実案件ではこの行から塗装パネルは起きない（本体の行で 1 枚起きる）"""
     rows = e.get('rows') or []
-    if not rows:
-        return False
-    return all(re.search(r'コウチン|工賃', _nfkc(_hw_kana(str(r.get('name') or '')))) or not int(r.get('price') or 0)
-               for r in rows)
+    return bool(rows) and all(_is_wage_row(r) for r in rows)
 
 
 def paint_frame_line(n: str):
@@ -550,7 +552,7 @@ def material_mode(total_wage: int, material: int, rate=None):
 
 # 「塗装材料代」「材料代」「材料費」のように**材料代そのもの**を刷る行（追加項目ではなく材料代に入れる。2026-09-20）。
 # 「シーリング材料費」のように前に工程の名前が付く行は追加項目のままにする（名前が丸ごとこれのときだけ）
-_MATERIAL_LINE_RE = re.compile(r'^(塗装|ﾍﾟｲﾝﾄ)?材料(代|費)$|^ﾏﾃﾘｱﾙ(代|費)$')
+_MATERIAL_LINE_RE = re.compile(r'^(塗装|ﾍﾟｲﾝﾄ|ペイント)?材料(代|費)$|^(ﾏﾃﾘｱﾙ|マテリアル)(代|費)$')   # 名前は NFKC 後（半角カナ → 全角）でも来るので両方見る（Codex 第27周）
 _ADD_ITEM_RE = re.compile(r'アンダ[ー\-]?コ|内板|調色|チッピング|ヒンジ|ホ[ー\-]?スメント|インナ|レ[ー\-]?ルカバ|フ[ュユ][ー\-]?エルリ[ッツ]ド|ホイ[ー\-]?ルハウス|加算|下地|シ[ー\-]リング|材|剤|費')
 
 
@@ -1629,6 +1631,7 @@ class Drafter:
             return self._paint_input_type(out)
         panels, other = list(out.get('panels') or []), list(out.get('other') or [])
         mat_line = 0   # 「塗装材料代」の行の額（追加項目にせず材料代に入れる。2026-09-20）
+        _mat_line_ids: set = set()   # 材料代に回した塗装行（工賃の合計から外す）
         n_other0 = len(other)   # ここから後ろが塗装行から追加項目にした行（前は転記の paint.other）
         auto_manual: list = []  # 下書きが作った手入力の塗装行（rec, 見積の名前）
         _tcs_used: set = set()  # 2 コートソリッド加算の「ルーフ以外 N 枚」に使った行
@@ -1745,6 +1748,7 @@ class Drafter:
                     panels.append(rec)
                     continue
             if _MATERIAL_LINE_RE.search(n):
+                _mat_line_ids.add(id(ln))   # 塗装工賃の合計（s_lines）からも外す（両方に入ると二重計上。Codex 第27周）
                 # 「塗装材料代」「材料費」の行は**材料代**（追加項目ではない）。工賃の列に刷る工場があり、
                 # 追加項目にすると材料代と二重に計上されて合計が合わなくなる
                 # （2026-09-20 実案件: 塗装材料代 46,390 が 追加項目 ＋ 割合計算の材料代 で二重になり不合格）
@@ -1812,7 +1816,7 @@ class Drafter:
                 out.pop(k, None)
             if dropped or other:
                 self.notes.append('塗装: 20.DB のパネルに対応付けできた行が無いので一括計上（paint.total）にした。パネル別にするなら reading の name をコグニのパネル名に直す')
-        s_lines = sum(int(float(_num(l.get('wage')) or 0)) for l in lines)
+        s_lines = sum(int(float(_num(l.get('wage')) or 0)) for l in lines if id(l) not in _mat_line_ids)   # 材料代に回した行は塗装工賃計に入れない（Codex 第27周）
         # 塗装行から追加項目（paint.other）にした行の工賃。パネル別なら other として別に書くので、印字の塗装工賃計（追加項目を含まない）と比べるときは外す。
         # 一括計上では other に残さず total に入れたまま（生成器は一括の塗装費用に書く）
         line_other_w = sum(int(float(_num(o.get('wage')) or 0)) for o in other[n_other0:]) if out.get('panels') is not None and 'other' in out else 0
@@ -2067,8 +2071,7 @@ class Drafter:
                 if e is None or o is None:
                     continue
                 keep, drop = ((o, e) if (_is_wage_only(e) and not _is_wage_only(o)) else (e, o))
-                if not _is_wage_only(drop):
-                    keep['methods'] += drop['methods']   # 工賃だけの行（金額の無い ｺｳﾁﾝ 行）の修理方法は採らない
+                keep['methods'] += drop['methods']   # methods と rows は同じ長さで持つ（修理方法の取捨は下で行う）
                 keep['rows'] += drop['rows']
                 keep['codes'] += [c for c in drop['codes'] if c not in keep['codes']]
                 cands.pop(drop['pnl']['code'], None)
@@ -2076,8 +2079,11 @@ class Drafter:
                                   f"（明細 {' / '.join(keep['codes'])}）。コグニも 1 部位 1 枚しか起こさない")
         panels = []
         for pcode, e in cands.items():
-            # 同じパネルに取替行があれば塗装も「取替」（コグニは取替パネルを新品塗装で計上する）
-            method = '取替' if '取替' in e['methods'] else '修理'
+            # 同じパネルに取替行があれば塗装も「取替」（コグニは取替パネルを新品塗装で計上する）。
+            # ただし「(ｺｳﾁﾝ)＝工賃」の行の修理方法は採らない —— 本体が 修理 なら 修理 のまま
+            # （金額の無い「(ｺｳﾁﾝ) 取替」で新品塗装にすると塗装指数が跳ね上がる。2026-09-20）
+            _ms = [m for m, r in zip(e['methods'], e['rows']) if not _is_wage_row(r)] or e['methods']
+            method = '取替' if '取替' in _ms else '修理'
             ratio = ''
             if method == '修理':
                 # コグニの自動連動は修理パネルを 1/2 で起こす（実機 2026-09-12 W66 修理 5 枚すべて 1/2）。

@@ -18,6 +18,12 @@ class _D(de.Drafter):
     def __init__(self, rd):
         self.rd = rd
         self.notes = []
+        self.generic = False          # 汎用車種ではない（paint() が見る）
+        self.pi = None                # 20.DB（塗装パネル一覧）は使わない
+        self._rev_rows = []
+
+    def _rev(self, *a, **kw):         # 確認箇所シートの行（テストでは捨てる）
+        self._rev_rows.append((a, kw))
 
 
 def test_forced_actual_uses_printed_totals():
@@ -106,6 +112,30 @@ def test_auto_rule_is_unchanged():
     d2 = _D({'paint': {}, 'totals': {}})
     got2 = d2._paint_input_type({'total': 85520, 'material': 19226})
     assert 'input_type' not in got2, got2
+
+
+def test_material_line_not_in_wage_total():
+    """「塗装材料代」の行は塗装工賃計にも材料代にも二重に入らない（印字の塗装計が無い見積。Codex 第27周）"""
+    rd = {'paint': {}, 'totals': {}, 'blocks': []}
+    d = _D(rd)
+    d.rd = {'paint': {'lines': [
+        {'name': 'ﾙ-ﾌ 修理 (1/2)', 'wage': 20000},
+        {'name': '塗装材料代', 'wage': 5000},
+    ]}, 'totals': {}, 'blocks': []}
+    out = d.paint()
+    # 塗装工賃計は材料代の行を含まない／材料代は 5,000
+    assert int(out.get('total') or 0) == 20000, out
+    assert int(out.get('material') or 0) == 5000, out
+    assert not any('材料代' in str((o or {}).get('name') or '') for o in (out.get('other') or [])), out
+
+
+def test_material_line_name_variants():
+    """NFKC 後の全角（ペイント材料代・マテリアル費）も材料代の行として拾う（Codex 第27周）"""
+    import draft_estimate as _de
+    for n in ('材料代', '材料費', '塗装材料代', 'ペイント材料代', 'マテリアル代', 'ﾏﾃﾘｱﾙ費'):
+        assert _de._MATERIAL_LINE_RE.search(n), n
+    for n in ('シーリング材料費', '材料代の内訳', '塗装材料代金'):
+        assert not _de._MATERIAL_LINE_RE.search(n), n
 
 
 def main() -> int:
