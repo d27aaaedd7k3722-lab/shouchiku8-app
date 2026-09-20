@@ -1863,6 +1863,39 @@ class Drafter:
                               'other', 'base', 'booth', 'wax', 'door_sash', 'stripe', 'low_cover',
                               'two_coat_solid', 'two_tone', 'auto_panels')
 
+    # 実額を**指定された**ときに畳む塗装の内訳（額は総額にまとめる）。
+    # 内板骨格塗装（frame）とボデーシーリング（sealing）は塗装計とは別の欄なので畳まない
+    # （残っていると生成器が実額にしない ＝ 今までどおりの一括計上になる）
+    FORCE_ACTUAL_DROP = ('panels', 'lines', 'bumper_front', 'bumper_rear', 'bumper_base', 'base', 'booth',
+                         'wax', 'door_sash', 'stripe', 'low_cover', 'two_coat_solid', 'two_tone', 'other',
+                         'auto_panels', 'material_rate', 'material_round', '_total_from_lines')
+
+    def _force_actual_paint(self, out: dict) -> dict:
+        """reading が入力方式「実額」を**指定した**ときは、塗装の内訳があっても実額で入れる
+        （総額 ＝ 塗装工賃計 ＋ 追加項目 ＋ 材料代。生成器が材料代を総額に足す）。
+
+        自動で実額を選ぶ規則（下の `_paint_input_type`）は変えない —— 指定されたときだけ畳む。
+        アプリ（neo-estimate）はコグニの NEO を作るときに必ずこれを指定する（2026-09-20 亮平さん指示）"""
+        drop = [k for k in self.FORCE_ACTUAL_DROP if out.get(k)]
+        if not drop:
+            return out
+        tot = int(float(_num(out.get('total')) or 0))
+        oth = sum(int(float(_num((o or {}).get('wage')) or 0)) for o in (out.get('other') or []) if isinstance(o, dict))
+        mat = int(float(_num(out.get('material')) or 0))
+        if not mat:   # 費用割合モードに切り替えて額を落としていたら、印字の材料代を戻す（実額は割合を持てない）
+            mat = int(float(_num((self.rd.get('totals') or {}).get('material')) or 0))
+        for k in self.FORCE_ACTUAL_DROP:
+            out.pop(k, None)
+        out['total'] = tot + oth
+        if mat:
+            out['material'] = mat
+        self.notes.append(
+            f'塗装は入力方式「実額」の指定があるので内訳を畳んだ（塗装工賃計 {tot:,}'
+            + (f' ＋ 追加項目 {oth:,}' if oth else '')
+            + (f' ＋ 材料代 {mat:,}' if mat else '')
+            + f' = {tot + oth + mat:,} 円を総額 1 つで入れる。畳んだ内訳: {", ".join(drop)}）')
+        return out
+
     def _paint_input_type(self, out: dict) -> dict:
         """一式しか無い塗装なら input_type='実額' を付ける。reading に指定があればそれを優先する"""
         if not isinstance(out, dict) or not out:
@@ -1871,10 +1904,10 @@ class Drafter:
         want = _nfkc(str(said.get('input_type') or '')).strip()
         if want:
             out['input_type'] = want
-            return out
+            return self._force_actual_paint(out) if want == '実額' else out
         if _flag(said.get('actual'), 'paint.actual'):
             out['input_type'] = '実額'
-            return out
+            return self._force_actual_paint(out)
         if int(float(_num(out.get('total')) or 0)) > 0 and not any(out.get(k) for k in self.PAINT_DETAIL_FOR_INPUT):
             if out.get('material') or out.get('material_rate'):
                 # 材料代が別に出ている見積は実額にしない。実額は総額 1 つだけの欄で、**材料計を持てない**ので
