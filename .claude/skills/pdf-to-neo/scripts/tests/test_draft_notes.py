@@ -814,6 +814,11 @@ def test_auto_panels_one_panel_per_area():
     assert '4802' not in codes, p                               # 残すのは本体の行
     q = [x for x in p['panels'] if x.get('code') == '4801'][0]
     assert q.get('method') == '修理' and q.get('ratio'), q       # 金額の無い「(ｺｳﾁﾝ) 取替」で新品塗装にしない
+    # 明細の並びが逆（工賃の行が先）でも同じ（順序で結果が変わらない。Codex 指摘）
+    rd2 = dict(rd, blocks=[{'title': '', 'rows': [rows[1], rows[0], rows[2]]}])
+    p2 = de.Drafter(rd2).build()['paint']
+    q2 = [x for x in (p2.get('panels') or []) if (x.get('code') or '').startswith('480')]
+    assert len(q2) == 1 and q2[0].get('method') == '修理', p2
 
 
 def test_paint_frame_with_a_lump_total_is_not_counted_twice():
