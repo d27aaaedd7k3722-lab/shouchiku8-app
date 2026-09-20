@@ -100,6 +100,7 @@
 | booth | `{"index": 0.3, "wage": 2550}` | ブース加算。見積書に「ブース」行があるときだけ書く。省略 = ブース使用オフ（コグニの既定。実機 2026-09-08） |
 | bumper_front / bumper_rear | `{"method": "新品", "color": "一色", "draft": false, "index": 2.2, "wage": 18700}` | 23.DB（水性は 93.DB）。method 新品/変形修正/外傷修正小/外傷修正大 |
 | wax / door_sash / stripe / low_cover / two_coat_solid / two_tone | README 参照 | 付加塗装。**`panels` があるときだけ書ける**（一括計上と併用すると ValueError。生成器 `PAINT_DETAIL_KEYS`） |
+| type_note / paint_note / coat_note | `"ｱﾝﾀﾞｰｺｰﾄ含み"` / `"水性"` / `""` | 塗装条件の**注記欄**（コグニの塗装条件で塗装の種類・塗料名・塗膜名の右に手で書く欄。印刷に出るだけで金額には影響しない）。NEO の `PaintingPlan.PaintingTypeName`（36 バイト）/ `PaintNameAdded` / `CoatNameAdded`（14 バイト）。半角カナに寄せて切り詰める |
 | sealing / frame / other | README 参照 | ボデーシーリング・内板骨格塗装・その他。**一括計上（`panels` なし）でも書ける**（2026-09-12 訂正。ボデーシーリングを `other` に落とすと塗装工賃計と材料代が狂う。判断規則 10-13） |
 
 塗装明細が無い見積（ディーラー概算など）は `panels` を省き `total` だけ → 下書きが `input_type: "実額"` を付け、コグニの**実額入力**（総額 1 つ）で書く（判断規則 10-15）。材料代が別に印字されている案件と `auto_panels` の案件は今までどおり（実額は材料計の欄を持てないので、「塗装費用(工場見積)」1 行の一括計上になる）。

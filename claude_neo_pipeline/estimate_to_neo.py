@@ -275,7 +275,8 @@ BUMPER_DRAFT_ADD = 0.4  # 絞模様有り の加算（コグニ実機 N-ONE 2026
 COAT_CODES = {'ソリッド': 1, 'メタリック': 2, '2コートパール': 3, '3コートパール': 4}  # NFKC 正規化後の照合用
 COAT_DISPLAY = ['', 'ソリッド', 'メタリック', '２コートパール', '３コートパール']  # NEO に書く表記（コグニ CoatName と同じ全角数字）
 BUMPER_ONLY_KEYS = ('paint', 'coat', 'hf', 'panels', 'bumper_front', 'bumper_rear', 'bumper_base', 'material', 'material_rate', 'material_round',
-                    'input_type', 'actual', 'total', 'note', 'auto_panels', '_note')  # パネル無しでバンパだけ塗る見積に許す paint のキー（許可リスト。sealing / frame / other / 付加塗装が混じる組合せは実機未確認なので通さない）
+                    'input_type', 'actual', 'total', 'note', 'auto_panels', '_note',
+                    'type_note', 'paint_note', 'coat_note')  # パネル無しでバンパだけ塗る見積に許す paint のキー（注記欄は金額に関係しないので許す。Codex 指摘）（許可リスト。sealing / frame / other / 付加塗装が混じる組合せは実機未確認なので通さない）
 PAINT_DETAIL_KEYS = ('bumper_front', 'bumper_rear', 'wax', 'door_sash', 'stripe', 'low_cover', 'two_coat_solid', 'two_tone')  # パネル別指数（paint.panels）のときだけ書ける項目。frame / sealing / other は一括計上でも可
 
 
@@ -3018,6 +3019,14 @@ class NeoBuilder:
                 # 上の notes を出す print ループはもう終わっているので、ここで出して報告にも残す（Codex 第1周の指摘）
                 self._paint_notes = (getattr(self, '_paint_notes', None) or []) + [_msg]
                 print('塗装:', _msg)
+        # 塗装条件の注記欄（印刷に出る自由入力。金額には影響しない）。実案件 600 本中 12 本が
+        # PaintingTypeName = 'ｱﾝﾀﾞｰｺｰﾄ含み'、1 本が PaintNameAdded = '水性'（2026-09-21 の棚卸しで同定）
+        _n_type = hw(str((pdx or {}).get('type_note') or '')).strip()
+        _n_paint = hw(str((pdx or {}).get('paint_note') or '')).strip()
+        _n_coat = hw(str((pdx or {}).get('coat_note') or '')).strip()
+        if _n_type or _n_paint or _n_coat:
+            cur.execute('UPDATE PaintingPlan SET PaintingTypeName=?, PaintingTypeNameAdded=?, PaintNameAdded=?, CoatNameAdded=?',
+                        (_fit(_n_type, 36), _fit(_n_type, 36), _fit(_n_paint, 14), _fit(_n_coat, 14)))
         _itype = unicodedata.normalize('NFKC', str((pdx or {}).get('input_type') or '')).strip()
         if (_itype == '実額' or _truthy((pdx or {}).get('actual'))) and not _jitsu:
             # 塗装の入力方式「実額」を**指定された**のに、内訳（パネル・バンパ・加算基礎・内板骨格塗装・追加項目 等）が

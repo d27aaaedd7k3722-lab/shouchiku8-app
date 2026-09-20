@@ -185,6 +185,27 @@ def main() -> int:
     except OSError:
         pass
 
+    # 塗装条件の注記欄（印刷に出る自由入力。実案件 600 本中 12 本が 'ｱﾝﾀﾞｰｺｰﾄ含み'）
+    b5 = NeoBuilder()
+    p5 = dict(PAINT)
+    p5['type_note'] = 'アンダーコート含み'
+    p5['paint_note'] = '水性'
+    p5.pop('total', None)
+    e5 = dict(est)
+    e5['paint'] = p5
+    n5, _r5 = b5.build(e5, VEH, hints={}, labor_rate=RATE, est_date='20260921', insurance={})
+    t5 = os.path.join(os.environ.get('TEMP', HERE), f'unit_paint_screen_note_{os.getpid()}.neo')
+    open(t5, 'wb').write(n5)
+    em5 = next(v for k, v in neo_diff.load(t5).items() if k.endswith('AnSvEm0001.sld'))
+    pl5 = _row(em5, 'PaintingPlan')
+    for k, v in (('PaintingTypeName', 'ｱﾝﾀﾞｰｺｰﾄ含み'), ('PaintingTypeNameAdded', 'ｱﾝﾀﾞｰｺｰﾄ含み'), ('PaintNameAdded', '水性'),
+                 ('PaintName', '２Ｋ'), ('CoatName', 'メタリック')):
+        fails = _cmp(f'塗装条件の注記 {k}', pl5.get(k), v, fails)
+    try:
+        os.remove(t5)
+    except OSError:
+        pass
+
     print('unit_paint_screen:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
 

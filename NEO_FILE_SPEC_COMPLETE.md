@@ -102,6 +102,20 @@ PolicyNo, ContractorName, AgencyName, AccidentDate/Era/EraYear, PresenceDate（�
 - Setting: `WageType=0, wb_PriceBase=レバーレート円/h, wb_Round=10, wi_Round=10, TaxKindFlag=0(消費税の表示方法 = 外税。1 は内税。§「消費税設定ダイアログ」。**明細に入れる金額はどちらでも税抜**), TaxRate=10, tx_CalculateFlag=1, tx_Unit=1, tx_ArrangeFlag=1`（NEW1 = 車両確定直後の保存だけ 86,100 で、これは作成時の入力ミス値。NEW2 以降は 8,610 に直してあるので NEW1 を Setting の根拠にしない）
 - SelfInfo: 自社情報 7 行（テンプレートの SHOUCHIKU 情報をそのまま利用）
 - ReportTitle: 帳票 15 種のタイトル。コグニが保存時に並べ替える（値は同じ）
+- **全テーブル・全列の洗い出し（実案件 200 本 × 生成 77 本、2026-09-21）**: 生成器が書いていない表・列で、実案件では値が入るものは
+  次の 3 つだけだった。いずれも**金額に影響しない**:
+  - `RWLinkParts`（実案件の 20%・40/200 本）= **「作業項目確認」（89.DB の連動作業）で提示された関連作業の一覧**。
+    列は `RecordNo, PartsCode, DisposalCode(0 取替/1 脱着), LRCode(L/R/空), PartsCount`。提示のうち採用した行は
+    明細側に `ERParts.RWLinkFlag=1` が立つ（40 本中 36 本で一致）。提示だけで採らなかった行も残る（200 行中 79 行）。
+    **コグニで新規作成しただけの見積は空**（実機 cogni_M1・cogni_pnt_A10・exp_manual）なので、生成器も空でよい
+  - `PartsPlan.NameShift=1`（実案件の 85%）・`CarSearch.ev_LColorCodeByManual/ev_UColorCodeByManual/ev_TrimCodeByManual=1`（86%）
+    = 人がその画面を通ったことを示す設定。**コグニ実機で新規作成した NEO は 0**（生成器と同じ）
+  - `PaintingPlan.PaintingTypeName / PaintingTypeNameAdded / PaintNameAdded / CoatNameAdded`
+    = **塗装条件の注記欄**（印刷に出る自由入力。実案件 600 本中 12 本が `'ｱﾝﾀﾞｰｺｰﾄ含み'`、1 本が `PaintNameAdded='水性'`）。
+    2026-09-21 に生成器が対応（`paint.type_note` / `paint_note` / `coat_note`。TEXT(36)/TEXT(14) で半角カナに寄せる）
+- **使われていない機能**（実案件 200〜250 本で確認。生成器も空のままでよい）: 画像（`AnSvIg0001.sld` の Image / ImageAnnotation は 0 行）、
+  リサイクル部品（`RCParts` / `RCLinkParts` 0 行）、`EPCLinkParts`・`DamageComment`・`DamageImage` 0 行、
+  総合計の値引き・割増（`Fixer` は名前だけで `Enabled=0, Price=0`、`Total.*Extra*` の金額は 0 件）
 - Statistics / Unspecified: 統計・予備。テンプレート値のまま
 
 ## 4. AnSvEm0001.sld（見積本体、25 テーブル）
