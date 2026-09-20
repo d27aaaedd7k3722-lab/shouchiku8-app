@@ -129,18 +129,23 @@ def paint_test(path, car, root):
     out = collections.Counter(); miss = []
     if not panels:
         return out, miss
-    n = len(panels); hf = int(pp.get('HFPainting') or 0); paint = int(pp.get('Paint') or 3); coat = int(pp.get('Coat') or 1)
+    # 加算基礎の枚数・単体塗/複数塗の判定は **部品コードのあるパネル（区分 0/2/6）だけ**で数える
+    # （手入力の塗装行 9 と 高機能塗装だけの行 7 は数えない。reference/painting.md §11(7)・§13(2)）
+    n = len([p for p in panels if (p.get('DisposalCode') if p.get('DisposalCode') is not None else -1) in (0, 2, 6) and str(p.get('PartsCode') or '').strip()])
+    hf = int(pp.get('HFPainting') or 0); paint = int(pp.get('Paint') or 3); coat = int(pp.get('Coat') or 1)
     try:
         pi = PaintIndex(root, car['CarCode'])
     except Exception as ex:
         return collections.Counter({'error': 1}), [str(ex)[:100]]
     form = pi.form_codes()[0]
     bt = pi.base_time(form, paint, coat, hf, n) if form else None
-    if pp.get('BaseTime') is not None and pp['BaseTime'] > 0:
+    if n > 0 and pp.get('BaseTime') is not None and pp['BaseTime'] > 0:   # 部品コードのあるパネルが 0 枚なら加算基礎は無い（Codex 指摘）
         out['base_ok' if (bt is not None and abs(bt - pp['BaseTime']) < 0.05) else 'base_ng'] += 1
     for p in panels:
         if p.get('WageByManual') not in ('', None):
             continue
+        if (p.get('DisposalCode') if p.get('DisposalCode') is not None else -1) not in (0, 2, 6) or not str(p.get('PartsCode') or '').strip():
+            continue   # 手入力の塗装行・高機能塗装だけの行は標準指数の突き合わせの対象外
         std = pi.standard_times(p.get('PartsCode'), hf, n, paint)
         key = 'new' if p.get('DisposalCode') == 0 else {1: 's1', 2: 's2', 3: 's3'}.get(p.get('PaintingArea') or 1, 's1')
         got = (std or {}).get(key)
