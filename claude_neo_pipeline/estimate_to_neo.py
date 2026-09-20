@@ -243,7 +243,8 @@ BUMPER_DISPOSAL = {'新品': (1, '新品'), '取替': (1, '新品'), '外傷修�
 BUMPER_DRAFT_ADD = 0.4  # 絞模様有り の加算（コグニ実機 N-ONE 2026-09-05: 修理 3 方式・塗膜によらず +0.4）
 COAT_CODES = {'ソリッド': 1, 'メタリック': 2, '2コートパール': 3, '3コートパール': 4}  # NFKC 正規化後の照合用
 COAT_DISPLAY = ['', 'ソリッド', 'メタリック', '２コートパール', '３コートパール']  # NEO に書く表記（コグニ CoatName と同じ全角数字）
-BUMPER_ONLY_KEYS = ('paint', 'coat', 'hf', 'panels', 'bumper_front', 'bumper_rear', 'bumper_base', 'material', 'material_rate', 'total', 'note', 'auto_panels', '_note')  # パネル無しでバンパだけ塗る見積に許す paint のキー（許可リスト。sealing / frame / other / 付加塗装が混じる組合せは実機未確認なので通さない）
+BUMPER_ONLY_KEYS = ('paint', 'coat', 'hf', 'panels', 'bumper_front', 'bumper_rear', 'bumper_base', 'material', 'material_rate', 'material_round',
+                    'input_type', 'actual', 'total', 'note', 'auto_panels', '_note')  # パネル無しでバンパだけ塗る見積に許す paint のキー（許可リスト。sealing / frame / other / 付加塗装が混じる組合せは実機未確認なので通さない）
 PAINT_DETAIL_KEYS = ('bumper_front', 'bumper_rear', 'wax', 'door_sash', 'stripe', 'low_cover', 'two_coat_solid', 'two_tone')  # パネル別指数（paint.panels）のときだけ書ける項目。frame / sealing / other は一括計上でも可
 
 
@@ -469,11 +470,58 @@ def two_tone_time(paint: int, coat_up: int, coat_low: int, count: int) -> Option
     return None
 
 
-def material_default(total_wage: int, rate) -> int:
-    """材料代の既定値 = 塗装工賃計 × 割合 を 10 円単位で四捨五入（コグニ実機 2026-09-05 NEW3/NEW4: 15,500×15%=2,325→2,330、18,950×15%=2,842.5→2,840、46,490×15%=6,973.5→6,970、46,490×14%=6,508.6→6,510。
+MATERIAL_ROUND_MODES = ('四捨五入', '切り上げ', '切り捨て')
+MATERIAL_ROUND_UNITS = (10, 1, 100)
+
+
+def material_round_of(spec) -> tuple[int, str]:
+    """`paint.material_round` → (単位, 丸め方)。既定は 10 円四捨五入（コグニ実機 2026-09-05 NEW3/NEW4）。
+    書き方は `{"unit": 10, "mode": "切り上げ"}` か、文字列 `"10円切り上げ"` / `"1円四捨五入"`。
+    工場のコグニの設定で違う（実案件 NEO 700 本: 10 円四捨五入が大半だが、10 円切り上げでしか説明できない案件が 22 本、
+    1 円単位の案件もある。NEO 仕様 §塗装「材料代の端数処理」）"""
+    unit, mode = 10, '四捨五入'
+    if spec in (None, ''):
+        return unit, mode
+    if isinstance(spec, dict):
+        u, m = spec.get('unit'), spec.get('mode')
+    else:
+        s = unicodedata.normalize('NFKC', str(spec))
+        mm = re.search(r'(\d+)\s*円?', s)
+        u = mm.group(1) if mm else None
+        m = next((k for k in MATERIAL_ROUND_MODES if k in s), None)
+        rest = re.sub(r'\d+', '', s).replace('円', '').replace(' ', '').replace('単位', '')
+        if m:
+            rest = rest.replace(m, '')
+        if rest.strip():   # 「10円切上げ」「foo」のような読めない値を既定に落とさない（Codex 指摘）
+            raise ValueError(f'paint.material_round が読めない（例 "10円切り上げ" / {{"unit": 10, "mode": "切り上げ"}}）: {spec!r}')
+    if u not in (None, ''):
+        try:
+            u = int(float(u))
+        except (TypeError, ValueError):
+            raise ValueError(f'paint.material_round の単位が数でない: {spec!r}')
+        if u not in MATERIAL_ROUND_UNITS:
+            raise ValueError(f'paint.material_round の単位は {" / ".join(str(x) for x in MATERIAL_ROUND_UNITS)} 円のどれか: {spec!r}')
+        unit = u
+    if m not in (None, ''):
+        if m not in MATERIAL_ROUND_MODES:
+            raise ValueError(f'paint.material_round の丸め方は {" / ".join(MATERIAL_ROUND_MODES)} のどれか: {spec!r}')
+        mode = m
+    return unit, mode
+
+
+def material_default(total_wage: int, rate, round_=None) -> int:
+    """材料代の既定値 = 塗装工賃計 × 割合 を、工場の端数処理で丸めた額（既定 10 円単位で四捨五入。
+    コグニ実機 2026-09-05 NEW3/NEW4: 15,500×15%=2,325→2,330、18,950×15%=2,842.5→2,840、46,490×15%=6,973.5→6,970、46,490×14%=6,508.6→6,510。
     コグニは double で計算するので 18,950×0.15 は 2842.4999… → 2,840。Python でも同じ double 計算にする）"""
-    x = (total_wage or 0) * (float(rate) / 100.0) / 10.0
-    return int(math.floor(x + 0.5)) * 10
+    unit, mode = material_round_of(round_)
+    x = (total_wage or 0) * (float(rate) / 100.0) / unit
+    if mode == '切り上げ':
+        n = math.ceil(x - 1e-9)
+    elif mode == '切り捨て':
+        n = math.floor(x + 1e-9)
+    else:
+        n = math.floor(x + 0.5)
+    return int(n) * unit
 
 
 def cogni_parts_names(name20: str) -> tuple[str, str]:
@@ -2738,7 +2786,7 @@ class NeoBuilder:
                 notes.append(f'塗装工賃計 明細 {wage_total_p} / 見積 {paint_total}')
             mr = float(pd.get('material_rate') or default_material_rate(paint_c, coat_c, hf) or 26)
             if not paint_material:
-                paint_material = material_default(wage_total_p, mr)
+                paint_material = material_default(wage_total_p, mr, pd.get('material_round'))
                 mat_auto_rate = mr
                 if pd.get('material_rate') in (None, ''):  # 見積に材料代も割合も無い → 既定の割合で計算した（どの表の値かを残す）
                     _src = ('ガイドライン表の 6500〜 列' if guideline_material_rate(paint_c, coat_c, hf) is not None
@@ -2848,7 +2896,7 @@ class NeoBuilder:
             wt = int(ptr['WageTotalOutTax'] or 0) + add_frame_w + add_etc_w  # 追加項目(Other) は WageTotal に含めず Total にだけ加算（実 NEO と同じ）
             mat = int(ptr['MaterialTotalOutTax'] or 0); mat_before = mat
             if mat_auto_rate is not None:  # 材料代 = 区分ごとの round10(工賃×割合) の合計。見積書に材料代が無いときは追加した骨格・付加塗装分も含めて再計算
-                new_mat = material_default(wt, mat_auto_rate)
+                new_mat = material_default(wt, mat_auto_rate, pdx.get('material_round'))
                 if new_mat != mat:
                     cur.execute('UPDATE PaintingTotal SET MaterialTotalOutTax=?,MaterialTotalInTax=?,MaterialTotalTax=?', t3i(new_mat))
                     paint_total += new_mat - mat
@@ -2861,6 +2909,13 @@ class NeoBuilder:
                          *t3i(fr_w), *t3i(et_w), *t3i(ot_w), *t3i(wt),
                          *t3i(int(ptr['TotalOutTax'] or 0) + add_frame_w + add_etc_w + add_other_w + (mat - mat_before))))  # 既存 Total（一括塗装費は WageTotal と Other の両方に入っている）＋追加分
             paint_total += add_frame_w + add_etc_w + add_other_w
+        _itype = unicodedata.normalize('NFKC', str((pdx or {}).get('input_type') or '')).strip()
+        if _itype == '参考':
+            # 塗装の入力方式「参考」（コグニ: その他 → 塗装 → 入力方式）。計算は指数と同じで、見積の位置づけだけが違う
+            # （実案件 NEO 700 本に 1 本。パネル・バンパ・追加項目はそのまま、材料代は手入力の印が付く）
+            cur.execute("UPDATE PaintingPlan SET InputType=2, InputTypeName='参考'")
+        elif _itype and _itype not in ('指数', '実額'):
+            raise ValueError(f"paint.input_type は 指数 / 実額 / 参考 のどれか: {(pdx or {}).get('input_type')!r}")
         # --- 内板骨格修正（内骨画面）: FramePlan = 基本修正作業（N_KIHON）, Frame = 部位区分×損傷ランク（N_KEI: A/B/C）
         nk_total = 0
         fr = est.get('frame') or {}

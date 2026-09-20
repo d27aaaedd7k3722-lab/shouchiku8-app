@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import difflib
 import json
+import math
 import os
 import re
 import sys
@@ -479,6 +480,64 @@ def infer_labor_rate(rows: list[dict]) -> int:
 # 塗装の「追加項目」（PaintingOther。材料代の対象外）に入れる工程の名前（NFKC 後の全角カナで照合）。
 # 実案件 NEO 7,002 本の追加項目の名前: アンダーコート 149・内板調色 63・チッピング 25・ヒンジ 30・レールカバー 14・フューエルリッド 12・ホースメント 10・ホイルハウス 5 …（2026-09-13）。
 # 「シーリング材料費」「…材」「…剤」「…費用」のような材料・費用の行も部位ではないのでこちら（ボデーシーリングの作業は先に paint.sealing へ分けてある）
+PAINT_FRAME_NAME = {'engine_room': 'エンジンルーム', 'front_pillar': 'フロントピラー',
+                    'center_pillar': 'センタピラー', 'rear_floor': 'リヤフロア'}
+_PAINT_FRAME_OPT = {'engine_room': {1: 'ラジエータサポート 両側新品または修正', 2: '＋ Fフェンダエプロン 片側', 3: '＋ Fフェンダエプロン 両側'},
+                    'front_pillar': {1: '片側新品', 2: '両側新品'}, 'center_pillar': {1: '片側新品', 2: '両側新品'},
+                    'rear_floor': {1: '1 台小修正', 2: '1 台大修正'}}
+
+
+def paint_frame_line(n: str):
+    """塗装明細の 1 行が「内板骨格塗装」（コグニの塗装画面 内板骨格タブ = PaintingFrame）か。戻り値 (欄, 区分) か None。
+    コグニの欄は 4 つで、指数は COM/NAIKOKUA.DB（車形別）:
+      エンジンルーム  1 ラジエータサポート両側新品または修正 / 2 ＋Fフェンダエプロン片側 / 3 ＋両側
+      フロントピラー  1 片側新品 / 2 両側新品      センタピラー 1 片側新品 / 2 両側新品
+      リヤフロア      1 1 台小修正 / 2 1 台大修正
+    印字は「ラジエータサポート 両側新品」「フロントフェンダエプロン 片側新品または修正」のように 2 行に分かれるので、
+    呼び出し側で同じ欄の区分を大きい方に寄せる。名前だけで決められる（外板パネルに無い）のはラジエータサポートとエプロンで、
+    ピラー・フロアは区分の語（片側新品 / 両側新品 / 1 台小修正 / 1 台大修正）が印字されているときだけ内板骨格とみなす
+    （外板パネルの「フロントピラー 修理 1/2」と取り違えないため）"""
+    if re.search(r'ラジエ[ー\-]?[タター]*サポ[ー\-]?ト', n):
+        return 'engine_room', 1
+    if re.search(r'フェンダ[ー\-]?エプロン|エプロン', n):
+        return 'engine_room', 3 if '両側' in n else 2
+    side = 2 if '両側' in n else (1 if '片側' in n else 0)
+    if side and re.search(r'(フロント|Ｆ|F)ピラ[ー\-]?', n):
+        return 'front_pillar', side
+    if side and re.search(r'(センタ[ー\-]?|Ｃ|C)ピラ[ー\-]?', n):
+        return 'center_pillar', side
+    if re.search(r'フロア', n) and re.search(r'[1１一]\s*台\s*(小|大)修正', n):
+        return 'rear_floor', 2 if '大修正' in n else 1
+    return None
+
+
+MATERIAL_ROUND_CANDS = ((10, '四捨五入'), (10, '切り上げ'), (10, '切り捨て'),
+                        (1, '四捨五入'), (1, '切り上げ'), (1, '切り捨て'),
+                        (100, '四捨五入'), (100, '切り上げ'), (100, '切り捨て'))
+
+
+def material_mode(total_wage: int, material: int, rate=None):
+    """印字の 塗装工賃計 と 材料代 から「材料代割合（整数 %）＋端数処理」を割り出す。戻り値 (割合, 端数処理 or None) か None。
+    端数処理が既定（10 円四捨五入）なら 2 つ目は None を返す（reading に余計な欄を書かない）。
+    コグニの材料代は「塗装工賃計 × 割合」を工場の設定で丸めた額で、割合の欄は整数 %（実案件 NEO 700 本すべて整数）。
+    丸めは工場ごとに違う（10 円四捨五入が大半・10 円切り上げが 22 本・1 円単位もある）ので、印字の材料代に戻る組合せを探す。
+    割合は 材料代 ÷ 塗装工賃計 に近い整数から順に試す（rate を渡せばその割合だけ確かめる）"""
+    if not total_wage or total_wage <= 0 or not material or material <= 0:
+        return None
+    exact = material / total_wage * 100
+    if rate:
+        cands = [int(round(float(rate)))]
+    else:
+        cands = sorted({int(math.floor(exact)), int(math.ceil(exact)), int(round(exact))})
+        cands = [r for r in cands if 1 <= r <= 100]
+        cands.sort(key=lambda r: abs(r - exact))
+    for r in cands:
+        for unit, mode in MATERIAL_ROUND_CANDS:
+            if material_default(total_wage, r, {'unit': unit, 'mode': mode}) == material:
+                return r, (None if (unit, mode) == (10, '四捨五入') else {'unit': unit, 'mode': mode})
+    return None
+
+
 _ADD_ITEM_RE = re.compile(r'アンダ[ー\-]?コ|内板|調色|チッピング|ヒンジ|ホ[ー\-]?スメント|インナ|レ[ー\-]?ルカバ|フ[ュユ][ー\-]?エルリ[ッツ]ド|ホイ[ー\-]?ルハウス|加算|下地|シ[ー\-]リング|材|剤|費')
 
 
@@ -1530,6 +1589,7 @@ class Drafter:
         if not (mat_lines and printed and mat_lines == printed and mat_lines != now):
             return
         out['material'] = mat_lines
+        self._mat_from_lines = True   # この材料代は「塗装工賃計 × 割合」ではない（割合を割り出さない）
         self.notes.append(f'材料代 {mat_lines:,} 円は塗装行の材料の合計（印字の材料計と一致）。'
                           f'工賃の列が空で材料の列だけに金額のある行（{" / ".join(_hw_kana(l.get("name") or "") for l in extra[:5]) or "（なし）"}）'
                           'の材料も入れた（この行は工賃が無いので塗装工賃計は変わらない。「追加項目（材料代の対象外）」の注記は材料率の計算の話）')
@@ -1541,6 +1601,7 @@ class Drafter:
         p = self.rd.get('paint')
         if not p:
             return None
+        self._mat_from_lines = False
         out: dict = {}
         for k, v in p.items():  # 塗料/塗膜/割合/材料/総額に加え、estimate.json の塗装キー（panels/base/booth/bumper_*/wax/sealing/frame/other/低隠蔽性 …）をそのまま通す
             if k in ('lines', 'note') or v in (None, ''):
@@ -1557,6 +1618,7 @@ class Drafter:
         n_other0 = len(other)   # ここから後ろが塗装行から追加項目にした行（前は転記の paint.other）
         auto_manual: list = []  # 下書きが作った手入力の塗装行（rec, 見積の名前）
         _tcs_used: set = set()  # 2 コートソリッド加算の「ルーフ以外 N 枚」に使った行
+        frame_from_lines_w = 0  # 塗装行から内板骨格塗装に振り分けた工賃（塗装工賃計に二重に足さないため）
         for ln in lines:
             name = _hw_kana(ln.get('name') or '')
             t = float(_num(ln['index'])) if _num(ln.get('index')) != '' else None
@@ -1569,6 +1631,21 @@ class Drafter:
                 self._put_special(out, 'booth', {'index': t or 0.0, 'wage': w or 0}, name)
                 continue
             if id(ln) in _tcs_used:   # 「ルーフ以外 N 枚」の行は 2 コートソリッド加算に取り込んだ
+                continue
+            _fr = paint_frame_line(n)
+            if _fr:
+                # 内板骨格塗装（コグニの塗装画面 内板骨格タブ）。外板パネルの行追加にすると、コグニで開いたときに
+                # 原本に無いパネルが増え、内板骨格タブが空になる（実案件の塗装明細 700 本中 279 本がこのタブを使う）
+                _k, _opt = _fr
+                _rec = out.setdefault('frame', {}).setdefault(_k, {})
+                _rec['option'] = max(int(_rec.get('option') or 0), _opt)   # エンジンルームは「ラジエータサポート」「エプロン」の 2 行で 1 つの区分
+                if t is not None:
+                    _rec['index'] = round(float(_rec.get('index') or 0) + t, 2) if _rec.get('index') else t
+                if w is not None:
+                    _rec['wage'] = int(_rec.get('wage') or 0) + w
+                frame_from_lines_w += (w or 0)
+                self.notes.append(f'塗装 {name}: 内板骨格塗装の {PAINT_FRAME_NAME[_k]}'
+                                  f'（{_PAINT_FRAME_OPT[_k][_rec["option"]]}）にした（コグニの塗装画面 内板骨格タブ）')
                 continue
             # 2 コートソリッド加算（付加塗装）。コグニは PaintingEtcetera の専用欄に入れる。
             # ここで拾わないと「外板パネルの行追加」に落ちて、原本に無いパネル行が 1 行増える（2026-09-18 実機で確認）。
@@ -1709,6 +1786,8 @@ class Drafter:
         _pf = out.get('frame') if isinstance(out.get('frame'), dict) else {}
         s_frame = sum(int(float(_num((_pf.get(k) or {}).get('wage')) or 0)) for k in ('engine_room', 'front_pillar', 'center_pillar', 'rear_floor')
                       if isinstance(_pf.get(k), dict))  # 内板骨格塗装も印字の塗装工賃計に入る（2026-09-14 C-HR ラジエータサポート 13,130）
+        s_frame_all = s_frame   # 内板骨格塗装の工賃の合計（印字の塗装工賃計に含まれる）
+        s_frame = max(0, s_frame - frame_from_lines_w)  # 塗装行から振り分けた分は s_lines に入っているので二重に足さない
         if 'total' not in out:
             out['total'] = s_lines
             out['_total_from_lines'] = line_other_w
@@ -1719,6 +1798,13 @@ class Drafter:
                 t_in = None
             if t_in is not None and t_in != s_lines - line_other_w + s_frame:
                 self.notes.append(f'塗装計: 印字 {t_in:,} と塗装行の工賃合計 {s_lines:,} が違う（差 {t_in - s_lines:+,}）。行の写し漏れか、内板骨格・付加塗装が含まれていないか確かめる')
+        if 'panels' not in out and s_frame_all and int(float(_num(out.get('total')) or 0)) > 0:
+            # 外板パネルの無い一括計上（塗装一式）で内板骨格塗装があるとき: 生成器は paint.total（一式の額）に内板骨格塗装を足す。
+            # 印字の塗装工賃計は内板骨格塗装を含む（判断規則 10-25）ので、一式の額から引いておかないと二重に乗る（Codex 指摘）
+            _t0 = int(float(_num(out['total'])))
+            out['total'] = _t0 - s_frame_all
+            self.notes.append(f'塗装は一括計上で内板骨格塗装 {s_frame_all:,} 円があるので、一式の額を {_t0:,} → {out["total"]:,} にした'
+                              '（塗装工賃計は「一式 + 内板骨格塗装」で元に戻る。印字の塗装工賃計は内板骨格塗装を含む）')
         self._material_from_lines(out, lines)
         # 材料代が「塗装工賃計 × 割合」の一括四捨五入と一致するなら割合だけ渡す（コグニは費用割合モード = MaterialTotalbyManual ''。額を渡すと '*' 手入力扱いになる。実機 2026-09-08 exp_paint_B）
         try:
@@ -1729,11 +1815,45 @@ class Drafter:
             tot = tot - int(out.get('_total_from_lines') or 0) + s_frame
         # 生成器は材料代を 塗装工賃計 × 割合 の 10 円丸め（material_default）で作る。1 円四捨五入でしか一致しない材料代（工場が 1 円単位で出す書式）で
         # 割合モードにすると NEO の材料代が数円ずれるので、そのときは印字の額を手入力（*）で渡す（2026-09-14 JPN タクシー: 127,466 × 16% = 20,394.56 → 印字 20,395 / 10 円丸め 20,390）
-        if mat and rate and tot and mat == material_default(tot, rate):
-            out.pop('material')
-            self.notes.append(f'材料代 {mat:,} = 塗装工賃計 {tot:,} × {rate:g}%（10 円丸め）と一致 → 費用割合モード（material を渡さない）')
-        elif mat and rate and tot and mat == int(tot * rate / 100 + 0.5):
-            self.notes.append(f'材料代 {mat:,} は 塗装工賃計 {tot:,} × {rate:g}% の 1 円四捨五入。コグニの割合計算（10 円丸め {material_default(tot, rate):,}）とは違うので額を手入力（*）で渡す')
+        if mat and tot and not getattr(self, '_mat_from_lines', False):
+            # コグニの材料代は「塗装工賃計 × 割合」を工場の端数処理で丸めた額。印字の材料代から割合（整数 %）と端数処理を割り出し、
+            # ぴったり戻るなら費用割合モードで渡す（MaterialTotalbyManual '' = コグニが計算した形）。
+            # 額をそのまま渡すと手入力 '*' になり、コグニで塗装を開き直したときに割合から計算し直されて額が動く
+            got = material_mode(tot, mat, rate or None)
+            if got is None and rate:
+                alt = material_mode(tot, mat)
+                got = alt if (alt and abs(alt[0] - float(rate)) <= 0.51) else None   # 印字の割合とかけ離れた値は採らない
+            if got and 'panels' not in out:
+                # 一括計上（塗装一式）は、生成器が材料代を割合から計算しない（額をそのまま書く）。
+                # 割合だけ渡すと材料代が消えるので、額は残して割合を参考として書く
+                self.notes.append(f'材料代 {mat:,} は 塗装工賃計 {tot:,} の {got[0]:g}% だが、塗装が一括計上なので額のまま渡す'
+                                  '（コグニの一式の欄は材料代を割合から計算しない）')
+                out['material_rate'] = got[0]
+                got = None
+            if got:
+                r_, rnd = got
+                out['material_rate'] = r_
+                if rnd:
+                    out['material_round'] = rnd
+                elif out.get('material_round') and material_default(tot, r_, out['material_round']) != mat:
+                    # 転記に書かれていた端数処理では印字の材料代に戻らない: 残すと生成器が別の額で計算し直す（Codex 指摘）
+                    self.notes.append(f'材料代の端数処理 {out["material_round"]} では印字の材料代 {mat:,} に戻らないので外した'
+                                      f'（塗装工賃計 {tot:,} × {r_:g}% の 10 円四捨五入で戻る）')
+                    out.pop('material_round', None)
+                out.pop('material', None)
+                _how = f"{rnd['unit']} 円{rnd['mode']}" if rnd else '10 円四捨五入'
+                _msg = (f'材料代 {mat:,} = 塗装工賃計 {tot:,} × {r_:g}%（{_how}）→ 費用割合モードで渡す'
+                        + ('' if rate else f'（割合の印字が無いので材料代から割り出した。実際は {mat / tot * 100:.2f}%）'))
+                self.notes.append(_msg)
+                self._rev('判断', '材料代', _msg)
+                if rnd:
+                    self._rev('要確認', '材料代', f'材料代の端数処理が {_how}（コグニの既定は 10 円四捨五入）。'
+                                              f'この工場の設定がそうなっているか、材料代の印字 {mat:,} 円を確かめる')
+            else:
+                _msg = (f'材料代 {mat:,} は 塗装工賃計 {tot:,} の {mat / tot * 100:.2f}% で、整数 % × 端数処理では戻らない'
+                        f'（10 円四捨五入の最寄り {material_default(tot, round(mat / tot * 100)):,}）。額を手入力（*）で渡す')
+                self.notes.append(_msg)
+                self._rev('参考', '材料代', _msg)
         return self._paint_input_type(out)
 
     # 塗装の入力方式（コグニ: その他 → 塗装 → 入力方式）。パネルも内訳も無い「一式」の見積は **実額**で入れる。
