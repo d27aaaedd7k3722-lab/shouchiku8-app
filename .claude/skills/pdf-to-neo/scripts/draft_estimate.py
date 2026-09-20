@@ -501,7 +501,7 @@ def _is_wage_only(e: dict) -> bool:
 
 def paint_frame_line(n: str):
     """塗装明細の 1 行が「内板骨格塗装」（コグニの塗装画面 内板骨格タブ = PaintingFrame）か。戻り値 (欄, 区分) か None。
-    コグニの欄は 4 つで、指数は COM/NAIKOKUA.DB（車形別）:
+    コグニの欄は 4 つで、指数は COM/NAIKOKUA.DB（車形別。塗料が水性なら COM/WNAIKOKUA.DB）:
       エンジンルーム  1 ラジエータサポート両側新品または修正 / 2 ＋Fフェンダエプロン片側 / 3 ＋両側
       フロントピラー  1 片側新品 / 2 両側新品      センタピラー 1 片側新品 / 2 両側新品
       リヤフロア      1 1 台小修正 / 2 1 台大修正

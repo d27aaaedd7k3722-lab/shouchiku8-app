@@ -172,7 +172,7 @@ LineNo 1-8 は固定名（文字書き/内張り/配線配管/ショートパー
 - Total: `nk_Total* = 基本 + Σ部位`。塗装側の内板骨格（下記）とは別
 
 ### 内板骨格塗装（塗装画面 内板骨格タブ → PaintingFrame）
-`er_Disposal 1=ラジエータサポート両側新品または修正 / 2=…+Fフェンダエプロン片側 / 3=…両側`、`fp_/cp_Disposal 1=片側新品 2=両側新品`、`rp_Disposal 1=1台小修正 2=1台大修正`。指数は COM/NAIKOKUA.DB（車形, No 01-09）。PaintingTotal の Frame 系に加算
+`er_Disposal 1=ラジエータサポート両側新品または修正 / 2=…+Fフェンダエプロン片側 / 3=…両側`、`fp_/cp_Disposal 1=片側新品 2=両側新品`、`rp_Disposal 1=1台小修正 2=1台大修正`。指数は COM/NAIKOKUA.DB（車形, No 01-09）。**塗料が水性（Paint=4）なら COM/WNAIKOKUA.DB**（車形 7 の 02 = 1.40 と 1.70 のように値が違う。2026-09-20）。PaintingTotal の Frame 系に加算
 
 ### 付加塗装・追加項目（塗装画面 付加塗装タブ。N-ONE 実機 2026-09-05、NONE_bp*.neo で全項目確定）
 - PaintingEtcetera（項目ごとに `<項目>=枚数, <項目>Time/TimeStandard, Wage*/WageStandard*`。指数は COM/fukaetc.DB（XOR 0xff CSV、8 行）と 2TONE.DB）:

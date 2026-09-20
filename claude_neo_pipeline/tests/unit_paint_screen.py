@@ -132,6 +132,25 @@ def main() -> int:
     if not _paint_notes(1300000):
         print('FAIL 塗装工賃計が違うのに警告が出ない')
         fails += 1
+
+    # 内板骨格塗装の標準指数は 溶剤（NAIKOKUA.DB）と 水性（WNAIKOKUA.DB）で違う。
+    # 車形 7: ラジエータサポート 両側新品 1.40 / 1.70、リヤフロア 1台小修正 0.90 / 1.10
+    b3 = NeoBuilder()
+    p3 = dict(PAINT)
+    p3['paint'] = '水性'      # 塗料だけ水性に替える（パネル・バンパの水性指数は別の話。ここでは内板骨格だけ見る）
+    p3.pop('total', None)
+    e3 = dict(est)
+    e3['paint'] = p3
+    n3_, r3 = b3.build(e3, VEH, hints={}, labor_rate=RATE, est_date='20260920', insurance={})
+    t3 = os.path.join(os.environ.get('TEMP', HERE), f'unit_paint_screen_w_{os.getpid()}.neo')
+    open(t3, 'wb').write(n3_)
+    fr3 = _row(next(v for k, v in neo_diff.load(t3).items() if k.endswith('AnSvEm0001.sld')), 'PaintingFrame')
+    for k, v in (('er_Time', 1.7), ('rp_Time', 1.1)):
+        fails = _cmp(f'水性の内板骨格 {k}', fr3.get(k), v, fails)
+    try:
+        os.remove(t3)
+    except OSError:
+        pass
     print('unit_paint_screen:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
 

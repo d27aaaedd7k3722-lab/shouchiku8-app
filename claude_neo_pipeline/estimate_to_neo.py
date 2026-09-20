@@ -132,6 +132,29 @@ def hw(s: str) -> str:
     return to_halfwidth(unicodedata.normalize('NFKC', s or ''))
 
 
+def _com_or_ref_lines(name: str, com_dir: str = '') -> list:
+    """COM の表を読む。**使っている ADDATA の COM.CAB を展開したもの**を優先し、無ければ同梱の予備（reference/）。
+    水性用の表（WNAIKOKUA.DB など）は同梱していないので、ADDATA から読めなければ空になる"""
+    for p in ([os.path.join(com_dir, name)] if com_dir else []) + [os.path.join(HERE, 'reference', name)]:
+        if os.path.exists(p):
+            return [l for l in bytes(x ^ 0xFF for x in open(p, 'rb').read()).decode('cp932', 'replace').splitlines() if l.strip()]
+    return []
+
+
+def paint_code_of(pd: dict) -> int:
+    """paint.paint（名前でもコードでも）→ PaintingPlan.Paint（1 速乾 / 3 ２Ｋ / 4 水性）。省略は ２Ｋ"""
+    pv = (pd or {}).get('paint')
+    if (isinstance(pv, (int, float)) and not isinstance(pv, bool)) or (isinstance(pv, str) and pv.strip().isdigit()):
+        c = _int_strict(pv, 'paint.paint')
+        if c not in PAINT_CODE.values():
+            raise ValueError(f'paint.paint のコードは {sorted(set(PAINT_CODE.values()))} のいずれか（{pv}）')
+        return c
+    pn_ = unicodedata.normalize('NFKC', pv or '２Ｋ').replace('2K', '２Ｋ')
+    if pn_ not in PAINT_CODE:
+        raise ValueError(f'paint.paint は {list(PAINT_CODE)} のいずれか（{pv}）')
+    return PAINT_CODE[pn_]
+
+
 def _xor_lines_ref(name: str) -> list:
     p = os.path.join(HERE, 'reference', name)
     if not os.path.exists(p):
@@ -2409,16 +2432,7 @@ class NeoBuilder:
             pi = getattr(self, '_paint_index', None)
             form = str(getattr(self, '_car_form', '') or '')
             rate = int(getattr(self, '_labor_rate', 0) or 0)
-            pv = pd.get('paint')
-            if (isinstance(pv, (int, float)) and not isinstance(pv, bool)) or (isinstance(pv, str) and pv.strip().isdigit()):  # 1 速乾 / 3 ２Ｋ / 4 水性 をコードで渡された場合
-                paint_c = _int_strict(pv, 'paint.paint')
-                if paint_c not in PAINT_CODE.values():
-                    raise ValueError(f'paint.paint のコードは {sorted(set(PAINT_CODE.values()))} のいずれか（{pv}）')
-            else:
-                pn_ = unicodedata.normalize('NFKC', pv or '２Ｋ').replace('2K', '２Ｋ')
-                if pn_ not in PAINT_CODE:
-                    raise ValueError(f'paint.paint は {list(PAINT_CODE)} のいずれか（{pv}）')
-                paint_c = PAINT_CODE[pn_]
+            paint_c = paint_code_of(pd)   # 1 速乾 / 3 ２Ｋ / 4 水性（名前でもコードでも受ける）
             coat_c = self._coat[0] if self._coat else COAT_CODE.get(unicodedata.normalize('NFKC', pd.get('coat') or ''), 2)
             _hf_in = unicodedata.normalize('NFKC', str(pd.get('hf') or 'しない')).strip()
             _hf_map = {unicodedata.normalize('NFKC', k): v for k, v in HF_CODE.items()}
@@ -2863,8 +2877,13 @@ class NeoBuilder:
         _pw_cmp = getattr(self, '_paint_wage_cmp', None); self._paint_wage_cmp = None  # 上の枝で控えた（明細合計, 見積の塗装工賃計）
         pf = pdx.get('frame') or {}
         if pf:
+            # 内板骨格塗装の標準指数は COM/NAIKOKUA.DB（溶剤）と **COM/WNAIKOKUA.DB（水性）** で値が違う
+            # （車形 7 のラジエータサポート 両側新品 1.40 / 1.70、両側新品+FRフェンダエプロン 1.90 / 2.50）。
+            # 水性の表は同梱していないので、使っている ADDATA の COM から読む（2026-09-20 に実案件 155 本の水性案件で発覚）
+            _nk_water = paint_code_of(pdx) == 4
+            _nk_file = 'WNAIKOKUA.DB' if _nk_water else 'NAIKOKUA.DB'
             nk = {}
-            for l in _xor_lines_ref('NAIKOKUA.DB'):
+            for l in _com_or_ref_lines(_nk_file, str(getattr(getattr(self, '_paint_index', None), 'com_dir', '') or '')):
                 f = [x.strip() for x in l.split(',')]
                 if len(f) >= 5 and f[1] == form_x:
                     nk[f[2]] = int(f[3]) / 100.0
@@ -2875,6 +2894,9 @@ class NeoBuilder:
                     continue
                 sel = int(v.get('option', 1) if isinstance(v, dict) else v)
                 t = float((v.get('index') if isinstance(v, dict) else 0) or nk.get(nos.get(sel, ''), 0))
+                if not t:  # 標準も見積の指数も無いまま 0 円で計上すると、塗装計が静かに不足する
+                    raise ValueError(f'内板骨格塗装 {key}（選択 {sel}）の指数を決められない（{_nk_file}・車形 {form_x!r}）。'
+                                     'paint.frame のその部位に見積書の指数を書く')
                 w = int((v.get('wage') if isinstance(v, dict) else 0) or rp2(t))
                 cur.execute(f'UPDATE PaintingFrame SET {pfx}_Disposal=?, {pfx}_Time=?, {pfx}_TimeStandard=?, {pfx}_WageOutTax=?, {pfx}_WageInTax=?, {pfx}_WageTax=?, '
                             f'{pfx}_WageStandardOutTax=?, {pfx}_WageStandardInTax=?, {pfx}_WageStandardTax=?', (sel, t, t, *t3i(w), *t3i(w)))
