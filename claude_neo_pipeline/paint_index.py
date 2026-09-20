@@ -521,17 +521,43 @@ class PaintIndex:
             out[key] = None if (not abn or abn == (0, 0)) else self._r1((abn[1] + abn[0] * Sn / 1000) * C2 / 100000 + self._hju(div, typ, int(math.ceil(Sn / 3 - 1e-9))))
         return out
 
-    def hf_time(self, area: int, hf: int, pn: Optional[dict] = None, paint: int = 3) -> float:
-        """高機能塗装（フッ素 1 / 耐スリ傷 2）のパネル別加算。COM/F_S.DB の式（実 NEO 4 パネル 31/58/79/92 d㎡ → 0.6/0.8/1.0/1.2 一致）。
-        F_S に該当行が無いときは経験式 floor10(0.3 + 0.01×面積)"""
+    def _scrach_time(self, form: str, paint: int, pn: dict, area: int) -> Optional[float]:
+        """スクラッチ（高機能塗装 3）のパネル別加算: COM/Scrach.DB。
+        行は `車形, 塗料, 'S', PanelDivision, PanelTypeDivision, PanelCode, A…, B…` で、
+        **A = 7 列目の先頭 4 桁**（2105 固定）・**B = 8 列目の先頭 4 桁 ÷ 10**（224.0 / 279.0 / 344.0 の 3 つだけ）。
+        式は F_S と同じ round1((B + A×面積/1000) × C2/100000)。
+        行の選び方は (div, type, PanelCode) の完全一致 → (9,9,9) の汎用行
+        （実案件 NEO の スクラッチ 82 パネルで 78 行が一致。2026-09-20 に解読）"""
+        c = self._c12(form, int(pn['div']))
+        if not c:
+            return None
+        rows = [r for r in self._com_rows('Scrach.DB') if len(r) >= 8 and r[0] == str(form) and r[1] == str(paint)]
+        for key in ((str(pn['div']), str(pn['type']), str(pn.get('pcode') or 0)), ('9', '9', '9')):
+            for r in rows:
+                # 4 桁に満たないセル（桁落ち・壊れた行）は使わない。汎用行へ落とす（Codex 指摘）
+                if (r[3], r[4], r[5]) == key and len(r[6]) >= 4 and len(r[7]) >= 4 and r[6][:4].isdigit() and r[7][:4].isdigit():
+                    return self._r1((int(r[7][:4]) / 10.0 + int(r[6][:4]) * area / 1000) * c[1] / 100000)
+        return None
+
+    def hf_time(self, area: int, hf: int, pn: Optional[dict] = None, paint: int = 3) -> Optional[float]:
+        """高機能塗装（フッ素 1 / 耐スリ傷 2 / スクラッチ 3）のパネル別加算。
+
+        **まず CHM「塗り数値」表の高機能の列**を使う（車種別に載っている値。塗料が水性なら水性ページ）。
+        実案件 NEO 825 パネルで、CHM で説明できるのが 775 行・式で 40 行 = 98%
+        （F_S の式だけだったときは 耐スリ傷 89%・スクラッチは対応できず。2026-09-20）。
+        CHM に高機能の列が無い車種は係数表の式: フッ素・耐スリ傷は COM/F_S.DB
+        （実 NEO 4 パネル 31/58/79/92 d㎡ → 0.6/0.8/1.0/1.2 一致）、スクラッチは COM/Scrach.DB（`_scrach_time`）。
+        どちらも引けなければ経験式 floor10(0.3 + 0.01×面積)。スクラッチだけは式も引けなければ None
+        （分からない値で埋めず、呼び出し側が見積書の指数を要求する）"""
         if not hf:
             return 0.0
-        if int(hf) == 3:
-            # スクラッチの加算は COM/Scrach.DB（車形・塗料・区分ごとの係数）で決まるが式が未同定
-            # （実案件 NEO 369 パネルで 耐スリ傷/フッ素の式・経験式のどれとも 2 割しか合わない。HANDOFF §8）。
-            # 分からない値で埋めないので None を返し、呼び出し側は見積書の指数（index）を要求する
-            return None
+        if pn:  # CHM の高機能列（面積が一致する行だけ採る。近似で拾った別パネルの値は使わない）
+            row = self.chm_row_for(pn, paint)
+            if row and row.get('hf') is not None and row.get('area') == pn.get('area'):
+                return row['hf']
         form = self.form_codes()[0]
+        if int(hf) == 3:
+            return self._scrach_time(form, paint, pn, area) if (form and pn) else None
         if form and pn:
             kind = {1: 'F', 2: 'T'}.get(int(hf), 'T')
             c = self._c12(form, int(pn['div']))

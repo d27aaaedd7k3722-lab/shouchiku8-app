@@ -151,6 +151,40 @@ def main() -> int:
         os.remove(t3)
     except OSError:
         pass
+    # 高機能塗装だけのパネル行（DisposalCode 7）: 明細は脱着でも、その部位に高機能塗装の加算だけ足せる。
+    # 実案件 NEO 80 行 / 60 本の形（AddedFrom 1・SortNo 13・印 '*'・塗装面積なし・パネル計に入る・加算基礎の枚数には数えない）
+    b4 = NeoBuilder()
+    e4 = dict(est)
+    e4['items'] = ITEMS + [{'code': '4300', 'name': 'ﾊﾞﾂｸﾄﾞｱﾊﾟﾈﾙ', 'method': '脱着', 'qty': 1}]
+    p4 = dict(PAINT)
+    p4['hf'] = '耐スリ傷'
+    p4['panels'] = PAINT['panels'] + [{'code': '4300', 'name': 'ﾊﾞﾂｸﾄﾞｱﾊﾟﾈﾙ', 'method': '高機能'}]   # 通常パネルに無い部位（重なると二重計上になるので生成器が止める）
+    p4.pop('total', None)
+    e4['paint'] = p4
+    n4, _r4 = b4.build(e4, VEH, hints={}, labor_rate=RATE, est_date='20260920', insurance={})
+    t4 = os.path.join(os.environ.get('TEMP', HERE), f'unit_paint_screen_hf_{os.getpid()}.neo')
+    open(t4, 'wb').write(n4)
+    em4 = next(v for k, v in neo_diff.load(t4).items() if k.endswith('AnSvEm0001.sld'))
+    c4 = [c[1] for c in em4.execute('pragma table_info(PaintingPanel)')]
+    r7 = [dict(zip(c4, x)) for x in em4.execute('SELECT * FROM PaintingPanel') if dict(zip(c4, x))['DisposalCode'] == 7]
+    if len(r7) != 1:
+        print(f'FAIL 高機能塗装だけの行が {len(r7)} 行')
+        fails += 1
+    else:
+        for k, v in (('PartsCode', '4300'), ('DisposalName', '耐スリ傷'), ('PaintingArea', -1), ('PrepareArea', -1),
+                     ('AddedFrom', 1), ('SortNo', 13), ('WageByManual', '*'), ('Manual', 0)):
+            fails = _cmp(f'高機能だけの行 {k}', r7[0].get(k), v, fails)
+        if not (r7[0].get('Time') and abs(r7[0]['Time'] - (r7[0].get('TimeStandardHF') or 0)) < 1e-9):
+            print(f"FAIL 高機能だけの行の指数が加算と違う: {r7[0].get('Time')} / {r7[0].get('TimeStandardHF')}")
+            fails += 1
+        if (r7[0].get('WageOutTax') or 0) != int(round((r7[0].get('Time') or 0) * RATE / 10) * 10):
+            print(f"FAIL 高機能だけの行の工賃: {r7[0].get('WageOutTax')}")
+            fails += 1
+    try:
+        os.remove(t4)
+    except OSError:
+        pass
+
     print('unit_paint_screen:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
 

@@ -217,6 +217,14 @@ def is_manual_panel(pnl: dict) -> bool:
     return bool(_flag(pnl.get('manual'), 'paint.panels[].manual')) or not str(pnl.get('code') or '').strip()
 
 
+def is_hf_only_panel(pnl: dict) -> bool:
+    """高機能塗装だけを足す塗装パネル行（PaintingPanel.DisposalCode 7）。
+    明細は脱着などで塗り替えはしないが、その部位に高機能塗装（耐スリ傷・スクラッチ）の加算だけ付ける行。
+    `paint.panels[]` に `{"code": "2300", "method": "高機能"}` と書く（実案件 NEO 80 行 / 60 本。2026-09-20）"""
+    m = unicodedata.normalize('NFKC', str(pnl.get('method') or '')).strip()
+    return bool(str(pnl.get('code') or '').strip()) and m in ('高機能', '高機能塗装', '耐スリ傷', 'スクラッチ', 'ｽｸﾗｯﾁ', 'フッ素')
+
+
 def default_material_rate(paint: int, coat: int, hf: int) -> Optional[float]:
     """材料代割合の既定値（見積書に材料代も割合も無いとき）。
     1) SHOUCHIKU ガイドライン表の 6500〜 列（guideline_material_rate。この PC に表があるとき）
@@ -2439,10 +2447,12 @@ class NeoBuilder:
             if _hf_in not in _hf_map:  # 知らない高機能塗装を黙って「しない」にしない（加算基礎・材料代割合・パネル加算が変わる）
                 raise ValueError(f"paint.hf は {sorted(set(HF_CODE) - {'ｽｸﾗｯﾁ'})} のいずれか（{pd.get('hf')!r}）")
             hf = _hf_map[_hf_in]
-            panels = [p_ for p_ in pd['panels'] if not is_manual_panel(p_)]   # 部品コードのある外板パネル（20.DB）
-            man_panels = [p_ for p_ in pd['panels'] if is_manual_panel(p_)]  # 手入力の塗装行（DisposalCode 9）
-            # 加算基礎の枚数・単体塗/複数塗の判定は部品コードのあるパネルだけで数える（手入力の塗装行は数えない。実案件 NEO 60/60・16/16。2026-09-13）
-            n_p = len(panels); n_rows = n_p + len(man_panels)
+            hf_panels = [p_ for p_ in pd['panels'] if is_hf_only_panel(p_)]   # 高機能塗装だけの行（DisposalCode 7）
+            panels = [p_ for p_ in pd['panels'] if not is_manual_panel(p_) and not is_hf_only_panel(p_)]   # 部品コードのある外板パネル（20.DB）
+            man_panels = [p_ for p_ in pd['panels'] if is_manual_panel(p_) and not is_hf_only_panel(p_)]  # 手入力の塗装行（DisposalCode 9）
+            # 加算基礎の枚数・単体塗/複数塗の判定は部品コードのあるパネルだけで数える（手入力の塗装行は数えない。実案件 NEO 60/60・16/16。2026-09-13。
+            # 高機能塗装だけの行も数えない = 実案件 59 本で成立、数える形で説明できるのは差の出ない 12 本だけ。2026-09-20）
+            n_p = len(panels); n_rows = n_p + len(man_panels) + len(hf_panels)
             pcols = [r[1] for r in cur.execute('PRAGMA table_info(PaintingPanel)')]
             notes = []
             if unicodedata.normalize('NFKC', str(((estimate or {}).get('paint') or {}).get('input_type') or '')).strip() == '実額'                     or _truthy(((estimate or {}).get('paint') or {}).get('actual')):
@@ -2473,6 +2483,7 @@ class NeoBuilder:
                     linked_disp.setdefault(r['PartsCode'], set()).add(int(d_))
             linked_codes = set(linked_disp)
             panel_wage = 0; panel_time = 0.0
+            written_codes = set()   # 実際に書いた塗装パネルの部品コード（20.DB で解決したあと）
             for i, pnl in enumerate(panels):
                 w = _money(pnl.get('wage'), f"塗装パネル {pnl.get('name', pnl.get('code', ''))} の工賃"); t = float(pnl.get('index') or 0)
                 new = pnl.get('method') in ('取替', '新品', '交換')
@@ -2527,6 +2538,51 @@ class NeoBuilder:
                 for key, tv in (('New', rec['TimeStandardNew']), ('1', rec['TimeStandard1']), ('2', rec['TimeStandard2']), ('3', rec['TimeStandard3']), ('HF', rec['TimeStandardHF'])):
                     rec[f'WageStandard{key}OutTax'], rec[f'WageStandard{key}InTax'], rec[f'WageStandard{key}Tax'] = t3(wstd(tv))
                 cur.execute(f"INSERT INTO PaintingPanel ({','.join(pcols)}) VALUES ({','.join('?' * len(pcols))})", [rec[c] for c in pcols])
+                written_codes.add(pcode_ins)
+                panel_wage += w; panel_time += t
+            # 高機能塗装だけを足すパネル行（DisposalCode 7）。明細は脱着などで塗り替えないが、その部位に高機能塗装の加算だけ付ける。
+            # 実案件 NEO 80 行 / 60 本（2026-09-20 集計）: DisposalName は高機能塗装の名前（耐スリ傷 68・ｽｸﾗｯﾁ 12）、
+            # 塗装面積は無し（PaintingArea/PrepareArea -1）、Time = 高機能の加算、標準欄は通常どおり、
+            # AddedFrom 1・SortNo 13・印 '*'（指数を手で入れた行は '#'・Manual 1）。加算基礎の枚数には数えないがパネル計には入る
+            for j, pnl in enumerate(hf_panels):
+                if not hf:
+                    raise ValueError(f"塗装パネル {pnl.get('code')} の修理方法「高機能」は、paint.hf に高機能塗装（フッ素/耐スリ傷/スクラッチ）を指定した見積でだけ使える")
+                code_hf = _code4(pnl.get('code'))
+                std_hf = pi.standard_times(code_hf, hf, n_p, paint_c) if pi else None
+                mp_hf = (std_hf or {}).get('panel') or {}
+                if not mp_hf:
+                    raise ValueError(f"塗装パネル {pnl.get('code')} {pnl.get('name', '')}: 20.DB に無い部品コード（高機能塗装だけの行も 20.DB のパネルで書く）")
+                t_std = (std_hf or {}).get('hf')
+                t = float(pnl.get('index') or 0) or (t_std if t_std else 0)
+                if not t:
+                    raise ValueError(f"高機能塗装の行 {code_hf} {pnl.get('name', '')}: 高機能の加算が取れない（CHM にも係数表にも無い）。paint.panels[].index に見積書の指数を書く")
+                w = _money(pnl.get('wage'), f"高機能塗装の行 {code_hf} の工賃") or (rp(t) if rate else 0)
+                man_hf = bool(pnl.get('index')) and (t_std is None or abs(t_std - t) > 0.05)
+                rec = {c: '' for c in pcols}
+                # PartsCode は 20.DB で解決したコード（ボディで枝番が変わる車では面積・区分と食い違わないように。Codex 指摘）
+                code_ins = mp_hf.get('code') or code_hf
+                if code_ins != code_hf:
+                    notes.append(f"高機能塗装の行 {code_hf}: このボディの塗装パネルは {code_ins} なのでそちらで書いた")
+                if code_ins in written_codes:
+                    # 通常のパネルの標準指数には高機能の加算が既に入っている。同じパネルに高機能だけの行を足すと二重に乗る
+                    # （実案件 80 行すべて、同じ部品コードの通常パネルは無い）。**20.DB で解決したあとのコードで見る**
+                    # （4800 と 4801 のように枝番が違っても同じパネルになることがある。Codex 第 3 周）
+                    raise ValueError(f"塗装パネル {code_ins}（{pnl.get('code')}）: 同じパネルの塗装行があるのに「高機能」の行も書いている"
+                                     '（通常のパネルの指数に高機能の加算が入るので二重計上になる）')
+                written_codes.add(code_ins)
+                rec.update({'RecordNo': n_p + j + 1, 'LineNo': n_p + j, 'PartsCode': code_ins, 'DisposalCode': 7,
+                            'DisposalName': HF_NAME.get(hf, ''), 'PanelName': mp_hf.get('name') or hw(pnl.get('name', ''))[:20].ljust(20),
+                            'PrepareArea': -1, 'PanelArea': int(mp_hf.get('area') or 0), 'PaintingArea': -1, 'PaintingAreaName': '',
+                            'Time': t, 'TimeStandardNew': (std_hf or {}).get('new') or 0, 'TimeStandard1': (std_hf or {}).get('s1') or 0,
+                            'TimeStandard2': (std_hf or {}).get('s2') or 0, 'TimeStandard3': (std_hf or {}).get('s3') or 0,
+                            'TimeStandardHF': t_std or 0,
+                            'WageOutTax': w, 'WageInTax': tax_of(w)[0], 'WageTax': tax_of(w)[1],
+                            'WageByManual': '#' if man_hf else '*', 'MaterialOutTax': -1, 'MaterialInTax': -1, 'MaterialTax': -1, 'MaterialByManual': '',
+                            'PanelDivision': mp_hf.get('div', 1), 'PanelTypeDivision': mp_hf.get('type', 1), 'PanelCode': mp_hf.get('pcode', 0),
+                            'SortNo': 13, 'ButtonNo': mp_hf.get('btn', 1), 'Provisional': 0, 'AddedFrom': 1, 'Manual': 1 if man_hf else 0})
+                for key, tv in (('New', rec['TimeStandardNew']), ('1', rec['TimeStandard1']), ('2', rec['TimeStandard2']), ('3', rec['TimeStandard3']), ('HF', rec['TimeStandardHF'])):
+                    rec[f'WageStandard{key}OutTax'], rec[f'WageStandard{key}InTax'], rec[f'WageStandard{key}Tax'] = t3(wstd(tv))
+                cur.execute(f"INSERT INTO PaintingPanel ({','.join(pcols)}) VALUES ({','.join('?' * len(pcols))})", [rec[c] for c in pcols])
                 panel_wage += w; panel_time += t
             # 手入力の塗装行（外板パネル画面の「行追加」。部品コード無し・名称と指数を手で入れた行 = DisposalCode 9）。
             # 実案件 NEO 354 本・631 行（2026-09-13）: 部品コード空・DisposalName 空（修理方法を選んだ行は '修理'/'取替'）・面積と標準欄はすべて -1・
@@ -2550,7 +2606,7 @@ class NeoBuilder:
                     raise ValueError('手入力の塗装行に名称（name）が無い（コグニの外板パネル画面に出る名前）')
                 m_ = unicodedata.normalize('NFKC', str(pnl.get('method') or '')).strip()
                 rec = {c: '' for c in pcols}
-                rec.update({'RecordNo': n_p + j + 1, 'LineNo': n_p + j, 'PartsCode': '', 'DisposalCode': 9,
+                rec.update({'RecordNo': n_p + len(hf_panels) + j + 1, 'LineNo': n_p + len(hf_panels) + j, 'PartsCode': '', 'DisposalCode': 9,
                             'DisposalName': ('取替' if m_ in ('取替', '新品', '交換') else ('修理' if m_ in ('修理', '修正') else '')),
                             'PanelName': nm, 'PrepareArea': -1, 'PanelArea': -1, 'PaintingArea': -1, 'PaintingAreaName': '',
                             'Time': t if t > 0 else -1, 'TimeStandardNew': -1, 'TimeStandard1': -1, 'TimeStandard2': -1, 'TimeStandard3': -1, 'TimeStandardHF': -1,

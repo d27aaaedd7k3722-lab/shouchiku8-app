@@ -1186,14 +1186,19 @@ def test_material_rate_default_uses_guideline_when_present():
 
 
 def test_scratch_high_function_paint():
-    """高機能塗装 スクラッチ（HFPainting 3 'ｽｸﾗｯﾁ'）: 加算基礎は T_KEI_3 の S 列、パネル加算は式が未同定なので標準なし（index 必須）。
+    """高機能塗装 スクラッチ（HFPainting 3 'ｽｸﾗｯﾁ'）: 加算基礎は T_KEI_3 の S 列。
+    パネル加算は **CHM の高機能列 → 無ければ COM/Scrach.DB の式**（2026-09-20 に解読。それまでは標準なしにしていた）。
+    W66 のフード（面積 81・div 1・type 2・PanelCode 0）は CHM に高機能列が無いので Scrach.DB の汎用行
+    （A 2105 / B 224.0）で 0.9 = round1((224.0 + 2105×81/1000) × 216/100000)。
     知らない高機能塗装の名前は黙って「しない」にせず止める（実案件 NEO 100 本で 3 を確認。2026-09-12）"""
     import paint_index as pi_
     assert pi_.HF_CODE['スクラッチ'] == 3 and pi_.HF_KIND[3] == 'S' and pi_.HF_NAME[3] == 'ｽｸﾗｯﾁ'
     root = NeoBuilder().engine.root
     p = pi_.PaintIndex(root, 'W66', body='10')
     st = p.standard_times('0600', 3, 2, 3)
-    assert st is not None and st['new'] is None and st['s1'] is None, st
+    assert st is not None and abs(st['hf'] - 0.9) < 1e-9, st
+    assert st['new'] is not None and st['s1'] is not None, st   # 加算が出せるので標準指数も出る
+    assert abs(st['new'] - round(st['chm']['new_multi'] + 0.9, 1)) < 1e-9, st
     form = p.form_codes()[0]
     assert p.base_time(form, 3, 3, 3, 2) is not None
     veh = {'model_code': 'NHP170', 'serial_no': '', 'desig': '19020', 'category': '0005', 'reg_date': 'R2.2', 'color_code': '209'}
