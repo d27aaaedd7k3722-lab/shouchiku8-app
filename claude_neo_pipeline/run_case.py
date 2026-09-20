@@ -25,7 +25,7 @@ for _st in (sys.stdout, sys.stderr):  # 検算結果の日本語を PC の既定
             _st.reconfigure(encoding='utf-8', errors='replace')
     except (AttributeError, ValueError, OSError):
         pass
-from estimate_to_neo import NeoBuilder, PAINT_DETAIL_KEYS, _flag  # noqa: E402  _flag = 人が書いた真偽値欄の厳密な読み取り
+from estimate_to_neo import NeoBuilder, _flag  # noqa: E402  _flag = 人が書いた真偽値欄の厳密な読み取り
 
 
 def _side_tokens(name: str) -> tuple:
@@ -289,9 +289,9 @@ def main(path: str, out: str = ''):
     # そのときは内訳どうしを突き合わせず、**塗装計（材料込）**で見る（材料代を総額に含めるので工賃計・材料代は 0 になる）
     _pd_ = est.get('paint') or {}
     _jitsu_req = unicodedata.normalize('NFKC', str(_pd_.get('input_type') or '')).strip() == '実額'         or _flag(_pd_.get('actual'), 'paint.actual')
-    # 生成器は内訳（バンパ 等・内板骨格・シーリング・追加項目）が残っていると実額にしない（estimate_to_neo の _jitsu と同じ判定）。
-    # そのときは今までどおり塗装工賃計・材料代も突き合わせる（読み取りの誤りを見逃さない。Codex 第26周）
-    _jitsu_paint = _jitsu_req and not any(_pd_.get(k) for k in PAINT_DETAIL_KEYS + ('frame', 'sealing', 'other'))
+    # 実額を指定されたら生成器は**必ず**実額の形で書く（内訳が残っていても、計算した塗装計を総額 1 つにする）。
+    # そのとき NEO は塗装工賃計・材料代の欄を持たない（0）ので、内訳どうしは突き合わせない（塗装計と合計で見る）
+    _jitsu_paint = _jitsu_req
     checks = [('部品計', 'parts', t.get('parts')), ('工賃計', 'wage', t.get('wage'))]
     if not _jitsu_paint:
         checks += [('塗装工賃計', 'paint', (t.get('paint') or 0) - (t.get('paint_material') or 0)),  # estimate.json の paint.total/ totals.paint は塗装工賃（材料別）

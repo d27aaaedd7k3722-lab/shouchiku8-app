@@ -795,6 +795,27 @@ def test_paint_frame_lines_go_to_the_frame_tab():
     assert int(p.get('total') or 0) == 28000, p                            # 塗装工賃計は内板骨格塗装を含む
 
 
+def test_auto_panels_one_panel_per_area():
+    """auto_panels: 同じ部位に本体（4801 ｸｵ-ﾀﾊﾟﾈﾙ）と工賃の行（4802 ｸｵ-ﾀﾊﾟﾈﾙ(ｺｳﾁﾝ)）があっても塗装パネルは 1 枚。
+    コグニも 1 部位 1 枚しか起こさない（実案件 1,800 本の集計。2 枚だと塗装工賃が 1 枚分多くなる）"""
+    veh = {'model_code': 'NHP170', 'serial_no': 'NHP170-7207367', 'desig': '19020', 'category': '0005', 'reg_date': 'R2.2', 'color_code': '209'}
+    rows = ['4801|左 ｸｵｰﾀﾊﾟﾈﾙ|修理|||1||16000||', '4802|左 ｸｵｰﾀﾊﾟﾈﾙ(ｺｳﾁﾝ)|取替|-||1|0|||',
+            '0600|ﾌｰﾄﾞﾊﾟﾈﾙ|取替|||1|50000|16000||']
+    rd = {'source': 't', 'issuer': '', 'est_date': '20260920', 'format': 'A', 'labor_rate': 8000, 'vehicle': veh,
+          'blocks': [{'title': '', 'rows': rows}],
+          'paint': {'paint': '2K', 'coat': 'メタリック', 'total': 65000, 'auto_panels': True},
+          'expenses': [], 'totals': {}}
+    if not _has_car('W66'):
+        print('  （W66 の ADDATA が無いので飛ばす）')
+        return
+    p = de.Drafter(rd).build()['paint']
+    codes = sorted(x.get('code') for x in (p.get('panels') or []))
+    assert codes.count('4801') + codes.count('4802') == 1, p    # クオータは 1 枚だけ
+    assert '4802' not in codes, p                               # 残すのは本体の行
+    q = [x for x in p['panels'] if x.get('code') == '4801'][0]
+    assert q.get('method') == '修理' and q.get('ratio'), q       # 金額の無い「(ｺｳﾁﾝ) 取替」で新品塗装にしない
+
+
 def test_paint_frame_with_a_lump_total_is_not_counted_twice():
     """一括計上（20.DB のパネルに当たらない）＋内板骨格塗装: 生成器は「一式 + 内板骨格塗装」を足すので、
     一式の額から内板骨格塗装を引いておく（印字の塗装工賃計 100,000 が二重に乗らない。Codex 指摘）"""

@@ -2402,6 +2402,7 @@ class NeoBuilder:
                     'WageTotalFrameOutTax=0,WageTotalFrameInTax=0,WageTotalFrameTax=0,WageTotalEtceteraOutTax=0,WageTotalEtceteraInTax=0,WageTotalEtceteraTax=0,'
                     'MaterialTotalOutTax=0,MaterialTotalInTax=0,MaterialTotalTax=0')
         pd = getattr(self, '_paint_detail', None)
+        _jitsu = False   # この build で塗装を実額の形で書いたか（下の枝で立てる。あとで指定どおりに書き直すかの判定に使う）
         if pd:  # パネル別塗装（`panels` あり）か、パネル無しでバンパだけ塗る見積（_paint_detail 側で判定）
             # パネル別塗装: 20.DB（パネルマスタ）+ CHM 塗り数値 + T_KEI_3/BOOTH（加算基礎・ブース）+ 23.DB（バンパ）で
             # コグニが「パネル追加」で生成する PaintingPanel/PaintingPlan/PaintingBumper/PaintingEtcetera/PaintingTotal と同形に書く
@@ -2910,6 +2911,27 @@ class NeoBuilder:
                          *t3i(int(ptr['TotalOutTax'] or 0) + add_frame_w + add_etc_w + add_other_w + (mat - mat_before))))  # 既存 Total（一括塗装費は WageTotal と Other の両方に入っている）＋追加分
             paint_total += add_frame_w + add_etc_w + add_other_w
         _itype = unicodedata.normalize('NFKC', str((pdx or {}).get('input_type') or '')).strip()
+        if (_itype == '実額' or _truthy((pdx or {}).get('actual'))) and not _jitsu:
+            # 塗装の入力方式「実額」を**指定された**のに、内訳（パネル・バンパ・加算基礎・内板骨格塗装・追加項目 等）が
+            # 残っていて上の一括計上の枝を通らなかったとき: ここで実額の形に書き直す。
+            # 総額は**計算し終えた塗装計（材料込）**そのものなので、金額は動かない（アプリの方針。2026-09-20 亮平さん指示）
+            _row = cur.execute('SELECT TotalOutTax FROM PaintingTotal').fetchone()
+            _tot_j = int((_row[0] if _row else 0) or 0)
+            cur.execute('UPDATE PaintingPlan SET InputType=0, InputTypeName=?, BoothFlag=0, '
+                        'BoothTime=-1, BoothTimeStandard=-1, BoothWageOutTax=-1, BoothWageInTax=-1, BoothWageTax=-1, '
+                        'BoothWageStandardOutTax=-1, BoothWageStandardInTax=-1, BoothWageStandardTax=-1, BoothWageByManual="", '
+                        'BaseTime=-1, BaseTimeStandard=-1, BaseWageOutTax=-1, BaseWageInTax=-1, BaseWageTax=-1, '
+                        'BaseWageStandardOutTax=-1, BaseWageStandardInTax=-1, BaseWageStandardTax=-1, BaseWageByManual=""', ('実額',))
+            cur.execute('UPDATE PaintingTotal SET TimeTotalPanel=0,TimeTotalBumper=0,TimeTotalFrame=0,TimeTotalEtcetera=0,TimeTotalOther=0,TimeTotal=0,'
+                        'WageTotalPanelOutTax=0,WageTotalPanelInTax=0,WageTotalPanelTax=0, WageTotalBumperOutTax=0,WageTotalBumperInTax=0,WageTotalBumperTax=0,'
+                        'WageTotalFrameOutTax=0,WageTotalFrameInTax=0,WageTotalFrameTax=0, WageTotalEtceteraOutTax=0,WageTotalEtceteraInTax=0,WageTotalEtceteraTax=0,'
+                        'WageTotalOtherOutTax=0,WageTotalOtherInTax=0,WageTotalOtherTax=0, WageTotalOutTax=0,WageTotalInTax=0,WageTotalTax=0, WageTotalByManual="",'
+                        'MaterialTotalOutTax=0,MaterialTotalInTax=0,MaterialTotalTax=0,MaterialTotalbyManual="", TotalOutTax=?,TotalInTax=?,TotalTax=?',
+                        (_tot_j, *tax_of(_tot_j)))
+            self._paint_notes = (getattr(self, '_paint_notes', None) or []) + [
+                f'塗装は実額の指定があるので、計算した塗装計（材料込）{_tot_j:,} 円を総額 1 つで入れた（内訳の欄は 0）']
+            print(f'塗装: 実額の指定 → 総額 {_tot_j:,} 円 1 つにした（内訳の欄は 0）')
+            paint_total, paint_material = _tot_j, 0
         if _itype == '参考':
             # 塗装の入力方式「参考」（コグニ: その他 → 塗装 → 入力方式）。計算は指数と同じで、見積の位置づけだけが違う
             # （実案件 NEO 700 本に 1 本。パネル・バンパ・追加項目はそのまま、材料代は手入力の印が付く）
