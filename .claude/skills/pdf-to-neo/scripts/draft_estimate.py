@@ -1882,32 +1882,51 @@ class Drafter:
 
     def _force_actual_paint(self, out: dict) -> dict:
         """reading が入力方式「実額」を**指定した**ときは、塗装の内訳があっても実額で入れる
-        （総額 ＝ 塗装工賃計 ＋ 追加項目 ＋ 材料代。生成器が材料代を総額に足す）。
+        （総額 ＝ 塗装工賃計 ＋ 材料代。生成器が材料代を総額に足す）。
 
+        金額は動かさない —— 畳んだ額が印字と合わなくなる形（バンパ・加算基礎・ブース・2トーンのように
+        独立した工賃を持つ内訳があって、印字の塗装計と突き合わせられないとき）は**畳まない**で注記する。
         自動で実額を選ぶ規則（下の `_paint_input_type`）は変えない —— 指定されたときだけ畳む。
         アプリ（neo-estimate）はコグニの NEO を作るときに必ずこれを指定する（2026-09-20 亮平さん指示）"""
         drop = [k for k in self.FORCE_ACTUAL_DROP if out.get(k)]
         if not drop:
             return out
-        tot = int(float(_num(out.get('total')) or 0))
-        oth = sum(int(float(_num((o or {}).get('wage')) or 0)) for o in (out.get('other') or []) if isinstance(o, dict))
-        if '_total_from_lines' in out:
-            # 塗装行から作った total は、追加項目にした行の工賃を**すでに含んでいる**（1624 行の註）。
-            # ここで足すと二重計上になる（印字の塗装工賃計から作った total のときだけ足す）
-            oth = 0
-        mat = int(float(_num(out.get('material')) or 0))
-        if not mat:   # 費用割合モードに切り替えて額を落としていたら、印字の材料代を戻す（実額は割合を持てない）
-            mat = int(float(_num((self.rd.get('totals') or {}).get('material')) or 0))
+
+        def _i(v) -> int:
+            try:
+                return int(float(_num(v) or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        tot_p = self.rd.get('totals') or {}
+        mat = _i(out.get('material')) or _i(tot_p.get('material'))
+        # 基準は**印字の合計欄**（塗装計（材料込）− 材料代 → 塗装工賃計）。印字が無いときだけ下書きの total を使う
+        base = _i(tot_p.get('paint_total')) - mat if _i(tot_p.get('paint_total')) else _i(tot_p.get('paint'))
+        if not base:
+            base = _i(out.get('total'))
+            if '_total_from_lines' not in out:
+                # 印字の塗装工賃計から作った total は追加項目を含まない（行から作った total は含む。1624 行の註）
+                base += sum(_i((o or {}).get('wage')) for o in (out.get('other') or []) if isinstance(o, dict))
+            # 独立した工賃を持つ内訳（バンパ・加算基礎・ブース・2トーン）が別にあると、この base では足りない。
+            # 印字の塗装計が無いので確かめようもないため、畳まずに今までどおりにする（金額を動かさない）
+            _wage_keys = [k for k in ('bumper_front', 'bumper_rear', 'bumper_base', 'base', 'booth', 'two_tone', 'two_coat_solid')
+                          if out.get(k)]
+            if _wage_keys:
+                self.notes.append('塗装は実額の指定があるが、印字の塗装計が無く '
+                                  + '・'.join(_wage_keys) + ' の工賃を総額に足せないので畳まない（金額を動かさないため）')
+                return out
+        if base <= 0:
+            self.notes.append('塗装は実額の指定があるが、塗装計の額が分からないので畳まない')
+            return out
         for k in self.FORCE_ACTUAL_DROP:
             out.pop(k, None)
-        out['total'] = tot + oth
+        out['total'] = base
         if mat:
             out['material'] = mat
         self.notes.append(
-            f'塗装は入力方式「実額」の指定があるので内訳を畳んだ（塗装工賃計 {tot:,}'
-            + (f' ＋ 追加項目 {oth:,}' if oth else '')
+            f'塗装は入力方式「実額」の指定があるので内訳を畳んだ（塗装工賃計 {base:,}'
             + (f' ＋ 材料代 {mat:,}' if mat else '')
-            + f' = {tot + oth + mat:,} 円を総額 1 つで入れる。畳んだ内訳: {", ".join(drop)}）')
+            + f' = {base + mat:,} 円を総額 1 つで入れる。畳んだ内訳: {", ".join(drop)}）')
         return out
 
     def _paint_input_type(self, out: dict) -> dict:

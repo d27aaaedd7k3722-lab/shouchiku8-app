@@ -114,8 +114,12 @@ def write_report(case: str, est: dict, rep: dict, rows: list[dict], inspect_json
             continue
         L.append(f"| {label} | {'' if a is None else f'{int(a):,}'} | {'' if b is None else f'{int(b):,}'} |")
     import unicodedata as _ud2
-    _ptype = _ud2.normalize('NFKC', str(((est.get('paint') or {}).get('input_type')) or '')).strip()
-    if _ptype == '実額' or (est.get('paint') or {}).get('actual'):
+    _pd2 = est.get('paint') or {}
+    _ptype = _ud2.normalize('NFKC', str(_pd2.get('input_type') or '')).strip()
+    # 生成器が実際に実額で書いたときだけ注記する（内訳が残っていると実額にならない。estimate_to_neo の _jitsu と同じ判定。Codex 第26周）
+    _PAINT_BLOCK = ('bumper_front', 'bumper_rear', 'wax', 'door_sash', 'stripe', 'low_cover', 'two_coat_solid', 'two_tone',
+                    'frame', 'sealing', 'other')
+    if (_ptype == '実額' or _pd2.get('actual') is True) and not any(_pd2.get(k) for k in _PAINT_BLOCK):
         # 実額は総額 1 つの欄で、塗装工賃計・材料代の内訳を持てない（reference/painting.md §2）。
         # 表の「生成」が 0 になるので、理由を添える（検算も塗装計（材料込）で見ている）
         L += ['', '> 塗装は**実額**（総額 1 つ）で入れています。塗装工賃計・材料代は NEO に内訳を持てないので'

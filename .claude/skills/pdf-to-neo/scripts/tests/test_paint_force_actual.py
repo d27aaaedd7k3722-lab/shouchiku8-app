@@ -20,18 +20,45 @@ class _D(de.Drafter):
         self.notes = []
 
 
+def test_forced_actual_uses_printed_totals():
+    """基準は印字の合計欄（塗装計（材料込）− 材料代）。下書きの total より優先する"""
+    rd = {'paint': {'input_type': '実額'}, 'totals': {'paint_total': 85520, 'material': 19226}}
+    out = {'total': 60000, 'panels': [{'name': 'ﾄﾞｱ'}], 'material_rate': 29}
+    got = _D(rd)._paint_input_type(out)
+    assert got.get('total') == 85520 - 19226, got   # 塗装工賃計 66,294（生成器が材料代を足して 85,520）
+    assert got.get('material') == 19226, got
+
+
+def test_forced_actual_keeps_detail_when_total_unknown():
+    """印字の塗装計が無く、独立した工賃を持つ内訳（バンパ・加算基礎 等）があるときは畳まない（金額を動かさない）"""
+    rd = {'paint': {'input_type': '実額'}, 'totals': {}}
+    out = {'total': 50000, 'panels': [{'name': 'ﾄﾞｱ'}], 'bumper_front': {'wage': 20000}}
+    d = _D(rd)
+    got = d._paint_input_type(out)
+    assert got.get('panels') and got.get('bumper_front'), got
+    assert any('畳まない' in n for n in d.notes), d.notes
+
+
 def test_forced_actual_folds_details():
     """パネル・追加項目・材料代があっても、指定されたら実額 1 本に畳む"""
     rd = {'paint': {'input_type': '実額'}, 'totals': {}}
     out = {'total': 100000, 'material': 20000, 'material_rate': 20,
            'panels': [{'name': 'ﾄﾞｱ'}], 'lines': [{'name': 'ﾄﾞｱ', 'wage': 100000}],
-           'other': [{'name': 'ｱﾝﾀﾞｰｺｰﾄ', 'wage': 5000}], 'booth': {'time': 0.5}}
+           'other': [{'name': 'ｱﾝﾀﾞｰｺｰﾄ', 'wage': 5000}]}
     got = _D(rd)._paint_input_type(out)
     assert got.get('input_type') == '実額', got
     assert got.get('total') == 105000, got          # 塗装工賃計 + 追加項目（材料代は生成器が総額に足す）
     assert got.get('material') == 20000, got
-    for k in ('panels', 'lines', 'other', 'booth', 'material_rate'):
+    for k in ('panels', 'lines', 'other', 'material_rate'):
         assert k not in got, (k, got)
+
+
+def test_forced_actual_folds_booth_when_printed_total_is_there():
+    """ブース・加算基礎があっても、印字の塗装工賃計があればその額で畳める"""
+    rd = {'paint': {'input_type': '実額'}, 'totals': {'paint': 120000}}
+    out = {'total': 100000, 'panels': [{'name': 'ﾄﾞｱ'}], 'booth': {'time': 0.5}, 'base': {'count': 2}}
+    got = _D(rd)._paint_input_type(out)
+    assert got.get('total') == 120000 and 'booth' not in got and 'base' not in got, got
 
 
 def test_forced_actual_does_not_double_count_other():
