@@ -173,7 +173,8 @@ def test_handoff_claims_about_the_generator():
         ('AddedFrom は明細にあるかだけで決まる', "'AddedFrom': 0 if (is_bankin or linked) else 1" in src),
         ('連動判定に修理方法を使う', 'linked = disp_pnl in linked_disp' in src),
         ('違反を止める関門 _linked_ng', '_linked_ng' in src),
-        ('塗装パネルは部品コード昇順（手入力の塗装行は後ろ）', "sorted(_pp, key=_order)" in src and "'' if int(x.get('DisposalCode') or 0) == 9 else str(x['PartsCode'])" in src),
+        ('塗装パネルは 連動（部品コード昇順）→ パネル追加 → 手入力の塗装行 の順',
+         "sorted(_pp, key=_order)" in src and "return (2 if d9 else (1 if added else 0), '' if (d9 or added) else str(x['PartsCode']))" in src),
         ('加算基礎の標準値は ADDATA 値', 'st_std = sb if sb is not None else st' in src),
         ('真偽値の厳密読み取り _flag', 'def _flag(' in src),
         ('握り潰しの控え silent_errors', 'silent_errors' in src),
@@ -192,8 +193,8 @@ def test_handoff_claims_about_the_generator():
 
 
 def test_handoff_numbers_match_the_real_neo_files():
-    """HANDOFF §5-1 の数値（実機 NEO 18 本 / パネル 44 行 / 連動 41 行 / 追加 3 行 /
-    明細に無い連動 0 件 / 修理方法の食い違い 0 行。2026-09-12 時点）が実データと合っていること"""
+    """HANDOFF §5-1 の数値（実機 NEO 31 本 / パネル 103 行 / 連動 80 行 / 追加 23 行 /
+    明細に無い連動 0 件 / 修理方法の食い違い 0 行。2026-09-20 に塗装画面の実験 13 本を足して測り直した）が実データと合っていること"""
     from neo_diff import load
     files = _neo_files()
     if not files:

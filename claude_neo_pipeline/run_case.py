@@ -308,7 +308,10 @@ def main(path: str, out: str = ''):
     # 費用工賃の一部だけが「作業計」に入り、残りが印字の「諸費用計」（下書きが totals.expense_printed に残す）に入る書式（トヨタ系ディーラー:
     # センサーエーミングは作業計、レッカー・産廃は諸費用計。2026-09-14 JPN タクシー 作業計 378,938 = 明細 296,378 + 内骨 62,560 + エーミング 20,000）
     # 印字の塗装工賃計は追加項目（paint.other）を含まない（生成器の塗装計は含む）。追加項目を除いた額も一致の候補にする（Codex 指摘。2026-09-14 C-HR）
-    _oth = sum(int((o or {}).get('wage') or 0) for o in ((est.get('paint') or {}).get('other') or []) if isinstance(o, dict))
+    # 追加項目の工賃は**生成した NEO の値**で引く。見積に指数だけ書いて工賃を生成器に計算させた案件では
+    # estimate.json の wage が空で、引き算が効かなかった（実機 2026-09-20 cogni_pnt_A10 で発覚）
+    _oth = int(t.get('paint_other') or 0) or sum(int((o or {}).get('wage') or 0)
+                                                 for o in ((est.get('paint') or {}).get('other') or []) if isinstance(o, dict))
     if _oth:
         alt['paint'] = [(t.get('paint') or 0) - (t.get('paint_material') or 0) - _oth]
     _ep = pt.get('expense_printed')

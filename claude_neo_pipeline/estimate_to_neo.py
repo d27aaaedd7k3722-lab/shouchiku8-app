@@ -2566,10 +2566,18 @@ class NeoBuilder:
                     + ' を W/S 連動（AddedFrom 0）で書こうとしている。明細に同じ部品コードの取替/修理/板金行が無いので、'
                       'コグニで塗装ページを開くとこの行は消え、塗装計がその分不足する。'
                       'パネル追加（AddedFrom 1・工賃印 \'*\'）で書くか、明細の部品コードと塗装パネルのコードを揃える（判断規則 10-17）')
-            _order = lambda x: (int(x.get('DisposalCode') or 0) == 9, '' if int(x.get('DisposalCode') or 0) == 9 else str(x['PartsCode']))  # noqa: E731  手入力の塗装行は最後（入力順のまま。sorted は安定）
+            def _order(x):
+                """コグニの並び: 明細から連動した行（部品コード昇順）→「パネル追加」で足した行（追加した順）→ 手入力の塗装行。
+                実機 2026-09-20（cogni_pnt_A10）: 連動 0600/2300/3100 のあとに パネル追加した 0800 が**末尾**に付いた
+                （全部を部品コード昇順にすると 0800 が 2 番目に来てしまう）。
+                実案件 1,800 本でも、連動行と追加行が混ざる 76 本すべてで「連動 → 追加」の順（例外なし）。
+                追加行と手入力の塗装行は入力順のまま（sorted は安定）"""
+                d9 = int(x.get('DisposalCode') or 0) == 9
+                added = int(x.get('AddedFrom') or 0) == 1
+                return (2 if d9 else (1 if added else 0), '' if (d9 or added) else str(x['PartsCode']))
             if _pp and [_order(x) for x in _pp] != sorted(_order(x) for x in _pp):
                 cur.execute('DELETE FROM PaintingPanel')
-                for n_, rec_ in enumerate(sorted(_pp, key=_order), start=1):  # コグニは塗装パネル行を部品コード昇順で保存する（工場 NEO 5 本・再検索 C06）
+                for n_, rec_ in enumerate(sorted(_pp, key=_order), start=1):  # 連動行は部品コード昇順（工場 NEO 5 本・再検索 C06）
                     rec_['RecordNo'] = n_; rec_['LineNo'] = n_ - 1  # LineNo は 0 始まり（再検索 C06: 0,1,2,3,4）
                     cur.execute(f"INSERT INTO PaintingPanel ({','.join(pcols)}) VALUES ({','.join('?' * len(pcols))})", [rec_[c] for c in pcols])
             booth = pd.get('booth') or {}; base = pd.get('base') or {}; bb = sb = None  # 標準値は取れないことがある（汎用車種・CHM の無い車種）
@@ -2783,8 +2791,10 @@ class NeoBuilder:
                 etc_w += w; etc_t += t
             other_w = bw + sw; other_t = round(bt + st, 1)
             wage_total_p = int(panel_wage + bumper_w + etc_w + other_w)
-            if paint_total and wage_total_p != paint_total:
-                notes.append(f'塗装工賃計 明細 {wage_total_p} / 見積 {paint_total}')
+            # 塗装工賃計の突き合わせは、内板骨格塗装・ボデーシーリングを足したあと（下の「塗装の追加要素」）で行う。
+            # ここで比べると、見積の塗装工賃計に含まれるその 2 つを引かないまま「差がある」と知らせてしまう
+            # （実機 2026-09-20 cogni_pnt_A10: 明細 1,096,000 / 見積 1,304,000 と出たが、差 208,000 は 内板骨格 184,000 + シーリング 24,000）
+            self._paint_wage_cmp = (wage_total_p, int(paint_total or 0))
             mr = float(pd.get('material_rate') or default_material_rate(paint_c, coat_c, hf) or 26)
             if not paint_material:
                 paint_material = material_default(wage_total_p, mr, pd.get('material_round'))
@@ -2850,6 +2860,7 @@ class NeoBuilder:
         def rp2(x):
             return r10(int(round((x or 0) * 10)) * rate_x / 10) if rate_x and x else 0
         add_frame_t = add_etc_t = add_other_t = 0.0; add_frame_w = add_etc_w = add_other_w = 0
+        _pw_cmp = getattr(self, '_paint_wage_cmp', None); self._paint_wage_cmp = None  # 上の枝で控えた（明細合計, 見積の塗装工賃計）
         pf = pdx.get('frame') or {}
         if pf:
             nk = {}
@@ -2910,6 +2921,14 @@ class NeoBuilder:
                          *t3i(fr_w), *t3i(et_w), *t3i(ot_w), *t3i(wt),
                          *t3i(int(ptr['TotalOutTax'] or 0) + add_frame_w + add_etc_w + add_other_w + (mat - mat_before))))  # 既存 Total（一括塗装費は WageTotal と Other の両方に入っている）＋追加分
             paint_total += add_frame_w + add_etc_w + add_other_w
+        if _pw_cmp and _pw_cmp[1]:
+            # 追加項目（paint.other）は塗装工賃計に入らない（コグニは「追加塗装工賃計」で別に足す。実機 A10 で確認）
+            _det = int(_pw_cmp[0]) + add_frame_w + add_etc_w
+            if _det != _pw_cmp[1]:
+                _msg = f'塗装工賃計 明細 {_det} / 見積 {_pw_cmp[1]}'
+                # 上の notes を出す print ループはもう終わっているので、ここで出して報告にも残す（Codex 第1周の指摘）
+                self._paint_notes = (getattr(self, '_paint_notes', None) or []) + [_msg]
+                print('塗装:', _msg)
         _itype = unicodedata.normalize('NFKC', str((pdx or {}).get('input_type') or '')).strip()
         if (_itype == '実額' or _truthy((pdx or {}).get('actual'))) and not _jitsu:
             # 塗装の入力方式「実額」を**指定された**のに、内訳（パネル・バンパ・加算基礎・内板骨格塗装・追加項目 等）が
@@ -2932,6 +2951,7 @@ class NeoBuilder:
                 f'塗装は実額の指定があるので、計算した塗装計（材料込）{_tot_j:,} 円を総額 1 つで入れた（内訳の欄は 0）']
             print(f'塗装: 実額の指定 → 総額 {_tot_j:,} 円 1 つにした（内訳の欄は 0）')
             paint_total, paint_material = _tot_j, 0
+            add_other_w = 0  # 追加項目も総額に畳まれた（totals['paint_other'] は 0）
         if _itype == '参考':
             # 塗装の入力方式「参考」（コグニ: その他 → 塗装 → 入力方式）。計算は指数と同じで、見積の位置づけだけが違う
             # （実案件 NEO 700 本に 1 本。パネル・バンパ・追加項目はそのまま、材料代は手入力の印が付く）
@@ -3039,7 +3059,9 @@ class NeoBuilder:
                     'tx_TotalOutTax=?, tx_TotalInTax=?, SubTotal=?, Total=?',
                     (parts_total, parts_total + parts_tax_sum, parts_tax_sum, wage_total, wage_total + wage_tax_sum, wage_tax_sum,
                      *t3(paint_total), *t3(paint_material), *t3(hy_parts), *t3(hy_wage), tx, tx, sub, sub + tx + hy_parts_nt + hy_wage_nt))
-        totals = {'parts': parts_total, 'wage': wage_total, 'paint': paint_total, 'paint_material': paint_material, 'frame': nk_total, 'recycle': rc_total,
+        totals = {'parts': parts_total, 'wage': wage_total, 'paint': paint_total, 'paint_material': paint_material,
+                  'paint_other': int(add_other_w),  # 追加項目（塗装の追加塗装工賃）。印字の塗装工賃計には入らないので検算で引く
+                  'frame': nk_total, 'recycle': rc_total,
                   'expense_parts': hy_parts + hy_parts_nt, 'expense_wage': hy_wage + hy_wage_nt, 'discount': pt_x + wg_x, 'subtotal': sub, 'tax': tx, 'total': sub + tx + hy_parts_nt + hy_wage_nt}
         # AnNote.ini の [Reserve] / [Comment] Flag は、書き終わった ERParts から数える
         # （リサイクル置換行は CommentFlag を 0 にするので、置換前の rows で数えると 1 過大になる）
