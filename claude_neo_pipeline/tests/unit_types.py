@@ -85,6 +85,23 @@ def test_bool_qty_is_error():
         raise AssertionError('真偽値の数量が通ってしまう')
 
 
+def test_header_car_name_is_50_bytes():
+    """管理領域の車名は 50B。後ろの 12B（入庫日・出庫日・進捗・画像枚数）にはみ出さない（2026-09-21。
+    コグニ本体 AxDBAcsEnv.dll の CREATE TABLE NeoHeader と AxDBAcsFl.dll の変換処理で確定）"""
+    import neo_header
+    tmpl = open(os.path.join(os.path.dirname(HERE), 'reference', 'template.neo'), 'rb').read()
+    before = neo_header._dec(tmpl[9:424], neo_header.A_SHIFT)
+    long_name = 'ｱ' * 70  # 半角カナ 70B（50B を超える）
+    h = neo_header.build(tmpl, car_name=long_name)
+    after = neo_header._dec(h[9:424], neo_header.A_SHIFT)
+    assert after[194:206] == before[194:206], f'車名が入庫日・出庫日の欄にはみ出した: {after[194:206].hex()}'
+    got = neo_header.decode(h + tmpl[424:])['car_name']
+    assert got == 'ｱ' * 50, f'車名が 50B で切れていない（{len(got.encode("cp932"))}B）'
+    # 往復: 50B 以下の車名はそのまま戻る
+    h2 = neo_header.build(tmpl, car_name='N BOX 5ﾄﾞｱﾜｺﾞﾝ')
+    assert neo_header.decode(h2 + tmpl[424:])['car_name'] == 'N BOX 5ﾄﾞｱﾜｺﾞﾝ'
+
+
 if __name__ == '__main__':
     fails = 0
     for name, fn in sorted(globals().items()):

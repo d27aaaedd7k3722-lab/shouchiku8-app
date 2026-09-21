@@ -26,7 +26,8 @@ XOR 0xFF したビット列を左シフトして格納した 2 ブロック。`d
 | 0-6 | 固定 `f7 ff fc c7 ff ff f8` |
 | 74-113 | 協定工場名（Insurance.ConsultantFactory、cp932 40B、0 埋め） |
 | 114-143 | 顧客名 Name1（30B） |
-| 144-205 | 車名 CarNameByUser（62B） |
+| 144-193 | 車名 CarName（50B） |
+| 194-205 | 入庫日 4B / 出庫日 4B（u16 年 + 月 + 日）/ 進捗 u16 / 画像枚数 u16。生成器は書かない（雛形のまま＝0。実 NEO 550 本も全部 0） |
 | 206-209 | 作成日 u16 年 + u8 月 + u8 日 |
 | 210-249 | double×5 = 部品計 / 工賃計 / 塗装計（材料込） / 費用計（部品+工賃） / 合計（税込） |
 | 274-281, 282-287, 288-291, 292-301 | 登録番号 陸運支局 / 分類番号 / かな / 一連番号 |
@@ -39,6 +40,10 @@ XOR 0xFF したビット列を左シフトして格納した 2 ブロック。`d
 | 15- | double×6 = -1.0、以降 0 埋め |
 
 実 NEO 4 件で往復一致。生成 NEO はこれまでテンプレートの値（N-BOX／別顧客）を引き継いでいたため、v4 から書き直すようにした。
+
+列の並びはコグニ本体 `AxDBAcsEnv.dll` の `CREATE TABLE NeoHeader`（`… SelfName(40) CustomerName(30) CarName(50) GarageInDate GarageOutDate Progress ImageCount CreateDate …`）と
+`AxDBAcsFl.dll` の変換処理（10008160〜）で確定した（2026-09-21）。本体の列位置と decodeA のオフセットの差は一定の 7。
+**車名は 50B**。以前は 144-205 の 62B と読んでいたが、後ろ 12B は入庫日・出庫日・進捗・画像枚数で、62B で書くと車名が 50B を超えたときにそこへはみ出す。
 文字は Windows 互換 cp932（IBM 拡張漢字は FA-FC 行。Python 標準の cp932 は NEC 選定 ED/EE 行になるため `neo_container` に `cp932w` コーデックを登録して xml / AnSMB / AnSvMail / 管理領域すべてに使う。例: 德 = FA BA）。
 
 ## 2. テキスト系内部ファイル

@@ -8,8 +8,12 @@ neo_header.py — NEO 先頭 424B 管理領域（既存見積一覧が読むサ�
       A[0:7]     固定 'f7 ff fc c7 ff ff f8'
       A[74:114]  協定工場名（Insurance.ConsultantFactory、cp932 40B）
       A[114:144] 顧客名 Name1（30B）
-      A[144:206] 車名 CarNameByUser（62B）
+      A[144:194] 車名 CarName（50B）
+      A[194:206] 入庫日(4B) 出庫日(4B) 進捗(u16) 画像枚数(u16)。生成器は書かない（雛形のまま＝0）
       A[206:210] 作成日 (u16 year, u8 month, u8 day)
+    列の並びはコグニ本体 AxDBAcsEnv.dll の CREATE TABLE NeoHeader と、AxDBAcsFl.dll の変換処理（10008160〜）で確定
+    （2026-09-21）。以前は車名を 62B と読んでいたが、実際は 50B の後ろに入庫日・出庫日・進捗・画像枚数が続く。
+    62B で書くと、車名が 50B を超えたときに入庫日などへはみ出す
       A[210:250] double×5 = 部品計, 工賃計, 塗装計(材料込), 費用計(部品+工賃), 合計(税込)
       A[274:282] 登録番号 陸運支局(8B) A[282:288] 分類番号(6B) A[288:292] かな(4B) A[292:302] 一連番号(10B)
     ブロック B（raw[~320:424]）: decodeB = ((raw ^ FF) as big-int) << 7
@@ -58,7 +62,7 @@ def decode(raw: bytes) -> dict:
     def s(bs):
         return bs.split(b'\0')[0].decode('cp932', 'replace')
     out = {
-        'agreed': s(a[74:114]), 'name1': s(a[114:144]), 'car_name': s(a[144:206]),
+        'agreed': s(a[74:114]), 'name1': s(a[114:144]), 'car_name': s(a[144:194]),
         'created': struct.unpack('<HBB', a[206:210]),
         'totals': [struct.unpack('<d', a[210 + 8 * j:218 + 8 * j])[0] for j in range(5)],
         'carno': (s(a[274:282]), s(a[282:288]), s(a[288:292]), s(a[292:302])),
@@ -87,7 +91,7 @@ def build(template_raw: bytes, *, agreed: str = '', name1: str = '', car_name: s
     a = bytearray(_dec(bytes(h[9:424]), A_SHIFT))
     a[74:114] = _fit(agreed, 40)
     a[114:144] = _fit(name1, 30)
-    a[144:206] = _fit(car_name, 62)
+    a[144:194] = _fit(car_name, 50)  # 後ろの A[194:206]（入庫日・出庫日・進捗・画像枚数）には触らない
     if created:
         a[206:210] = struct.pack('<HBB', created.year, created.month, created.day)
     if totals:
