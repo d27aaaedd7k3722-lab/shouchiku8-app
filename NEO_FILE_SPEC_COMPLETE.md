@@ -163,7 +163,7 @@ PolicyNo, ContractorName, AgencyName, AccidentDate/Era/EraYear, PresenceDate（�
 - PaintingPanel の **高機能塗装だけの行（DisposalCode 7）**: 明細は脱着などで塗り替えない部位に高機能塗装の加算だけ足す行（実案件 NEO 80 行 / 60 本。2026-09-20）。`DisposalName` = 高機能塗装の名前（耐スリ傷 68・ｽｸﾗｯﾁ 12）, `PaintingArea/PaintingAreaName/PrepareArea` は無し（-1/空）, `Time` = 高機能の加算（`TimeStandardHF` と同値が 76/80）, 標準欄（TimeStandard*/WageStandard*）は通常のパネルと同じに入る, `AddedFrom 1`, `SortNo 13`, 印 `*`（指数を手で入れた行は `#`・`Manual 1`）。パネル計には入り（60/60）、加算基礎の枚数には数えない（59 本で成立）。生成器は `paint.panels[]` の `method: "高機能"` で書く
 - PaintingPanel の **手入力の塗装行（DisposalCode 9）**: 外板パネル画面の「行追加」で名称・指数を手で入れた行（実案件 NEO 354 本・631 行。2026-09-13）。`PartsCode ''`, `DisposalName ''`（修理方法を選んだ行は '修理'/'取替'）, `PanelName` 入力のまま（詰めない）, `PanelArea/PrepareArea/PaintingArea -1`, `PaintingAreaName ''`, `TimeStandard*/WageStandard*/Material* -1`, `PanelDivision/PanelTypeDivision/PanelCode/ButtonNo -1`, `SortNo 15`, `AddedFrom 1`, `Provisional 0`。指数あり: `Time` = 指数・工賃 = r10(指数×単価)・`WageByManual '#'`・`Manual 1`／工賃だけ: `Time -1`・`'*'`・`Manual 2`。部品コードのあるパネルの後ろに入力順で並ぶ（LineNo = RecordNo-1）。`TimeTotalPanel`・`WageTotalPanel`・材料代の対象に入り、加算基礎の枚数（単体塗/複数塗の判定も）には数えない（60/60・16/16）。手入力の塗装行だけを足しても `BaseWageByManual` は '' のまま（241/245）。部品コードのあるパネルが無く手入力の塗装行だけなら `BaseTimeStandard -1`（加算基礎を入れれば手入力 '#'）、`BumperBase* -1`。生成器は `paint.panels[].manual`
 - PaintingBumper（fb_/rb_）: `Disposal 0 なし/1 新品/2 変形修正/3 外傷修正（23.DB の無い車種: 小/大の区別なし、FBANPA_J69.neo）/4 外傷修正小/5 外傷修正大`（N-ONE 実機 2026-09-05、NONE_bp/bp2/bp4.neo）, `Name` 同名, `Form -1 / 0 大型 / 1 標準`（`FormName` '大型'/'標準'。23.DB の無い車種（COM/FBANPA.DB を使う 586 車種（evidence/car_file_counts.json））でだけ形状を選べ、J69 パートナーの保存版 FBANPA_J69.neo で 0/1 を確認。23.DB 車種は -1）, `Color 0 一色/1 黒ライン/2 二色`, `Draft 0 無し/1 有り`（絞模様。新品では選択不可）, `DraftName ''（新品）/'無し'/'有り'`, `Time`（`<car>23.DB` の 8 列 [新品一色, 新品二色, 外傷大一色, 外傷大二色, 外傷小一色, 外傷小二色, 変形一色, 変形二色]。絞模様有りは **+0.4**（修理 3 方式・ソリッド/パールとも一定）。実機 J52 2コートパール F: 新品 1.3/1.8、外傷大 2.4/2.9、外傷小 2.2/2.7、変形 3.1/3.6、絞有り 各 +0.4）, `Wage*`, `WageByManual ''`（新規見積でバンパを初めて選んだ直後の保存では `'$'`、バンパ加算も `BumperBaseWageByManual='$'`。値は標準と同じ。生成器は標準と同じなら ''、違えば '*'）。「別調色」ボタン = バンパ設定ダイアログ（バンパ別調色チェック＋バンパ用塗膜）。PaintingFrame（er_/fp_/cp_/rp_ 骨格）, PaintingEtcetera（ARWax 枚数×0.1h 等）, PaintingLinkParts（パネル追加では 0 行）, PaintingOther（追加項目タブ 内板調色…。工場塗装費一括は `Name='塗装費用(工場見積)', WageByManual='*'`）
-- PaintingTotal: `TimeTotalPanel/Bumper/Frame/Etcetera/Other`、`TimeTotal = パネル + バンパ + 骨格 + 付加 + 加算基礎`（**ブース指数は含まない**。N-ONE 保存版 1.2+2.8+1.9=5.9。バンパ単独塗装のときは加算基礎の代わりに `PaintingPlan.BumperBase*`（BAN.DB）が `TimeTotalBumper` に内包される: NEW3 fb_Time 1.3 + BumperBaseTime 0.5 = TimeTotalBumper 1.8 = TimeTotal）、`WageTotal* = パネル + バンパ + 骨格 + 付加 + ブース + 加算基礎`（Other は追加項目のみ。**加算基礎は Other ではない**）、`MaterialTotal* = round10(WageTotal×割合)（10 円単位で四捨五入）`（手入力なら MaterialTotalbyManual '*'）、`Total = WageTotal + Other + Material`（Other = 追加項目タブの工賃。コグニが計算した WageTotal には入らない: SIENTA_w 52,800 + 191,360 + 7,920 = 252,080）。**例外**: 生成器の一括塗装費（非コグニ書式の見積の「塗装 ○○円」を PaintingOther 行 0 '塗装費用(工場見積)' に入れる形）は WageTotalOther と WageTotal の両方に同額を書き Total には一度だけ計上する（SIENTA_adas: 191,360/191,360/191,360）。コグニはこの形を読み・印刷し、塗装画面で再計算すると WageTotal がパネル分だけに正規化される
+- PaintingTotal: `TimeTotalPanel/Bumper/Frame/Etcetera/Other`、`TimeTotal = パネル + バンパ + 骨格 + 付加 + 加算基礎`（**ブース指数は含まない**。N-ONE 保存版 1.2+2.8+1.9=5.9。バンパ単独塗装のときは加算基礎の代わりに `PaintingPlan.BumperBase*`（BAN.DB）が `TimeTotalBumper` に内包される: NEW3 fb_Time 1.3 + BumperBaseTime 0.5 = TimeTotalBumper 1.8 = TimeTotal）、`WageTotal* = パネル + バンパ + 骨格 + 付加 + ブース + 加算基礎`（Other は追加項目のみ。**加算基礎は Other ではない**）、`MaterialTotal* = round10(ceil1(WageTotal×割合))`（1 円単位で切り上げてから 10 円単位で四捨五入。§10-3・ADDATA 仕様書 §16-3）（手入力なら MaterialTotalbyManual '*'）、`Total = WageTotal + Other + Material`（Other = 追加項目タブの工賃。コグニが計算した WageTotal には入らない: SIENTA_w 52,800 + 191,360 + 7,920 = 252,080）。**例外**: 生成器の一括塗装費（非コグニ書式の見積の「塗装 ○○円」を PaintingOther 行 0 '塗装費用(工場見積)' に入れる形）は WageTotalOther と WageTotal の両方に同額を書き Total には一度だけ計上する（SIENTA_adas: 191,360/191,360/191,360）。コグニはこの形を読み・印刷し、塗装画面で再計算すると WageTotal がパネル分だけに正規化される
 
 ### 塗装条件の派生（N-ONE 実機 2026-09-04、NONE_hf/f/lc/2t.neo）
 - 高機能塗装 フッ素(1)/耐スリ傷(2)（証拠: 工場のコグニ生成 NEO 04011103（証拠パック外）と N-ONE 案件の HF 保存版。証拠パックでは neo_CHR_ETO_exp（HFPainting 2 耐スリ傷、TimeStandardHF あり）が保存例で、他の NEO は HFPainting 0）: PaintingPanel `TimeStandardHF` にパネル別加算（面積 33 → 0.6。floor10(0.3+0.01×面積) と一致）、`TimeStandardNew/1/2/3` は加算込みの値に置き換わり `Time` も標準へ戻る（手入力 `#` は失われる）。加算基礎 T_KEI_3 は HF 列（2.8 → 3.4）、**ブース加算は 0**（BoothTime 0。BoothFlag はコグニ実機で HF を選んだ直後の保存版（NONE_bp4 系）は 1 のまま、生成器由来 NEO を開いて保存した CHR_ETO_exp は 0 が温存される = 状態依存。生成器は hf があれば BOOTH.DB の値（HF 時 0）でフラグを立てる）
@@ -331,7 +331,7 @@ DamageBlock/DamageParts の再生成、AnFlInfo の `AnVer.db` 更新、`.~ne` �
 - **材料代の端数処理は工場ごとに違う**（コグニの環境設定。NEO には残らない）。実案件 366 本（手入力印の無いもの）で確かめると
   10 円四捨五入 332 本 / **10 円切り上げでしか説明できない 22 本** / 1 円単位の工場もある / どれでも説明できない 5 本。
   生成器は `paint.material_round`（`{"unit": 10, "mode": "切り上げ"}` 等）で切り替える（既定 10 円四捨五入）
-- 材料代の既定値 = **塗装工賃計 × 割合 を 10 円単位で四捨五入**（15,500×15%=2,325→2,330、18,950×15%=2,842.5→2,840（double で 2842.49…）、46,490×15%=6,973.5→6,970、46,490×14%=6,508.6→6,510）。従来の floor10 は誤り
+- 材料代の既定値 = **塗装工賃計 × 割合 を 1 円単位で切り上げてから 10 円単位で四捨五入**（本体 `CalculateMaterialTotal` の `NeoTruncEx(v + 0.9)` → 10 円四捨五入。ADDATA 仕様書 §16-3。15,500×15%=2,325→2,330、18,950×15%=2,842.49…→2,843→2,840、46,490×15%=6,973.5→6,974→6,970、46,490×14%=6,508.6→6,509→6,510、**80,230×28%=22,464.4→22,465→22,470**（1 円切り上げが無い以前の式では 22,460）。実案件 99.98%。従来の floor10 は誤り。2026-09-21 に 1 円切り上げを足した）
 - 塗装計タブ: 外板パネル（パネル＋加算基礎＋ブース）/ バンパ / 内板骨格 / 付加塗装 の工賃と材料代、小計、割合、塗装費用計 = 塗装工賃計 ＋ 材料代 ＋ 追加塗装工賃計
 
 - **塗装の入力方式（指数 / 実額）= `PaintingPlan.InputType` / `InputTypeName`**（実案件 NEO 400 本、2026-09-19 調査）:
@@ -628,3 +628,102 @@ DamageBlock/DamageParts の再生成、AnFlInfo の `AnVer.db` 更新、`.~ne` �
 - `<見積名>.xml` の `ii_PresenceDate`: 立会日（`Insurance.PresenceDate` を `YYYY/MM/DD` にした値）。
   2026-09-21 まで空のままだった
 - `AnFlInfo` の `NewCreate`: この見積の作成日。`AnVer.db_BackN` は版が上がるたびに 1 つずつ後ろへ押し出す
+
+
+---
+
+## 11. NEO の正体と保存の流れ（2026-09-21 夜。本体 AxDBAcsFl.dll / AudaMain.exe を逆アセンブルして確定）
+
+### 11-1. NEO は「見出し ＋ Windows 標準の CAB ファイル」
+
+| 位置 | 中身 | 隠し方 |
+|---|---|---|
+| 0–15（16B） | `NEO3` `0010` 情報部の長さ 305 履歴部の長さ（10 ＋ 93 × 件数） | そのまま |
+| 16–320（305B） | 見積の要約（`NeoHeader` の列） | 右へ 3 回転 → 全ビット反転 |
+| 321–330（10B） | 履歴見出し `0010` 93 件数 | そのまま |
+| 331– （93B × 件数） | 履歴（日時 7B・ライセンス ID 8B・double × 6・30B） | 左へ 1 回転 → 反転 |
+| その後ろ | **CAB ファイル本体**（`MSCF` で始まる） | 先頭 32B だけ左へ 13 回転 → 反転 |
+
+- 圧縮は独自ではなく Windows の `cabinet.dll`（`AxCabAcs.dll CompressFile`）。形式 MSZIP、セット番号 12345、ディスク名 "MyDisk"
+- 「CK」付きのかたまりは CAB のデータブロックそのもの（4B チェックサム・u16 圧縮後長・u16 展開後長・`CK`＋deflate）。展開後は 1 ブロック最大 32,768B
+- **CK の 4 バイトは CAB 標準のチェックサム**（コグニ保存 186 本すべてで計算値と一致）。CAB 規格では 0 は「検査しない」なので、生成器が 0 を書いても開ける（生成 364 本すべて）
+- CAB の開始位置は 424 固定ではなく **331 ＋ 93 × 履歴件数**
+- 生成器がこれまで「管理領域 424B」「ファイルテーブルのエントリ」と呼んでいたものは、上の見出しと CAB 標準の「ファイル一覧」の記録。
+  1 件は「サイズ・位置・フォルダ番号 u16・日付・時刻・属性 0x20・`\ファイル名`」で、エントリ末尾の `00 00` × 11 は 2〜12 件目のフォルダ番号 0
+
+**生成器が触ると壊れる領域**: 先頭 16B の整合（`NEO3` / 305 / 10＋93×件数）と履歴件数、`Agreed` と `AgreedPassword`（協定の施錠。550 本すべて 0）、
+CAB の見出し、各ファイルのフォルダ番号 `00 00`、`AnDBVersion.ini` の中身（最新は If=3 / Em=3 / Ig=1 で、雛形と同一）。
+
+**生成器の扱いとの関係**: `neo_container.py` は先頭 424B を「管理領域」、424 から最初の CK までを「ファイルテーブル」と呼んで扱う。
+424 は **履歴 1 件の NEO での CAB の開始位置**（331 ＋ 93 × 1）にあたる。ただし生成器は 424 から最初の CK までを**不透明なまま雛形から写し**、
+書き換える値（チャンク数・1 件目のファイルのサイズ）は**その末尾から後ろ向きに数えた位置**（`mgmt[-14]` / `mgmt[-10]`）で書くので、
+履歴が 2 件以上の雛形でも CAB の中身の位置はずれない（生成 NEO 364 本のうち履歴 2〜5 件の 103 本も開けている）。
+見出しの書き換え（`neo_header.py`）は 424 より前だけを触る。
+
+生成器の未対応（今は無害）: CAB 全体のサイズ値を更新していない／1 件目のファイルのサイズを u16 で書いている（64KB を超えると壊れる。今は xml で約 1.7KB）／
+ファイル数・名前の長さを変えると位置がずれる（雛形の名前をそのまま使うので問題なし）／`neo_header.py` は履歴の 1 件目（いちばん古い記録）を書き換える
+（最新の記録は末尾。履歴が 2 件以上の雛形では、既存見積一覧の履歴表示だけがずれる）。
+
+### 11-2. 保存の順序（`AudaMain.exe SaveExecuteEx`、00418500〜）
+
+1. `.sld` は sqlite3.dll で直接書く普通の SQLite（serialize ではない）→ 3 つとも `VaccumDB`（事前にバックアップ、失敗したら戻す）
+2. `AnSMB.txt`（4159C4 が明細と 11/12/13/17/83.DB から組み立てる。AdVer 0320 で分岐あり）
+3. 既存の `*.xml` を消して `<NEO 名>.xml` を作る（AxUtil）→ `AnCooperate.txt` → `AnSvMail.ini` / `AnSvImge.ini`（AxDBAcsFl）→ `AnNote.ini` → `AnFlInfo`
+4. `Template\AnDBVersion.ini` を作業フォルダへ上書きコピー
+5. `SaveNeoFile` が作業フォルダ全体を名前順で CAB にする
+
+**保存処理は合計を計算し直さない**（メモリ上の値をそのまま書く）。`AnFlInfo` の `NewCreate` は新規作成のときだけ、
+版の押し出し（`_Back1`〜`_Back10`）は `AnVersion.ini` / `AnVer.db` / `AudaMain.exe` の 3 つで、値が変わったときだけ 1 つずつ後ろへずらす。
+
+### 11-3. 合計の式（`AnTsmBL.CalculatTotal`。外税の実案件 1,487 本すべてで SubTotal・消費税・Total が 1 円も違わず再現）
+
+```
+P = ms_PartsTotal + hy_PartsTaxTotal ± pt_Extra
+W = ms_WageTotal + pn_Total + nk_Total + hy_WageTaxTotal ± wg_Extra        （pn_MaterialTotal は pn_Total に含まれる）
+X = 課税のレッカー（hy_Wrecker*TaxFlag = 0）
+SubTotal = P + W + X
+消費税   = 丸め(SubTotal × TaxRate / 100、単位 tx_Unit、丸め方 tx_ArrangeFlag 1 四捨五入 / 2 切り捨て / 3 切り上げ)
+            tx_CalculateFlag = 0 なら 0
+Total    = SubTotal + 消費税 + 非課税のレッカー + hy_PartsNoTax + hy_WageNoTax + Σ Fixer.Price（Enabled=1）
+```
+
+- `ms_PartsTotal` は明細の部品代の合計（リサイクル行を含み、ReserveFlag 1/2 の行と部品代 −1 の行は除く）
+- `ms_WageTotal` は明細の工賃の合計 ＋ ADAS 作業の工賃（工賃の 3 列がどれも 0 以上の作業だけ）
+- 値引・割増は P と W の段階で足し引き（`pt_ExtraTotalInTax > 0` のときだけ効く。Flag 0 値引・1 割増）
+- `TotalSumChange` は合計を再計算しない（画面更新だけ）。`CalculatTotal` を呼ぶのは明細・費用・塗装・ADAS・内板骨格の変更時
+- **各行の税額も消費税設定の丸め方**（2026-09-21 に実装。実案件 3,000 本で 設定どおり 173 行・四捨五入 0 行）
+- 未対応: 内税（`TaxKindFlag = 1`）は税込から税額を逆算する別経路（`GetInTaxEx` 4071E4）。生成器は税抜の SubTotal から計算するので、実案件の内税 13 本中 6 本で Total が合わない
+
+### 11-4. `WageByManual` の印（`IsWageByManual` 40EE78 ほか）
+
+| 印 | 付く条件 | 本体の再計算 |
+|---|---|---|
+| `#` | 表で指数を入れた／直接入力ダイアログで指数あり | しない（工賃は指数×単価で出し直す） |
+| `*` | 表で工賃を入れた（Time は −1）／直接入力で指数なし | しない |
+| `@` | 直接入力の損傷面積モード（板金ランク）。DamageArea に面積 | しない |
+| `$` | 11.DB の暫定指数を写したもの | **する**（手入力扱いではない。再計算のたびに一度空になり、また写される） |
+| `n` | 本体が見る値として存在（意味は未解明） | しない |
+
+ほかに本体が埋める列: 部品代の無い取替行 `PartsPriceFlag=1`、部品番号を手で直した行 `OrderFlag='9'`、部品代を手で直した行 `PartsPriceByManual='*'`、
+`ChangeTotal = 部品代 ＋ 工賃`。保留（ReserveFlag 1/2）の行と `RCParts`（リサイクル台帳）は合計に入らない。
+
+### 11-5. 費用 36 行の構造（実案件 800 本。2026-09-21 に生成器を合わせた）
+
+| 行 | NameFix | Attribute | 名前 |
+|---|---|---|---|
+| 1〜8 | 1 | 1〜8 | 全工場共通（800/800 一致）: 文字書き費用 / 内張り費用 / 配線・配管費用 / ショートパーツ / レッカー代１ / レッカー代２ / 写真代他 / その他控除（`AnDefine.ini [CostItem]` と `AnOtrBL.bpl` のハードコードが正本） |
+| 9〜36 | 0 | 0 | **工場の雛形ごとに全く違う**（行 10 は 'ｱﾗｲﾒﾝﾄ調整費' の工場も 'ﾗｽﾄｯﾌﾟ' の工場も 'エーミング' の工場もある）。行番号に意味は無く、Name が正本 |
+
+生成器の割り付け: 固定行 1〜8 だけキーワードで寄せ、名前は書き換えない。自由行は雛形の名前と突き合わせる（完全一致 → 前方一致。
+前方一致は雛形名が費用名で始まる向きだけ、候補が複数なら寄せない）。無ければ空き行に名前を書く。**半角カナと全角は区別する**
+（実機 cogni_CXA は 'ﾚｯｶｰ' を雛形の全角 'レッカー費' の行に寄せず空き行に置いた）。レッカーも自由行（上の 11-3 の X に流さない）。
+
+帳票様式（`AudaData\Const\PrintSheetDesign\*.xml`）は見積書の欄 ↔ NEO 列の正本で、非課税費用は `TaxfreeExpense:1〜5` の **5 行まで**しか刷らない
+（実案件 800 本で非課税費用は 0 本なので実害は無い）。
+
+### 11-6. 設定の実体はインストール先ではない
+
+コグニの設定の実体は `C:\Users\Public\Documents\Audatex\Auda7\Data\`（`AnOption.ini` / `Current\AnLatest.ini` / `AnUsrTbl.sld` など）。
+`C:\Program Files (x86)\Audatex\Auda7\AudaData\` は出荷時の雛形で、`Const\` だけは両者一致。
+`Template\` にコグニ純正の見積雛形（.sld）は無く、NEO に詰める ini 4 本（`AnDBVersion.ini` `AnNote.ini` `AnSvImge.ini` `AnSvMail.ini`）の素だけ。
+前 3 本は生成器の雛形とバイト一致。
