@@ -523,7 +523,8 @@ class AddataVehicleResolver:
         return out
 
     def finish_code(self, car: str, code: str) -> int:
-        """66.DB: 'NH731P      001 00       3B02' → 先頭桁 3 = 塗膜区分（1 ソリッド / 2 メタリック / 3 2コートパール / 4 3コートパール / 9 特殊）"""
+        """66.DB: 'NH731P      001 00       3B02' → 先頭桁 3 = 塗膜区分（1 ソリッド / 2 メタリック / 3 2コートパール / 4 3コートパール / 9 特殊）。
+        同じ色に行が 2 つある（塗料メーカーで対応が違う）色では**先頭の行**を返すので、塗膜は見積書の印字を優先すること（`color_paint_info`）"""
         code = unicodedata.normalize('NFKC', code or '').upper().strip()
         for l in self._vdb_bytes(car, '66'):
             if self._d(l[0:12]).upper() == code:
@@ -531,6 +532,48 @@ class AddataVehicleResolver:
                 if m:
                     return int(m.group(1))
         return 0
+
+    def color_paint_info(self, car: str, code: str, water: bool = False) -> dict:
+        """66.DB（水性は 96.DB）の**その色の行すべて**から、塗装条件を読む（2026-09-21 に解読）。
+
+        行 = `カラーコード 12, 枝番 3（001〜006）, 年式群 1, ボディ 2, グレード 5, 装備 2, 塗膜 1, 高機能 1, 低隠蔽 1, 2コートソリッド 1, 注記`。
+
+        - 塗膜 [25] … 1 ソリッド / 2 メタリック / 3 2コートパール / 4 3コートパール / 9 特殊
+        - 高機能 [26] … `B` しない / `T` 耐スリ傷 / `S` スクラッチ / `9` 塗料メーカーによる（実案件 1,270 本で
+          B→しない 980/991・T→耐スリ傷 209/213・S→スクラッチ 15/20）
+        - 低隠蔽 [27] … `9` は低隠蔽性塗色の可能性（実案件 11 本中 5 本で低隠蔽性が立つ。`0` の色では 2.5%）
+        - 2コートソリッド [28] … `1` は 2コートソリッドの可能性（実案件 16 本中 12 本。`2` の色では 9%）
+
+        **同じ色に行が複数ある色が 8 割**（注記「塗料ﾒｰｶｰにより補修対応が異なる」）。年式群・ボディでは絞れない
+        （実案件 215 本のうち絞れたのは 7 本）ので、塗膜は**見積書の印字を正**とする。先頭行で決めると 3 割外れる。
+
+        戻り値 {'coats': [塗膜…], 'hf': ['B'…], 'low_cover': bool, 'two_coat_solid': bool, 'special': bool, 'notes': [注記…], 'rows': 行数}"""
+        code = unicodedata.normalize('NFKC', code or '').upper().strip()
+        out = {'coats': [], 'hf': [], 'low_cover': False, 'two_coat_solid': False,
+               'special': False, 'notes': [], 'rows': 0}
+        if not code:
+            return out
+        for l in self._vdb_bytes(car, '96' if water else '66'):
+            if self._d(l[0:12]).upper() != code:
+                continue
+            f = l.decode('cp932', 'replace')
+            if len(f) < 29:
+                continue
+            out['rows'] += 1
+            c = f[25]
+            if c.isdigit():
+                if c == '9':
+                    out['special'] = True
+                elif int(c) in (1, 2, 3, 4) and int(c) not in out['coats']:
+                    out['coats'].append(int(c))
+            if f[26] not in out['hf']:
+                out['hf'].append(f[26])
+            out['low_cover'] = out['low_cover'] or f[27] == '9'
+            out['two_coat_solid'] = out['two_coat_solid'] or f[28] == '1'
+            nt = f[29:].strip()
+            if nt and nt not in out['notes']:
+                out['notes'].append(nt)
+        return out
 
     # ------------------------------------------------------------ 総合解決
     @staticmethod

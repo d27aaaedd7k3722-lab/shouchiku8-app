@@ -312,15 +312,28 @@ def _inspect(path: str, out_json: str = '') -> int:
     # ---- 6. 塗装 --------------------------------------------------------------------------------
     p = est.get('paint') or {}
     print('=' * 100)
+    # 車両色から分かる塗装条件（66/96.DB）。塗装が一括計上の見積でも見積書の読み落としを拾えるようにここで見る（2026-09-21）。
+    # 文言と条件は生成器と同じ関数を使う（両者がずれると、どちらを見たかで ★ が変わる。Codex 指摘）
+    try:
+        from estimate_to_neo import color_paint_notes, paint_code_of
+        _ci = nb.resolver.color_paint_info(car_code, car.get('ColorCode', '') or '',
+                                           water=paint_code_of(p) == 4)
+        _fc0 = nb.resolver.finish_code(car_code, car.get('ColorCode', '') or '')
+        _coat0 = _coat_code(p.get('coat', '')) or (_fc0 if _fc0 in (1, 2, 3, 4) else 0)  # 生成器と同じ順（見積の印字 → 66.DB）
+        for _w in (color_paint_notes(_ci, _coat0, _hf_code(p.get('hf', 'しない')), p) if p else []):
+            warn.append('塗装 ' + _w)   # 塗装の欄が無い見積では知らせない（生成器と同じ。Codex 指摘）
+    except Exception:  # noqa: BLE001
+        pass
+
     if p.get('panels') or is_bumper_only_paint(p):   # バンパだけの詳細塗装（panels: []）も標準指数を見る（Codex 指摘）
         paint_c, hf_c = _paint_code(p.get('paint', '２Ｋ')), _hf_code(p.get('hf', 'しない'))
-        try:  # 生成器 build と同じ: 車両色の 66.DB 先頭桁 → 見積の塗膜名 → 既定 2（メタリック）
+        try:  # 生成器 build と同じ順: **見積書の塗膜の印字** → 車両色の 66.DB 先頭桁 → 既定 2（メタリック）
             fc = nb.resolver.finish_code(car_code, car.get('ColorCode', '') or '')
         except Exception:
             fc = None
-        coat_c = fc if fc in (1, 2, 3, 4) else (_coat_code(p.get('coat', '')) or 2)
-        if p.get('coat') and fc in (1, 2, 3, 4) and _coat_code(p.get('coat', '')) not in (0, fc):
-            warn.append(f"塗装 ★見積の塗膜 {p.get('coat')}（={_coat_code(p.get('coat', ''))}）と車両色 {car.get('ColorCode')} の 66.DB 塗膜 {fc} が違う（生成器は 66.DB を優先する）")
+        coat_c = _coat_code(p.get('coat', '')) or (fc if fc in (1, 2, 3, 4) else 2)  # 2026-09-21: 生成器と逆だったのを直した
+        # 見積の塗膜と 66.DB の食い違いは、上の色別の知らせ（color_paint_notes）が**候補すべて**と突き合わせて出す。
+        # ここで 66.DB の先頭行とだけ比べると、2 通りある色で 2 つ目を選んだ見積に空振りの ★ が出る（Codex 指摘 2026-09-21 に削除）
         pi = PaintIndex(nb.engine.root, car_code, body=car.get('BodyCode', ''))  # 20.DB はボディで面積が違う行を持つ
         from estimate_to_neo import is_manual_panel
         _man = [x for x in p['panels'] if is_manual_panel(x)]

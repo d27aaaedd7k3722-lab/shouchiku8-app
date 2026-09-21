@@ -155,6 +155,52 @@ def paint_code_of(pd: dict) -> int:
     return PAINT_CODE[pn_]
 
 
+COAT_NAMES = {1: 'ソリッド', 2: 'メタリック', 3: '２コートパール', 4: '３コートパール'}
+HF_NAMES_TS = {2: '耐スリ傷', 3: 'ｽｸﾗｯﾁ'}
+
+
+def color_paint_notes(ci: dict, coat_c: int, hf: int, pd: dict) -> list[str]:
+    """カラーコードから分かる塗装条件（66/96.DB の `color_paint_info`）と見積の食い違いを知らせる文。
+    金額は変えない（見積書の印字が正）。塗装がパネル別でも一括計上でも同じ文を出す（Codex 指摘 2026-09-21）"""
+    out: list[str] = []
+    if not ci or not ci.get('rows'):
+        return out
+    pd = pd or {}
+
+    def _pos(k) -> bool:
+        try:
+            return _money(pd.get(k), f'paint.{k}') > 0   # '104,660' のようなカンマ付きの書き方も受ける（Codex 指摘）
+        except Exception:  # noqa: BLE001
+            return False
+
+    # 塗装をしない見積（paint 欄が無い・金額 0）では知らせない。`{'total': 0}` のような書き方もある（Codex 指摘 2026-09-21）
+    if not (pd.get('panels') or pd.get('bumper_front') or pd.get('bumper_rear')
+            or any(_pos(k) for k in ('total', 'material', 'paint_total', 'wage'))):
+        return out
+    cands = ' / '.join(COAT_NAMES.get(c, str(c)) for c in (ci.get('coats') or []))
+    if len(ci.get('coats') or []) > 1 and not str(pd.get('coat') or '').strip():
+        out.append('★ 塗膜: この色は ADDATA に ' + cands + ' の 2 通りある（塗料メーカーで対応が違う）。見積書の塗膜欄を確かめる'
+                   + ('（注記: ' + ' / '.join(ci['notes']) + '）' if ci.get('notes') else ''))
+    elif (str(pd.get('coat') or '').strip() and ci.get('coats') and coat_c and coat_c not in ci['coats']):
+        # 見積書に印字がある塗膜が ADDATA の候補のどれでもないときだけ知らせる（読み取りミスか、工場が塗装条件で変えた）。
+        # 印字が無いときの既定値と比べると、水性（96.DB）の色を 66.DB 由来の既定と突き合わせて空振りする（Codex 指摘 2026-09-21）
+        out.append(f'★ 塗膜: 見積は {COAT_NAMES.get(coat_c, coat_c)} だが、この色は ADDATA では ' + cands + '（見積書の印字を優先した）')
+    if ci.get('special') and not str(pd.get('coat') or '').strip():
+        out.append('★ 塗膜: この色は ADDATA で特殊塗色（区分 9）。塗膜は見積書の印字で決めること')
+    cand_hf = {{'T': 2, 'S': 3}[x] for x in (ci.get('hf') or []) if x in ('T', 'S')}
+    if cand_hf and hf == 0:
+        out.append('★ 高機能塗装: 見積は しない だが、この色は ' + ' / '.join(HF_NAMES_TS[c] for c in sorted(cand_hf))
+                   + '（ADDATA の 66/96.DB）。見積書の高機能塗装欄を確かめる')
+    elif cand_hf and hf in (2, 3) and hf not in cand_hf:
+        out.append(f'★ 高機能塗装: 見積は {HF_NAMES_TS[hf]} だが、この色は '
+                   + ' / '.join(HF_NAMES_TS[c] for c in sorted(cand_hf)) + '（ADDATA の 66/96.DB）')
+    if ci.get('low_cover') and not pd.get('low_cover'):
+        out.append('★ 低隠蔽性塗色: この色は ADDATA で低隠蔽性の指定がある。見積書に付加塗装の記載が無いか確かめる')
+    if ci.get('two_coat_solid') and not pd.get('two_coat_solid'):
+        out.append('★ 2コートソリッド: この色は ADDATA で 2コートソリッドの指定がある。見積書に付加塗装の記載が無いか確かめる')
+    return out
+
+
 def _xor_lines_ref(name: str) -> list:
     p = os.path.join(HERE, 'reference', name)
     if not os.path.exists(p):
@@ -2470,6 +2516,8 @@ class NeoBuilder:
             notes = []
             if _hf_warn:
                 notes.append(_hf_warn)
+            # カラーコードから分かる塗装条件（66/96.DB）と見積の食い違い。金額は変えない（見積書の印字が正）
+            notes += color_paint_notes(getattr(self, '_color_info', None) or {}, coat_c, hf, pd)
             if unicodedata.normalize('NFKC', str(((estimate or {}).get('paint') or {}).get('input_type') or '')).strip() == '実額'                     or _truthy(((estimate or {}).get('paint') or {}).get('actual')):
                 # 実額は総額 1 つだけの欄で、パネル・加算基礎・材料計を持てない。パネルがあるのに指定されたら黙って捨てない
                 notes.append('paint.input_type「実額」は塗装パネルのある見積では使えないので、指数（パネル別）のままにした'
@@ -2910,6 +2958,17 @@ class NeoBuilder:
             pt_all = paint_total + paint_material
             pt_in, pt_tax = tax_of(pt_all)
             _pdx0 = (estimate or {}).get('paint') or {}
+            # 塗装が一括計上の見積でも、色から分かる塗装条件の食い違いは知らせる（Codex 指摘 2026-09-21）
+            try:
+                _hf0 = HF_CODE.get(unicodedata.normalize('NFKC', str(_pdx0.get('hf') or 'しない')).strip(), 0)
+            except Exception:  # noqa: BLE001
+                _hf0 = 0
+            _n0 = (color_paint_notes(getattr(self, '_color_info', None) or {},
+                                     (self._coat or (0, ''))[0], _hf0, _pdx0)
+                   if _pdx0 else [])   # 塗装の欄が無い見積（塗装しない案件）では知らせない（Codex 指摘）
+            self._paint_notes = _n0   # この見積の分で置き換える（NeoBuilder を使い回したとき前の案件の注記が残らないように。Codex 指摘）
+            for _x in _n0:
+                print('塗装:', _x)
             _adds = [k for k in PAINT_DETAIL_KEYS + ('frame', 'sealing', 'other') if _pdx0.get(k)]
             _jitsu = (_truthy(_pdx0.get('actual')) or unicodedata.normalize('NFKC', str(_pdx0.get('input_type') or '')).strip() == '実額') and not _adds
             if _jitsu:
@@ -3728,6 +3787,17 @@ class NeoBuilder:
         fc = None if car.get('_generic') else self.resolver.finish_code(car['CarCode'], car.get('ColorCode', ''))
         if fc in (1, 2, 3, 4):
             self._coat = (fc, ['', 'ソリッド', 'メタリック', '２コートパール', '３コートパール'][fc])
+        # その色の塗装条件（66/96.DB: 塗膜の候補・高機能塗装・低隠蔽性・2コートソリッド・注記）。金額は変えず、食い違いを ★ で知らせる
+        self._color_info = None
+        if not car.get('_generic'):
+            try:
+                _w = paint_code_of(estimate.get('paint') or {}) == 4   # 生成と同じ解釈（Codex 指摘）
+            except Exception:  # noqa: BLE001
+                _w = False
+            try:
+                self._color_info = self.resolver.color_paint_info(car['CarCode'], car.get('ColorCode', ''), water=_w)
+            except Exception:  # noqa: BLE001
+                self._color_info = None
         _pd0 = estimate.get('paint') or {}
         # パネルが 1 枚も無くバンパだけ塗る見積（`panels: []` + bumper_front/rear）も塗装詳細として扱う（実機 2026-09-12 w66d_real: 加算基礎数値 -1、BAN.DB のバンパ加算基礎）
         _bumper_only0 = (isinstance(_pd0.get('panels'), list) and not _pd0.get('panels') and any(_pd0.get(k) for k in ('bumper_front', 'bumper_rear'))

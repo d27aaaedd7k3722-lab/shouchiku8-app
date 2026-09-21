@@ -260,6 +260,20 @@ def main() -> int:
     _d.grade = 'X'  # どの条件行にも当たらないグレード → 無条件行
     fails = _cmp('23.DB 該当しないグレード', _d.bumper_time(True, 2, '取替'), 2.5, fails)
 
+    # 66/96.DB の色別の塗装条件（2026-09-21 に解読）。塗膜の候補・高機能塗装・注記が読めること
+    from addata_vehicle_resolver import AddataVehicleResolver as _R
+    _r = _R(os.environ.get('ADDATA_ROOT') or r'C:\Addata')
+    _i = _r.color_paint_info('W66', '2SK')
+    fails = _cmp('66.DB 塗膜の候補（2 通りある色）', _i['coats'], [2, 3], fails)
+    fails = _cmp('66.DB 行数', _i['rows'], 2, fails)
+    fails = _cmp('66.DB 高機能（なし）', _i['hf'], ['B'], fails)
+    fails = _cmp('66.DB 注記あり', bool(_i['notes']), True, fails)
+    _i2 = _r.color_paint_info('W66', '070')
+    fails = _cmp('66.DB 塗膜 1 通りの色', _i2['coats'], [4], fails)
+    _i3 = _r.color_paint_info('W82', '4X1')
+    fails = _cmp('66.DB 高機能（耐スリ傷の色）', _i3['hf'], ['T'], fails)
+    fails = _cmp('66.DB 無い色は行 0', _r.color_paint_info('W66', 'ZZZZ')['rows'], 0, fails)
+
     print('unit_paint_screen:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
 

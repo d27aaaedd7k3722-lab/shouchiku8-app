@@ -406,7 +406,7 @@ plain = bytes(a ^ b for a, b in zip(cipher, keystream))
 | 26.DB | ◎ | カラー（コード・名称・RGB・注記） |
 | 29.DB | ◎ | **トリムコード一覧**（トヨタ車。W66: `29W66      00/20/40`、K70: `ZX9/ZY0/ZY1`。行の [11:] がコード）。コグニ「装備バリエーション変更」ダイアログのトリムコード「一覧選択」に出る候補（2026-09-06 夜 TRIM_W66b.neo: 20 を選ぶと Car.TrimCodeFlag 1 / TrimCode '20'、CarSearch.ev_TrimCode '20'、TrimName・TrimRGB は空。29.DB に名称は無い）。生成器は `vehicle.trim_code` を 29.DB の候補と照合して Car/CarSearch に書く（候補に無い・29.DB が無い車種は例外）。画面の注記「カラーコード、トリムコードによる部品検索が行えます」のとおり検索条件だが、13.DB/83.DB にトリム列は無く、部品への影響は未確認 |
 | 55.DB / 56.DB | ○ | ADAS 作業（55: 9900 再設定基本・9902 スキャンツール接続、56: 9930 マルチパーパスカメラ・9940 ミリ波レーダのエイミング。列: Year, Body, Grade, FEVACode, PartsCode, ItemNo/Sub, ItemName, CommentScanTool, Time…）。ADAS 収録車のみ |
-| 66.DB / 96.DB | ◎ | カラーコード → 塗膜（AdVer, ColorCode, SubCode, Year, Body, Grade, FVA, Coat, HFPainting, LCColorFlag, TwoCSolidFlag, Note1-5）溶剤/水性 |
+| 66.DB / 96.DB | ◎ | カラーコード → 塗装条件（ColorCode 12, SubCode 3, Year 1, Body 2, Grade 5, FVA/EVA 2, Coat 1, HFPainting 1, LCColorFlag 1, TwoCSolidFlag 1, Note）溶剤/水性。**2026-09-21 に 4 桁すべて解読**: 塗膜 1-4（9 特殊）/ 高機能 `B` しない `T` 耐スリ傷 `S` スクラッチ `9` メーカーによる / 低隠蔽 `9` / 2コートソリッド `1`。**同じ色に行が 2 つある色が 8 割**（塗料メーカーで塗膜が違う）で年式群・ボディでは絞れないため、塗膜は見積書の印字が正。生成器 `color_paint_info()`、painting.md §16 |
 | 76.DB | ◎ | CHM ページ索引（塗り数値・車種別補修塗装指数・作業別ページ） |
 | 79.DB | ○ | `car,1,1,1,TOSO1` 塗装ワークシート TIF セット指定（COM/TOSOWS.CAB TOSO1-7.TIF） |
 | 83.DB | ◎ | 色別部品価格（LCG、201B ブロック。§11-9。カラーコード → 品番・価格・名称 '(ﾄｿｳｽﾞﾐ)'） |
