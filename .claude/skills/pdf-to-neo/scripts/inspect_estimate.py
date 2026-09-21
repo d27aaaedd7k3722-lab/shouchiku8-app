@@ -335,6 +335,7 @@ def _inspect(path: str, out_json: str = '') -> int:
         # 見積の塗膜と 66.DB の食い違いは、上の色別の知らせ（color_paint_notes）が**候補すべて**と突き合わせて出す。
         # ここで 66.DB の先頭行とだけ比べると、2 通りある色で 2 つ目を選んだ見積に空振りの ★ が出る（Codex 指摘 2026-09-21 に削除）
         pi = PaintIndex(nb.engine.root, car_code, body=car.get('BodyCode', ''))  # 20.DB はボディで面積が違う行を持つ
+        pi.set_vehicle(car, eva_hint)  # 条件行のある表（77/97/87/99・23/93.DB）で生成器と同じ行を選ぶ（2026-09-21）
         from estimate_to_neo import is_manual_panel
         _man = [x for x in p['panels'] if is_manual_panel(x)]
         n_p = len(p['panels']) - len(_man)  # 手入力の塗装行（部品コード無し）は枚数に数えない

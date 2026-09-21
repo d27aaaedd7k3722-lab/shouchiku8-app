@@ -493,32 +493,44 @@ class AddataVehicleResolver:
         return [r['code'] for r in self._color_rows(car)]
 
     def form_codes(self, car: str, year: str = '', body: str = '', grade: str = '', fva2: str = '') -> dict:
-        """25.DB（平文）: [2B ヘッダ] + 11B レコード×N = [YearCode 2][BodyCode 2][GradeCode 1][駆動+エンジン 2][CarFormCode][FormCode1][FormCode2][FinishCode]
-        先頭 7 文字が空白のレコードは全年式・全ボディ共通。実 NEO 9 台で 9/9 一致（例 N-BOX '7252' = 軽/2/5ドア/2、SAI '2142'、ハイゼットトラック '7232'）。
+        """25.DB（平文）: **13B レコード×N**（ヘッダなし。全 1,209 ファイルが 13 で割り切れる。2026-09-21 に訂正）
+        = [枝番 1][ボディ 1（u8。0 = 共通）][該当グレードの列挙 7][CarFormCode][FormCode1][FormCode2][FinishCode]
+
+        それまで「2B ヘッダ + 11B」と読んでいたので、**2 件目以降のレコードがずれて**この車のボディ用の行を選べていなかった
+        （ボディで車形が変わる車種が 227/1,209。CarFormCode は加算基礎・ブース・バンパ・高機能の表のキーなので金額が変わる）。
+        [2:9] の 7 文字が空白のレコードは全年式・全ボディ共通。**[1] のボディは車のボディ以下でいちばん大きい行**を採る。
         コグニ DLL の TRC_XXX25 レコード定義（YearCode, BodyCode, GradeCode, FVACode, CarFormCode, FormCode1, FormCode2, FinishCode）に対応。"""
         p = os.path.join(self.root, car[0], car, f'{car}25.DB')
         out = {}
         if not os.path.exists(p):
             return out
         b = open(p, 'rb').read()
-        recs = [b[2 + i * 11: 2 + (i + 1) * 11] for i in range((len(b) - 2) // 11)]
+        recs = [b[i * 13:(i + 1) * 13] for i in range(len(b) // 13)]
+        bnum = int(str(body).strip()) if str(body).strip().isdigit() else None
         best = None
         for r in recs:
-            key = r[:7].decode('latin1'); codes = r[7:11].decode('latin1')
-            if not re.match(r'^\d{4}$', codes):
+            key = r[2:9].decode('latin1'); codes = r[9:13].decode('latin1')
+            if not re.match(r'^\d{3}[\d ]$', codes):
+                continue   # FinishCode（4 桁目）は空白の車種がある（実案件 9 件。2026-09-21）
+            rec_body = r[1]   # [1] = ボディ（0 = 共通）。車のボディ以下で**いちばん大きい**行が正（実案件で確認）
+            if bnum is not None and rec_body > bnum:
                 continue
+            # [2:9] の 7 文字は**該当するグレードコードの列挙**（'B      ' / 'JKL    ' / 'ABCDP  '。条件行を持つのは 5 車種）。
+            # 年式・ボディ・駆動の欄ではない（2026-09-21 に実データで確認。Codex 指摘）
+            cond = key.strip().upper()
             score = 0
             ok = True
-            for val, seg in ((year, key[0:2]), (body, key[2:4]), (grade, key[4:5]), (fva2, key[5:7])):
-                if seg.strip():
-                    if val and seg == val:
-                        score += 1
-                    else:
-                        ok = False
-            if ok and (best is None or score > best[0]):
-                best = (score, codes)
+            if cond:
+                if grade and str(grade).strip().upper() in cond:
+                    score += 1
+                else:
+                    ok = False
+            # ボディが分かるときは「ボディ以下でいちばん大きい行」、分からないときは共通行（0）を優先（Codex 指摘）
+            rank = rec_body if bnum is not None else -rec_body
+            if ok and (best is None or (score, rank) > (best[0], best[1])):
+                best = (score, rank, codes)
         if best:
-            c = best[1]
+            c = best[2]
             out = {'CarFormCode': c[0], 'FormCode1': c[1], 'FormCode2': c[2], 'FinishCode': c[3]}
         return out
 

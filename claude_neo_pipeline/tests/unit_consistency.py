@@ -1052,14 +1052,20 @@ def test_split_panel_area_is_reported():
 
 
 def test_prepare_area_formula():
-    """下処理面積の近似 = 四捨五入(切上(面積 × 割合) × 0.345)。実機の 13 例が合う（W66 ルーフ 287 だけ合わない = 既知差 W66y。judgment_rules 10-18）"""
+    """下処理面積 = min(切上(切上(面積 × 割合) ÷ 3), HJU_SS の上限)。HJU_SS を引く index そのもの。
+    2026-09-21 に 0.345 の近似から訂正（実案件 1,097 行。2 式が割れた 188 行で旧式が正しい行は 0）。
+    W66 のルーフ 287（既知差 W66y）も新式なら合う"""
     from paint_index import PaintIndex
-    cases = [(81, '1/2', 14), (88, '1/2', 15), (40, '1/2', 7), (68, '1/2', 12), (45, '1/1', 16), (285, '1/3', 33), (94, '1/2', 16), (22, '1/3', 3),
-             (28, '1/2', 5), (47, '1/3', 6), (79, '1/1', 27), (37, '1/2', 7), (20, '1/1', 7), (88, '1/1', 30)]
+    pi = PaintIndex(os.environ.get('ADDATA_ROOT') or r'C:\Addata', 'W66')
+    cases = [(81, '1/2', 14), (88, '1/2', 15), (40, '1/2', 7), (68, '1/2', 12), (45, '1/1', 15), (285, '1/3', 32), (94, '1/2', 16), (22, '1/3', 3),
+             (28, '1/2', 5), (47, '1/3', 6), (79, '1/1', 27), (37, '1/2', 7), (20, '1/1', 7), (88, '1/1', 30),
+             (287, '1/2', 48), (287, '1/3', 32)]   # W66 のルーフ（実機の値）
     for area, ratio, want in cases:
-        got = PaintIndex.prepare_area(area, ratio)
+        got = pi.prepare_area(area, ratio, 1, 3)
         assert got == want, (area, ratio, got, want)
-    assert PaintIndex.prepare_area(81, '') == -1  # 取替（新品）は -1
+    assert pi.prepare_area(81, '') == -1  # 取替（新品）は -1
+    assert pi.prepare_area(300, '1/1', 1, 3) == 49   # 上限（区分 1・種別 3 は 49 で頭打ち）
+    assert pi.prepare_area(300, '1/1', 1, 9) == 99   # 区分 1・種別 9 の上限は 99
 
 
 def test_repair_row_construct_group_and_price_flag():

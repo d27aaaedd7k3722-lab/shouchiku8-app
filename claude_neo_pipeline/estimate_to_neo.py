@@ -2588,7 +2588,8 @@ class NeoBuilder:
                 linked = disp_pnl in linked_disp.get(pcode_ins, set())  # 明細に同じ部品・同じ修理方法の行があるパネルはコグニが W/S 連動で自動生成（AddedFrom 0・WageByManual ''。工場のコグニ生成 NEO 04011103）。無いパネルは「パネル追加」相当（AddedFrom 1・'*'）
                 rec.update({'RecordNo': i + 1, 'LineNo': i, 'PartsCode': pcode_ins,
                             'DisposalCode': disp_pnl, 'DisposalName': '取替' if new else '修理', 'PanelName': name,
-                            'PrepareArea': -1 if new else (pi.prepare_area(area, ratio) if pi else -1), 'PanelArea': area,
+                            'PrepareArea': -1 if new else (pi.prepare_area(area, ratio, int(mp.get('div') or 1),
+                                                                          int(mp.get('type') or 1)) if pi else -1), 'PanelArea': area,
                             'PaintingArea': -1 if new else {'1/1': 1, '1/2': 2, '1/3': 3}.get(ratio, 1), 'PaintingAreaName': ratio,
                             'Time': t, 'TimeStandardNew': s['new'] or (t if new else 0), 'TimeStandard1': s['s1'] or (t if ratio == '1/1' else 0),
                             'TimeStandard2': s['s2'] or (t if ratio == '1/2' else 0), 'TimeStandard3': s['s3'] or (t if ratio == '1/3' else 0), 'TimeStandardHF': s['hf'] or 0,
@@ -3456,13 +3457,18 @@ class NeoBuilder:
         reg = car.get('ps_CarRegDate', '')
         dep, div, biz, ser = split_reg_no(cust.get('reg_no', '')) or ('', '', '', '')
         _acc8 = _date8_str(ins.get('accident_date', ''))   # 区切り付き・和暦で来ても 8 桁から作る（'2026/09/01' が '2026//0/9/' になっていた）
+        _pre8 = _date8_str(ins.get('presence_date', ''))   # 立会日（8 桁）。xml にも入れる（2026-09-21）
+        _pre8 = _pre8 if (len(_pre8) == 8 and _pre8 != '00000000') else ''
         vals = {'CustomerName1': _fit(cust.get('name', ''), 30), 'CustomerName2': '', 'AdjusterName': _fit(ins.get('adjuster', ''), 20), 'AcceptNo': _fit(ins.get('accept_no', ''), 37), 'TicketNo': _fit(ins.get('policy_no', ''), 20),   # DB と同じ欄幅
                 'AccidentDate': (f'{_acc8[:4]}/{_acc8[4:6]}/{_acc8[6:8]}' if _acc8 else ''),
                 'CarNo': f'{dep}{div}{biz}{ser}', 'CarName': car.get('CarNameByUser', ''), 'CarMouldNo': car.get('ps_CarMouldNo', ''), 'CarKindNo': car.get('ps_CarKindNo', ''),
                 'ColorCode': car.get('ColorCode', ''), 'OwnerName': _fit(cust.get('owner_name', cust.get('name', '')), 20), 'UserName': _fit(cust.get('user_name', '同上'), 20),   # DB と同じ欄幅（XML だけ切っていなかった。2026-09-15 アプリのレビュー）
                 'CreatedDate': f'{est_date[:4]}/{est_date[4:6]}/{est_date[6:8]}', 'GarageInDate': '', 'GarageOutDate': '', 'CarSerialNo': car.get('ps_CarSerialNo', ''),
                 'CarTermEraDate': '', 'Kilometrage': str(cust.get('kilometer') or ''), 'CarRegistedDate': (f'{reg[:4]}/{reg[4:6]}' if reg else ''),
-                'ii_CustomerName': _fit(ins.get('contractor', ''), 20), 'ii_PresenceDate': '', 'ii_AgreedDate': '', 'ii_RepairDays': '', 'ii_TimePrice': '',
+                'ii_CustomerName': _fit(ins.get('contractor', ''), 20),
+                # 立会日は xml にも入る（実案件 120 本すべてで Insurance.PresenceDate を YYYY/MM/DD にした値。2026-09-21 まで空のままだった）
+                'ii_PresenceDate': (f'{_pre8[:4]}/{_pre8[4:6]}/{_pre8[6:8]}' if _pre8 else ''),
+                'ii_AgreedDate': '', 'ii_RepairDays': '', 'ii_TimePrice': '',
                 'MakerName': car.get('MakerName', ''), 'CarNameName': car.get('CarNameName', ''), 'ModelName': car.get('ModelName', ''), 'CarYearName': '', 'BodyName': '', 'FVariationNameByUser': car.get('FVANameByUser', ''), 'GradeName': '',
                 'Total': str(total), 'CarNoArea': dep, 'CarNoClass': div, 'CarNoKana': biz, 'CarNoSeries': ser}
         if reg:
@@ -3819,11 +3825,8 @@ class NeoBuilder:
         self._paint_index = None
         try:  # 塗装明細が無くても 20.DB のパネル一覧は要る（PaintingLinkParts は塗装をしない見積にも入る。実機 cogni_K1）
             self._paint_index = PaintIndex(self.resolver.root, car['CarCode'], body=car.get('BodyCode', ''))
-            # 77/87/97/99.DB（パネル別塗り数値）には装備・グレード別の行があるので、この車の装備を渡す
-            self._paint_index.eva = set(eva or ())
-            self._paint_index.grade = str(car.get('GradeCode', '') or '')
-            _yc = str(car.get('YearCode', '') or '').strip()
-            self._paint_index.year_grp = _yc[-1] if (_yc.isdigit() and int(_yc)) else ''
+            # 77/87/97/99.DB（パネル別塗り数値）・23/93.DB（バンパ）には装備・グレード・年式群別の行がある
+            self._paint_index.set_vehicle(car, eva or ())
         except Exception as ex:
             if self._paint_detail:
                 print('PaintIndex skip', ex)

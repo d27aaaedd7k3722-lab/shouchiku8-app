@@ -206,14 +206,35 @@ class PaintIndex:
 
     # ------------------------------------------------------------ CHM: 補修塗装指数（溶剤系）
     def _chm_path(self) -> Optional[str]:
+        """76.DB からこの車の「塗り数値」CHM を選ぶ。行 = `車種 3, 年式群 1, ボディ 2, ?, グレード 1, ?, 索引 3, ファイル名, 見出し`。
+
+        **ボディで CHM が変わる車種が 88 ある**（例 C34: ボディ 00 は C3400LTB / ボディ 10 は C3401LTB）。
+        2026-09-21 まで、ファイル名の正規表現が行の接頭辞まで拾って（`9970000C3400LTB.CHM`）必ず
+        「そんなファイルは無い」となり、フォルダ内の先頭 CHM ＝ ボディ 00 用に落ちていた。
+        ボディ別の表はパネルの面積・行の構成が違うので、塗り数値がずれる"""
         p76 = os.path.join(self.car_dir, f'{self.car}76.DB')
         if os.path.exists(p76):
+            have = {os.path.basename(x).lower(): x for x in glob.glob(os.path.join(self.car_dir, '*'))}
+            cand = []
             for l in _xor_lines(p76):
-                m = re.search(r'(\S+LTB\.CHM)', l, re.I)
-                if m and '塗り数値' in l:
-                    q = os.path.join(self.car_dir, m.group(1))
-                    if os.path.exists(q):
-                        return q
+                if '塗り数値' not in l:
+                    continue
+                m = re.search(r'([A-Za-z][0-9A-Za-z]*LTB\.CHM)', l, re.I)   # 行末のファイル名（接頭辞の数字を含めない）
+                if not m:
+                    continue
+                q = have.get(m.group(1).lower())   # 同じフォルダに .CHM と .chm が混ざっている車種がある（Codex 指摘）
+                if q:
+                    # 年式群 [3]・グレード [7] に条件のある行は後回し（この 2 つを見て選べる材料が無いため。715 ファイル中 25）
+                    cand.append((l[4:6].strip(), q, 1 if (l[3].strip() or l[7].strip()) else 0))
+            if cand:
+                want = ('%02d' % self.body_code) if self.body_code else '00'
+                # 年式群・グレードの条件はここでは判定できない（コンストラクタで読むので車両条件がまだ無い）ので、
+                # **条件の無い行を先に**、そのあとでボディの近い順に探す（Codex 指摘）
+                for cond in (0, 1):
+                    for key in (want, '00', ''):
+                        for body, q, c_ in cand:
+                            if c_ == cond and (body == key or key == ''):
+                                return q
         c = glob.glob(os.path.join(self.car_dir, '*LTB.CHM')) + glob.glob(os.path.join(self.car_dir, '*LTB.chm'))
         return c[0] if c else None
 
@@ -461,12 +482,41 @@ class PaintIndex:
         return math.floor(x * 10 + 0.5 + 1e-9) / 10.0
 
     def form_codes(self) -> tuple[str, str, str, str]:
-        """<car>25.DB [9:13] = CarFormCode, FormCode1, FormCode2, FinishCode"""
+        """<car>25.DB（13B レコード）= [枝番 1][ボディ 1（u8。0 = 共通）][年式・ボディ・グレード・FVA 7][CarFormCode][FormCode1][FormCode2][FinishCode]。
+
+        **ボディで車形が変わる車種が 227/1,209 ある**ので、この車のボディ以下でいちばん大きいボディの行を採る
+        （2026-09-21。それまで先頭 13 バイトだけを見ていたので、ボディ 10/20/… の車で車形を取り違えていた。
+        車形は加算基礎 T_KEI_3・ブース BOOTH・バンパ加算基礎 BAN・FBANPA・Scrach・F_S・H_N_SSZ のキー）"""
         p = os.path.join(self.car_dir, f'{self.car}25.DB')
         if not os.path.exists(p):
             return ('', '', '', '')
-        c = open(p, 'rb').read()[9:13].decode('latin1')
-        return (c[0], c[1], c[2], c[3]) if len(c) == 4 else ('', '', '', '')
+        b = open(p, 'rb').read()
+        best = None
+        for i in range(len(b) // 13):
+            r = b[i * 13:(i + 1) * 13]
+            c = r[9:13].decode('latin1')
+            if not (len(c) == 4 and c[:3].isdigit() and (c[3].isdigit() or c[3] == ' ')):
+                continue   # FinishCode（4 桁目）は空白の車種がある
+            if self.body_code and r[1] > self.body_code:
+                continue      # この車のボディより大きいボディ専用の行は使わない
+            # [2:9] の条件（年式群・ボディ・グレード・駆動）が空でない行は、この車に合うときだけ使う
+            # （条件行を持つのは 1,209 ファイル中 5 ファイル。set_vehicle 前は grade も年式群も空なので無条件行が選ばれる）
+            # [2:9] は**該当するグレードコードの列挙**（'B      ' / 'ABCDP  '）。条件行を持つのは 1,209 ファイル中 5
+            cond = r[2:9].decode('latin1').strip().upper()
+            score = 0
+            if cond:
+                _g = str(getattr(self, 'grade', '') or '').strip().upper()
+                if not _g or _g not in cond:
+                    continue
+                score = 1
+            # 条件が合った行を優先し、同点ならボディ（分かる車は最大・分からない車は共通行 0）で決める（Codex 指摘）
+            rank = (score, r[1] if self.body_code else -r[1])
+            if best is None or rank > best[0]:
+                best = (rank, c)
+        if not best:
+            return ('', '', '', '')
+        c = best[1]
+        return (c[0], c[1], c[2], c[3])
 
     def _kei1(self, form: str, div: int, typ: int, disp: str, pa: int, area: int, paint: str = '1') -> Optional[tuple[int, int]]:
         for r in self._com_rows('T_KEI_1.DB'):
@@ -490,6 +540,14 @@ class PaintIndex:
                 if (r[1] == f1 and r[2] == f2) or (r[1] == f1 and r[2] == '9') or (r[1] == '9'):
                     return int(r[4]) / 100.0
         return 0.0
+
+    def _hju_max(self, div: int, typ: int) -> int:
+        """HJU_SS のその区分での index の上限（(1,2)=(1,3)=(1,4)=49 / (1,9)=99 / (2,9)=40）"""
+        tbl = {}
+        for r in self._com_rows('HJU_SS.DB'):
+            if len(r) >= 4 and r[0].isdigit() and r[1].isdigit() and r[2].isdigit():
+                tbl.setdefault((int(r[0]), int(r[1])), []).append(int(r[2]))
+        return max(tbl.get((div, typ)) or tbl.get((div, 9)) or [0])
 
     def _hju(self, div: int, typ: int, idx: int) -> float:
         """HJU_SS: 修正塗装の下処理時間（PanelDivision, PanelTypeDivision 2/3/4 以外は 9, index=ceil(S'/3)、最大行で頭打ち）"""
@@ -551,6 +609,18 @@ class PaintIndex:
                 out.setdefault(f[5], []).append({'grp': f[1], 'body': f[2], 'grade': f[3], 'eva': f[4], 'vals': vals})
         setattr(self, key, out)
         return out
+
+    def set_vehicle(self, car: dict, eva=None) -> 'PaintIndex':
+        """条件行のある表（77/87/97/99.DB のパネル別塗り数値、23/93.DB のバンパ）を引くための
+        車両条件をまとめて渡す。生成器・突合せ（inspect_estimate）・下書き（draft_estimate）の
+        3 か所が**同じ行**を選ぶようにするための入口（2026-09-21。それまでは生成器だけが渡していて、
+        突合せの表示と実際に書かれる NEO が別の行を見ていた）。`eva` を省くと装備は変えない"""
+        if eva is not None:
+            self.eva = {str(x).strip().upper() for x in eva if str(x).strip()}
+        self.grade = str((car or {}).get('GradeCode', '') or '')
+        _yc = str((car or {}).get('YearCode', '') or '').strip()
+        self.year_grp = _yc[-1] if (_yc.isdigit() and int(_yc)) else ''
+        return self
 
     def _pick_panel_row(self, rows: list) -> Optional[dict]:
         """77/87/97/99.DB の行をこの車で選ぶ。ボディ専用行 → 共通行（'00'）、その中で
@@ -696,20 +766,26 @@ class PaintIndex:
                         return self._r1((int(r[6]) + int(r[5]) * area / 1000) * c[1] / 100000)
         return floor10(0.3 + 0.01 * area)
 
-    @staticmethod
-    def prepare_area(area: int, ratio: str) -> int:
-        """修正パネルの下処理面積の近似: 塗装面積（面積 × 1/1・1/2・1/3 を切上で整数化）× 0.345 を四捨五入。
-        実機で合う 13 例: J87 0600 45 1/1 → 16、0800 28 1/2 → 5、2300 94 1/2 → 16、2601 20 1/1 → 7、4600 22 1/3 → 3、4800 88 1/2 → 15、5800 285 1/3 → 33、
-        W66 0600 81 1/2 → 14、0800 28 1/2 → 5、2300 88 1/1 → 30・1/2 → 15、4600 40 1/2 → 7、4802 68 1/2 → 12、W82 1000 47 1/3 → 6、ZYX11 3500 79 1/1 → 27、U52 1000 37 1/2 → 7。
-        合わないのは **W66 のルーフ 287 だけ**（1/2 → 実機 48 / 式 50、1/3 → 実機 32 / 式 33。2026-09-12 w66b_real で再確認）。
-        J87 のルーフ 285 1/3 → 33 は式どおりなので「大面積」ではなく車種（車形 6 と 7）か COM/T_KEI_4（2 行 × 6 定数・用途未同定）の
-        係数差と推定。切上(面積×割合÷3) に置き換えると W66 ルーフは合うが J87 45 1/1（→16）と 285 1/3（→33）が外れるので採らない。
-        金額に影響しない表示列（ロードマップ 1-10、判断規則 10-18）"""
+    def prepare_area(self, area: int, ratio: str, div: int = 0, typ: int = 0) -> int:
+        """修正パネルの `PaintingPanel.PrepareArea`。**HJU_SS（修正塗装の下処理時間）を引くときの index そのもの**:
+
+        ```
+        S = 切上(パネル面積 × 1/1・1/2・1/3)      下処理面積 = min(切上(S ÷ 3), HJU_SS のその区分の上限)
+        ```
+
+        上限は (区分 1, 種別 2/3/4) = 49 / (1, 9) = 99 / (2, 9) = 40。取替（新品）は -1。
+
+        2026-09-21 に訂正（実案件 1,097 行で 旧式 51% → 新式 59%。2 式が割れた 188 行のうち**旧式が正しい行は 0**。
+        残差はすべて「塗装割合を変えたのに再計算されていない古い値」で説明できる）。
+        それまでは `四捨五入(S × 0.345)` の近似で、W66 のルーフ 287（既知差 W66y）が合わなかったが、新式では
+        1/2 → 48・1/3 → 32 と実機に一致する。金額に影響しない表示列（判断規則 10-18）"""
         r = {'1/1': 1.0, '1/2': 0.5, '1/3': 1.0 / 3}.get(ratio)
         if not r:
             return -1
         part = int(math.ceil(area * r - 1e-9))
-        return int(math.floor(part * 0.345 + 0.5))
+        idx = max(1, int(math.ceil(part / 3 - 1e-9)))
+        mx = self._hju_max(div, typ) if (div or typ) else 0
+        return min(idx, mx) if mx else idx
 
     def standard_times(self, code: str, hf: int, n_panels: int, paint: int = 3) -> Optional[dict]:
         """paint: PaintingPlan.Paint（1 速乾 / 3 ２Ｋ / 4 水性）。係数表（T_KEI_1 / F_S）の塗料列に渡す"""

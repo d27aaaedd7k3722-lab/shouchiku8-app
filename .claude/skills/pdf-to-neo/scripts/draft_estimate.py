@@ -603,6 +603,7 @@ class Drafter:
             try:
                 self.pi: Optional[PaintIndex] = PaintIndex(self.nb.engine.root, self.car['CarCode'],
                                                           body=self.car.get('BodyCode', ''))
+                self.pi.set_vehicle(self.car)   # グレード・年式群（装備はこの時点ではまだ決まっていないので後で入れる）
             except Exception as e:  # noqa: BLE001  20.DB（塗装パネル）が無い車種はある。塗装は一括計上に落ちる
                 self.pi = None
                 self.notes.append(f'塗装パネル表（20.DB）を読めないので塗装はパネル別にできない: {type(e).__name__}: {e}')
@@ -2609,6 +2610,10 @@ class Drafter:
             self.notes.append('装備を採用: ' + hints['note'])
         if excl:
             hints['eva_exclude'] = sorted(excl)  # 生成器にも渡す（部品証拠から拾ったレターを外す）
+        if self.pi is not None:
+            # 装備が決まったので、条件行のある表（77/97/87/99.DB・23/93.DB）に反映する。
+            # **新しく採用した装備が無くても、reading に元から書かれている hints.eva_codes は渡す**（Codex 指摘 2026-09-21）
+            self.pi.set_vehicle(self.car, sorted(set(hints.get('eva_codes') or []) - excl))
         vetoed = sorted(ch for ch in self.eva_votes if ch in self.eva_veto)
         if vetoed:
             self.notes.append(f'装備 {vetoed} は同じ品番が装備条件なしの行にもあるので採用しない')
