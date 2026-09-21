@@ -45,3 +45,5 @@ for k, a, b in zip(cols, g, c):
     if a != b:
         ng += 1; print('NG', k, a, b)
 print('FBANPA bumper cells NG', ng, '/', len(cols))
+# NG があれば終了コードで落とす（print だけだと verify_all が緑のまま通る。2026-09-21）
+sys.exit(1 if (ng or ok != len(OBS) or ok2 != len(PANEL)) else 0)

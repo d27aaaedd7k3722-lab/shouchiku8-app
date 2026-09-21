@@ -26,5 +26,8 @@ for path in rt.NEOS:
         else:
             ng += 1; miss.append((os.path.basename(path)[:8], code, 'ct', ct, 'pred', pred, 'base', base, (r.get('WorkCode') or '').strip()))
 print('ChangeTotal(骨格, ±10) ok', ok, 'ng', ng)
+_ng_total = ng   # 終了コードに使う（2026-09-21）
 for m in miss[:10]:
     print('  ', m)
+import sys as _sys
+_sys.exit(1 if _ng_total else 0)

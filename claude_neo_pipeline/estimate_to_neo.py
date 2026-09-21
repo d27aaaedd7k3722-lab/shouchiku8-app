@@ -591,11 +591,23 @@ def material_round_of(spec) -> tuple[int, str]:
 
 
 def material_default(total_wage: int, rate, round_=None) -> int:
-    """材料代の既定値 = 塗装工賃計 × 割合 を、工場の端数処理で丸めた額（既定 10 円単位で四捨五入。
-    コグニ実機 2026-09-05 NEW3/NEW4: 15,500×15%=2,325→2,330、18,950×15%=2,842.5→2,840、46,490×15%=6,973.5→6,970、46,490×14%=6,508.6→6,510。
-    コグニは double で計算するので 18,950×0.15 は 2842.4999… → 2,840。Python でも同じ double 計算にする）"""
+    """材料代の既定値 = 塗装工賃計 × 割合 を、工場の端数処理で丸めた額。
+
+    既定は **1 円単位で切り上げてから 10 円単位で四捨五入**（2026-09-21 に訂正）。
+    実案件 4,025 本（単色・自動計算）で **4,024 本（99.98%）**を説明する。
+    それまでの「10 円四捨五入」だけでは 3,724 本（92.52%）で、
+    `工賃 × 割合` の 10 円位の端数が .41〜.49 のとき 10 円ずれていた（300 本。
+    例: 80,460 × 14% = 11,264.4 → 実機 11,270・旧式 11,260）。
+    コグニ実機の 4 例（2026-09-05 NEW3/NEW4: 15,500×15%→2,330、18,950×15%→2,840、
+    46,490×15%→6,970、46,490×14%→6,510）は新式でも同じ値になる。
+    コグニは double で計算するので 18,950×0.15 は 2842.4999… → 2,840。Python でも同じ double 計算にする"""
     unit, mode = material_round_of(round_)
-    x = (total_wage or 0) * (float(rate) / 100.0) / unit
+    _yen = (total_wage or 0) * (float(rate) / 100.0)
+    if unit == 10 and mode not in ('切り上げ', '切り捨て'):
+        # 既定（10 円四捨五入）のときだけ先に 1 円で切り上げる。
+        # 工場が「1 円単位・四捨五入」を設定しているときに切り上げへ変えてしまわないように（Codex 指摘 2026-09-21）
+        _yen = math.ceil(_yen - 1e-9)
+    x = _yen / unit
     if mode == '切り上げ':
         n = math.ceil(x - 1e-9)
     elif mode == '切り捨て':
@@ -603,6 +615,14 @@ def material_default(total_wage: int, rate, round_=None) -> int:
     else:
         n = math.floor(x + 0.5)
     return int(n) * unit
+
+
+def _smb_cutwork(tail: str) -> str:
+    """AnSMB.txt の 104〜115 桁。12.DB の CutWork 欄（11 バイト）を写し、先頭 1 桁を英字の有無で '1'/'0' にする。
+    欄が空（空白だけ）なら 12 バイトとも空白。2026-09-21 に実案件 46,437 行で確かめた（99.989%）"""
+    if not (tail or '').strip():
+        return ''
+    return ('1' if re.search(r'[A-Z]', tail) else '0') + tail
 
 
 def cogni_parts_names(name20: str) -> tuple[str, str]:
@@ -2129,6 +2149,11 @@ class NeoBuilder:
                     raise ValueError(f"修理方法 '{method}' が不明（{it.get('name') or it.get('code')}）。{sorted(set(DISPOSAL))} のいずれかにするか、手入力行なら method を空にする")
             dcode = DISPOSAL.get(method, DISPOSAL.get(_m, 0 if pprice > 0 else (1 if wage > 0 else 0)))  # 正規化した名称（'脱着　板金' 等）でも引く
             if method == '部品':
+                # 実案件では「部品」という名称の行は **7,219 行すべてが手入力行**（区分 -1・`PartsCode` 空・
+                # `PartsPriceByManual '*'`）で、区分 0（取替）の「部品」は 1 行も無い（2026-09-21 に 7,215 本で確認）。
+                # ただしそれは**工場のコグニで人が手入力した行**で、こちらは見積書の品番・金額から部品を照合できる。
+                # 区分だけ -1 にすると「区分 -1 なのに部品コードがある」という実機に無い形になるので、
+                # 揃えるなら照合ごと手入力にする必要がある（影響が大きいので保留。HANDOFF に記録）
                 dcode = 0
             disp_name = _m if (_m in ('取替', '脱着', '修理', '脱着修理', '脱着板金', '点検', '調整', '点検調整', '分解調整', '板金') and DISPOSAL.get(_m, dcode) == dcode) else DISPOSAL_NAME.get(dcode, method)  # W/S の名称をそのまま（NEW2: 脱着板金/脱着修理、点検/調整）。別名（部品・交換・取付 等）は既定名
             if free_method:   # コグニに無い修理方法（再封印 など）は手入力の作業行として印字の語を写す
@@ -3571,7 +3596,7 @@ class NeoBuilder:
             put(98, f"{max(1, r['PartsCount'] if r['PartsCount'] > 0 else 1):02d}", 2)
             _of = r.get('OrderFlag')
             put(100, (' ' if _of in (None, '') else str(_of)), 1)  # 数値の 0 も '0' として書く（ERParts と同じ値にする）  # 100 桁 = ERParts.OrderFlag（部品発注の状態）。触っていない見積は全行 空白（実機 cogni_M1、実 NEO 199 本 6,477 行で恒等）
-            put(101, ('1' if r.get('_smb_recycle') else '0') + ('1' if r.get('ReserveFlag') else '0') + '00', 4); put(104, (('1' + str(r.get('_smb_tail') or '')) if re.search(r'[A-Z]', str(r.get('_smb_tail') or '')) else '0'), 12); put(127, 'F99999', 6)  # 101 桁 = リサイクル置換、102 桁 = 保留（実機 2026-09-09 cogni_CX4 6800）。 104〜115 桁: 12.DB の CutWork 欄（[65:76] = 部分切断作業）に **英字（可能作業 KS 等）があれば** '1' + その欄、無ければ '0' と空白（実 NEO 801 行で完全一致。数字だけの '0      0   ' 等は 0）
+            put(101, ('1' if r.get('_smb_recycle') else '0') + ('1' if r.get('ReserveFlag') else '0') + '00', 4); put(104, _smb_cutwork(str(r.get('_smb_tail') or '')), 12); put(127, 'F99999', 6)  # 101 桁 = リサイクル置換、102 桁 = 保留（実機 2026-09-09 cogni_CX4 6800）。 104〜115 桁: 12.DB の CutWork 欄（[65:76] = 部分切断作業）を **欄が空でなければそのまま写し**、先頭 1 桁を英字の有無で '1'/'0' にする（2026-09-21 に訂正。実案件 46,437 行で 99.380% → 99.989%。それまで『数字だけの欄は捨てる』としていたが、当時の根拠 801 行にたまたま数字だけの欄を持つ部品が入っていなかっただけで、実際は 179/815 本が 1 行以上ずれていた）
             out.append(bytes(line) + b'\r\n')
         return b''.join(out)
 

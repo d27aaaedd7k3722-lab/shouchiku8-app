@@ -202,7 +202,18 @@ def main():
     print(f"paint: {tot['paint_ok']}/{tot['paint_all']}")
     if a.json:
         json.dump(report, open(a.json, 'w', encoding='utf-8'), ensure_ascii=False, indent=1, default=str)
+    # 下限を割ったら終了コードで落とす（2026-09-21。それまで print だけで、verify_all は何が壊れても緑だった）。
+    # 工場 NEO 10 本の現在値は parts a 714/722・std 77/77・paint 44/44。標準指数と塗装は 1 行でも落ちたら不合格。
+    # **`--mode` や `--only` で一部だけ回したときは見ない**（母集団が違うので下限が意味を持たない。Codex 指摘）
+    if a.mode != 'all' or a.only:
+        return 0
+    limits = {'parts_a': (tot['a_ok'], tot['a_all'], 712), 'std': (tot['std_ok'], tot['std_all'], 77),
+              'paint': (tot['paint_ok'], tot['paint_all'], 44)}
+    bad = [f'{k} {v[0]}/{v[1]}（下限 {v[2]}）' for k, v in limits.items() if v[0] < v[2]]
+    if bad:
+        print('*** roundtrip 下限割れ:', ' / '.join(bad))
+    return 1 if bad else 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main() or 0)

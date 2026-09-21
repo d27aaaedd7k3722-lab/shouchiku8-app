@@ -139,7 +139,11 @@ class PaintIndex:
 
     def _pick_body(self, rows: list, note: bool = True) -> Optional[dict]:
         """同じパネルコードの行から、この車のボディに合うものを選ぶ。
-        ボディ専用行 → 全ボディ共通（body 0）→ 先頭 の順（ボディが分からない車は従来どおり先頭）。
+
+        ボディ専用行 → **この車のボディ以下でいちばん大きいボディの行** → 全ボディ共通（body 0）→ 先頭 の順
+        （ボディが分からない車は従来どおり先頭）。真ん中の規則は 25.DB（車形）と同じ考え方で、2026-09-21 に足した。
+        実案件 W44（ボディ 40）の 5000 クオータは body 0 が面積 73・body 30 が 79 で、実機は **79**。
+        共通行に先に落ちると面積＝塗装指数がずれる。
         選んだ先に面積の違う行が残っていたら控える（黙って先頭を採らない）"""
         if not rows:
             return None
@@ -149,6 +153,12 @@ class PaintIndex:
             if hit:
                 self._note_areas(hit, note)
                 return hit[0]
+            under = [r for r in rows if 0 < int(r.get('body') or 0) < b]
+            if under:
+                _mx = max(int(r.get('body') or 0) for r in under)
+                same = [r for r in under if int(r.get('body') or 0) == _mx]
+                self._note_areas(same, note)
+                return same[0]
             common = [r for r in rows if not r.get('body')]
             if common:
                 self._note_areas(common, note)
@@ -165,7 +175,11 @@ class PaintIndex:
         panel_exact と違って他ボディ専用行へ逃げない。PaintingLinkParts（W/S 連動の紐付け）用:
         コグニは、この車のボディに載っていないパネルは連動しない
         （コグニ実機 2026-09-12 W90 ハイエース ボディ 20: 明細 4800 取替は 20.DB にボディ 10 専用行しか無く、
-        PaintingLinkParts に出なかった。生成器は panel_exact で他ボディ行を拾って書いていた）"""
+        PaintingLinkParts に出なかった。生成器は panel_exact で他ボディ行を拾って書いていた）
+
+        **ここには `panel()` の「ボディ以下でいちばん大きい行」を入れない**（Codex 指摘 2026-09-21 を不採用）。
+        入れると W90 のボディ 20 で body 10 の行が見つかって「連動する」と判定してしまい、上の実機確認と食い違う。
+        この関数は面積を決めるためではなく**連動するかどうかを決める**ためのもの"""
         c = str(code).zfill(4)
         rows = [r for r in self.panels if r['code'] == c]
         b = self.body_code
@@ -199,10 +213,23 @@ class PaintIndex:
             self._note_areas(same, True)   # 同じコードで面積が割れていたら知らせる（黙って先頭を採らない）
             return same[0]
         if same:
-            hit = [r for r in same if r.get('body') == b] or [r for r in same if not r.get('body')]
+            hit = [r for r in same if r.get('body') == b]
             if hit:
                 self._note_areas(hit, True)
                 return hit[0]
+            # このボディ専用の行が**枝番違いにある**なら、そちらへ進む（後段。W90 ハイエース: 4800 = ボディ 10 /
+            # 4801 = ボディ 20）。枝番が無いときだけ、**ボディ以下でいちばん大きいボディ** → 全ボディ共通 の順で選ぶ
+            # （2026-09-21。W44 ボディ 40 の 5000 クオータは ボディ 0 が面積 73・ボディ 30 が 79 で実機は 79）
+            _br = [r for r in self.panels if r['code'][:3] == code[:3] and r['code'] != code
+                   and r.get('body') == b and _panel_key(r['name']) == _panel_key(same[0]['name'])]
+            if not _br:
+                _und = [r for r in same if 0 < int(r.get('body') or 0) < b]
+                _mx = max((int(r.get('body') or 0) for r in _und), default=0)
+                hit = ([r for r in _und if int(r.get('body') or 0) == _mx]
+                       or [r for r in same if not r.get('body')])
+                if hit:
+                    self._note_areas(hit, True)
+                    return hit[0]
             # 同じコードに、このボディ用も全ボディ共通も無い（他ボディ専用しか無い）。
             # そのときは枝番違いにこのボディ用の行があることがある
             # （W90 ハイエース: 4800 = ボディ 10 専用 / 4801 = ボディ 20 専用）

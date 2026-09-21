@@ -32,3 +32,5 @@ for tag, codes in CASES.items():
                 tot_ok += 1
             tot_all += 1
 print('cells', tot_ok, '/', tot_all)
+import sys as _sys
+_sys.exit(1 if tot_ok != tot_all else 0)   # 1 セルでも違えば落とす（2026-09-21）

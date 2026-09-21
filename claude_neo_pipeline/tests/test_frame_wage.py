@@ -24,3 +24,5 @@ for code in codes:
         if g[code][i] != c[code][i]:
             ng += 1; print('NG', code, col, g[code][i], c[code][i])
 print('wage-only test NG cells', ng, '/', len(codes) * len(COLS))
+import sys as _sys
+_sys.exit(1 if ng else 0)   # 2026-09-21

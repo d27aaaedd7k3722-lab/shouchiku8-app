@@ -817,13 +817,19 @@ def test_paint_panel_is_picked_by_body():
 
 
 def test_paint_panel_falls_back_to_common_row():
-    """そのボディ専用の行が無ければ全ボディ共通（body 0）の行、それも無ければ先頭を使う"""
+    """そのボディ専用の行が無ければ **この車のボディ以下でいちばん大きいボディの行** → 全ボディ共通（body 0）→ 先頭 の順。
+
+    2026-09-21 に「ボディ以下で最大」を足した（25.DB の車形と同じ考え方）。根拠は実案件 W44（ボディ 40）の
+    5000 クオータで、ボディ 0 の行が面積 73・ボディ 30 の行が 79、実機は 79。共通行に先に落ちると塗装指数がずれる"""
     from paint_index import PaintIndex
     nb = NeoBuilder()
-    pi = PaintIndex(nb.engine.root, 'W90', body='99')   # 存在しないボディ
+    pi = PaintIndex(nb.engine.root, 'W90', body='99')   # どのボディ行にも一致しない値
     p = pi.panel_exact('2700')
-    assert p, '共通行にも落ちていない'
-    assert not p['body'] or p['body'] == 0, f'他ボディ専用の行を選んでいる（{p}）'
+    assert p, 'どの行にも落ちていない'
+    assert int(p.get('body') or 0) <= 99, f'自分のボディより大きい行を選んでいる（{p}）'
+    for _b in ('10', '20'):   # 実在するボディはそのまま当たる
+        q = PaintIndex(nb.engine.root, 'W90', body=_b).panel_exact('2700')
+        assert q and int(q.get('body') or 0) in (0, int(_b)), f'ボディ {_b} で別のボディ行（{q}）'
 
 
 def test_paint_panel_follows_the_body_branch_code():
