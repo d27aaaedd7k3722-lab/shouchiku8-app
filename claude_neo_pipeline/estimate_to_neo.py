@@ -484,9 +484,12 @@ def two_coat_solid_time(roof: int, n_other: int, paint: int = 2) -> float:
         raise ValueError('付加塗装 2コートソリッド: fukaetc.DB の列数が不足')
     if not roof and n_other <= 0:
         return 0.0
-    t = (v[2] if water else 0.0) + (v[0] if roof else 0.0)
-    if n_other > 0:
-        t += v[1] * n_other
+    # **基本加算は必ず付く**（水性は表の 3 列目 0.10、溶剤は表に列が無く「ルーフ以外 1 枚」と同じ 0.10）。
+    # 溶剤の 1 列目 0.40 は「基本 0.10 ＋ ルーフ 0.30」をまとめた値なので、ルーフの加算は 0.40 − 0.10 = 0.30。
+    # 実案件 NEO 153 件すべてと、実機（2K: ルーフのみ 0.4 / +1 枚 0.5、水性: 1 枚 0.2 / ルーフ+2 枚 0.6）が一致する
+    # （2026-09-21。それまでは溶剤でルーフが無いときに基本加算 0.10 が抜けていた）
+    base = v[2] if water else v[1]
+    t = base + v[1] * max(n_other, 0) + ((v[0] if water else round(v[0] - base, 2)) if roof else 0.0)
     return round(t, 1)
 
 

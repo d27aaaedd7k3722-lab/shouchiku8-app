@@ -238,6 +238,15 @@ def main() -> int:
         for _e, _v in ((frozenset(), 5.3), (frozenset('R'), 3.5), (frozenset('W'), 5.7), (frozenset('WR'), 4.0)):
             fails = _cmp(f'77.DB 装備 {sorted(_e) or "なし"}', _m.get(_e), _v, fails)
 
+    # 2コートソリッド: 基本 0.10 ＋ 0.10 × ルーフ以外 ＋ 0.30 × ルーフ
+    # （実機 2K: ルーフのみ 0.4 / +1 枚 0.5 / +5 枚 0.9 / +7 枚 1.1、水性: 1 枚 0.2 / 2 枚 0.3 / ルーフ+2 枚 0.6。
+    #  実案件 153 本すべて一致。2026-09-21 に溶剤でルーフが無いときの 0.10 が抜けていたのを直した）
+    import estimate_to_neo as _E
+    for _args, _want in (((1, 0, 3), 0.4), ((1, 1, 3), 0.5), ((1, 5, 3), 0.9), ((1, 7, 3), 1.1),
+                         ((0, 1, 3), 0.2), ((0, 4, 3), 0.5), ((0, 8, 3), 0.9),
+                         ((0, 1, 4), 0.2), ((0, 2, 4), 0.3), ((1, 2, 4), 0.6)):
+        fails = _cmp(f'2コートソリッド {_args}', _E.two_coat_solid_time(*_args), _want, fails)
+
     print('unit_paint_screen:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
 
