@@ -221,7 +221,7 @@ NEO の `TimeStandardNew/1/2/3 = 塗り数値 + 高機能加算`、`TimeStandard
 
 `車形コード, 塗料(1 速乾/3 ２Ｋ/4 水性), 塗膜(1-4), 種別(B なし/F フッ素/S 予備/T 耐スリ傷), 1枚, 2枚, 3枚, 4枚, 5枚`（×1/100）。C-HR: `6,3,3,T,340,350,360,370,380` → 4 枚 3.70 ✓。N-BOX: `7,3,2,B,…,310` → 5 枚以上 3.1 ✓。
 BOOTH.DB `車形, 塗料, 塗膜, 種別, 値`: 高機能なし・塗膜 1-3 は 0.5、3コートパールと高機能塗装は 0。
-下処理面積 PrepareArea: 生成器は 四捨五入(切上(面積×割合)×0.345) の近似（実機 13 例で一致。W66 ルーフ 287 だけ 1/2 → 48 / 式 50 で合わず未解決。表示のみの列で金額に影響しない。正は NEO 仕様書 §10-3 と HANDOFF §8）
+下処理面積 PrepareArea: 生成器は min(切上(切上(面積×割合)÷3), HJU_SS の上限 49/99/40) の近似（実機 13 例で一致。W66 ルーフ 287 だけ 1/2 → 48 / 式 50 で合わず未解決。表示のみの列で金額に影響しない。正は NEO 仕様書 §10-3 と HANDOFF §8）
 
 ### 11-5. バンパ = `<car>23.DB`（溶剤）/ `93.DB`（水性）
 
@@ -429,7 +429,7 @@ plain = bytes(a ^ b for a, b in zip(cipher, keystream))
 | S_Est.DB | ◎ | 車種, YearCode, PanelPaintingTimes, PanelHFPaintingTimes（`W69 00 10`）: 算出方式フラグ。10 = T_KEI 式＋F_S（595 車）、11/12 = 87.DB 収録、20 = 別版（W64 等）、50/60/00 = 旧版。**2 桁目（高機能塗装の算出方式）は実案件 1,800 本で高機能塗装の種類と対応する**: `x0` の車は 耐スリ傷 250 件・`x1` の車は スクラッチ 27 件（例外 2 件）。生成器 `PaintIndex.car_hf_kind()` が引いて、見積の高機能塗装と食い違うときに ★ で知らせる（2026-09-21） |
 | T_KEI_1.DB | ◎ | 塗り数値の係数（CarFormCode, PanelDivision, PanelTypeDivision, DisposalCode K=取替/S=修正, PaintingArea 9=取替/1-3=修正 1/n, Paint, PanelAreaMin/Max, CoefficientA（面積係数）, CoefficientB（固定分））。式 §11-6 |
 | T_KEI_2 | ◎ | CarFormCode, PanelDivision, C1=291（単体塗）, C2=216（複数塗・修正・高機能）の換算係数（全車形同値） |
-| T_KEI_4 | × | 2 行×6 定数（`000305,073758,000502,033917,000032,000100` / `000499,077349,000502,033917,000032,000135`）。塗り数値の式には不要。33917 ≒ 0.339 が下処理面積の係数の候補だが、実機の値は `round(切上(面積×割合)×0.345)` に合う（W66 のルーフ 287 だけ例外で、その 1 枚は ちょうど 1/3）。2 行の違い（305/499・73758/77349・100/135）は **溶剤/水性ではない**（実案件 1,762 パネルで 下処理面積の比は 溶剤 0.350 / 水性 0.344 でほぼ同じ）。用途未同定 |
+| T_KEI_4 | × | 2 行×6 定数（`000305,073758,000502,033917,000032,000100` / `000499,077349,000502,033917,000032,000135`）。塗り数値の式には不要。33917 ≒ 0.339 が下処理面積の係数の候補だが、実機の値は `round(min(切上(切上(面積×割合)÷3), HJU_SS の上限 49/99/40))` に合う（W66 のルーフ 287 だけ例外で、その 1 枚は ちょうど 1/3）。2 行の違い（305/499・73758/77349・100/135）は **溶剤/水性ではない**（実案件 1,762 パネルで 下処理面積の比は 溶剤 0.350 / 水性 0.344 でほぼ同じ）。用途未同定 |
 | T_KEI_3.DB | ◎ | 加算基礎数値（§11-4） |
 | BOOTH.DB | ◎ | ブース加算 |
 | BAN_FUKA.DB | ◎ | 板金付加作業（RTTI: MakerCode, PartsCode, ShapeModifyTime, WorkName, Comment）: 部品コード別、例 2300 トリム.サービスホールカバー脱着 0.30。時間 0 の '*' 付きは手加算の案内 |
@@ -476,3 +476,70 @@ DBSEARCH.dll が直接読むのは 01/11/13/15/17/20/25/80/83.DB と KA27/KA28/K
 **55/56.DB（ADAS）**: 55 = 基本作業（TRC_AnAdasBaseWorkList、18 列: YearCode, BodyCode, GradeCode, FEVACode, PartsCode 9900〜, ItemNoSubCombiCode, ItemNoCombiCode, ExtraFlag, ExtraDivision, ItemNo A010, ItemNoSub, ItemName, CommentScanTool, OrderNo, Time(×100), Provisional($ 暫定), Note, NoteSub）、56 = センサ別作業（28 列、A100〜A140、BasePartsCode1..10 = 前提作業の 55 コード）。パーサは `claude_neo_pipeline/adas_db.py`。部品コード→ADAS 作業のリンクは **24.DB** と推定（組合せコードが 56.DB の ItemNoSubCombiCode と同じ体系。実機未確認）。NEO 保存形式は NEO 仕様 §10-6。
 
 **コグニ環境 DB**（`C:\Program Files (x86)\Audatex\Auda7\AudaData\`）: AnUsrTblPnt.sld = 材料代割合既定値 MaterialRate(Paint, Coat, HFPainting) / TwoToneMaterialRate、AnUsrTbl.sld = 顧客・自社・リサイクル・登録部品・パネル、AnUsrTblSU.sld = 見積集計。
+
+
+---
+
+## 14. コグニ本体のバイナリから確定したこと（2026-09-21）
+
+コグニ本体（`Auda7\Bin`、Delphi/C++Builder 製）は **RTTI にクラスの公開プロパティ名がそのまま残っている**。
+`AxDBAcs.bpl` から **ADDATA 全 125 表と NEO 全テーブルの列名**が読める。これまで推測だった列がいくつも確定した。
+
+### 14-1. 列名が確定した表（抜粋）
+
+| 表 | 確定した列 | これまで |
+|---|---|---|
+| `BAN.DB` | `CarFormCode, Coat, NewTime, DraftTime, OldTime` | 3 列目しか使っていなかった。**4 列目 = 絞模様加算（全 40 行で 0.40）、5 列目 = 旧塗装の加算基礎** |
+| `FBANPA.DB` | `CarFormCode, DisposalCode, Coat, DisposalLevel, Time10, Time11, Time12, Time20, Time21, Time22` | 6 つの値は **Time1x と Time2x の 2 群**（§11-8 の「塗装パネルがあるかで群が変わる」と符合するが、列名の 1/2 が何を指すかは未確定） |
+| `T_KEI_1.DB` | `…, PanelAreaMin, PanelAreaMax, CoefficientA, CoefficientB` | 4 列目の `K`/`S` は **DisposalCode** |
+| `T_KEI_3.DB` | `CarFormCode, Paint, Coat, HFPainting, CoefficientD1〜D5` | 4 列目の `B/F/S/T` は **HFPainting**（標準/フッ素/スクラッチ/耐スリ傷） |
+| `77/97.DB` | `…, TimePaintFluoridation, TimePaintAbrasion` | 6 列目 = フッ素、7 列目 = 耐スリ傷（実案件の観察と一致） |
+| `87/99.DB` | `…, TimePaintScrach` | 6 列目 = スクラッチ |
+| `SIRU.DB` | `CarFormCode, DoorType, Paint, Coat, DisposalCode, Time1, Time2, Material` | **低隠蔽性塗色（LCColor）の指数と材料代**。`DoorType` は ドア枚数 2〜5。`Material` は**円額**（例 1,500 円） |
+| `HJU_SS.DB` | `PanelDivision, PanelTypeDivision, PreparePanel, PrepareTimeA/B/X/K` | `PreparePanel` = NEO の `PaintingPanel.PrepareArea` そのもの。下処理時間は 4 列あるが、今の ADDATA では 286 行すべて A=B=K・X=0 |
+| `S_Est.DB` | `車種, YearCode, PanelPaintingTimes, PanelHFPaintingTimes` | **1 桁目 = パネル塗装の算出方式**（生成器は 2 桁目しか読んでいない） |
+| `Pmashi.DB` | `CarCode, CarYearCode, CarTypeCode, GradeCode, FVACode, TimePremium` | **車種別の指数割増**。この ADDATA 版の COM.CAB には同梱されていない |
+| `67.DB` / `SOZAI.DB` | `PartsCode → MaterialCode` / `MaterialCode, MaterialName`（01 アルミ / 02 樹脂） | 部品の素材 |
+
+### 14-2. 本体にあるのに生成器が持っていない計算
+
+| 内容 | 所在 | 金額 |
+|---|---|---|
+| **関連作業の自動展開と重複作業の指数調整**（`<car>89.DB` = `KeyPartsCode+KeyRepairCode → LinkCode/RepairCode/LRCode/Count ×15`） | `AnLstBLCrw.bpl` | **効く**。生成器は 89.DB を使っていない |
+| **低隠蔽性塗色の指数・材料代を SIRU.DB から引く**（生成器は `fukaetc.DB` の車種非依存の定数で出している。材料代は円額の可能性） | `AnPntBLOpt.bpl` | 効く |
+| **材料代の「単価方式」**（材料単価 × 時間 × 係数。`PaintingPlan.MaterialUnitFlag / MaterialUnit / MaterialCoefficient`） | `AnPntBL.bpl` | 工場が単価方式なら効く |
+| **部品／工賃の値引き・割増（率・単位・丸め）とレッカー 2 件** | `AnTsmBL.bpl` | 実案件では 1/1,000 本 |
+| **工賃単価が 4 本立て**（取替 / 外板 / 内板 / 塗装。`Setting.wi_PriceChange/PricePanel/PriceFrame/PricePainting`） | `AnComBL.bpl` | 実案件では全件 0（未使用） |
+| **損傷部位ごとの板金指数の上限**（`KATB120.DB`） | `AnLstBL.bpl` | 上限を超える入力の検出 |
+| 汎用車種の色 → 塗装条件の既定（`KA28.DB` 溶剤 / `KA98.DB` 水性。66/96.DB が無い車用） | `AnPntBL.bpl` | 汎用車種で効く |
+
+### 14-3. 15.DB の構造が確定（実案件 1,238 車種・315,206 レコード）
+
+- **104 バイトのヘッダ = `A`〜`Z` の区分索引**（26 組の from/to）。例外ゼロ
+- 19 バイトは `[0:2]ref [2:4]sub [4:6]指数 [6]区分レター [7]cyc [8]年式群 [9]ボディ [10:15]グレード [15:17]FVA/EVA [17:19]link` で**全バイトに意味が付いている**
+- `(ref, レター, cyc, 年式群, ボディ, グレード 7)` が同じ行は**全車種で 0 件**（同条件の重複による取り違えは構造上あり得ない）
+- **link の 2 文字目が英字（`AA`/`II`/`JJ` のような同字）の行が 10.3%**。生成器の偶奇判定は数字しか見ないので発火しない。
+  中身は「同系列のまとめ行」（合算式は未確定）。標準指数行の 2.07% に触れる
+
+### 14-4. 83.DB にまだ読んでいない欄がある
+
+`[59:65]` カラーコード（6 バイト。`[65:77]` は全ブロック空白）のあと、
+**`[77:89]` 適用開始 / `[89:101]` 適用終了 / `[101:]` 備考**が入っている（13.DB と同じ構造）。
+開始・終了は `YYYYMM` のほか**車台番号**でも切られる（レンジ付き 19,815 ブロック・備考付き 15,654 ブロック）。
+`(ref, カラーコード, フラグ)` が同じで品番が割れる組が 13,881 あり、**この 2 欄を読むだけで 74%（10,265 組）が決まる**。
+
+### 14-5. ADDATA の未読ファイルの棚卸し（全 33,118 ファイル）
+
+| ファイル | 中身 | 使えるか |
+|---|---|---|
+| **`HELP\lbmanual.chm`** | 自研センター「指数テーブルマニュアル」全 216 ページ。**作業コードごとの「指数に含まれる作業・含まれない作業」**（約 80 コード）、**割増項目の一覧**、外板板金の面積算定、**内板骨格の損傷ランク A/B/C の判定基準**、補修塗装指数の構成 | **いちばん使える**。作業指数の内訳はここにある |
+| **車種の `*LTB.CHM` の `263_P020`〜`P065`** | **脱着・取替指数のフル掲載**（`B010 ﾌﾛﾝﾄﾊﾞﾝﾊﾟ脱着 １台 0.60 ／ ﾌｪｰｽｷｯﾄのみ 0.50`、`(含)` 作業・部品） | 使える。生成器は塗装のページ（`263_T001`）しか読んでいない |
+| **`HELP\DataInfo.pdf`** | 記号の意味（`＃` 指数手入力 / `＊` 工賃実額 / `＄` **コグニ独自の参考値** / `＠` 板金を面積で入力）、**複合作業一覧表**の存在と印刷方法、収録車種一覧（車種コードと「塗装指数なし」等の別） | 使える |
+| **`<車種>N_KEI.DB`**（802 車種） | 骨格の部位コード → **その車種の部品コード一覧**（逆引き） | 使える |
+| `KCS\*KCS.CHM`（714 本） | 構造調査シリーズ（断面図・高張力鋼板・シーリング）。**指数表は 1 つも無い** | 使えない |
+| `IMG.CAB` / `WS.CAB` / `PNTG*.CAB` / `TOSOWS.CAB` | 部位図のベクタ・クリック座標、ワークシートの画像 | 使えない（名称表ではない） |
+| `DIF\*.TXT` | 月次の更新ファイル一覧（`種別,0,0,相対パス`） | 使えない |
+| `ADDR\ADRA*.CAB` | 郵便番号 → 住所（日本郵便） | 無関係 |
+
+**車種別 DB の番号は 34 種で、未知の番号は 1 つも無い**（01/05-13/15/17/19/20/21/23/24/25/26/29/55/56/66/67/76/77/83/87/89/93/96/97/99）。
+`HELP\*LTB.CHM` 137 本は `COM/SK_TBL.DB` の 137 行と一致し、**車種フォルダを持たない車（輸入車・トラック・旧型）の指数はここにしかない**。

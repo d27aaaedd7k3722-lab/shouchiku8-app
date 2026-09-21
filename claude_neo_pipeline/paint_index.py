@@ -64,18 +64,43 @@ class PaintIndex:
                 com_dir = None
         self.com_dir = com_dir or os.path.join(HERE, 'reference')
         self.panels = self._load_20()
-        self.chm_rows, self.chm_base = self._load_chm()
+        # CHM（塗り数値）は **最初に使うときに読む**（2026-09-21）。76.DB はボディだけでなく年式群・グレードでも
+        # 別の CHM を指すので、`set_vehicle()` で車両条件が入ってから読まないと条件行を選べない（Codex 指摘）
+        self._chm_done = False
+        self._chm_rows: list = []
+        self._chm_base: dict = {}
+        # <car>77/87/97/99.DB（パネル別の塗り数値。収録のある車種だけ）は要求時に読む（_load_panel_tbl）
+        self._chm_water: Optional[list[dict]] = None  # 水性ページ（CHM「車種別補修塗装指数（水性）」）は要求時に読む
+
+    def _chm_ready(self) -> None:
+        """CHM をまだ読んでいなければここで読む（車両条件が決まってからで間に合うように遅らせている）"""
+        if self._chm_done:
+            return
+        self._chm_done = True
+        self._chm_rows, self._chm_base = self._load_chm()
         # CHM（車種別補修塗装指数）を **展開できなかった** PC では、修正塗装の標準指数が取れない。
         # 黙って別の値で通ると見積が静かにずれるので 1 回だけ知らせる（hh.exe が無い／ポリシーで使えない PC 対策）。
         # 展開はできたが補修塗装指数のページが無い車種（古い車種の CHM）は正常なので警告しない
-        self.chm_unavailable = bool(getattr(self, '_chm_extract_failed', False))
-        if self.chm_unavailable and PaintIndex._warned_chm is not True:
+        if bool(getattr(self, '_chm_extract_failed', False)) and PaintIndex._warned_chm is not True:
             PaintIndex._warned_chm = True
             hh_ = os.path.join(os.environ.get('WINDIR', ''), 'hh.exe')
             print(f'★ 塗装指数表（CHM）を展開できない: {self.car}。修正塗装の標準指数が取れないので '
                   f'paint.panels[].index を見積書の値で書くこと（{hh_} が使えるか確認）')
-        # <car>77/87/97/99.DB（パネル別の塗り数値。収録のある車種だけ）は要求時に読む（_load_panel_tbl）
-        self._chm_water: Optional[list[dict]] = None  # 水性ページ（CHM「車種別補修塗装指数（水性）」）は要求時に読む
+
+    @property
+    def chm_rows(self) -> list:
+        self._chm_ready()
+        return self._chm_rows
+
+    @property
+    def chm_base(self) -> dict:
+        self._chm_ready()
+        return self._chm_base
+
+    @property
+    def chm_unavailable(self) -> bool:
+        self._chm_ready()
+        return bool(getattr(self, '_chm_extract_failed', False))
 
     # ------------------------------------------------------------ 20.DB: 塗装パネルマスタ
     def _load_20(self) -> list[dict]:
@@ -224,13 +249,24 @@ class PaintIndex:
                     continue
                 q = have.get(m.group(1).lower())   # 同じフォルダに .CHM と .chm が混ざっている車種がある（Codex 指摘）
                 if q:
-                    # 年式群 [3]・グレード [7] に条件のある行は後回し（この 2 つを見て選べる材料が無いため。715 ファイル中 25）
-                    cand.append((l[4:6].strip(), q, 1 if (l[3].strip() or l[7].strip()) else 0))
+                    # 年式群 [3]・グレード [7] の条件。CHM は最初に使うときに読むので、ここでは車両条件が入っている
+                    _y, _g = l[3].strip(), l[7].strip()
+                    _cy = str(getattr(self, 'year_grp', '') or '').strip()
+                    _cg = str(getattr(self, 'grade', '') or '').strip().upper()
+                    if _y and _cy and _y != _cy:
+                        continue    # 年式群が違う行は使わない
+                    if _g and _cg and _g.upper() != _cg:
+                        continue    # グレードが違う行は使わない
+                    # 順位: ①行の条件が**すべて**この車に当てはまる ②条件の無い行 ③条件はあるが車両側の値が無くて
+                    # 確かめられない行。②を③より先にするのが要点（グレードが分からない車で、グレード専用の表を
+                    # 当ててしまわないため。Codex 指摘 2026-09-21）
+                    _spec = bool(_y or _g)
+                    _all_ok = (not _y or (_cy and _y == _cy)) and (not _g or (_cg and _g.upper() == _cg))
+                    rank = 0 if (_spec and _all_ok) else (1 if not _spec else 2)
+                    cand.append((l[4:6].strip(), q, rank))
             if cand:
                 want = ('%02d' % self.body_code) if self.body_code else '00'
-                # 年式群・グレードの条件はここでは判定できない（コンストラクタで読むので車両条件がまだ無い）ので、
-                # **条件の無い行を先に**、そのあとでボディの近い順に探す（Codex 指摘）
-                for cond in (0, 1):
+                for cond in (0, 1, 2):
                     for key in (want, '00', ''):
                         for body, q, c_ in cand:
                             if c_ == cond and (body == key or key == ''):

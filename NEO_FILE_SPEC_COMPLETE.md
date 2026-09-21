@@ -584,3 +584,28 @@ DamageBlock/DamageParts の再生成、AnFlInfo の `AnVer.db` 更新、`.~ne` �
 - COM の係数表はすべて XOR 0xff の CSV として復号済み（ADDATA §11-8）。ロッカ（サイドシル、PanelDivision 2）の塗り数値は CHM 表を正とする: SIRU.DB（車形×塗料×…×区分 1-4、K/S）との対応は未同定（同じ車形・面積 20 で 1.1 と 1.4 の車があり、区分の出所が不明）。CHM の無い車種のロッカは手入力 `#` にする
 - （確定済み）KA81.DB 本体レコードの x,y = 生産期間（月シリアル、id の 1 枠前の値。ADDATA 仕様 §2、evidence/KA81_period.json、resolver Candidate.period）。未確定は表1 ヘッダ第 2 値 1945 だけ
 - 17.DB の from/to = IMG.CAB の図番号範囲（ADDATA 仕様 §12、証拠 IMG_CAB_listing.txt）。20.DB は塗装パネルマスタ。13.DB = 83.DB の無い 672 車種の色別・期間別・仕様別部品表（ADDATA 仕様 §11-9b、COLOR_D98.neo 2026-09-06 夜）: 選んだ 11.DB 変種（ボディ条件 [7] 込み）の色別フラグが 1 なら車両カラーの同語幹行の品番・価格・'(ﾄｿｳｽﾞﾐ)' 名称が ERParts に入り、期間・仕様違いが複数ならダイアログで選んだ行の品番・価格が PartsNo/PartsNoStandard/PartsPriceStandardOutTax に入る。工場 NEO の `PartsNo '…-C0   *'` はその複数候補の印（PartsNoStandard に '*' は無い。発生条件はデータ版依存で未確定、生成器は付けない）
+
+
+---
+
+## AnSMB.txt の桁と、仕様書の書きぶりについて（2026-09-21 の調査）
+
+実案件の `AnSMB.txt` と `ERParts` の列を突き合わせた結果、**この桁表にはまだ確かめきれていない欄がある**。
+
+| 桁 | これまでの記述 | 2026-09-21 に分かったこと |
+|---|---|---|
+| `[12]` | リサイクル部品は `'1'`、通常 `' '` | `ERParts.PartsCodeSub` に対応するとみられる（実案件 15,656 行が一致・221 行が不一致）。リサイクル限定ではない |
+| `[100]` | （桁表から抜けていた） | `ERParts.OrderFlag`。生成器は実装済みで、**仕様書の表だけが抜けていた** |
+| `[103]` | `'0'`（未使用） | `ERParts.RWLinkFlag` の可能性が高いが**確定していない**。実案件で RWLinkFlag が立つ 105 行のうち `[103]='1'` は 12 行で、残り 92 行は `'0'`。生成器は RWLinkParts を書かない（＝ RWLinkFlag は常に 0）ので現状は実案件の大勢と一致する |
+| `[105:116]` | `'S'` は入らない | **入る**（実案件 300 本で 49 行）。12.DB の CutWork ではなく可能作業側の値とみられる |
+
+**この 4 つは「実案件と照らすと説明が足りない」段階**で、実機で 1 件ずつ作って確かめるのが確実。
+金額には出ない（AnSMB は固定長のテキスト層）。
+
+## 実装済みなのに仕様書に書いていなかったもの（2026-09-21 に追記）
+
+- `PaintingPlan.InputType` / `InputTypeName`: **実額入力は実装済み**（`paint.input_type: "実額"` または `paint.actual`）。
+  総額 1 つだけを `PaintingTotal` に入れ、パネル・加算基礎・材料計は持たない
+- `<見積名>.xml` の `ii_PresenceDate`: 立会日（`Insurance.PresenceDate` を `YYYY/MM/DD` にした値）。
+  2026-09-21 まで空のままだった
+- `AnFlInfo` の `NewCreate`: この見積の作成日。`AnVer.db_BackN` は版が上がるたびに 1 つずつ後ろへ押し出す

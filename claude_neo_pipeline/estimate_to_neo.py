@@ -1489,6 +1489,16 @@ class AddataParts:
         g = [ch for ch in fl[0:5] if ch.strip()]; e = [ch for ch in fl[5:7] if ch.strip()]
         return (1 if (g and grade in g) else 0, 1 if (e and fva in e) else 0, 1 if e else 0)
 
+    @staticmethod
+    def _flags_rank2(fl: str, grade: str, fva: str, eva) -> tuple:
+        """15.DB 行を選ぶときの一致の具体性。_flags_rank と違い **一致した FVA/EVA の文字数**まで見る。
+        実機の 15.DB には同じ区分に 'Q' と 'WQ' のように装備が 1 つの行と 2 つの行が並ぶことがあり、
+        両方とも条件を満たす車ではコグニは **文字数の多い行**を採る（実案件 Q42 0010 取替: eva に W と Q があり
+        実機 1.6h = 'WQ' 行 160、_flags_rank だと同順位で先着の 'Q' 行 130 を採って 0.3h 少なくなっていた）。
+        実案件 638 本の測定で、この順位づけを含む行選びの直しが ±0.1 の外れ 55 行 → 17 行に効いた（2026-09-21）"""
+        g = [ch for ch in fl[0:5] if ch.strip()]; e = [ch for ch in fl[5:7] if ch.strip()]
+        return (1 if (g and grade in g) else 0, sum(1 for ch in e if ch == fva), sum(1 for ch in e if ch == fva or ch in (eva or ())), 1 if e else 0)
+
     DISP_LETTER = {0: 'K', 1: 'D', 2: 'S', 6: 'S', 3: 'DS', 5: 'OH'}  # 脱着修理(3) は DS 変種行だけを見る。分解調整(5) = 11.DB の 'OH'（オーバーホール）行（J97 7600 'I7O7' 3.0h、D88 7900 'D6J6' 3.2h = 04011103/04011141）。'C' 行は点検調整(4) 用で区分レター無し = 標準なし（監査 42）
 
     def _std_row(self, ref: int, dcode: int, grade: str, fva: str, eva: set, grp: str, body: Optional[str] = None) -> Optional[dict]:
@@ -1505,6 +1515,21 @@ class AddataParts:
             if cand:
                 cand.sort(key=lambda r: (self._flags_rank(r['flags'], grade, fva), 1 if (b_ and int(r.get('body') or 0) == b_) else 0), reverse=True)
                 return cand[0]
+        return None
+
+    def _pick_row15(self, ref: int, sc: str, grade: str, fva: str, eva: set, grp: str, body: str = '') -> Optional[dict]:
+        """この部品の 15.DB 行（host = 自分、または sub = 自分）から区分 sc の行を 1 つ選ぶ。
+        _std_pick15 と違い **sub が見積に居るかどうかは見ない**（居るかどうかは呼ぶ側が決める）。
+        順位は 群（車両の年式群 → 共通）→ ボディ固有 → フラグの具体性（_flags_rank2）→ sub 付き。R2（相手と共有する行）で使う"""
+        b_ = int(body) if str(body or '').strip().isdigit() else 0
+        cands = [x for h, xs in self._load_15_raw().items() for x in xs
+                 if (h == ref or x['sub'] == ref) and x['letter'] == sc[0] and x['cyc'] == sc[1:]
+                 and x.get('body', 0) in (0, b_) and self._flags_ok(x['grade'], grade, fva, eva, True)]
+        for g_ in ([grp, ''] if grp else ['']):
+            eg = [x for x in cands if x['grp'] == g_]
+            if eg:
+                eg.sort(key=lambda x: (1 if (b_ and x.get('body') == b_) else 0, self._flags_rank2(x['grade'], grade, fva, eva), 1 if x['sub'] else 0), reverse=True)
+                return eg[0]
         return None
 
     def _std_pick15(self, ref: int, sc: str, grade: str, fva: str, eva: set, grp: str, present: set, body: str = '', host_fallback: bool = False) -> Optional[dict]:
@@ -1536,8 +1561,10 @@ class AddataParts:
                 # sub_ref 付きしか無い区分（全候補が sub 付き: J52 0402 F の T/BDFG/C 変種。J52 6500 の V5/W5 は sub 0・link 'B4' で該当しない）はそのまま標準にする。sub 有無が混在する区分では相手不在の組合せを選ばない
                 eg = eg2 or (eg if eg and all(x['sub'] for x in eg) else [])
                 egf = [x for x in eg if self._flags_ok(x['grade'], grade, fva, eva, True)]
-                if egf:  # 群・sub・フラグで有効な行の中で、フラグの具体性 → 車両のボディ固有行（D98 0800 B0: 共通 0.5 / ボディ 20 は 0.8）→ sub 付き の順
-                    egf.sort(key=lambda x: (self._flags_rank(x['grade'], grade, fva), 1 if (b_ and x.get('body') == b_) else 0, 1 if x['sub'] else 0), reverse=True)
+                if egf:  # 群・sub・フラグで有効な行の中で、**車両のボディ固有行**（D98 0800 B0: 共通 0.5 / ボディ 20 は 0.8）→ フラグの具体性 → sub 付き の順
+                    # ボディ固有行はグレード/装備フラグの一致より強い（2026-09-21 実案件 638 本で確認、7 行が一致）。
+                    # 実案件 J87 4300（ボディ 20）: 共通行のグレード C 一致 170 より ボディ 20 の無条件行 190 が正しい。順を入れ替える前は 1.7h（実機 1.9h）
+                    egf.sort(key=lambda x: (1 if (b_ and x.get('body') == b_) else 0, self._flags_rank2(x['grade'], grade, fva, eva), 1 if x['sub'] else 0), reverse=True)
                     if slot_check:
                         taker = self._slot_taken(ref, sc, egf[0], grade, fva, eva, grp, b_, present_)
                         if taker:
@@ -1770,12 +1797,12 @@ class AddataParts:
             return {x['letter'] + x['cyc'] for x in r15_all.get(rf, [])} | {x['letter'] + x['cyc'] for hs in r15_all.values() for x in hs if x['sub'] == rf}
         secs_list = re.findall(r'[A-Z]\d?', row['secs'])
         own_secs = _own_secs(ref)
-        tot = 0; used: list[str] = []; used_hidden: list[str] = []; links = set(); own_picks: list = []; foreign = 0; resolved = False
+        tot = 0; used: list[str] = []; used_hidden: list[str] = []; own_picks: list = []; foreign = 0; resolved = False
         for sc in secs_list:
             if sc in own_secs:
                 pick = self._std_pick15(ref, sc, grade, fva, eva, grp, present_same, body, False)
                 if pick:
-                    tot += pick['wi']; used.append(sc); links.add(pick['link']); own_picks.append((sc, pick)); resolved = True
+                    tot += pick['wi']; used.append(sc); own_picks.append((sc, pick)); resolved = True
                 else:
                     pb = self._std_pick15(ref, sc, grade, fva, eva, grp, present_same, body, True)  # 車両条件に合わない／枠を取られた区分: 表示指数は無いが取替合計の標準工賃は同ブロックのホストの行（実機 pair_U 0400 = 43,000 + 0.4h、pair_none 0402 = 57,600 + 0.3h）
                     if pb:
@@ -1787,53 +1814,74 @@ class AddataParts:
         if not resolved:
             return None  # どこにも指数の無い区分だけ（工場 NEO 6001 'C5': WorkCode 空）
         base = tot + foreign  # ChangeTotal の標準工賃 = 連動加算前・吸収前の自区分の全区分（NEW2 0010 = 50,700 + 1.3h、H5 0800 = 37,000 + 0.6h、H3 吸収された 2450 = 58,500 + 0.2h）
-        if self.block_of(ref) not in self.FRAME_BLOCKS and own_picks:
-            # 吸収: 自分の行のリンク符号が同ブロックの見積中の他部品（取替/脱着）の区分に一致 → その作業は相手に含まれる（実機 H3: 2300 取替 E1 が居ると 2310 G1(link E1)・2450 I1(link E1) は指数なし。H7: 2300 脱着 D1 では吸収されない）
-            blk = self.block_of(ref); other_secs: set = set()
-            for pref, pd in present_rows:
-                if pref == ref or pd not in (0, 1) or self.block_of(pref) != blk or self.block_of(pref) in self.FRAME_BLOCKS:
+        act: dict = {sc: pk for sc, pk in own_picks}  # 表示指数に効いている 15.DB 行（区分 → 行）。吸収の判定は全部そろってから 1 度だけ行う
+        shared: list[str] = []
+        if self.block_of(ref) not in self.FRAME_BLOCKS:
+            # R2 相手と共有する行: host = 自分・sub = 相手 の行は、**相手が見積に居て、その区分が相手自身の 11.DB 区分でもある**とき
+            # 自分の指数にも入る（両者が同じ 1 行を見る）。相手の修理方法は問わない（同じ修理方法に限ると実案件 638 本で 17 行落ちる）。
+            # 実案件 J97 4600 Rrパネル取替（実機 12.1h）= K3 370 + **L3 760（sub 4800・4800 も明細に居る）** + P3 80。
+            # 4800 側も同じ L3 760 を自分の指数にする（WorkCode 'L3W3'）。W46 6750 脱着（実機 8.4h）= F6 230(sub 7600) + G6 230(sub 7900) + I6 380。
+            # この 1 条件だけで実案件 638 本の外れが 33 行減る（2026-09-21）。以前の「連動 2」（リンクの系列と偶奇が自区分と同じ sub 付き行を
+            # WorkCode に足す）はこの規則に置き換えた（実機の WorkCode に共有行の区分は出ない: J97 4600 は 'K3P3Q3' のまま）
+            dmap: dict = {}
+            for p_, d_ in present_rows:
+                dmap.setdefault(int(p_), int(d_))
+            cand_shared: list = []
+            for x in r15_all.get(ref, []):
+                sc = x['letter'] + x['cyc']
+                if x['sub'] and x['sub'] != ref and x['sub'] in present and sc not in secs_list and sc not in act and sc not in cand_shared:
+                    cand_shared.append(sc)
+            for sc in cand_shared:
+                pk = self._pick_row15(ref, sc, grade, fva, eva, grp, body)
+                if not pk or not pk['sub'] or pk['sub'] == ref or pk['sub'] not in present:
                     continue
-                prow_ = self._std_row(pref, pd, grade, fva, eva, grp, body)
-                if prow_:
-                    other_secs |= set(re.findall(r'[A-Z]\d?', prow_['secs']))
-            ext = self._active_links(present_rows, ref, grade, fva, eva, grp, body)
-            for sc, pick in own_picks:
-                ev = self._even_partner(pick['link'] or '')
-                if pick['link'] and sc in used and (pick['link'] in other_secs or (ev and ev in ext)):
-                    tot -= pick['wi']; used.remove(sc); links.discard(pick['link'])  # 偶奇ペア: 見積中の他部品が使う行のリンク X(2k) が有効なら X(2k+1) の行は吸収（ブロックをまたぐ。H31）
-        appended: list[str] = []
-        if self.block_of(ref) not in self.FRAME_BLOCKS and dcode in (0, 1) and used:
+                srow = self._std_row(pk['sub'], dmap.get(pk['sub'], 0), grade, fva, eva, grp, body)  # 相手自身の 11.DB 区分か（相手の修理方法で引く）
+                if not srow or sc not in re.findall(r'[A-Z]\d?', srow['secs'] or ''):
+                    continue
+                tot += pk['wi']; act[sc] = pk; shared.append(sc)
+        if self.block_of(ref) not in self.FRAME_BLOCKS and dcode in (0, 1) and (used or shared):
             # 連動 1: 見積中の他部品 P の区分のうち、P 自身の 15.DB に無く この ref の 15.DB にある区分を加算（実機 2026-09-05 NEW2 0010+0020 脱着板金 → 1.4、2026-09-08 H1 0010 取替+0020 脱着 → 0.9、H6 0010 脱着+0020 取替 → 0.5、H2 2300 取替+0800 取替 → 2.1）。
             # P が自分の 15.DB を持つ部品（0800 の T/S）なら、この ref が取替のときだけ（H7: 2300 脱着 + 0800 脱着 は 0.6 のまま）。相手が骨格ブロックでも加算する（D88 ピラー 2200 = A1 620 + A25 相手の Y9 70）
             for pref, pd in present_rows:
-                if pref == ref or pd not in (0, 1, 3):
-                    continue
+                if pref == ref or pd not in (0, 1, 3, 5):  # 分解調整(5) の相手も連動加算の相手になる（2026-09-21 実案件 638 本で 6 行）。
+                    continue                               # 例: W12 8605 脱着 実機 7.2h = A8 380 + B8 170 + C8 170（相手 8700・8950 はどちらも分解調整で TimeStandard 0 = この部品に吸収）
                 p_has15 = bool(r15_all.get(pref))
                 if p_has15 and dcode != 0:
                     continue
                 prow = self._std_row(pref, 1 if pd == 3 else pd, grade, fva, eva, grp, body)  # 脱着板金の相手は脱着(D) 行の区分で加算
                 p_own = _own_secs(pref) if p_has15 else set()
                 for sc in re.findall(r'[A-Z]\d?', prow['secs']) if prow else []:
-                    if sc in p_own or sc in secs_list or sc in used or sc in used_hidden or sc in appended:
-                        continue  # 自分の 11.DB 区分（吸収で used から外れた区分も含む）は WorkCode に重複させない（Codex e22）
+                    if sc in p_own or sc in secs_list or sc in used or sc in used_hidden or sc in act:
+                        continue  # 自分の 11.DB 区分（吸収で used から外れた区分も含む）は WorkCode に重複させない（Codex e22）。act = R2 で足した共有行も含む（二重加算の防止）
                     pick = self._std_pick15(ref, sc, grade, fva, eva, grp, present_same | {pref}, body)  # 連動相手は修理方法によらず sub 判定で「居る」扱い（Codex e20）
                     if pick and sc in own_secs:
-                        tot += pick['wi']; used_hidden.append(sc)  # 連動加算は WorkCode に出ない（実機 2026-09-08 H15: 2300 取替 + 2344 取替 → 'E1'、H16: 0010 取替 + 0020 取替 → 'B'。以前の 'BC' 説は撤回）
-            # 連動 2: sub が見積に居るエントリのうち、リンク記号の系列と偶奇が自区分と同じもの（両側の加算）
-            def _par(link: str):
-                return (link[0], int(link[1]) % 2) if len(link) == 2 and link[1].isdigit() else None
-            own_par = set(p for p in (_par(l) for l in links) if p)
-            cand_secs: list[str] = []
-            for e in r15_all.get(ref, []):
-                sc = e['letter'] + e['cyc']
-                if e['sub'] and e['sub'] in present_same and sc not in secs_list and sc not in used and sc not in used_hidden and sc not in appended and sc not in cand_secs and e['grp'] in (grp, '') and _par(e['link']) in own_par:
-                    cand_secs.append(sc)
-            for sc in cand_secs:  # 区分ごとに候補を集め、群優先・グレード/FVA/EVA の優先順位で 1 件に絞ってから加算
-                pick = self._std_pick15(ref, sc, grade, fva, eva, grp, present_same, body)
-                if pick and pick['sub'] and sc not in used and _par(pick['link']) in own_par:  # 絞り込み後の行でもリンク系列・偶奇を再確認
-                    tot += pick['wi']; appended.append(sc)
-        secs_out = row['secs'] + ''.join(appended)  # WorkCode は 11.DB の区分文字列そのまま（自分の 15.DB に無い区分も出る: 実機 H5 'TN1'、H6 'C'、工場 NEO 'T3V3'）
-        if not used:
+                        tot += pick['wi']; used_hidden.append(sc); act[sc] = pick  # 連動加算は WorkCode に出ない（実機 2026-09-08 H15: 2300 取替 + 2344 取替 → 'E1'、H16: 0010 取替 + 0020 取替 → 'B'。以前の 'BC' 説は撤回）
+        if self.block_of(ref) not in self.FRAME_BLOCKS and act:
+            # R1 偶奇リンクの抑止: 奇数リンク X(2k+1) の行は、偶数 X(2k) の行が有効なら指数に入らない。
+            # 有効かどうかは **自分の行どうし**（act = 11.DB の区分 + R2 の共有行 + 連動 1 で足した行）と、
+            # 見積中の非骨格の他部品が実際に使う行のリンク（_active_links）の両方で見る。
+            # 自分の行どうしにも効かせるのが要点で、実案件 638 本ではこの 1 点だけで外れが 65 行減る（いちばん大きい要因、2026-09-21）。
+            # 例: J97 4600 は L3（link D2）が有効なので P3（link D3）が落ちて 370 + 760 + 80 = 12.1h（実機と一致）。
+            #     W46 6750 は F6/G6（link I0）が有効なので H6（link I1）が落ちて 230 + 230 + 380 = 8.4h。
+            #     D64 4600 は連動 1 で足した M3（link L6）が有効なので自区分の N3（link L7）が落ちる。
+            # R5 以前あった「自分のリンク符号が同ブロックの他部品の 11.DB 区分と一致 → 吸収」（H3 2300+2310/2450 で入れた条件）は外した。
+            # 上の偶奇ペアの規則が同じ現象をより正確に拾うので、重ねると消しすぎる（実案件 638 本で 8 行。H3 は偶奇ペアだけで再現する）。
+            # _active_links による外部リンクの抑止（H31: 2700 取替の T1/F0 → 4810 脱着の U3/F1）はそのまま残す
+            ext = self._active_links(present_rows, ref, grade, fva, eva, grp, body)
+            links_act = {pk['link'] for pk in act.values() if pk['link']}
+            for sc, pk in list(act.items()):
+                ev = self._even_partner(pk['link'] or '')
+                if not ev or (ev not in links_act and ev not in ext):
+                    continue
+                tot -= pk['wi']; del act[sc]
+                if sc in used:
+                    used.remove(sc)
+                if sc in used_hidden:
+                    used_hidden.remove(sc)
+                if sc in shared:
+                    shared.remove(sc)
+        secs_out = row['secs']  # WorkCode は 11.DB の区分文字列そのまま（自分の 15.DB に無い区分も出る: 実機 H5 'TN1'、H6 'C'、工場 NEO 'T3V3'）
+        if not act:
             return {'time': 0.0, 'base': base / 100.0, 'secs': secs_out, 'prov': row['prov'], 'pn': row['pn'], 'absorbed': True}  # 表示指数なし（相手に吸収 / 区分が他部品の下 / 枠を取られた）。WorkCode は残る
         return {'time': tot / 100.0, 'base': base / 100.0, 'secs': secs_out, 'prov': row['prov'], 'pn': row['pn']}
 
@@ -3889,7 +3937,17 @@ class NeoBuilder:
                 ver = mm.group(1) if mm else ''
             old = re.search(r'^AnVer\.db=(.*)$', t, re.M)
             if ver and old and old.group(1).strip() != ver:
-                t = re.sub(r'^AnVer\.db=.*$', f'AnVer.db={ver}\r\nAnVer.db_Back1={old.group(1).strip()}', t, flags=re.M)
+                # 既存の履歴を 1 つずつ後ろへ押し出す（Back1 → Back2 …）。実案件には Back6 まである。
+                # 押し出さずに書き足すと AnVer.db_Back1 の行が 2 つできる（2026-09-21 に修正）
+                backs = re.findall(r'^AnVer\.db_Back(\d+)=(.*)$', t, re.M)
+                hist = [old.group(1).strip()] + [v.strip() for _n, v in sorted(backs, key=lambda x: int(x[0]))]
+                t = re.sub(r'^AnVer\.db_Back\d+=.*\r?\n?', '', t, flags=re.M)
+                lines = [f'AnVer.db={ver}'] + [f'AnVer.db_Back{i + 1}={v}' for i, v in enumerate(hist) if v]
+                t = re.sub(r'^AnVer\.db=.*$', '\r\n'.join(lines), t, flags=re.M)
+            # NewCreate はコグニが新規作成した日（保存では更新されない）。雛形の日付をそのまま配ると
+            # どの案件も同じ日付になるので、この見積の作成日を入れる（実案件 400 本すべて 'YYYY/MM/DD'。2026-09-21）
+            if est_date and len(est_date) == 8:
+                t = re.sub(r'^NewCreate=.*$', f'NewCreate={est_date[:4]}/{est_date[4:6]}/{est_date[6:8]}', t, flags=re.M)
             files['AnFlInfo'] = t.encode('cp932w', 'replace')
         neo = nc.repack_neo(tpl, files, mgmt, entries)
         # 先頭 424B の管理領域（既存見積一覧のサマリ）を今回の見積の値で書き直す
