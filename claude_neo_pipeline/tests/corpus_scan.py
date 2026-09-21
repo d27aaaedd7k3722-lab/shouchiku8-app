@@ -163,7 +163,7 @@ def rt_one(item):
     except Exception as ex:
         out['std'] = {'error': 1}; out['miss_std'] = [_err(ex)]
     try:
-        c, miss = rt.paint_test(path, car, os.environ.get('ADDATA_ROOT') or r'C:\Addata'); out['paint'] = dict(c); out['miss_paint'] = _clean_miss(miss[:15])
+        c, miss = rt.paint_test(path, car, os.environ.get('ADDATA_ROOT') or r'C:\Addata', eva); out['paint'] = dict(c); out['miss_paint'] = _clean_miss(miss[:15])
     except Exception as ex:
         out['paint'] = {'error': 1}; out['miss_paint'] = [_err(ex)]
     return out

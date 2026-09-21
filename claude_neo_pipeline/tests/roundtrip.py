@@ -120,8 +120,12 @@ def std_test(parts, rows, car, eva):
     return out, miss
 
 
-def paint_test(path, car, root):
-    """PaintingPanel（標準扱いの行）と PaintingPlan.BaseTime を paint_index で再現"""
+def paint_test(path, car, root, eva=None):
+    """PaintingPanel（標準扱いの行）と PaintingPlan.BaseTime を paint_index で再現。
+
+    **生成器と同じ条件で作ること**（ボディと装備・グレード・年式群）。2026-09-21 まで
+    `PaintIndex(root, car)` とだけ書いていて、条件行のある表（77/97/87/99.DB・20.DB のボディ別面積）を
+    生成器と違う行で引いていた ＝ 塗装の再現率が実態より低く出ていた（同じ 3,496 行で 97.7% → 99.0%）"""
     from paint_index import PaintIndex
     d = neo_diff.load(path); em = d['AnSvEm0001.sld']
     pp = dict(em.execute('select * from PaintingPlan').fetchone())
@@ -134,7 +138,8 @@ def paint_test(path, car, root):
     n = len([p for p in panels if (p.get('DisposalCode') if p.get('DisposalCode') is not None else -1) in (0, 2, 6) and str(p.get('PartsCode') or '').strip()])
     hf = int(pp.get('HFPainting') or 0); paint = int(pp.get('Paint') or 3); coat = int(pp.get('Coat') or 1)
     try:
-        pi = PaintIndex(root, car['CarCode'])
+        pi = PaintIndex(root, car['CarCode'], body=str(car.get('BodyCode', '') or ''))
+        pi.set_vehicle(car, eva or ())
     except Exception as ex:
         return collections.Counter({'error': 1}), [str(ex)[:100]]
     form = pi.form_codes()[0]
@@ -184,7 +189,7 @@ def main():
             tot[f'{m}_ok'] += c['ok']; tot[f'{m}_all'] += c['ok'] + c['none'] + c['wrong']
         c, miss = std_test(parts, rows, car, eva)
         rep['std'] = {'count': dict(c), 'miss': miss}
-        pc, pm = paint_test(path, car, nb.engine.root)
+        pc, pm = paint_test(path, car, nb.engine.root, eva)
         rep['paint'] = {'count': dict(pc), 'miss': pm}
         tot['paint_ok'] += pc['ok'] + pc['base_ok']; tot['paint_all'] += pc['ok'] + pc['ng'] + pc['base_ok'] + pc['base_ng']
         tot['std_ok'] += c['ok']; tot['std_all'] += c['ok'] + c['none'] + c['wrong']

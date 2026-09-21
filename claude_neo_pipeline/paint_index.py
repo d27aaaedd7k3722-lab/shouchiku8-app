@@ -724,7 +724,12 @@ class PaintIndex:
 
         S_Est.DB は 1 行 1 車種（`C10 00       50` = 車種コード・ボディ・2 桁）。**2 桁目が高機能塗装の種類**で、
         実案件 NEO 1,800 本の突き合わせでは `x0` の車は耐スリ傷 250 件・`x1` の車はスクラッチ 27 件（例外 2 件）。
-        1 桁目（0/1/2/5/6）は用途未同定（汎用車種は 00）。2026-09-21 に同定"""
+        1 桁目は `car_paint_kind()` を見ること。2026-09-21 に同定"""
+        v = self._s_est()
+        return {0: 2, 1: 3}.get(int(v[1])) if v else None
+
+    def _s_est(self) -> str:
+        """COM/S_Est.DB のこの車種の 2 桁（`C10 00       50` の末尾）。無ければ ''"""
         for l in self._com_rows('S_Est.DB'):
             if not l or not l[0]:
                 continue
@@ -732,8 +737,32 @@ class PaintIndex:
             if t[:3].strip().upper() == str(self.car).upper():
                 v = t[-2:].strip()
                 if len(v) == 2 and v.isdigit():
-                    return {0: 2, 1: 3}.get(int(v[1]))
-        return None
+                    return v
+        return ''
+
+    def car_paint_kind(self) -> Optional[int]:
+        """この車種のパネル塗装指数の**素性**（COM/S_Est.DB の 1 桁目 = RTTI の `PanelPaintingTimes`）。
+
+        - `1` 正規の指数 ＋ CHM の「車種別補修塗装指数」ページあり（631 車種）
+        - `5` 正規の指数 ＋ CHM ページなし（係数表 T_KEI で計算。464 車種）
+        - **`2` 暫定指数 ＋ CHM あり（76 車種）／`6` 暫定 ＋ CHM なし（38 車種）** … コグニは塗装パネルの印を `$`
+          （弊社独自の参考値）で書く。値そのものは ADDATA どおりで、実案件の暫定行 1,025 行のうち
+          1,024 行が生成器の計算と一致する ＝ **違うのは印だけ**
+        - `0` その車種には塗装指数が無い（98 車種。97 車種は 20.DB すら持たない。汎用車種 Z10/Z30 もここ）。
+          実案件でもパネル行はすべて手入力（区分 9）
+
+        2026-09-21 に実案件 7,004 本・パネル 16,531 行の層別で同定"""
+        v = self._s_est()
+        return int(v[0]) if v else None
+
+    def car_paint_provisional(self) -> bool:
+        """この車種の塗装パネルの標準指数が**暫定**（コグニの印 `$`）か。**1 桁目が 2 のときだけ**。
+
+        実案件の外板パネル行で: 1 桁目 2 → `$` 179 / `*` 2 / `#` 5・`''` は **0**、
+        1 桁目 1 → `''` 2,859 / `$` 22、1 桁目 5 → `''` 87。
+        **1 桁目 6 は `$` 8 / `''` 7 で割れている**（9 車種・15 行と少なく、分ける条件が分からない）ので
+        暫定にはしない（2026-09-21）"""
+        return self.car_paint_kind() == 2
 
     def _scrach_time(self, form: str, paint: int, pn: dict, area: int) -> Optional[float]:
         """スクラッチ（高機能塗装 3）のパネル別加算: COM/Scrach.DB。

@@ -1741,7 +1741,7 @@ class AddataParts:
                 if sc in own:
                     pk = self._std_pick15(int(pref), sc, grade, fva, eva, grp, present_all, body, False)
                     if pk and pk.get('link'):
-                        links.add(pk['link'])
+                        links.add(self._link_even_form(pk['link']))   # 重ね文字（`LL`）は偶数 `L0` として数える
         if len(cache) > 512:
             cache.clear()
         cache[key] = frozenset(links)
@@ -1751,6 +1751,19 @@ class AddataParts:
     def _even_partner(link: str) -> str:
         """奇数リンク X(2k+1) のペア X(2k)。偶数・無効なら ''"""
         return (link[0] + str(int(link[1]) - 1)) if (len(link) == 2 and link[1].isdigit() and int(link[1]) % 2 == 1) else ''
+
+    @staticmethod
+    def _link_even_form(link: str) -> str:
+        """その行が「偶数側」として他の行を抑止するときの符号。
+
+        リンクは `L0` `L1` のような 文字＋数字 のほかに、**同じ文字の重ね**（`LL` `MM` `II`）がある
+        （15.DB の link 非空 175,692 行のうち 10.3%）。重ねの行は「同系列のまとめ行」で、
+        **偶数 `X0` と同じように 奇数 `X1` の行を抑止する**（2026-09-21。W90 の既知差 +7.7h の正体。
+        実案件 638 本の標準指数が 98.73% → 98.92%、直り 7 行・壊れ 0 行）"""
+        link = (link or '').strip()
+        if len(link) == 2 and link[0].isalpha() and link[0] == link[1]:
+            return link[0] + '0'
+        return link
 
     def _frame_combination(self, members, grade: str, fva: str, eva: set, grp: str, body: str = '', touched: Optional[set] = None, own_all: bool = False, ext_links: frozenset = frozenset()) -> dict[int, int]:
         """骨格ブロックの組合せ指数（コグニ実機 J52 2026-09-06: 1400/1410/1420/1430/1434/1500/1512/1600/1603/1611/1612/1902/1904/1950 の 23 通りで一致。値は W/S 頁明細の画面読取、保存 NEO は FRAME_p7/p8）。
@@ -1813,7 +1826,7 @@ class AddataParts:
                 a['target'] = a['by'][0]  # 単独値: 自区分の行を全部自分に
             else:
                 a['target'] = h if h in present else (x['sub'] if (x['sub'] and x['sub'] in present) else None)
-        applied = {(self.block_of(a['host']), a['row']['link']) for a in activ.values() if a['target'] is not None}  # リンク記号は部位ブロック内で閉じる（W66 X30 の C7 を他ブロックの C6 で消さない）
+        applied = {(self.block_of(a['host']), self._link_even_form(a['row']['link'])) for a in activ.values() if a['target'] is not None}  # リンク記号は部位ブロック内で閉じる（W66 X30 の C7 を他ブロックの C6 で消さない）。重ね文字（`LL`）は偶数 `L0` として数える（Codex 指摘 2026-09-21）
 
         def _suppressed(blk: str, link: str) -> bool:
             ev = self._even_partner(link)
@@ -1926,7 +1939,8 @@ class AddataParts:
             # 上の偶奇ペアの規則が同じ現象をより正確に拾うので、重ねると消しすぎる（実案件 638 本で 8 行。H3 は偶奇ペアだけで再現する）。
             # _active_links による外部リンクの抑止（H31: 2700 取替の T1/F0 → 4810 脱着の U3/F1）はそのまま残す
             ext = self._active_links(present_rows, ref, grade, fva, eva, grp, body)
-            links_act = {pk['link'] for pk in act.values() if pk['link']}
+            # 重ね文字のリンク（`LL`/`MM`）は偶数 `X0` として数える（_link_even_form）
+            links_act = {self._link_even_form(pk['link']) for pk in act.values() if pk['link']}
             for sc, pk in list(act.items()):
                 ev = self._even_partner(pk['link'] or '')
                 if not ev or (ev not in links_act and ev not in ext):
@@ -2618,6 +2632,9 @@ class NeoBuilder:
             # 加算基礎の枚数・単体塗/複数塗の判定は部品コードのあるパネルだけで数える（手入力の塗装行は数えない。実案件 NEO 60/60・16/16。2026-09-13。
             # 高機能塗装だけの行も数えない = 実案件 59 本で成立、数える形で説明できるのは差の出ない 12 本だけ。2026-09-20）
             n_p = len(panels); n_rows = n_p + len(man_panels) + len(hf_panels)
+            # S_Est.DB の 1 桁目が 2/6 の車種は、塗装パネルの標準指数が**暫定**（コグニは印 `$` = 弊社独自の参考値で書く）。
+            # 値は ADDATA どおりで生成器の計算と一致する（実案件の暫定行 1,025 行中 1,024 行）ので、違うのは印だけ（2026-09-21）
+            _pnl_prov = bool(pi and pi.car_paint_provisional())
             pcols = [r[1] for r in cur.execute('PRAGMA table_info(PaintingPanel)')]
             notes = []
             if _hf_warn:
@@ -2700,7 +2717,9 @@ class NeoBuilder:
                             'Time': t, 'TimeStandardNew': s['new'] or (t if new else 0), 'TimeStandard1': s['s1'] or (t if ratio == '1/1' else 0),
                             'TimeStandard2': s['s2'] or (t if ratio == '1/2' else 0), 'TimeStandard3': s['s3'] or (t if ratio == '1/3' else 0), 'TimeStandardHF': s['hf'] or 0,
                             'WageOutTax': w, 'WageInTax': tax_of(w)[0], 'WageTax': tax_of(w)[1],
-                            'WageByManual': ('#' if pnl_manual else ('' if (is_bankin or linked) else '*')), 'MaterialOutTax': -1, 'MaterialInTax': -1, 'MaterialTax': -1, 'MaterialByManual': '',
+                            # 暫定の印 `$` は標準行（印が空になる行）だけに付ける。手入力 `#` とパネル追加 `*` はそのまま
+                            'WageByManual': ('#' if pnl_manual else (('$' if _pnl_prov else '') if (is_bankin or linked) else '*')),
+                            'MaterialOutTax': -1, 'MaterialInTax': -1, 'MaterialTax': -1, 'MaterialByManual': '',
                             'PanelDivision': mp.get('div', 1), 'PanelTypeDivision': mp.get('type', 1), 'PanelCode': mp.get('pcode', 0),
                             'SortNo': 1, 'ButtonNo': mp.get('btn', i + 1), 'Provisional': 0, 'AddedFrom': 0 if (is_bankin or linked) else 1,  # 明細にその部品があるかだけで決める（実機 71 行で例外なし）。指数が標準と違う（pnl_manual）ことは関係ない —— それで 0 にすると明細に無いパネルが連動扱いになり、コグニが塗装ページを開いたときに消える
                             # 指数が標準値と異なる（工場見積の独自指数）ときは Manual=1: 0 だとコグニが塗装タブ表示時に標準値へ再計算する（N-ONE 案件 2026-09-04）
