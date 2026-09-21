@@ -167,6 +167,7 @@ SELFTEST_TESTS = [  # 配布先でも動く自己診断（ADDATA だけで完結
     'unit_cab.py',  # 元号は改元日で分ける（2019-01〜04 は平成 31）
     'unit_handoff.py',  # 引き継ぎ文書（HANDOFF.md）の主張と実装・ADDATA の突き合わせ（3〜4 秒）
     'unit_paint_screen.py',  # 塗装画面（実機 2026-09-20 の全機能入り見積と同じ NEO になるか）
+    'unit_expense_lines.py',  # 費用 36 行の割付（固定行 1〜8 / 自由行 9〜36 は名前で合わせる / レッカーは hy_Wrecker）
     'neo_diff.py',  # 上記テストが使う NEO 差分ツール
 ]
 EXCLUDE_PIPELINE_TESTS = 'claude_neo_pipeline/tests/'  # 生成器の tests だけ除外（スキル同梱の scripts/tests は入れる）  # tests は元 PC の案件・実 NEO を前提にした開発用（スキルの回帰は scripts/regress_cases.py）

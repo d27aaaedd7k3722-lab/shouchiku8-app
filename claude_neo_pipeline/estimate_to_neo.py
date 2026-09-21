@@ -132,6 +132,35 @@ def hw(s: str) -> str:
     return to_halfwidth(unicodedata.normalize('NFKC', s or ''))
 
 
+def _exp_key(s: str) -> str:
+    """費用名を突き合わせる形にそろえる（空白と区切り記号だけ落とす）。
+    **半角カナと全角は別物として扱う**——実機がそうしているから。実機 NEO cogni_CXA では
+    'ｴｰﾐﾝｸﾞ'(半角) が雛形の 'ｴｰﾐﾝｸﾞ費用'(半角) の行 13 に寄せられた一方、'ﾚｯｶｰ'(半角) は
+    雛形の 'レッカー費'(全角) の行 28 には寄らず、空き行 36 に 'ﾚｯｶｰ' の名前で置かれた（2026-09-10）。
+    ここで NFKC 正規化すると 'ﾚｯｶｰ' が行 28 に吸われて実機と食い違う"""
+    return ''.join(ch for ch in (s or '') if not ch.isspace() and ch not in '・,，.．-－_/／()（）')
+
+
+def _pick_template_line(fixed: dict, nm: str, used: set):
+    """雛形（工場のコグニ設定）の自由行 9〜36 から、この費用名に当たる行を選ぶ。
+    行番号ではなく **名前** で合わせるのが実機（行 10 が 'ｱﾗｲﾒﾝﾄ調整費' の工場も 'ﾗｽﾄｯﾌﾟ' の工場もある）。
+    完全一致 → 前方一致（'ｴｰﾐﾝｸﾞ' は 'ｴｰﾐﾝｸﾞ費用' の行へ。実機 cogni_CXA の運用）の順で探し、
+    前方一致の候補が 2 つ以上あるときは選ばない（'清掃' が '室内清掃費' か 'ｴﾝｼﾞﾝﾙｰﾑ清掃' か決められない）。
+    前方一致は **雛形の名前が費用名で始まる向きだけ**。実機の根拠はその向き（短い費用名 → 長い雛形名）しか無く、
+    逆向き（費用名 'ｴｰﾐﾝｸﾞ作業' が雛形 'ｴｰﾐﾝｸﾞ' で始まる）で寄せると、PDF より情報の少ない雛形の名前が
+    見積書に刷られる（Codex 指摘 2026-09-21）。
+    選ばなければ呼び出し側が空き行に名前を書いて載せるので、見積書に刷られる費用名は必ず正しくなる"""
+    key = _exp_key(nm)
+    if not key:
+        return None
+    free = [ln for ln in range(9, 37) if not any(u[0] == ln for u in used)]
+    exact = [ln for ln in free if _exp_key(fixed.get(ln, '')) == key]
+    if exact:
+        return exact[0]
+    pre = [ln for ln in free if _exp_key(fixed.get(ln, '')).startswith(key)]
+    return pre[0] if len(pre) == 1 else None
+
+
 def _com_or_ref_lines(name: str, com_dir: str = '') -> list:
     """COM の表を読む。**使っている ADDATA の COM.CAB を展開したもの**を優先し、無ければ同梱の予備（reference/）。
     水性用の表（WNAIKOKUA.DB など）は同梱していないので、ADDATA から読めなければ空になる"""
@@ -3305,10 +3334,28 @@ class NeoBuilder:
         # 費用名は **見積書の印字どおり**（全角なら全角）で reading に写す。draft が半角カナに直すので
         # 既定行に載る。ここで表記ゆれを一般に吸収してはいけない——実機は半角カナの費用名を既定行へ寄せず
         # 自由行に置くため（cogni_CXA の 'ﾚｯｶｰ' は自由行 36。2026-09-10 に確認）
-        KEYMAP = [('文字書き', 1), ('内張', 2), ('配線', 3), ('ショートパーツ', 4), ('ｼｮｰﾄﾊﾟｰﾂ', 4), ('レッカー', 5), ('写真', 7),
-                  ('エーミング', 13), ('ｴｰﾐﾝｸﾞ', 13), ('DTC', 26), ('診断', 26), ('スキャン', 26), ('光軸', 18), ('再設定', 18), ('リセット', 18),
-                  ('アライメント', 10), ('ｱﾗｲﾒﾝﾄ', 10), ('清掃', 9), ('コーティング', 12), ('ｺｰﾃｨﾝｸﾞ', 12), ('防錆', 24), ('ソナー', 11)]
+        #
+        # 行 1〜8 と 行 9〜36 は性質が違う（実案件 800 本で確定。2026-09-21）:
+        #   行 1〜8  … NameFix=1 / Attribute=1〜8。名前は 800/800 が完全に同一（AnDefine.ini [CostItem] が正本）。
+        #              どの工場でも同じ行に同じ費用が載るので、キーワードで寄せてよい。名前は書き換えない（変更不可の行）
+        #   行 9〜36 … NameFix=0 / Attribute=0。**名前は工場の雛形ごとに全く違う**（行 10 は 'ｱﾗｲﾒﾝﾄ調整費' の工場も
+        #              'ﾗｽﾄｯﾌﾟ' の工場も 'エーミング' の工場もある）。行番号にコグニ上の意味は無く、Name が正本。
+        #              だから **自由行をキーワードで決め打ちしてはいけない**。決め打ちしたうえに Name を書き換えないと、
+        #              見積書に刷られる費用名が PDF の文言ではなく雛形の文言になる（金額は合うので検算では捕まらない）
+        #
+        # レッカーを固定行 5/6（Attribute 5/6）へ自動で寄せてはいけない。帳票様式
+        # AudaData\Const\PrintSheetDesign\ForPage_Estimate1.xml は明細に TaxableExpenseExceptWrecker
+        # （＝レッカー以外）だけを並べ、レッカーは合計欄の独立行 TaxableTotal/WreckerCost（= Total.hy_Wrecker1/2）
+        # から刷る。ここだけ見ると「行 5 に載せて hy_Wrecker も書く」のが正しく見えるが、**実機はそうしない**:
+        #   - 実機 NEO cogni_CXA は 'ﾚｯｶｰ' を**自由行 36** に置いている（2026-09-10 確認。行 5 は空のまま）
+        #   - 実案件 800 本で行 5/6 に金額が入ったものは 0 本、hy_Wrecker が非ゼロのものも 0 本
+        #     （204 本が自由行に 'レッカー費' の**名前だけ**持つ＝工場の雛形）
+        # 行 5/6 と hy_Wrecker は、人が総合計画面のレッカー欄に直接入れたときの置き場で、
+        # 費用欄から自動で流れるものではない。だから費用名に「レッカー」があっても自由行に載せる（2026-09-21）
+        KEYMAP = [('文字書き', 1), ('内張', 2), ('配線', 3), ('配管', 3), ('ショートパーツ', 4), ('ｼｮｰﾄﾊﾟｰﾂ', 4), ('写真', 7)]
         used = set(); free_line = 36
+        placed = {}  # _exp_key(費用名) -> 載せた自由行。同じ費用名の部品側・工賃側を同じ行に入れるため
+                     # （寄せ先が前方一致の行だと、行の Name は雛形のまま＝費用名と違うので、行の名前では引き直せない）
         hy_parts = hy_wage = 0
         hy_parts_nt = hy_wage_nt = 0  # 非課税（OutTaxFlag=1）
         for ex in expenses:
@@ -3320,8 +3367,11 @@ class NeoBuilder:
             nm = ex.get('name', '')
             kind_ = 'parts' if ex.get('kind') == 'parts' else 'wage'
             line = next((ln for kw, ln in KEYMAP if kw in nm and (ln, kind_) not in used), None)
-            if line is None:  # 既に別種別で使った任意行と同名なら同じ行に載せる
-                line = next((ln for (ln, k_) in used if k_ != kind_ and ln > 8 and unicodedata.normalize('NFKC', fixed.get(ln, '')) == unicodedata.normalize('NFKC', nm)), None)
+            if line is None:  # 同じ費用名を既に自由行へ載せていれば、別種別（部品⇔工賃）は同じ行に載せる
+                ln_ = placed.get(_exp_key(nm))
+                line = ln_ if (ln_ is not None and (ln_, kind_) not in used) else None
+            if line is None:  # 雛形の自由行に同じ名前（か、その名前で始まる行）があればそこへ
+                line = _pick_template_line(fixed, nm, used)
             if line is None:
                 while any(u[0] == free_line for u in used) and free_line > 9:
                     free_line -= 1
@@ -3333,6 +3383,8 @@ class NeoBuilder:
                 nm20 = _fit(hw(nm), 20)
                 cur.execute('UPDATE Expense SET Name=? WHERE LineNo=?', (nm20, line)); fixed[line] = nm20
             used.add((line, kind_))
+            if line > 8:
+                placed.setdefault(_exp_key(nm), line)
             it_, tx = tax_of(amt)
             tf = 1 if _flag(ex.get('taxfree'), 'expenses[].taxfree') else 0  # 文字列 "false" を非課税にしない（Codex 指摘）
             if tf:
