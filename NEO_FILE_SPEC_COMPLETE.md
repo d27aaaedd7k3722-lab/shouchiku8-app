@@ -692,7 +692,12 @@ Total    = SubTotal + 消費税 + 非課税のレッカー + hy_PartsNoTax + hy_
 - 値引・割増は P と W の段階で足し引き（`pt_ExtraTotalInTax > 0` のときだけ効く。Flag 0 値引・1 割増）
 - `TotalSumChange` は合計を再計算しない（画面更新だけ）。`CalculatTotal` を呼ぶのは明細・費用・塗装・ADAS・内板骨格の変更時
 - **各行の税額も消費税設定の丸め方**（2026-09-21 に実装。実案件 3,000 本で 設定どおり 173 行・四捨五入 0 行）
-- 未対応: 内税（`TaxKindFlag = 1`）は税込から税額を逆算する別経路（`GetInTaxEx` 4071E4）。生成器は税抜の SubTotal から計算するので、実案件の内税 13 本中 6 本で Total が合わない
+- **内税（`TaxKindFlag = 1`）は別経路**（`GetSubTotal` 406B40 / `GetTotal` 408C04 / `GetInTaxEx` 4071E4）。2026-09-21 に実装。実案件の内税 NEO 81 本すべてで 4 項目が一致（外税の式では 23 本が合わない）:
+  ```
+  ΣIn = 外税と同じ組合せを税込（*InTax）の列で足したもの
+  tx_TotalOutTax = 丸め(ΣIn × 率 / (100 + 率))   tx_TotalInTax = ΣIn − SubTotal   Total = ΣIn + 非課税
+  ```
+  外税と違い、税の 2 列は別の値になる（81 本中 21 本で食い違う）
 
 ### 11-4. `WageByManual` の印（`IsWageByManual` 40EE78 ほか）
 
