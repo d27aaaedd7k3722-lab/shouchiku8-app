@@ -1517,13 +1517,17 @@ class AddataParts:
                 return cand[0]
         return None
 
-    def _pick_row15(self, ref: int, sc: str, grade: str, fva: str, eva: set, grp: str, body: str = '') -> Optional[dict]:
+    def _pick_row15(self, ref: int, sc: str, grade: str, fva: str, eva: set, grp: str, body: str = '', host_only: bool = False) -> Optional[dict]:
         """この部品の 15.DB 行（host = 自分、または sub = 自分）から区分 sc の行を 1 つ選ぶ。
         _std_pick15 と違い **sub が見積に居るかどうかは見ない**（居るかどうかは呼ぶ側が決める）。
-        順位は 群（車両の年式群 → 共通）→ ボディ固有 → フラグの具体性（_flags_rank2）→ sub 付き。R2（相手と共有する行）で使う"""
+        順位は 群（車両の年式群 → 共通）→ ボディ固有 → フラグの具体性（_flags_rank2）→ sub 付き。R2（相手と共有する行）で使う。
+        host_only=True は **host = 自分の行だけ**（R2 はこちら）。sub = 自分（＝指数を他部品の下に置かれている）行が
+        同じ区分に居ると、それが先に並んで sub == ref で捨てられ、本来の共有行ごと落ちてしまうため（Codex 指摘 1、2026-09-21）。
+        現行 ADDATA（2026/08 版）では実案件 638 本・R2 の候補 59,279 件で「同じ区分に sub = 自分の行もある」場面は **0 件**で、
+        直しても出力は 1 行も変わらない（明細 36,632 行で値を突き合わせて確認）。将来の版で起きたときに黙って落とさないための予防"""
         b_ = int(body) if str(body or '').strip().isdigit() else 0
         cands = [x for h, xs in self._load_15_raw().items() for x in xs
-                 if (h == ref or x['sub'] == ref) and x['letter'] == sc[0] and x['cyc'] == sc[1:]
+                 if (h == ref if host_only else (h == ref or x['sub'] == ref)) and x['letter'] == sc[0] and x['cyc'] == sc[1:]
                  and x.get('body', 0) in (0, b_) and self._flags_ok(x['grade'], grade, fva, eva, True)]
         for g_ in ([grp, ''] if grp else ['']):
             eg = [x for x in cands if x['grp'] == g_]
@@ -1657,7 +1661,9 @@ class AddataParts:
                 egf = [x for x in sec if self._flags_ok(x['grade'], grade, fva, eva, True)]
                 if not egf:
                     continue
-                egf.sort(key=lambda x: (self._flags_rank(x['grade'], grade, fva), 1 if (b_ and x.get('body') == b_) else 0, 1 if x['sub'] else 0), reverse=True)
+                # 枠の取り合いも通常の行選び（_std_pick15）と同じ順位に揃える（Codex 指摘 2、2026-09-21）。
+                # 実案件 638 本・699,319 回の並べ替えで選ばれる行が変わったのは 0 回（明細 36,632 行の値も不変）。揃えるのは食い違いを残さないため
+                egf.sort(key=lambda x: (1 if (b_ and x.get('body') == b_) else 0, self._flags_rank2(x['grade'], grade, fva, eva), 1 if x['sub'] else 0), reverse=True)
                 pick = egf[0]
                 if (pick.get('link') or '') == link and pick.get('grade', '').strip():
                     return pick  # 競合 ref が選ぶ行が同じ枠の条件付き行 → 枠はその ref のもの
@@ -1832,7 +1838,7 @@ class AddataParts:
                 if x['sub'] and x['sub'] != ref and x['sub'] in present and sc not in secs_list and sc not in act and sc not in cand_shared:
                     cand_shared.append(sc)
             for sc in cand_shared:
-                pk = self._pick_row15(ref, sc, grade, fva, eva, grp, body)
+                pk = self._pick_row15(ref, sc, grade, fva, eva, grp, body, host_only=True)  # R2 は host = 自分の行だけ（Codex 指摘 1）
                 if not pk or not pk['sub'] or pk['sub'] == ref or pk['sub'] not in present:
                     continue
                 srow = self._std_row(pk['sub'], dmap.get(pk['sub'], 0), grade, fva, eva, grp, body)  # 相手自身の 11.DB 区分か（相手の修理方法で引く）
