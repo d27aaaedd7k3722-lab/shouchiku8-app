@@ -70,6 +70,21 @@ def main() -> int:
     check(tot['SubTotal'] == 162505 and tot['tx_TotalOutTax'] == 16250, f"taxfloor 162,505 → {tot['tx_TotalOutTax']}")
     rows, st, tot, rep = build(F2 + [{'name': '雑費', 'method': '', 'qty': 1, 'price': 5, 'manual': True}], tax_round='切り上げ')
     check(st['tx_ArrangeFlag'] == 3 and tot['tx_TotalOutTax'] == 16251, f"taxceil 162,505 → {tot['tx_TotalOutTax']}")
+    # 各行の税額も消費税設定の丸め方に従う（2026-09-21。実案件 3,000 本で、丸め方で差が出る行のうち設定どおり 173 行・四捨五入 0 行）。
+    # これまでは合計の消費税だけ設定に従い、各行は常に四捨五入していた。単価欄（PartsUnitPriceTax）は実機どおり常に切り捨てのまま
+    for how, want in (('四捨五入', 25), ('切り捨て', 24), ('切り上げ', 25)):
+        rows, st, tot, rep = build(F2 + [{'name': '雑費', 'method': '', 'qty': 1, 'price': 245, 'manual': True}], tax_round=how)
+        r_ = next((r for r in rows.values() if str(r.get('PartsName') or '').strip() == '雑費'), None)
+        check(r_ is not None and r_['PartsPriceTax'] == want and r_['PartsPriceInTax'] == 245 + want,
+              f"{how}: 245 円の行の税 {r_ and r_['PartsPriceTax']}（{want} のはず）")
+    for how, want in (('切り捨て', 0), ('切り上げ', 1)):
+        rows, st, tot, rep = build(F2 + [{'name': '雑費', 'method': '', 'qty': 1, 'price': 5, 'manual': True}], tax_round=how)
+        r_ = next((r for r in rows.values() if str(r.get('PartsName') or '').strip() == '雑費'), None)
+        check(r_ is not None and r_['PartsPriceTax'] == want, f"{how}: 5 円の行の税 {r_ and r_['PartsPriceTax']}（{want} のはず）")
+    # 設定が 1 回の build の間だけ効き、次の build に残らない（ContextVar を戻している）
+    rows, st, tot, rep = build(F2 + [{'name': '雑費', 'method': '', 'qty': 1, 'price': 245, 'manual': True}])
+    r_ = next((r for r in rows.values() if str(r.get('PartsName') or '').strip() == '雑費'), None)
+    check(r_ is not None and r_['PartsPriceTax'] == 25, f"前の build の丸め方が残っている（{r_ and r_['PartsPriceTax']}）")
     # 消費税の表示方法（コグニの「消費税設定」）: 既定は外税、金額が税込で印字された見積書（10-4）は内税 = 実機 NEO と同じ TaxKindFlag 1
     rows, st, tot, rep = build(F2)
     check(st['TaxKindFlag'] == 0, f"既定は外税 {st['TaxKindFlag']}")

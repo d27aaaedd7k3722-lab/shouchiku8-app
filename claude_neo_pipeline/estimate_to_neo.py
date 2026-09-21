@@ -120,10 +120,44 @@ def r10_even(x: float) -> int:
 
 
 def tax_of(out: int) -> tuple[int, int]:
-    """(税込, 税) 10% 四捨五入（コグニ生成 NEO の末尾 5 円の行 89 件: PartsPrice 245 → 25、PartsPriceStandard 195 → 20、ChangeTotal 295 → 30。
-    例外は PartsUnitPriceTax（切捨 155 → 15）と数量行の PartsPriceTax（四捨五入(単価×0.1)×数量）。旧生成器の切捨行（PartsCode '' の 195 → 19）はコグニに温存される。総合計の消費税も四捨五入 §6）"""
-    t = int(math.floor(out * TAX + 0.5))
+    """(税込, 税)。税額は消費税設定の丸め方（_TAX_ROUND。既定 四捨五入）で整数にする
+    （四捨五入の工場のコグニ生成 NEO の末尾 5 円の行 89 件: PartsPrice 245 → 25、PartsPriceStandard 195 → 20、ChangeTotal 295 → 30。
+    切り捨て・切り上げの工場は各行もその丸め方。実案件 3,000 本で設定どおり 173 行・四捨五入 0 行、2026-09-21）。
+    例外は PartsUnitPriceTax（常に切捨 155 → 15）と数量行の PartsPriceTax（丸め(単価×率)×数量）。旧生成器の切捨行（PartsCode '' の 195 → 19）はコグニに温存される"""
+    t = _tax_amount(out)
     return out + t, t
+
+
+# 消費税の丸め方（Setting.tx_ArrangeFlag = 四捨五入 / 切り捨て / 切り上げ）。build() が estimate['tax_round'] で
+# build の間だけ設定し、終了時に戻す（_WAGE_UNIT と同じ仕組み）。
+# 本体は **明細・費用の各行の税額も**この設定で丸める（2026-09-21。実案件 3,000 本で、丸め方で差が出る行のうち
+# 設定どおり 173 行・四捨五入 0 行。本体 AnTsmBL / AnLstBL の税計算も消費税設定を読む）。
+# これまでは合計の消費税だけ設定に従い、各行は常に四捨五入していた
+_TAX_ROUND: contextvars.ContextVar = contextvars.ContextVar('neo_tax_round', default='四捨五入')
+
+
+def _tax_round_name(v) -> str:
+    """estimate['tax_round'] を 四捨五入 / 切り捨て / 切り上げ にそろえる（それ以外は既定の四捨五入。合計側の解釈と同じ）"""
+    v = str(v or '四捨五入')
+    return v if v in ('切り捨て', '切り上げ') else '四捨五入'
+
+
+def _tax_amount(out) -> int:
+    """税抜 out の税額を、消費税設定の丸め方で整数にする。10% は整数演算（245 × 0.1 = 24.500000000000004 のような誤差を避ける）"""
+    how = _TAX_ROUND.get()
+    if abs(TAX - 0.1) < 1e-9:
+        n = int(out) * 10
+        if how == '切り捨て':
+            return n // 100
+        if how == '切り上げ':
+            return -((-n) // 100)
+        return (n + 50) // 100
+    x = out * TAX
+    if how == '切り捨て':
+        return int(math.floor(x + 1e-9))
+    if how == '切り上げ':
+        return int(math.ceil(x - 1e-9))
+    return int(math.floor(x + 0.5))
 
 
 def hw(s: str) -> str:
@@ -2556,7 +2590,7 @@ class NeoBuilder:
                     if base == 'PartsUnitPrice':
                         tx = int(int(out) * TAX); it_ = int(out) + tx  # 単価欄の税だけ切捨（NONE_dc 155 → 15）
                     if base == 'PartsPrice' and int(rec.get('PartsCount') or 0) > 1 and int(rec.get('PartsUnitPriceOutTax') or 0) > 0 and int(rec['PartsUnitPriceOutTax']) * int(rec['PartsCount']) == int(out):
-                        tx = int(math.floor(int(rec['PartsUnitPriceOutTax']) * TAX + 0.5)) * int(rec['PartsCount']); it_ = int(out) + tx  # 数量行の税 = 単価の税（四捨五入）×数量（コグニ実機: 155×10 → 税 160、185×9 → 171。単価欄 PartsUnitPriceTax は切捨 15 のまま）
+                        tx = _tax_amount(int(rec['PartsUnitPriceOutTax'])) * int(rec['PartsCount']); it_ = int(out) + tx  # 数量行の税 = 単価の税（消費税設定の丸め。既定 四捨五入）×数量（コグニ実機: 155×10 → 税 160、185×9 → 171。単価欄 PartsUnitPriceTax は切捨 15 のまま）
                     rec[base + 'InTax'] = it_; rec[base + 'Tax'] = tx
                 else:
                     rec[base + 'InTax'] = -1; rec[base + 'Tax'] = -1
@@ -3709,11 +3743,13 @@ class NeoBuilder:
         if insurance is None:  # estimate_schema.md は estimate['insurance'] が正。引数で渡さない呼び出し元でも保険・案件欄を落とさない（Codex 指摘 2026-09-14）
             insurance = estimate.get('insurance') if isinstance(estimate.get('insurance'), dict) else None
         token = set_wage_unit(_money(estimate.get('wage_round'), 'wage_round（工賃の丸め単位）') or 10)  # 工賃丸め単位（工場のコグニ設定。100 円丸めの工場あり）。この build の間だけ有効
+        tax_token = _TAX_ROUND.set(_tax_round_name(estimate.get('tax_round')))  # 各行の税額の丸め方（Setting.tx_ArrangeFlag）。この build の間だけ有効
         com_tables.reset_sources()  # このビルドで COM の表をどこから読んだか（予備を使ったら run_case が ★）
         try:
             return self._build_inner(estimate, vehicle_inputs, hints, labor_rate, est_date, insurance)
         finally:
             reset_wage_unit(token)
+            _TAX_ROUND.reset(tax_token)
 
     def _build_inner(self, estimate: dict, vehicle_inputs: dict, hints: Optional[dict], labor_rate: Optional[int],
                      est_date: Optional[str], insurance: Optional[dict]) -> tuple[bytes, dict]:
