@@ -99,6 +99,16 @@ def main() -> int:
         else:
             print('ok   重ね文字リンク', _link, '→', got)
 
+    # 重ね文字 XX は同じ英字の数字行（X0〜X9）を全部落とす（本体 AnLstBLMng.bpl CheckWorkGroup 00417A3C）。
+    # その判定に使う「重ね文字か」。偶数 X0 と違って X0 自身も落とすので、_link_even_form（→ X0）とは別に要る
+    for _link, _want in (('LL', True), ('MM', True), ('L0', False), ('L1', False), ('', False), (None, False), ('L', False), (' LL ', True), ('L2L', False)):
+        got = _AP._is_doubled_link(_link)
+        if got != _want:
+            fails += 1
+            print('FAIL 重ね文字の判定', repr(_link), 'got', got, 'expected', _want)
+        else:
+            print('ok   重ね文字の判定', repr(_link), '→', got)
+
     print('unit_link_absorb:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
 

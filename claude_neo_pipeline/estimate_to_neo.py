@@ -1793,6 +1793,8 @@ class AddataParts:
                     pk = self._std_pick15(int(pref), sc, grade, fva, eva, grp, present_all, body, False)
                     if pk and pk.get('link'):
                         links.add(self._link_even_form(pk['link']))   # 重ね文字（`LL`）は偶数 `L0` として数える
+                        if self._is_doubled_link(pk['link']):
+                            links.add(pk['link'].strip())  # LL そのものも残す（同じ英字の数字行 L0〜L9 を全部落とす。本体 CheckWorkGroup）
         if len(cache) > 512:
             cache.clear()
         cache[key] = frozenset(links)
@@ -1802,6 +1804,12 @@ class AddataParts:
     def _even_partner(link: str) -> str:
         """奇数リンク X(2k+1) のペア X(2k)。偶数・無効なら ''"""
         return (link[0] + str(int(link[1]) - 1)) if (len(link) == 2 and link[1].isdigit() and int(link[1]) % 2 == 1) else ''
+
+    @staticmethod
+    def _is_doubled_link(link: str) -> bool:
+        """重ね文字のリンク（`LL` `MM` `II`）か"""
+        link = (link or '').strip()
+        return len(link) == 2 and link[0].isalpha() and link[0] == link[1]
 
     @staticmethod
     def _link_even_form(link: str) -> str:
@@ -1879,7 +1887,13 @@ class AddataParts:
                 a['target'] = h if h in present else (x['sub'] if (x['sub'] and x['sub'] in present) else None)
         applied = {(self.block_of(a['host']), self._link_even_form(a['row']['link'])) for a in activ.values() if a['target'] is not None}  # リンク記号は部位ブロック内で閉じる（W66 X30 の C7 を他ブロックの C6 で消さない）。重ね文字（`LL`）は偶数 `L0` として数える（Codex 指摘 2026-09-21）
 
+        doubled_app = {(self.block_of(a['host']), a['row']['link'].strip()[0]) for a in activ.values()
+                       if a['target'] is not None and self._is_doubled_link(a['row']['link'])}
+
         def _suppressed(blk: str, link: str) -> bool:
+            ln = (link or '').strip()
+            if len(ln) == 2 and ln[1].isdigit() and ((blk, ln[0]) in doubled_app or ln[0] * 2 in ext_links):
+                return True  # 重ね文字 XX が有効なら同じ英字の数字行（X0〜X9）を全部落とす（本体 CheckWorkGroup 00417A3C）
             ev = self._even_partner(link)
             return bool(ev) and ((blk, ev) in applied or ev in ext_links)  # 同ブロックの偶数行、または見積中の非骨格部品が使う偶数リンク（H31: 2700 の T1/F0 → 4810 の U3/F1）
         tot: dict[int, int] = {}
@@ -1992,9 +2006,15 @@ class AddataParts:
             ext = self._active_links(present_rows, ref, grade, fva, eva, grp, body)
             # 重ね文字のリンク（`LL`/`MM`）は偶数 `X0` として数える（_link_even_form）
             links_act = {self._link_even_form(pk['link']) for pk in act.values() if pk['link']}
+            # 重ね文字（`LL`）が有効なら、同じ英字の**数字リンクの行を全部**落とす（L0〜L9。偶数も奇数も）。
+            # コグニ本体 AnLstBLMng.bpl CheckWorkGroup（00417A3C）の規則: 偶数 X(2k) は X(2k+1) だけを落とすが、
+            # 重ね XX は同じ英字の数字行をすべて落とす（2026-09-21 逆アセンブル）
+            doubled = {(pk['link'] or '').strip()[0] for pk in act.values() if self._is_doubled_link(pk['link'])}
             for sc, pk in list(act.items()):
-                ev = self._even_partner(pk['link'] or '')
-                if not ev or (ev not in links_act and ev not in ext):
+                ln_ = (pk['link'] or '').strip()
+                by_doubled = len(ln_) == 2 and ln_[1].isdigit() and (ln_[0] in doubled or ln_[0] * 2 in ext)
+                ev = self._even_partner(ln_)
+                if not by_doubled and (not ev or (ev not in links_act and ev not in ext)):
                     continue
                 tot -= pk['wi']; del act[sc]
                 if sc in used:
