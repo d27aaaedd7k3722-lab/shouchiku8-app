@@ -152,6 +152,8 @@ def _inspect(path: str, out_json: str = '') -> int:
     reg_ym = re.sub(r'\D', '', str(car.get('ps_CarRegDate', '')))[:6]
     parts = AddataParts(nb.engine, car_code)
     parts.vehicle_body = body
+    parts.vehicle_sbase = str(car.get('SBaseCode', '') or '')  # 行のボディ条件に SBaseCode・LBaseCode も当てはめる（生成器と同じ）
+    parts.vehicle_lbase = str(car.get('LBaseCode', '') or '')
     raw11 = parts._load_11_raw()
     try:
         raw83 = parts._load_83_raw()

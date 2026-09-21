@@ -746,12 +746,66 @@ def display_name(std: str) -> str:
 
 
 # ======================================================================
+# ---- 15.DB / 11.DB の行の条件の照らし方（コグニ本体 DBSEARCH.dll を逆アセンブルして確定。2026-09-21）
+#   ボディ（10001DF0）: 行のボディが 0（共通）か、車の BodyCode・LBaseCode・SBaseCode のどれかに一致すれば通す。複数当たれば値の大きい方
+#                       （W12 などボディ 40 の車は SBase 30 の行も使う。これまでは BodyCode しか見ておらず 8 行外していた）
+#   年式群（10001DB0）: 行の群が空欄か、車の群**以下**なら通す。群の大きい方を優先（これまでは一致だけで 3 行外していた）
+class _Body(int):
+    """車のボディ（int として BodyCode の値を持ち、.set に照らしてよいボディの集合 {0, BodyCode, SBaseCode} を持つ）"""
+
+
+def _bparse(b, extra=()) -> '_Body':
+    """extra: この車の LBaseCode・SBaseCode（AddataParts._sbase_for）"""
+    bs = str(b or '').strip()
+    v = _Body(int(bs) if bs.isdigit() else 0)
+    if isinstance(extra, str):
+        extra = (extra,)
+    v.set = frozenset({0, int(v)} | {int(x) for x in extra if str(x or '').strip().isdigit()})
+    return v
+
+
+def _bset(b_):
+    return getattr(b_, 'set', None) or frozenset({0, int(b_ or 0)})
+
+
+def _brank(v, b_):
+    """行のボディの優先順位（車に当てはまらない行は -1、当てはまれば値そのもの。値の大きい方が具体的）"""
+    v = int(v or 0)
+    return v if v in _bset(b_) else -1
+
+
+def _bspec(v, b_):
+    """行のボディが共通（0）でなく、この車に当てはまるか"""
+    v = int(v or 0)
+    return bool(v) and v in _bset(b_)
+
+
+def _grps(grp):
+    """15.DB の年式群の探し方: 車の群から 0 まで下げ、最後に空欄（群の大きい方が優先）"""
+    g = str(grp or '').strip()
+    if not g:
+        return ['']
+    if not g.isdigit():
+        return [g, '']
+    return [str(k) for k in range(int(g), -1, -1)] + ['']
+
+
 class AddataParts:
     """車種フォルダの 11/12/15/17.DB を使った部品照合"""
+
+    def _sbase_for(self, body) -> tuple:
+        """行の条件を照らすとき、この車のボディなら LBaseCode・SBaseCode も当てはまるボディに加える（_bparse）。
+        別のボディ・共通（''）を指定されたときは足さない"""
+        b = str(body or '').strip()
+        if not (b and b == str(getattr(self, 'vehicle_body', '') or '').strip()):
+            return ()
+        return (getattr(self, 'vehicle_lbase', '') or '', getattr(self, 'vehicle_sbase', '') or '')
 
     def __init__(self, engine: AddataSearchEngine, car_code: str):
         self.e = engine
         self.car = car_code
+        self.vehicle_sbase = ''   # 車の SBaseCode（BodyCode と違う車だけ意味がある。_sbase_for）
+        self.vehicle_lbase = ''   # 車の LBaseCode（生成器は '00' を書く。実案件も 1,253 本中 1,252 本が '00'）
         self.p11 = engine.load_11db(car_code)
         self.p12 = engine.load_12db(car_code)
         self.p15 = engine.load_15db(car_code)
@@ -1379,10 +1433,10 @@ class AddataParts:
         コグニの部品検索と同じ変種を選ぶ（ctx = {'grade','fva','eva','year'}。コグニ実機 FRAME_p8 1904: 年式 01 → 群 1 の 61160-T4G-J00ZZ 14,100）"""
         rows = [r for r in self.by_ref.get(ref_no, []) if '-' in str(r['parts_no'])]
         b = str((ctx or {}).get('body') or getattr(self, 'vehicle_body', '') or '').strip()
-        b_ = int(b) if b.isdigit() else 0  # 未確定・非数値のボディは 0（共通行だけ）= _std_row と同じ扱い（Codex 99）
+        b_ = _bparse(b, self._sbase_for(b))  # 未確定・非数値のボディは 0（共通行だけ）= _std_row と同じ扱い（Codex 99）
         raw11 = self._load_11_raw().get(ref_no, [])
         if rows and raw11:  # 他ボディ専用の 11.DB 行は候補から外す（Codex 98/100: 許される行が無ければ変種なし。11.DB 生行が読めない車種だけ従来どおり）
-            ok_pn = {self.norm_pn(r['pn']) for r in raw11 if r.get('disp') == 'K' and int(r.get('body') or 0) in (0, b_)}
+            ok_pn = {self.norm_pn(r['pn']) for r in raw11 if r.get('disp') == 'K' and int(r.get('body') or 0) in _bset(b_)}
             rows = [r for r in rows if self.norm_pn(r['parts_no']) in ok_pn]
         pn = self.norm_pn(re.sub(r'\s*\(\d+\)\s*$', '', parts_no or ''))
         hit = [r for r in rows if self.norm_pn(r['parts_no']) == pn] if pn else []
@@ -1521,17 +1575,17 @@ class AddataParts:
         std_pn と同じ品番のときその行の値、そうでなければ同じ品番の行（ボディ固有行優先）の値
         （D98 0124: 共通行 89348-B2050-C0 は 1、ボディ 20 行は 0 → コグニは -C0 のまま。COLOR_D98.neo。Codex 100）"""
         b = str(body if body is not None else getattr(self, 'vehicle_body', '') or '').strip()
-        b_ = int(b) if b.isdigit() else 0
+        b_ = _bparse(b, self._sbase_for(b))
         pn = self.norm_pn(std_pn or '')
         if ctx:
             y = str(ctx.get('year') or '').strip(); grp = y[-1] if y.isdigit() and int(y) else ''
             srow = self._std_row(ref, 0, ctx.get('grade', ''), ctx.get('fva', ''), set(ctx.get('eva') or ()), grp, b)
             if srow and self.norm_pn(srow.get('pn', '')) == pn:
                 return int(srow.get('color_flag') or 0) & 1
-        rows = [r for r in self._load_11_raw().get(ref, []) if r.get('disp') == 'K' and self.norm_pn(r['pn']) == pn and int(r.get('body') or 0) in (0, b_)]
+        rows = [r for r in self._load_11_raw().get(ref, []) if r.get('disp') == 'K' and self.norm_pn(r['pn']) == pn and int(r.get('body') or 0) in _bset(b_)]
         if not rows:
             return 0
-        rows.sort(key=lambda r: 1 if (b_ and int(r.get('body') or 0) == b_) else 0, reverse=True)
+        rows.sort(key=lambda r: _brank(r.get('body'), b_), reverse=True)
         return int(rows[0].get('color_flag') or 0) & 1
 
     def colored_part(self, ref: int, color: str, grade: str, fva: str, eva: set, std_pn: str = '', reg_ym: str = '', serial_no: str = '') -> Optional[dict]:
@@ -1657,12 +1711,12 @@ class AddataParts:
         if not tok:  # 点検調整(4) など標準指数の対象外
             return None
         b = str(body if body is not None else getattr(self, 'vehicle_body', '') or '').strip()
-        b_ = int(b) if b.isdigit() else 0
-        rows = [r for r in self._load_11_raw().get(ref, []) if r['disp'] == tok and int(r.get('body') or 0) in (0, b_)]
+        b_ = _bparse(b, self._sbase_for(b))
+        rows = [r for r in self._load_11_raw().get(ref, []) if r['disp'] == tok and int(r.get('body') or 0) in _bset(b_)]
         for g_ in ([grp, ''] if grp else ['']):
             cand = [r for r in rows if r['grp'] == g_ and self._flags_ok(r['flags'], grade, fva, eva, True)]
             if cand:
-                cand.sort(key=lambda r: (self._flags_rank(r['flags'], grade, fva), 1 if (b_ and int(r.get('body') or 0) == b_) else 0), reverse=True)
+                cand.sort(key=lambda r: (self._flags_rank(r['flags'], grade, fva), _brank(r.get('body'), b_)), reverse=True)
                 return cand[0]
         return None
 
@@ -1674,28 +1728,28 @@ class AddataParts:
         同じ区分に居ると、それが先に並んで sub == ref で捨てられ、本来の共有行ごと落ちてしまうため（Codex 指摘 1、2026-09-21）。
         現行 ADDATA（2026/08 版）では実案件 638 本・R2 の候補 59,279 件で「同じ区分に sub = 自分の行もある」場面は **0 件**で、
         直しても出力は 1 行も変わらない（明細 36,632 行で値を突き合わせて確認）。将来の版で起きたときに黙って落とさないための予防"""
-        b_ = int(body) if str(body or '').strip().isdigit() else 0
+        b_ = _bparse(body, self._sbase_for(body))
         cands = [x for h, xs in self._load_15_raw().items() for x in xs
                  if (h == ref if host_only else (h == ref or x['sub'] == ref)) and x['letter'] == sc[0] and x['cyc'] == sc[1:]
-                 and x.get('body', 0) in (0, b_) and self._flags_ok(x['grade'], grade, fva, eva, True)]
-        for g_ in ([grp, ''] if grp else ['']):
+                 and x.get('body', 0) in _bset(b_) and self._flags_ok(x['grade'], grade, fva, eva, True)]
+        for g_ in _grps(grp):
             eg = [x for x in cands if x['grp'] == g_]
             if eg:
-                eg.sort(key=lambda x: (1 if (b_ and x.get('body') == b_) else 0, self._flags_rank2(x['grade'], grade, fva, eva), 1 if x['sub'] else 0), reverse=True)
+                eg.sort(key=lambda x: (_brank(x.get('body'), b_), self._flags_rank2(x['grade'], grade, fva, eva), 1 if x['sub'] else 0), reverse=True)
                 return eg[0]
         return None
 
     def _std_pick15(self, ref: int, sc: str, grade: str, fva: str, eva: set, grp: str, present: set, body: str = '', host_fallback: bool = False) -> Optional[dict]:
         r15 = self._load_15_raw()
-        b_ = int(body) if str(body or '').strip().isdigit() else 0
+        b_ = _bparse(body, self._sbase_for(body))
 
         def _match(x: dict) -> bool:
-            return x['letter'] == sc[0] and x['cyc'] == sc[1:] and (x.get('body', 0) in (0, b_))  # ボディコード条件（0 = 共通、他ボディの行は除外）
+            return x['letter'] == sc[0] and x['cyc'] == sc[1:] and (x.get('body', 0) in _bset(b_))  # ボディコード条件（0 = 共通、他ボディの行は除外）
 
         taker_box: list = []  # 枠を取った行（_slot_taken の戻り値）。host_fallback の ChangeTotal 用にそのまま使う（Codex e21）
 
         def _select(es: list, present_: set, slot_check: bool) -> Optional[dict]:
-            for g_ in ([grp, ''] if grp else ['']):
+            for g_ in _grps(grp):
                 eg = [x for x in es if x['grp'] == g_]
                 # **この車のボディ専用行が sub_ref 付きで、その相手が見積に居ないなら、この区分は標準なし**。
                 # 下の「全候補 sub 付きならそのまま採る」救済に入れてはいけない（入れると sub=4801 の行を採って 8.1 を作る）。
@@ -1707,7 +1761,7 @@ class AddataParts:
                 # （同じ実機で 2700 取替: N1 のボディ 20 行は装備 P 付き、見積は P 無し → 共通行 1.9 が採られた）
                 if b_:
                     # 押しのける側のボディ専用行は、車両条件（グレード/装備）に合うものだけ（Codex 指摘: 不一致行で過剰/過小除外しない）
-                    _bs = [x for x in eg if x.get('body') == b_ and x['sub'] and self._flags_ok(x['grade'], grade, fva, eva, True)]
+                    _bs = [x for x in eg if _bspec(x.get('body'), b_) and x['sub'] and self._flags_ok(x['grade'], grade, fva, eva, True)]
                     if _bs and all(x['sub'] not in present_ for x in _bs):
                         continue   # 次の年式群へ（無ければ None = 標準なし）
                 eg2 = [x for x in eg if not x['sub'] or x['sub'] in present_]
@@ -1717,7 +1771,7 @@ class AddataParts:
                 if egf:  # 群・sub・フラグで有効な行の中で、**車両のボディ固有行**（D98 0800 B0: 共通 0.5 / ボディ 20 は 0.8）→ フラグの具体性 → sub 付き の順
                     # ボディ固有行はグレード/装備フラグの一致より強い（2026-09-21 実案件 638 本で確認、7 行が一致）。
                     # 実案件 J87 4300（ボディ 20）: 共通行のグレード C 一致 170 より ボディ 20 の無条件行 190 が正しい。順を入れ替える前は 1.7h（実機 1.9h）
-                    egf.sort(key=lambda x: (1 if (b_ and x.get('body') == b_) else 0, self._flags_rank2(x['grade'], grade, fva, eva), 1 if x['sub'] else 0), reverse=True)
+                    egf.sort(key=lambda x: (_brank(x.get('body'), b_), self._flags_rank2(x['grade'], grade, fva, eva), 1 if x['sub'] else 0), reverse=True)
                     if slot_check:
                         taker = self._slot_taken(ref, sc, egf[0], grade, fva, eva, grp, b_, present_)
                         if taker:
@@ -1733,6 +1787,9 @@ class AddataParts:
             pres_ = set(present) | {ref}
 
             def _ok(x: dict) -> bool:  # 選べる行だけでホストを数える（sub 無し、sub が見積に居る、または全候補 sub 付きの区分 = _select と同じ規則。Codex e23）
+                # ホストを数えるときの年式群は、以前どおり「車の群か空欄」だけ（2026-09-22）。群を下げて探すのは行を選ぶ _select 側だけにする。
+                # ここまで下げると別ホストの低い群の行やグレード違いの行まで数えて一意の判定が崩れ、_select の条件を全部写さないと
+                # 食い違う（Codex が周回ごとに別の食い違いを指摘した）。600 本でここを広げた効果は 0 行だった
                 return _match(x) and x['grp'] in ('', grp)
 
             def _rows(h: int) -> list:
@@ -1762,7 +1819,7 @@ class AddataParts:
                     if _match(x):
                         by_sec.setdefault((x['letter'], x['cyc'], x['grp']), []).append(x)
                 for grp_rows in by_sec.values():
-                    bodyrows = [x for x in grp_rows if b_ and x.get('body') == b_ and self._flags_ok(x['grade'], grade, fva, eva, True)]
+                    bodyrows = [x for x in grp_rows if _bspec(x.get('body'), b_) and self._flags_ok(x['grade'], grade, fva, eva, True)]
                     cands = bodyrows if bodyrows else grp_rows
                     es += [x for x in cands if x['sub'] == ref]
                     # ボディ専用行の sub が枝番違い（4801 ≠ 4800）で押しのけた区分。Time は -1 だが取替合計（ChangeTotal）にはこの行の指数が入る
@@ -1800,10 +1857,10 @@ class AddataParts:
         for other, rows in self._load_15_raw().items():
             if other == ref or self.block_of(other) != blk:
                 continue
-            sec_all = [x for x in rows if x['letter'] == sc[0] and x['cyc'] == sc[1:] and x.get('body', 0) in (0, b_)]
+            sec_all = [x for x in rows if x['letter'] == sc[0] and x['cyc'] == sc[1:] and x.get('body', 0) in _bset(b_)]
             if not sec_all:
                 continue
-            for cg in ([g_, ''] if g_ else ['']):  # 競合 ref も _std_pick15 と同じ順（年式群 → 共通）で「その ref が選ぶ 1 行」を決める
+            for cg in _grps(g_):  # 競合 ref も _std_pick15 と同じ順（年式群 → 共通）で「その ref が選ぶ 1 行」を決める
                 sec = [x for x in sec_all if x['grp'] == cg]
                 sec2 = [x for x in sec if not x['sub'] or x['sub'] in present]
                 sec = sec2 or (sec if sec and all(x['sub'] for x in sec) else [])
@@ -1812,7 +1869,7 @@ class AddataParts:
                     continue
                 # 枠の取り合いも通常の行選び（_std_pick15）と同じ順位に揃える（Codex 指摘 2、2026-09-21）。
                 # 実案件 638 本・699,319 回の並べ替えで選ばれる行が変わったのは 0 回（明細 36,632 行の値も不変）。揃えるのは食い違いを残さないため
-                egf.sort(key=lambda x: (1 if (b_ and x.get('body') == b_) else 0, self._flags_rank2(x['grade'], grade, fva, eva), 1 if x['sub'] else 0), reverse=True)
+                egf.sort(key=lambda x: (_brank(x.get('body'), b_), self._flags_rank2(x['grade'], grade, fva, eva), 1 if x['sub'] else 0), reverse=True)
                 pick = egf[0]
                 if (pick.get('link') or '') == link and pick.get('grade', '').strip():
                     return pick  # 競合 ref が選ぶ行が同じ枠の条件付き行 → 枠はその ref のもの
@@ -1895,7 +1952,7 @@ class AddataParts:
                     by_sec.setdefault(x['letter'] + x['cyc'], []).append((h, x))
             self._r15_by_sec = by_sec
         present = {int(p) for p, _ in members}
-        b_ = int(body) if str(body or '').strip().isdigit() else 0
+        b_ = _bparse(body, self._sbase_for(body))
         # 区分（レター+サイクル）は車種ファイル全体でほぼ一意（全 1,230 車種 22.3 万キーのうち複数 host にまたがるのは 0.8%）。
         # 行は別ブロックの host の下にも置かれる（D88 1910 カウルトップサイドパネルの Y9 は H10 ピラー 2200 の下、sub 0）ので全体から探し、同ブロック・自部品を優先する
         activ: dict[tuple, dict] = {}
@@ -1905,14 +1962,14 @@ class AddataParts:
                 continue
             for sc in re.findall(r'[A-Z]\d?', prow['secs']):
                 blk_p = self.block_of(int(p))
-                cands_all = [(h, x) for h, x in by_sec.get(sc, []) if x.get('body', 0) in (0, b_)]
+                cands_all = [(h, x) for h, x in by_sec.get(sc, []) if x.get('body', 0) in _bset(b_)]
                 # 同じ部位ブロックの host（または自部品を host/sub に持つ行）を優先し、無いときだけ全体から探す（同じ区分が別ブロックにもある 0.8% で誤選択しないため）
                 cands = [(h, x) for h, x in cands_all if (blk_p and self.block_of(h) == blk_p) or h == int(p) or x['sub'] == int(p)] or cands_all  # 12.DB ブロック不明（''）の部品は自部品の行だけを同ブロック扱いにする
                 pick = None
-                for g_ in ([grp, ''] if grp else ['']):
+                for g_ in _grps(grp):
                     eg = [(h, x) for h, x in cands if x['grp'] == g_ and self._flags_ok(x['grade'], grade, fva, eva, True)]
                     if eg:
-                        eg.sort(key=lambda hx: (self._flags_rank(hx[1]['grade'], grade, fva), 1 if (b_ and hx[1].get('body') == b_) else 0,
+                        eg.sort(key=lambda hx: (_brank(hx[1].get('body'), b_), self._flags_rank(hx[1]['grade'], grade, fva),  # ボディが先（本体 DBSEARCH の優先順位。Codex 指摘）
                                                 1 if (hx[0] == p or hx[1]['sub'] == p) else 0, 1 if (blk_p and self.block_of(hx[0]) == blk_p) else 0,
                                                 1 if hx[0] in present else 0, 1 if hx[1]['sub'] in present else 0), reverse=True)
                         pick = eg[0]
@@ -2154,6 +2211,8 @@ class NeoBuilder:
         self._sil_call = []  # この呼び出し分だけを stats に載せる（直呼びで前回分を引き継がず、2 回目の同じ失敗も落とさない。Codex 指摘）
         parts = AddataParts(self.engine, car_code)
         parts.vehicle_body = str((getattr(self, '_row_ctx', None) or {}).get('body', '') or '')  # 11.DB 変種のボディ条件（_std_row / variant）
+        parts.vehicle_sbase = str((getattr(self, '_row_ctx', None) or {}).get('sbase', '') or '')  # SBaseCode も行のボディ条件に当てはめる（本体 DBSEARCH 10001DF0）
+        parts.vehicle_lbase = str((getattr(self, '_row_ctx', None) or {}).get('lbase', '') or '')  # LBaseCode も同じ
         self._blocks17 = parts.blocks
         self._last_parts = parts
         try:  # 20.DB 塗装パネルの集合（板金行の DamageRank 既定値 'A' の判定に使う）
@@ -3842,7 +3901,7 @@ class NeoBuilder:
             if not codes:
                 raise ValueError(f"{car['CarCode']} には 29.DB（トリムコード一覧）が無い（trim_code {tc!r} は指定できない）")
             car['TrimCode'] = tc; car['TrimCodeFlag'] = 1
-        self._row_ctx = {'year': car.get('YearCode', ''), 'body': str(car.get('BodyCode', '') or ''), 'reg_ym': str(car.get('ps_CarRegDate', '') or '')[:6],
+        self._row_ctx = {'year': car.get('YearCode', ''), 'body': str(car.get('BodyCode', '') or ''), 'sbase': str(car.get('SBaseCode', '') or ''), 'lbase': str(car.get('LBaseCode', '') or ''), 'reg_ym': str(car.get('ps_CarRegDate', '') or '')[:6],
                          'serial': str(car.get('ps_CarSerialNo', '') or ''),   # 83.DB は車台番号でも期間が切られる（2026-09-21）
                          'color': car.get('ColorCode', '') if car.get('ColorCodeFlag') else '', 'grade': car.get('GradeCode', ''), 'fva': (car.get('FVACode', '') or '')[-1:],  # 4WD は 'ZA' なので照合は末尾 1 文字
                          'eva': (set(str(x) for x in ((hints or {}).get('eva_codes') or []) if x) | ({'Z'} if car.get('four_wd') else set()))

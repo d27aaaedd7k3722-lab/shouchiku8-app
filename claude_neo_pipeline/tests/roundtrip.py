@@ -106,8 +106,11 @@ def std_test(parts, rows, car, eva):
         d = int(r['DisposalCode'])
         if d not in (0, 1, 2, 3, 6):
             continue
+        ev = set(eva)
+        if str(car.get('FVACode') or '').strip().startswith('Z') and len(str(car.get('FVACode') or '').strip()) == 2:
+            ev.add('Z')   # 4WD（FVA 'ZA' など）は装備に Z を足す（生成器本体と同じ。測り方の不備で 5 行を外れと数えていた。2026-09-21）
         try:
-            std = parts.cogni_standard(int(code), d, car.get('GradeCode', ''), (car.get('FVACode', '') or '')[-1:], set(eva), car.get('YearCode', ''), present, car.get('BodyCode', ''))
+            std = parts.cogni_standard(int(code), d, car.get('GradeCode', ''), (car.get('FVACode', '') or '')[-1:], ev, car.get('YearCode', ''), present, car.get('BodyCode', ''))
         except Exception as ex:
             std = {'time': None, 'secs': 'ERR ' + str(ex)[:60]}
         t = std['time'] if std else None
@@ -181,6 +184,7 @@ def main():
         rep['vehicle'] = vehicle_test(res, car, cs, eva)
         try:
             parts = e.AddataParts(nb.engine, cc)
+            parts.vehicle_body = str(car.get('BodyCode', '') or ''); parts.vehicle_sbase = str(car.get('SBaseCode', '') or ''); parts.vehicle_lbase = str(car.get('LBaseCode', '') or '')  # 生成器と同じ条件で引く
         except Exception as ex:
             rep['parts_error'] = str(ex)[:120]; report[name] = rep; print(name, rep['vehicle'].get('ok'), 'parts ERR'); continue
         for m in modes:

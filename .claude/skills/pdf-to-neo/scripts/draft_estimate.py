@@ -616,6 +616,8 @@ class Drafter:
         if not self.generic:
             self.parts = AddataParts(self.nb.engine, self.car['CarCode'])
             self.parts.vehicle_body = str(self.car.get('BodyCode', '') or '')
+            self.parts.vehicle_sbase = str(self.car.get('SBaseCode', '') or '')  # 行のボディ条件に SBaseCode・LBaseCode も当てはめる（生成器と同じ）
+            self.parts.vehicle_lbase = str(self.car.get('LBaseCode', '') or '')
             self.raw11 = self.parts._load_11_raw()
             try:
                 self.raw83 = self.parts._load_83_raw()

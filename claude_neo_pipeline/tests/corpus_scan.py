@@ -150,6 +150,7 @@ def rt_one(item):
     out['vehicle']['has_desig'] = bool((v.get('input') or {}).get('desig'))
     try:
         parts = e.AddataParts(nb.engine, car['CarCode'])
+        parts.vehicle_body = str(car.get('BodyCode', '') or ''); parts.vehicle_sbase = str(car.get('SBaseCode', '') or ''); parts.vehicle_lbase = str(car.get('LBaseCode', '') or '')  # 生成器と同じ条件で引く
     except Exception as ex:
         out['error'] = 'parts ' + _err(ex); return out
     for m in ('a', 'b', 'c'):
