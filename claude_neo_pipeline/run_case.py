@@ -207,15 +207,11 @@ def _warn_too_many_manual(est: dict, rep: dict, st: dict) -> None:
 
 def _warn_known_unresolved(est: dict) -> list:
     """実機との差が残っていて**金額に影響する**既知の組合せ（HANDOFF §8）。該当したら ★ でコグニ実機確認へ誘導する。
-    - 4600（ロワバック系）取替 と クオータパネル（4800/4801/5000/5001）取替 が同時: W90 ハイエース（ボディ 20）で
-      4600 の指数が 4.0 → 11.7 になる連動加算を生成器が再現できていない（cogni_W90b、2026-09-12）"""
-    out = []
-    items = [it for it in (est.get('items') or []) if str(it.get('method') or '').strip() == '取替' and not it.get('manual')]
-    codes = {str(it.get('code') or '').strip().zfill(4) for it in items if str(it.get('code') or '').strip()}
-    if '4600' in codes and codes & {'4800', '4801', '5000', '5001'}:
-        out.append('4600 取替 と クオータパネル取替 が同時にある。実機（W90 ボディ 20）では 4600 の指数が連動加算で 4.0 → 11.7 になったが生成器は再現できていない（HANDOFF §8）。'
-                   'この案件はコグニ実機で 4600 の指数を確認し、違えば index を手入力（#）で書く')
-    return out
+    今は該当する組合せが無い。以前ここにあった「4600（ロワバック系）取替 と クオータパネル取替 が同時」
+    （W90 ハイエースで 4600 の指数が 4.0 → 11.7）は、2026-09-22 に本体の SearchKotin / SetConnectPartsTime
+    （区分キーで 15.DB 全体から引き、時間を host か sub に回す）を再現して実機と一致したので外した（cogni_W90b）。
+    新しく見つかった未解決の組合せはここに足す"""
+    return []
 
 
 def _warn_tax_included(pt: dict) -> None:
@@ -257,6 +253,8 @@ def main(path: str, out: str = ''):
         print(f'  ★ {_ku}')
     if st.get('labor_rate_assumed'):
         print('  ★ レバーレートが見積に無く、工賃÷指数からも決められないので 7,280 円を仮定した。estimate.json に labor_rate を書く（標準工賃・塗装工賃がこの単価で計算されている）')
+    if getattr(nb, '_std_route_note', None):
+        print(f'  ★ {nb._std_route_note}')
     for _an in getattr(nb, '_adas_notes', None) or []:
         print(f'  ★ {_an}')
     if str(v.get('confidence') or '') == 'low':

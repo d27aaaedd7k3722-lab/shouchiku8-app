@@ -1159,12 +1159,11 @@ def test_assumed_labor_rate_is_reported():
 
 
 def test_run_case_warns_known_unresolved_combination():
-    """金額に影響する既知の未解決（4600 取替 + クオータ取替の連動加算）は run_case が ★ で知らせる"""
+    """4600 取替 + クオータ取替の連動加算は 2026-09-22 に再現できた（cogni_W90b が実機と一致）ので、もう ★ を出さない"""
     import run_case
     est = {'items': [{'code': '4600', 'method': '取替'}, {'code': '4800', 'method': '取替'}]}
-    assert run_case._warn_known_unresolved(est), '4600+4800 で警告が出ない'
+    assert not run_case._warn_known_unresolved(est), '再現できた組合せなのに警告が出る'
     assert not run_case._warn_known_unresolved({'items': [{'code': '4600', 'method': '取替'}, {'code': '2700', 'method': '取替'}]})
-    assert not run_case._warn_known_unresolved({'items': [{'code': '4600', 'method': '修理'}, {'code': '4800', 'method': '取替'}]})
 
 
 def test_material_rate_default_uses_guideline_when_present():

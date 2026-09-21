@@ -1677,7 +1677,7 @@ class AddataParts:
             for bi in range((len(raw) - H) // B):
                 blk = raw[H + bi * B:H + (bi + 1) * B]; ref, sub, wi = struct.unpack_from('<HHH', blk, 0)
                 out.setdefault(ref, []).append({'letter': chr(blk[6]), 'cyc': chr(blk[7]).strip(), 'grp': chr(blk[8]).strip(), 'wi': wi, 'body': blk[9],
-                                                'grade': blk[10:17].decode('latin1').ljust(7), 'link': blk[17:19].decode('latin1').strip(), 'sub': sub})  # [9] = ボディコード条件（0 = 共通。D98 ハイゼットカーゴ BodyCode 20: 0800 取替 B0 50 → 80）
+                                                'grade': blk[10:17].decode('latin1').ljust(7), 'link': blk[17:19].decode('latin1').strip(), 'sub': sub, 'host': ref, 'fi': bi})  # [9] = ボディコード条件（0 = 共通。D98 ハイゼットカーゴ BodyCode 20: 0800 取替 B0 50 → 80）
         self._r15 = out
         return out
 
@@ -1841,6 +1841,52 @@ class AddataParts:
             # 自分の行はあるが車両条件に合わない／枠を取られた区分: ChangeTotal の標準工賃は同ブロックのホスト（別 ref）の行で（コグニ実機 2026-09-08 cogni_pair_none 0402 'DE' = 57,600 + 0400 の 0.3h、cogni_pair_U 0400 = 43,000 + 0402 の U 行 0.4h）
             pick = _select(_host_es(), present, False)
         return pick
+
+    def _kotin(self, sc: str, grade: str, fva: str, eva: set, grp: str, body) -> Optional[dict]:
+        """区分キー（英字＋数字。例 'L3'）だけで 15.DB を**車種ファイル全体から** 1 行引く。
+        コグニ本体 DBSEARCH.dll SearchKotin（10008430）の再現（2026-09-22 逆アセンブル）。
+        本体は「どの部品の下の行か」を見ずに区分キーで引き、見つけた行の host / sub で時間の置き場を決める
+        （_kotin_dest）。生成器はこれまで自分の部品（host = 自分 か sub = 自分）の行から探していたため、
+        同じ区分キーの行が別の部品の下にも居ると本体と違う行を採っていた。
+        条件: 年式群（行が空欄か、行 <= 車の群）・ボディ（行が 0 か BodyCode/LBase/SBase）・グレード・FVA/EVA。
+        順位: 年式群の大きい方 → ボディの大きい方 → フラグの具体性（_flags_rank2）→ ファイル上で先"""
+        b_ = _bparse(body, self._sbase_for(body))
+        # 車の年式群が空欄（YearCode '00'）なら 0 として扱い、群 '0' の行も通す。本体 DBSEARCH の年式判定（10001DB0）が
+        # そうしている（2026-09-22 逆アセンブル。「行の群が空欄か、車の群がそれ以上なら通す。車の群が空欄なら 0」）。
+        # 従来の _grps('') == [''] とは違うが、こちらが本体どおり（Codex 指摘は不採用）
+        car_g = grp if str(grp).isdigit() else '0'
+        key = (sc, grade, fva, frozenset(eva or ()), grp, int(b_), _bset(b_))
+        cache = self.__dict__.setdefault('_kotin_cache', {})
+        if key in cache:
+            return cache[key]
+        best = None; bk = None
+        for xs in self._load_15_raw().values():
+            for x in xs:
+                if x['letter'] != sc[0] or x['cyc'] != sc[1:]:
+                    continue
+                if x['grp'] and not (x['grp'] <= car_g):
+                    continue
+                if x.get('body', 0) not in _bset(b_) or not self._flags_ok(x['grade'], grade, fva, eva, True):
+                    continue
+                k = (x['grp'] or ' ', x.get('body', 0), self._flags_rank2(x['grade'], grade, fva, eva), -x['fi'])
+                if bk is None or k > bk:
+                    best, bk = x, k
+        cache[key] = best
+        return best
+
+    @staticmethod
+    def _kotin_dest(gp: dict, ref: int, dvalid: set) -> Optional[int]:
+        """_kotin の行の時間を入れる明細（部品コード）。コグニ本体 AnLstBLMng SetConnectPartsTime（0040FE88）:
+        host が見積に居れば host、居なければ sub（sub も居なければ None = この区分はどこにも入らない）。
+        dvalid = 時間を受け取れる明細（取替・脱着・分解調整で、指数を手入力していない行）。自分（ref）は常に受け取れる。
+        実案件 600 本: host が手入力（'#'/'*'）の行だと時間は sub（自分）に残る（D98・D18 6337 は host 6336 が '#' で Time 0.4。
+        W21/W85 7600・7900 も host 6750 が手入力で時間が残る）。host が標準の行なら時間は host へ行き自分は Time -1"""
+        h_, s_ = gp['host'], gp['sub']
+        if h_ == ref or h_ in dvalid:
+            return h_
+        if s_ and (s_ == ref or s_ in dvalid):
+            return s_
+        return None
 
     def _slot_taken(self, ref: int, sc: str, own: dict, grade: str, fva: str, eva: set, g_: str, b_: int, present: set) -> Optional[dict]:  # g_ = 車両の年式群（grp）。戻り値 = 枠を取った行（無ければ None）
         """15.DB の枠の取り合い（コグニ実機 2026-09-08 J87、cogni_pair_U.neo / cogni_TU.neo）: 自分の行が無条件（グレード/EVA フラグ空・共通ボディ 0）で、
@@ -2011,10 +2057,14 @@ class AddataParts:
 
     FRAME_BLOCKS = ('A25', 'A35', 'P05', 'X20', 'X30')  # 骨格系ブロックの部品自身には連動加算を行わない（組合せ規則が別）。相手側が骨格でも加算はする（D88 ピラー 2200 = A1 + A25 相手の Y9 がコグニ実値）
 
-    def cogni_standard(self, ref: int, dcode: int, grade: str, fva: str, eva: set, year: str, present_rows, body: str = '') -> Optional[dict]:
+    def cogni_standard(self, ref: int, dcode: int, grade: str, fva: str, eva: set, year: str, present_rows, body: str = '', manual_rows=None) -> Optional[dict]:
         """コグニが車両条件から選ぶ標準指数。present_rows = 見積中の (ref, DisposalCode) 一覧（連動加算に使う）
         単一部品 58/75 ＋ 連動加算（相手部品の区分がこの ref の 15.DB にある: バンパビーム C・ドアロワガーニッシュ E1 ／ sub 付き区分でリンク記号の系列と偶奇が同じ: 両側 H）で 67/75
-        戻り値 {'time', 'secs', 'prov', 'pn'} または None"""
+        戻り値 {'time', 'secs', 'prov', 'pn'} または None
+        manual_rows = 指数を手入力した明細の (部品コード, 修理方法) の集合。時間を受け取る host にならない（_kotin_dest）。
+        時間を別の明細へ回した区分があるとき、戻り値に 'moved'（[(区分, 回した先の部品コード, wi)]）、
+        'time_all'（回した分も含む指数 = 手入力行の TimeStandard）、'time_self'（この行に残る時間）を付ける。
+        'time' は回した分を除いた表示指数（標準の行の TimeStandard）で、0 なら 'absorbed'"""
         present_rows = list(present_rows or []); present = set(p[0] for p in present_rows)
         present_same = set(p[0] for p in present_rows if p[1] == dcode)  # 同じ修理方法で見積に居る相手（sub_ref 付き区分・両側加算の判定用）
         grp = str(year).strip()[-1] if str(year).strip().isdigit() and int(year) else ''  # 年式群 = YearCode の下 1 桁（'01' → '1'、'10' → '0'。'00' は群なし）
@@ -2037,8 +2087,19 @@ class AddataParts:
         secs_list = re.findall(r'[A-Z]\d?', row['secs'])
         own_secs = _own_secs(ref)
         tot = 0; used: list[str] = []; used_hidden: list[str] = []; own_picks: list = []; foreign = 0; resolved = False
+        _man = set((int(p_), int(d_)) for p_, d_ in (manual_rows or ()))
+        _dvalid = {int(p_) for p_, d_ in present_rows if int(d_) in (0, 1, 5) and (int(p_), int(d_)) not in _man}  # 時間を受け取れる明細（_kotin_dest）
         for sc in secs_list:
             if sc in own_secs:
+                # 本体どおり区分キーで車種全体から 1 行を引き、その行の host / sub のうち見積に居る明細へ時間を入れる。
+                # 自分が受け取る区分はこの行の指数、別の明細へ回す区分は '_to_other' を付けて表示指数の書き分けに回す。
+                # どこにも入らない（host も sub も見積に居ない）ときは従来の探し方に任せる
+                gp = self._kotin(sc, grade, fva, eva, grp, body)
+                dest = self._kotin_dest(gp, ref, _dvalid) if gp else None
+                if dest is not None:
+                    g2 = dict(gp); g2['_to_other'] = dest != ref; g2['_dest'] = dest
+                    tot += gp['wi']; used.append(sc); own_picks.append((sc, g2)); resolved = True
+                    continue
                 pick = self._std_pick15(ref, sc, grade, fva, eva, grp, present_same, body, False)
                 if pick:
                     tot += pick['wi']; used.append(sc); own_picks.append((sc, pick)); resolved = True
@@ -2093,6 +2154,14 @@ class AddataParts:
                     if sc in p_own or sc in secs_list or sc in used or sc in used_hidden or sc in act:
                         continue  # 自分の 11.DB 区分（吸収で used から外れた区分も含む）は WorkCode に重複させない（Codex e22）。act = R2 で足した共有行も含む（二重加算の防止）
                     pick = self._std_pick15(ref, sc, grade, fva, eva, grp, present_same | {pref}, body)  # 連動相手は修理方法によらず sub 判定で「居る」扱い（Codex e20）
+                    gp = self._kotin(sc, grade, fva, eva, grp, body)
+                    if gp:  # 本体どおり区分キーで引いた行の時間が自分に入るときだけ（host = 自分、または host 不在で sub = 自分）
+                        _d_ = self._kotin_dest(gp, ref, _dvalid)
+                        if _d_ == ref:
+                            pick = gp
+                        elif _d_ is not None:
+                            pick = None   # 別の明細が受け取る
+                        # _d_ が None（host も sub も受け取れない）なら従来の選び方の結果（pick）を残す（Codex 指摘）
                     if pick and sc in own_secs:
                         tot += pick['wi']; used_hidden.append(sc); act[sc] = pick  # 連動加算は WorkCode に出ない（実機 2026-09-08 H15: 2300 取替 + 2344 取替 → 'E1'、H16: 0010 取替 + 0020 取替 → 'B'。以前の 'BC' 説は撤回）
         if self.block_of(ref) not in self.FRAME_BLOCKS and act:
@@ -2129,6 +2198,20 @@ class AddataParts:
         secs_out = row['secs']  # WorkCode は 11.DB の区分文字列そのまま（自分の 15.DB に無い区分も出る: 実機 H5 'TN1'、H6 'C'、工場 NEO 'T3V3'）
         if not act:
             return {'time': 0.0, 'base': base / 100.0, 'secs': secs_out, 'prov': row['prov'], 'pn': row['pn'], 'absorbed': True}  # 表示指数なし（相手に吸収 / 区分が他部品の下 / 枠を取られた）。WorkCode は残る
+        moved = [(sc_, pk_['_dest'], pk_['wi']) for sc_, pk_ in act.items() if pk_.get('_to_other')]
+        if moved:
+            # 区分の時間を別の明細（host / sub）へ回した行。本体は時間を回した先に足し、この行の Time から外す。
+            # 標準の行の表示指数（TimeStandard）にも入れない（実案件 600 本の標準の行 372 行中 345 行が TimeStandard 0 / Time -1）。
+            # 例外は入力順で、回した先が**後から**入力された行は入れた時点の表示指数が残る（RecordNo で見て 27 行: U62・J97 4800 取替は 4600 が後）。
+            # ただし見積書（印刷の並び = LineNo）からは入力順が分からず（LineNo で「先が後」の 4 行は 2 行ずつ）、
+            # 実機実験 pair_U（0400 → 0402 の順に入力）でも 0400 は TimeStandard 0 なので、生成器は常に外す。
+            # 手入力の行（'#'/'*'）は表示指数を残す（実機 CXF 0454 '#': 0404 に K9 を回しても TimeStandard 0.7）。build 側で time_all を使う
+            self_t = tot - sum(wi_ for _sc, _d, wi_ in moved)
+            out = {'time': self_t / 100.0, 'base': base / 100.0, 'secs': secs_out, 'prov': row['prov'], 'pn': row['pn'],
+                   'time_all': tot / 100.0, 'time_self': self_t / 100.0, 'moved': moved}
+            if self_t == 0:
+                out['absorbed'] = True  # 従来の吸収行と同じ書き方（TimeStandard 0 / Time -1、WorkCode・BlockCode は残す）
+            return out
         return {'time': tot / 100.0, 'base': base / 100.0, 'secs': secs_out, 'prov': row['prov'], 'pn': row['pn']}
 
 
@@ -3910,6 +3993,8 @@ class NeoBuilder:
                          'eva': (set(str(x) for x in ((hints or {}).get('eva_codes') or []) if x) | ({'Z'} if car.get('four_wd') else set()))
                                 - set(str(x).strip() for x in ((hints or {}).get('eva_exclude') or []) if str(x).strip())}  # 色別部品の装備条件は build 前に分かる EVA（hints と 4WD の 'Z'）で判定。**eva_exclude はここにも効かせる** —— 行生成（11/13/83.DB の変種選択）に使うので、最終 CarEVA だけ直しても品番・価格がずれる（Codex 指摘 2026-09-12）
         self._tax_round = estimate.get('tax_round')  # 消費税の計算単位（Setting.tx_ArrangeFlag と消費税額。write_ansvif / write_ansvem が参照）
+        self._man_rows_std = None   # 標準指数の手入力行の集合（汎用車種の build や前の build の値を持ち越さない。Codex 指摘）
+        self._std_route_note = None  # 標準指数の時間の置き場が本体とずれている可能性（run_case が ★ で出す）
         self._tax_included = bool(estimate.get('tax_included'))  # 見積書が税込で印字されている（Setting.TaxKindFlag = 内税。コグニの「消費税設定」の表示方法）
         rows, stats = self.build_rows(estimate['items'], car['CarCode'], labor_rate, index_policy=(estimate.get('index_policy') or 'auto'))
         try:  # 「重複部品コードチェック」（12.DB のレベル欄）: コグニで開くとダイアログが出る組合せを警告する（行は変えない）
@@ -3947,9 +4032,16 @@ class NeoBuilder:
         # コグニの標準指数（11.DB × 15.DB の選択規則）: 工賃も指数も無い取替/脱着行は標準で埋め、標準どおりの行は WorkCode/暫定 '$' を揃える
         if not car.get('_generic'):
             ap_std = getattr(self, '_parts_for_std', None)
+            self._man_rows_std = None   # 前の build の値を持ち越さない
             if ap_std is not None:
                 present = [(int(r['PartsCode']), int(r['DisposalCode'])) for r in rows if r.get('PartsCode') and not r.get('_reserve')]
                 rate_ = int(stats.get('labor_rate') or labor_rate or 0)
+
+                def _will_be_manual(r):   # 下のループで「工賃未指定・指数だけ」→ '#' になる行も手入力として数える（Codex 指摘）
+                    return (not r.get('_wage_given') and float(r.get('Time') or -1) > 0 and (r.get('WageOutTax', -1) or -1) < 0 and rate_)
+                _man_rows = {(int(r['PartsCode']), int(r['DisposalCode'])) for r in rows if r.get('PartsCode') and not r.get('_reserve')
+                             and (r.get('WageByManual') in ('#', '*') or _will_be_manual(r))}  # 指数を手入力した行（時間を受け取る host にならない）
+                self._man_rows_std = _man_rows
                 for r_ in rows:
                     if r_.get('_reserve'):
                         continue
@@ -3960,7 +4052,12 @@ class NeoBuilder:
                         r_['ChangeTotalOutTax'] = (ps_ if ps_ > 0 else 0) or -1  # 手入力指数行の取替合計 = 標準部品代のみ（標準工賃 0。コグニ生成 NEO の板金 '#' 行と同形）
                     if not r_.get('PartsCode') or int(r_['DisposalCode']) == 4:
                         continue  # 点検調整(4) は 11.DB に修理方法トークンが無く標準指数を持たない（実機確認）。分解調整(5) は 'C' 変種行がある部品だけ cogni_standard が値を返す
-                    std = ap_std.cogni_standard(int(r_['PartsCode']), int(r_['DisposalCode']), car.get('GradeCode', ''), (car.get('FVACode', '') or '')[-1:], set(eva), car.get('YearCode', ''), present, car.get('BodyCode', ''))
+                    std = ap_std.cogni_standard(int(r_['PartsCode']), int(r_['DisposalCode']), car.get('GradeCode', ''), (car.get('FVACode', '') or '')[-1:], set(eva), car.get('YearCode', ''), present, car.get('BodyCode', ''),
+                                                manual_rows=_man_rows)
+                    if std and std.get('moved') and (r_.get('WageByManual') in ('#', '*') or (int(r_['PartsCode']), int(r_['DisposalCode'])) in _man_rows):  # ループで「指数だけ → '#'」になる見込みの行も手入力として扱う
+                        # 区分の時間を別の明細へ回した手入力行: 表示指数は回した分も残す（実機 CXF 0454 '#': TimeStandard 0.7 / BlockCode A05 / WageFileTime '0.7'）
+                        std = {k_: v_ for k_, v_ in std.items() if k_ != 'absorbed'}
+                        std['time'] = std['time_all']
                     r_['_cogni_std'] = std
                     # 部位コード: 12.DB の基本版（行番号の百の位 0）に無い部品で、車両条件の標準も引けない行はコグニが空にする
                     # （実機 2026-09-08 cogni_K1/K2/K3 と pair_P/Q/U/none: J87 0140 フォグライト = 版 1/2 のみ → 常に空。0402 ヘッドライトユニットも版 1/2 のみで、装備 U で表示指数 0.4 を持つときだけ A05。相手に吸収されて指数が無いときは空）
@@ -4033,7 +4130,8 @@ class NeoBuilder:
                         r_.update({'Time': std['time'], 'TimeStandard': std['time'], 'WageStandardOutTax': int(r_['WageOutTax']), 'WageByManual': '', 'WorkCode': std['secs'].ljust(10)[:10], 'WageFileTime': f"{std['time']:g}"})
                         ps_ = int(r_.get('PartsPriceStandardOutTax') or 0)
                         r_['ChangeTotalOutTax'] = (ps_ if ps_ > 0 else 0) + r10_even(std['base'] * rate_)
-                    elif r_.get('WageByManual') == '#' and (estimate.get('index_policy') or 'auto') != 'manual' and r_.get('Time', -1) > 0 and abs(float(r_['Time']) - std['time']) < 0.01 and rate_:
+                    elif r_.get('WageByManual') == '#' and (estimate.get('index_policy') or 'auto') != 'manual' and r_.get('Time', -1) > 0 and abs(float(r_['Time']) - std['time']) < 0.01 and rate_ \
+                            and not std.get('moved'):   # 時間を別の明細へ回した手入力行は標準に戻さない（std['time'] は表示用の time_all で、この行の標準ではない。Codex 指摘）
                         # 合算標準（'FG' 等）は 15.DB の個別 wi に無いので前段で '#' になる。見積の指数が合算標準と一致するなら標準扱いに戻す
                         ws_ = r10_even(std['time'] * rate_)
                         _is_std = int(r_.get('WageOutTax') or 0) == ws_
@@ -4044,6 +4142,17 @@ class NeoBuilder:
                         # index_policy manual で見積の指数が標準と一致する '#' 行: 手入力指数のまま標準欄には標準値（コグニの '#' 行と同じ。分解調整 7600 'I7O7' 3.0h = 04011103。監査 42）
                         ws_ = r10_even(std['time'] * rate_)
                         r_.update({'TimeStandard': std['time'], 'WageStandardOutTax': ws_, 'WorkCode': std['secs'].ljust(10)[:10], 'WageFileTime': f"{std['time']:g}"})
+                # 手入力の行（時間の受け取り先にならない）の一部は、このループの中で決まる（見積の指数が組合せ標準と違えば '#'）。
+                # 最終の集合がループ前の見込みと違ったら、時間の置き場（_kotin_dest）が本体とずれている可能性があるので知らせる。
+                # 最終の集合でやり直す 2 回回しも試したが、やり直しで手入力の印が戻る・揺れるなど別の食い違いが周回ごとに出たので、
+                # 知らせるだけにした（2026-09-22。Codex 5〜7 周目）
+                _final_man = {(int(r['PartsCode']), int(r['DisposalCode'])) for r in rows
+                              if r.get('PartsCode') and not r.get('_reserve') and r.get('WageByManual') in ('#', '*')}
+                self._man_rows_std = _man_rows   # ChangeTotal の再計算は標準指数と同じ集合で（行ごとの時間の置き場と食い違わせない）
+                _moved_rows = {(int(r['PartsCode']), int(r['DisposalCode'])) for r in rows if r.get('PartsCode') and (r.get('_cogni_std') or {}).get('moved')}
+                if _final_man != _man_rows and _moved_rows:
+                    self._std_route_note = ('標準指数: 区分の時間を別の明細へ回した行があり、手入力の行の判定が計算の途中で変わった'
+                                            f'（{sorted(_final_man ^ _man_rows)}）。時間の置き場がコグニと違う可能性がある。コグニで該当行の指数を確かめる')
         for r_ in rows:  # 板金(6)/修理(2) 行の WorkCode は標準化パスの後でも空欄（Codex e32: 標準が引けて指数一致の行で復活しないように）
             if not r_.get('_reserve') and int(r_.get('DisposalCode') or 0) in (2, 6):
                 r_['WorkCode'] = ' ' * 10
@@ -4133,7 +4242,8 @@ class NeoBuilder:
                     continue
                 ps_ = int(r_.get('PartsPriceStandardOutTax') or 0)
                 try:
-                    stdK = ap_ct.cogni_standard(int(r_['PartsCode']), 0, car.get('GradeCode', ''), (car.get('FVACode', '') or '')[-1:], set(eva), car.get('YearCode', ''), present, car.get('BodyCode', ''))
+                    stdK = ap_ct.cogni_standard(int(r_['PartsCode']), 0, car.get('GradeCode', ''), (car.get('FVACode', '') or '')[-1:], set(eva), car.get('YearCode', ''), present, car.get('BodyCode', ''),
+                                                manual_rows=getattr(self, '_man_rows_std', None))  # 標準指数の計算と同じ手入力行の集合（Codex 指摘）
                 except Exception:
                     stdK = None
                 wk = r10_even(stdK['base'] * rate_) if (stdK and rate_) else 0
