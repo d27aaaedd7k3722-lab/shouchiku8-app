@@ -1365,7 +1365,26 @@ class AddataParts:
                         continue
                     t = dec[6:].decode('cp932', 'replace')
                     fl = t[0:7]; name20 = t[7:27]; name = name20.strip(); pn = t[27:44].strip(); price = t[44:50].strip(); cg = t[50:52]; color = t[53:64].strip()  # フラグ 7、名称 20（[0] L/R/' ' [1] F/R/' '）、品番 17、価格 6、ConstructGroup 2、' '、カラーコード 11（以降は未使用領域なので固定幅で切る）
-                    frm = to = note = ''; bad_period = False
+                    frm = to = note = ''; bad_period = False; s_frm = s_to = ''
+                    if src == '83':
+                        # 83.DB も 13.DB と同じ「適用開始 / 終了 / 備考」を持つ（2026-09-21 に判明。幅は 12 バイト）。
+                        # 開始・終了は **YYYYMM か車台番号**（`FD3-1100001`）。備考は色名・仕様（`ｸﾞﾚ-ｼﾞﾕ`・`QPﾗｲﾄﾜ-ﾑｸﾞﾚ-`）。
+                        # 全 188 車種 92,715 ブロックのうち レンジ付き 19,815（車台番号 11,362 / 年月 8,453）・備考付き 15,654。
+                        # 同じ (部品, 色, フラグ) で品番が割れる 13,881 組のうち **10,265 組がこの 2 欄で決まる**
+                        _f, _t2, note = t[71:83].strip(), t[83:95].strip(), t[95:141].strip()
+                        for v, dst in ((_f, 'f'), (_t2, 't')):
+                            if v.isdigit() and len(v) == 6:
+                                if dst == 'f':
+                                    frm = v
+                                else:
+                                    to = v
+                            elif v:
+                                if dst == 'f':
+                                    s_frm = v
+                                else:
+                                    s_to = v
+                        if (frm and not 1 <= int(frm[4:6]) <= 12) or (to and not 1 <= int(to[4:6]) <= 12) or (frm and to and frm > to):
+                            frm = to = ''; bad_period = True
                     if src == '13':
                         frm, to, note = t[71:77].strip(), t[77:83].strip(), t[83:].strip()
                         for v in (frm, to):
@@ -1377,7 +1396,8 @@ class AddataParts:
                     if price and not price.isdigit():  # 空欄（価格未設定）は 0、非空の不正値だけ例外
                         raise ValueError(f'{src}.DB ブロック {k}: 価格欄が数値でない {price!r}')
                     out.setdefault(ref, []).append({'flags': fl, 'name': name, 'name20': name20, 'pn': pn, 'price': int(price) if price else 0, 'cgroup': cg, 'color': color,
-                                                    'src': src, 'from': frm, 'to': to, 'note': note, 'period_invalid': bad_period})
+                                                    'src': src, 'from': frm, 'to': to, 'note': note, 'period_invalid': bad_period,
+                                                    'serial_from': s_frm, 'serial_to': s_to})
             except ValueError:
                 raise
             except Exception as ex:
@@ -1417,7 +1437,7 @@ class AddataParts:
         rows.sort(key=lambda r: 1 if (b_ and int(r.get('body') or 0) == b_) else 0, reverse=True)
         return int(rows[0].get('color_flag') or 0) & 1
 
-    def colored_part(self, ref: int, color: str, grade: str, fva: str, eva: set, std_pn: str = '', reg_ym: str = '') -> Optional[dict]:
+    def colored_part(self, ref: int, color: str, grade: str, fva: str, eva: set, std_pn: str = '', reg_ym: str = '', serial_no: str = '') -> Optional[dict]:
         """色別・期間別部品（83.DB / 13.DB）。フラグ（グレード/FVA/EVA 文字）が車両条件に合う行を優先、無条件行を次点。
         規則（コグニ実機 COLOR_D98.neo 2026-09-06 夜 と工場 NEO 6 件の突合せ tests/test_color13.py）:
           1. 車両カラーの行。無ければ色なし行（生産期間・仕様違いの品番: W66 4525 69350-52391/52401、W64 2450 87940-B1B60/B1502）
@@ -1447,11 +1467,43 @@ class AddataParts:
             cands = plain
         else:
             return None  # 条件付き行が車両条件に合わず無条件行も無ければ色別部品は使わない（11.DB 側へフォールバック）
+        if len(cands) > 1 and any(r.get('serial_from') or r.get('serial_to') for r in cands) and serial_no:
+            # 83.DB は**車台番号**でも期間が切られる（`FD3-1100001` 〜 `FD3-1103130`。全 188 車種で 11,362 ブロック）。
+            # 同じ接頭辞・同じ桁数なら文字列の大小で比べられる（2026-09-21）
+            sn = self._norm_serial(serial_no)
+            inside = [r for r in cands
+                      if self._serial_in(sn, r.get('serial_from', ''), r.get('serial_to', ''))]
+            if len(inside) == 1:
+                return inside[0]
+            if inside:
+                cands = inside
         if len(cands) > 1 and any(r.get('from') or r.get('to') for r in cands):
             ym = str(reg_ym or '').strip()
             inside = [r for r in cands if not r.get('period_invalid') and (not r.get('from') or r['from'] <= ym) and (not r.get('to') or ym <= r['to'])] if (ym.isdigit() and len(ym) == 6) else []  # 期間不明の行は初度登録で絞る候補にしない
             cands = inside if len(inside) == 1 else cands[:1]  # 初度登録で 1 行に絞れればそれ、無理ならダイアログ既定の先頭行
         return cands[0]
+
+    @staticmethod
+    def _norm_serial(s: str) -> str:
+        """車台番号を比べられる形にする（大文字・前後の空白を落とす）"""
+        return unicodedata.normalize('NFKC', str(s or '')).strip().upper()
+
+    @classmethod
+    def _serial_in(cls, sn: str, frm: str, to: str) -> bool:
+        """車台番号 sn が [frm, to] の範囲に入るか。接頭辞（`FD3-`）が違う行は当てない。
+        片側だけの行（`FD3-1103131` 〜 空）は「それ以降」の意味"""
+        if not sn:
+            return False
+        for v in (frm, to):
+            v = cls._norm_serial(v)
+            if v and not (sn.split('-')[0] == v.split('-')[0]):
+                return False   # 型式の部分が違う = この行の範囲は判定できない
+        f, t = cls._norm_serial(frm), cls._norm_serial(to)
+        if f and sn < f:
+            return False
+        if t and sn > t:
+            return False
+        return bool(f or t)
 
     def colored_part_by_pn(self, ref: int, pn_norm: str, grade: str, fva: str, eva: set) -> Optional[dict]:
         """品番で 83.DB を引く（カラー未確定時）。同じ品番が条件違いで複数あれば colored_part と同じ条件フィルタ・具体度順位"""
@@ -2091,7 +2143,7 @@ class NeoBuilder:
                     if std_pn and parts.variant_color_flag(ref, std_pn, ctx.get('body'), ctx):  # 初度登録年月（reg_ym）で 13.DB の生産期間を絞る
                         # 品番が無い／83.DB に無い品番のときは車両のカラーコードに合う色別品番（コグニの部品検索と同じ）
                         # カラー未設定の車両でも色なし（期間・仕様別）行は対象（コグニの「複数部品選択」はカラーに依らず出る）。色付き行は colored_part 側でカラー一致のときだけ使う
-                        cp = parts.colored_part(ref, ctx.get('color', '') or '', ctx.get('grade', ''), ctx.get('fva', ''), set(ctx.get('eva') or ()), std_pn, ctx.get('reg_ym', ''))
+                        cp = parts.colored_part(ref, ctx.get('color', '') or '', ctx.get('grade', ''), ctx.get('fva', ''), set(ctx.get('eva') or ()), std_pn, ctx.get('reg_ym', ''), ctx.get('serial', ''))
                         if cp and pn_in:
                             w['why'] = (w.get('why') or '') + f" 色別品番 {cp['pn']}（見積 {it.get('parts_no')} は {cp.get('src', '83')}.DB に無い）"
                 if cp:
@@ -3597,7 +3649,9 @@ class NeoBuilder:
             if not codes:
                 raise ValueError(f"{car['CarCode']} には 29.DB（トリムコード一覧）が無い（trim_code {tc!r} は指定できない）")
             car['TrimCode'] = tc; car['TrimCodeFlag'] = 1
-        self._row_ctx = {'year': car.get('YearCode', ''), 'body': str(car.get('BodyCode', '') or ''), 'reg_ym': str(car.get('ps_CarRegDate', '') or '')[:6], 'color': car.get('ColorCode', '') if car.get('ColorCodeFlag') else '', 'grade': car.get('GradeCode', ''), 'fva': (car.get('FVACode', '') or '')[-1:],  # 4WD は 'ZA' なので照合は末尾 1 文字
+        self._row_ctx = {'year': car.get('YearCode', ''), 'body': str(car.get('BodyCode', '') or ''), 'reg_ym': str(car.get('ps_CarRegDate', '') or '')[:6],
+                         'serial': str(car.get('ps_CarSerialNo', '') or ''),   # 83.DB は車台番号でも期間が切られる（2026-09-21）
+                         'color': car.get('ColorCode', '') if car.get('ColorCodeFlag') else '', 'grade': car.get('GradeCode', ''), 'fva': (car.get('FVACode', '') or '')[-1:],  # 4WD は 'ZA' なので照合は末尾 1 文字
                          'eva': (set(str(x) for x in ((hints or {}).get('eva_codes') or []) if x) | ({'Z'} if car.get('four_wd') else set()))
                                 - set(str(x).strip() for x in ((hints or {}).get('eva_exclude') or []) if str(x).strip())}  # 色別部品の装備条件は build 前に分かる EVA（hints と 4WD の 'Z'）で判定。**eva_exclude はここにも効かせる** —— 行生成（11/13/83.DB の変種選択）に使うので、最終 CarEVA だけ直しても品番・価格がずれる（Codex 指摘 2026-09-12）
         self._tax_round = estimate.get('tax_round')  # 消費税の計算単位（Setting.tx_ArrangeFlag と消費税額。write_ansvif / write_ansvem が参照）
