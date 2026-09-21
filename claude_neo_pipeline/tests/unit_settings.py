@@ -92,6 +92,18 @@ def main() -> int:
     check(st2['TaxKindFlag'] == 1, f"税込印字は内税 {st2['TaxKindFlag']}")
     check(tot2['Total'] == tot['Total'] and rows2['5600']['WageOutTax'] == rows['5600']['WageOutTax'],
           f"表示方法だけの違いで金額は変わらない {tot2['Total']} / {tot['Total']}")
+    # 内税の合計は本体どおり「各行の税込の合計 ΣIn から税を逆算」（2026-09-21。AnTsmBL GetInTaxEx。実案件の内税 81 本で全一致）:
+    #   tx_TotalOutTax = 四捨五入(ΣIn / 11)、tx_TotalInTax = ΣIn − SubTotal、Total = ΣIn ＋ 非課税
+    # 245 円の行を 2 つ入れると、各行の税 25 + 25 = 50 と、税抜の合計 490 の 10% = 49 が 1 円ずれる
+    extra = [{'name': '雑費', 'method': '', 'qty': 1, 'price': 245, 'manual': True}, {'name': '雑品', 'method': '', 'qty': 1, 'price': 245, 'manual': True}]
+    rows, st, tot, rep = build(F2 + extra)
+    rows2, st2, tot2, rep2 = build(F2 + extra, tax_included=10)
+    sum_in = sum(tot2[k] for k in ('ms_PartsTotalInTax', 'ms_WageTotalInTax', 'pn_TotalInTax', 'nk_TotalInTax', 'hy_PartsTaxTotalInTax', 'hy_WageTaxTotalInTax'))
+    check(st2['TaxKindFlag'] == 1 and tot2['SubTotal'] == tot['SubTotal'], f"内税の SubTotal {tot2['SubTotal']} / {tot['SubTotal']}")
+    check(tot2['Total'] == sum_in, f"内税の Total {tot2['Total']} は各行の税込の合計 {sum_in} のはず")
+    check(tot2['tx_TotalOutTax'] == (sum_in * 100 + 561) // 1100, f"内税の税 {tot2['tx_TotalOutTax']} は ΣIn/11 の四捨五入 {(sum_in * 100 + 561) // 1100} のはず")
+    check(tot2['tx_TotalInTax'] == sum_in - tot2['SubTotal'], f"内税の tx_TotalInTax {tot2['tx_TotalInTax']} は ΣIn − SubTotal {sum_in - tot2['SubTotal']} のはず")
+    check(tot2['Total'] == tot['Total'] + 1, f"245 円 × 2 行の丸めぶん内税の Total が外税より 1 円多い（{tot2['Total']} / {tot['Total']}）")
     # 名称欄のカタカナは半角（亮平さん指示 2026-09-17。実案件 NEO 400 本: 明細 19,454 行中 19,280 行・
     # 外板パネル 851 行中 849 行・追加塗装 2,915 行中 2,864 行が半角）。estimate に全角で書かれていても生成器が直す
     import re as _re

@@ -3470,6 +3470,24 @@ class NeoBuilder:
         else:
             tx = int(math.floor(sub * TAX + 0.5))  # 税率が 10% 以外のときの経路。round() は偶数丸め（125 → 12）なので使わない
         def t3(v): i, t = tax_of(v); return (v, i, t)
+        tx_in = tx
+        total_all = sub + tx + hy_parts_nt + hy_wage_nt
+        if getattr(self, '_tax_included', False):
+            # 内税（Setting.TaxKindFlag=1）は本体が別の経路で合計する（AnTsmBL GetSubTotal 406B40 / GetTotal 408C04 / GetInTaxEx 4071E4。
+            # 2026-09-21 に逆アセンブルで確定し、実案件の内税 NEO 81 本すべてで SubTotal・税の 2 列・Total が一致。外税の式では 23 本が合わない）:
+            #   ΣIn = 各行の税込額（*InTax の列）を外税と同じ組合せで足したもの。税は ΣIn から逆算する
+            #   tx_TotalOutTax = 丸め(ΣIn × 率 / (100 + 率))、tx_TotalInTax = ΣIn − SubTotal、Total = ΣIn + 非課税
+            # 外税の式（税抜の合計 × 10%）を内税に使うと、各行の税の丸めの積み重ねぶん Total が数円ずれる
+            def _in(v):
+                return (tax_of(abs(int(v)))[0] if v else 0) * (1 if v >= 0 else -1)
+            sum_in = (parts_total + parts_tax_sum) + (wage_total + wage_tax_sum) + _in(paint_total) + _in(nk_total) + _in(hy_parts) + _in(hy_wage) + _in(pt_x) + _in(wg_x)
+            if abs(TAX - 0.1) < 1e-9:
+                tx = sum_in // 11 if _tr == '切り捨て' else (-((-sum_in) // 11) if _tr == '切り上げ' else (sum_in * 100 + 561) // 1100)  # 四捨五入は本体どおり +0.51（端数 k/11 は 0.49〜0.5 の間に来ないので +0.5 と同じ）
+            else:
+                x = sum_in * TAX / (1 + TAX)
+                tx = int(math.floor(x + 1e-9)) if _tr == '切り捨て' else (int(math.ceil(x - 1e-9)) if _tr == '切り上げ' else int(math.floor(x + 0.51)))
+            tx_in = sum_in - sub
+            total_all = sum_in + hy_parts_nt + hy_wage_nt
         cur.execute('UPDATE Total SET ms_RecyclePartsTotalOutTax=?,ms_RecyclePartsTotalInTax=?,ms_RecyclePartsTotalTax=?, nk_TotalOutTax=?,nk_TotalInTax=?,nk_TotalTax=?, '
                     'hy_PartsNoTaxTotalOutTax=?,hy_PartsNoTaxTotalInTax=?,hy_PartsNoTaxTotalTax=0, hy_WageNoTaxTotalOutTax=?,hy_WageNoTaxTotalInTax=?,hy_WageNoTaxTotalTax=0',
                     (*t3i(rc_total), *t3i(nk_total), hy_parts_nt, hy_parts_nt, hy_wage_nt, hy_wage_nt))
@@ -3479,11 +3497,11 @@ class NeoBuilder:
                     'hy_PartsTaxTotalOutTax=?,hy_PartsTaxTotalInTax=?,hy_PartsTaxTotalTax=?, hy_WageTaxTotalOutTax=?,hy_WageTaxTotalInTax=?,hy_WageTaxTotalTax=?,'
                     'tx_TotalOutTax=?, tx_TotalInTax=?, SubTotal=?, Total=?',
                     (parts_total, parts_total + parts_tax_sum, parts_tax_sum, wage_total, wage_total + wage_tax_sum, wage_tax_sum,
-                     *t3(paint_total), *t3(paint_material), *t3(hy_parts), *t3(hy_wage), tx, tx, sub, sub + tx + hy_parts_nt + hy_wage_nt))
+                     *t3(paint_total), *t3(paint_material), *t3(hy_parts), *t3(hy_wage), tx, tx_in, sub, total_all))
         totals = {'parts': parts_total, 'wage': wage_total, 'paint': paint_total, 'paint_material': paint_material,
                   'paint_other': int(add_other_w),  # 追加項目（塗装の追加塗装工賃）。印字の塗装工賃計には入らないので検算で引く
                   'frame': nk_total, 'recycle': rc_total,
-                  'expense_parts': hy_parts + hy_parts_nt, 'expense_wage': hy_wage + hy_wage_nt, 'discount': pt_x + wg_x, 'subtotal': sub, 'tax': tx, 'total': sub + tx + hy_parts_nt + hy_wage_nt}
+                  'expense_parts': hy_parts + hy_parts_nt, 'expense_wage': hy_wage + hy_wage_nt, 'discount': pt_x + wg_x, 'subtotal': sub, 'tax': tx, 'total': total_all}
         # AnNote.ini の [Reserve] / [Comment] Flag は、書き終わった ERParts から数える
         # （リサイクル置換行は CommentFlag を 0 にするので、置換前の rows で数えると 1 過大になる）
         self._has_reserve = cur.execute('SELECT COUNT(*) FROM ERParts WHERE ReserveFlag=1').fetchone()[0] > 0
