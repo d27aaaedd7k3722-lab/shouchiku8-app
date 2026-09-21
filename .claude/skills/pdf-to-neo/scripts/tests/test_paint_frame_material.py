@@ -49,8 +49,13 @@ def test_material_default_rounding():
     assert material_default(15500, 15) == 2330          # コグニ実機 NEW3
     assert material_default(18950, 15) == 2840          # double で 2842.4999… → 2,840（切り上げなら 2,850）
     assert material_default(46490, 14) == 6510
-    assert material_default(80230, 28) == 22460
-    assert material_default(80230, 28, '10円切り上げ') == 22470      # 実案件（10 円切り上げの工場）
+    # 本体（AnPntBL CalculateMaterialTotal）は 1 円単位で切り上げてから 10 円四捨五入する（2026-09-21 に確定。実案件 99.98%）。
+    # 80,230 × 28% = 22,464.4 → 22,465 → 22,470（それまでの式は 1 円切り上げが無く 22,460 だった）
+    assert material_default(80230, 28) == 22470
+    assert material_default(80230, 28, '10円切り上げ') == 22470
+    # 既定と 10 円切り上げが分かれる例: 80,220 × 28% = 22,461.6 → 22,462 → 既定 22,460 / 切り上げ 22,470
+    assert material_default(80220, 28) == 22460
+    assert material_default(80220, 28, '10円切り上げ') == 22470      # 実案件（10 円切り上げの工場）
     assert material_default(75240, 26, {'unit': 1, 'mode': '切り上げ'}) == 19563   # 1 円単位の工場
     assert material_default(127466, 16, {'unit': 1, 'mode': '四捨五入'}) == 20395  # JPN タクシー
     assert material_round_of(None) == (10, '四捨五入')
@@ -77,7 +82,8 @@ def test_bumper_only_paint_allows_the_new_paint_keys():
 def test_material_mode():
     """印字の材料代から 割合（整数 %）と端数処理を割り出す"""
     assert de.material_mode(15500, 2330) == (15, None)                                   # 既定の丸めなら端数処理は書かない
-    assert de.material_mode(80230, 22470) == (28, {'unit': 10, 'mode': '切り上げ'})
+    assert de.material_mode(80230, 22470) == (28, None)                                  # 1 円切り上げが先なので既定の丸めで 22,470 になる
+    assert de.material_mode(80220, 22470) == (28, {'unit': 10, 'mode': '切り上げ'})     # 既定なら 22,460。印字 22,470 は 10 円切り上げの工場
     assert de.material_mode(75240, 19563) == (26, {'unit': 1, 'mode': '切り上げ'})
     assert de.material_mode(127466, 20395) == (16, {'unit': 1, 'mode': '四捨五入'})
     assert de.material_mode(100000, 26000) == (26, None)

@@ -504,9 +504,15 @@ def test_wage_round_1_and_material_rounding():
     # 2026-09-20: 10 円丸めで戻らない材料代も、工場の端数処理（ここでは 1 円四捨五入）を割り出して割合モードで渡す
     assert 'material' not in est['paint'] and est['paint'].get('material_rate') == 16, est['paint']
     assert est['paint'].get('material_round') == {'unit': 1, 'mode': '四捨五入'}, est['paint']
-    rd['paint']['material'] = 20390
+    # コグニ既定（1 円切り上げ → 10 円四捨五入）: 20,394.56 → 20,395 → 20,400。既定と一致すれば端数処理は書かない
+    # （以前の式は 1 円切り上げが無く既定が 20,390 だった。本体どおりに直したので例を替えた。2026-09-21）
+    rd['paint']['material'] = 20400
     p2 = de.Drafter(rd).build()['paint']
-    assert 'material' not in p2 and not p2.get('material_round'), p2   # 10 円丸め（コグニ既定）と一致すれば端数処理は書かない
+    assert 'material' not in p2 and not p2.get('material_round'), p2
+    # 20,390 は既定では出ない。10 円切り捨ての工場として割り出す
+    rd['paint']['material'] = 20390
+    p3 = de.Drafter(rd).build()['paint']
+    assert 'material' not in p3 and p3.get('material_round') == {'unit': 10, 'mode': '切り捨て'}, p3
 
 
 def test_unit_price_fraction_rows_are_evidence():
@@ -850,21 +856,25 @@ def test_material_rate_is_derived_from_the_printed_amount():
 
 def test_material_round_of_the_factory_is_kept():
     """10 円四捨五入で戻らない材料代は、工場の端数処理（10 円切り上げ など）を割り出して渡す"""
-    p = _paint_est([{'name': 'ﾎﾞﾝﾈｯﾄ 取替', 'index': 10.0, 'wage': 80230}], {'total': 80230, 'material': 22470})
+    # 80,220 × 28% = 22,461.6 → 1 円切り上げ 22,462 → 既定（10 円四捨五入）なら 22,460。印字 22,470 は 10 円切り上げの工場
+    # （以前は 80,230 の例だったが、本体どおり 1 円切り上げが先になって既定でも 22,470 になるので例を替えた。2026-09-21）
+    p = _paint_est([{'name': 'ﾎﾞﾝﾈｯﾄ 取替', 'index': 10.0, 'wage': 80220}], {'total': 80220, 'material': 22470})
     assert p.get('material_rate') == 28 and p.get('material_round') == {'unit': 10, 'mode': '切り上げ'}, p
 
 
 def test_stale_material_round_is_dropped():
     """転記に書かれた端数処理では印字の材料代に戻らないとき、その指定を外す
     （残すと生成器が別の額で計算し直す。Codex 指摘）"""
-    # 80,230 × 28% = 22,464.4 → 四捨五入 22,460 / 切り上げ 22,470。印字が 22,460 なら「切り上げ」の指定は外す
-    p = _paint_est([{'name': 'ﾎﾞﾝﾈｯﾄ 取替', 'index': 10.0, 'wage': 80230}],
-                   {'total': 80230, 'material': 22460, 'material_round': '10円切り上げ'})
+    # 80,220 × 28% = 22,461.6 → 1 円切り上げ 22,462 → 既定（10 円四捨五入）22,460 / 切り上げ 22,470。
+    # 印字が 22,460 なら「切り上げ」の指定は外す（以前は 80,230 の例だったが、本体どおり 1 円切り上げが先になって
+    # 既定が 22,470 に変わったので例を替えた。2026-09-21）
+    p = _paint_est([{'name': 'ﾎﾞﾝﾈｯﾄ 取替', 'index': 10.0, 'wage': 80220}],
+                   {'total': 80220, 'material': 22460, 'material_round': '10円切り上げ'})
     assert p.get('material_rate') == 28 and 'material_round' not in p and 'material' not in p, p
     # 印字の材料代に戻る指定は残す（書き方は正規化されてもよい）
     from estimate_to_neo import material_round_of
-    p2 = _paint_est([{'name': 'ﾎﾞﾝﾈｯﾄ 取替', 'index': 10.0, 'wage': 80230}],
-                    {'total': 80230, 'material': 22470, 'material_round': '10円切り上げ'})
+    p2 = _paint_est([{'name': 'ﾎﾞﾝﾈｯﾄ 取替', 'index': 10.0, 'wage': 80220}],
+                    {'total': 80220, 'material': 22470, 'material_round': '10円切り上げ'})
     assert material_round_of(p2.get('material_round')) == (10, '切り上げ') and 'material' not in p2, p2
 
 
