@@ -2514,9 +2514,12 @@ class NeoBuilder:
                     try:
                         # 20.DB はボディごとに面積・名称の違う行を持つので、この車のボディで引く。
                         # 使い回して「選べなかった」控えを 1 か所に集める（report に載せるため）
-                        _key = (car_code, parts.vehicle_body)   # 車種・ボディが変わったら作り直す
+                        _rc = getattr(self, '_row_ctx', None) or {}
+                        _key = (car_code, parts.vehicle_body, str(_rc.get('grade', '') or ''), str(_rc.get('year', '') or ''))   # 車種・ボディ・グレード・年式が変わったら作り直す
                         if getattr(self, '_pi_rows_key', None) != _key:
                             self._pi_rows = PaintIndex(self.engine.root, car_code, body=parts.vehicle_body)
+                            # 20.DB の行はグレード条件で分かれる（paint_index._by_grade）ので、車のグレードも渡す（Codex 指摘 2026-09-22）
+                            self._pi_rows.set_vehicle({'GradeCode': _rc.get('grade', ''), 'YearCode': _rc.get('year', '')})
                             self._pi_rows_key = _key
                         pn20 = self._pi_rows.panel(f'{ref:04d}')
                         if pn20 and pn20.get('name'):

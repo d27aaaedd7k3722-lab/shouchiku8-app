@@ -288,6 +288,29 @@ def main() -> int:
     fails = _cmp('汎用車種は塗装指数なし', _PI(_root, 'Z10').car_paint_kind(), 0, fails)
     fails = _cmp('暫定でない車は False', _PI(_root, 'W66').car_paint_provisional(), False, fails)
 
+    # 20.DB の行にはグレード条件（[6:11]）がある。同じコード・同じボディで面積をグレードで分けている（2026-09-22）
+    if os.path.isdir(os.path.join(_root, 'D', 'D19')):
+        def _area(g):
+            _p = _PI(_root, 'D19', body='10')
+            _p.set_vehicle({'CarCode': 'D19', 'YearCode': '00', 'BodyCode': '10', 'GradeCode': g, 'FVACode': 'A'}, ())
+            return (_p.panel('5800') or {}).get('area')
+        fails = _cmp('20.DB グレード条件（D19 5800 グレード B → 183）', _area('B'), 183, fails)
+        fails = _cmp('20.DB グレード条件（D19 5800 グレード A → 213）', _area('A'), 213, fails)
+        fails = _cmp('20.DB グレード不明なら従来どおり先頭', (_PI(_root, 'D19', body='10').panel('5800') or {}).get('area'), 213, fails)
+        _pB = _PI(_root, 'D19', body='10')
+        _pB.set_vehicle({'CarCode': 'D19', 'YearCode': '00', 'BodyCode': '10', 'GradeCode': 'B', 'FVACode': 'A'}, ())
+        _pB.panel('5800')
+        fails = _cmp('グレードで決まったら面積の割れを控えない（Codex 指摘）', [u['code'] for u in _pB.body_unresolved], [], fails)
+    if os.path.isdir(os.path.join(_root, 'U', 'U92')):
+        # ボディがグレードより優先: ボディ 50・グレード C の 4300 は、共通ボディ・グレード CD の行（200）より
+        # ボディ 50 専用・条件なしの行（226）。実案件と一致
+        _pU = _PI(_root, 'U92', body='50')
+        _pU.set_vehicle({'CarCode': 'U92', 'YearCode': '00', 'BodyCode': '50', 'GradeCode': 'C', 'FVACode': 'C'}, ())
+        fails = _cmp('20.DB ボディ専用がグレード専用より優先（U92 4300 → 226）', (_pU.panel('4300') or {}).get('area'), 226, fails)
+        _pU0 = _PI(_root, 'U92', body='10')
+        _pU0.set_vehicle({'CarCode': 'U92', 'YearCode': '00', 'BodyCode': '10', 'GradeCode': 'C', 'FVACode': 'C'}, ())
+        fails = _cmp('20.DB ボディ専用が無ければグレード専用（U92 ボディ 10 グレード C → 200）', (_pU0.panel('4300') or {}).get('area'), 200, fails)
+
     print('unit_paint_screen:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
 

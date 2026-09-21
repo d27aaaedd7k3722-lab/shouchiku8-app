@@ -105,7 +105,10 @@ class PaintIndex:
     # ------------------------------------------------------------ 20.DB: 塗装パネルマスタ
     def _load_20(self) -> list[dict]:
         """400B ヘッダ（部品コード上2桁 → レコード範囲）+ 39B レコード×N
-        [code u16][area u16][0x20][body u8][5B][flag 1][name 20B][PanelDivision 1][PanelTypeDivision 1][PanelCode 1|' '][ButtonNo 2][' ']
+        [code u16][area u16][0x20][body u8][グレード条件 5B][flag 1][name 20B][PanelDivision 1][PanelTypeDivision 1][PanelCode 1|' '][ButtonNo 2][' ']
+
+        グレード条件 = その行を使えるグレードの並び（空白なら全グレード）。同じコード・同じボディで面積の違う行を
+        グレードで分けている（D19 5800 ﾙ-ﾌﾊﾟﾈﾙ: 条件なし 213 / グレード B 183。実案件のグレード B の車は 183。2026-09-22）
 
         body = ボディコード（0 = 全ボディ共通、10 / 20 = そのボディ専用。KA81 の id と同じ 1 バイト整数）。
         同じパネルコードでもボディで面積が変わる（W90 ハイエース: L ｽﾗｲﾄﾞﾄﾞｱﾊﾟﾈﾙ 178（共通/10）と 196（20））ので、
@@ -121,10 +124,25 @@ class PaintIndex:
             dv = r[33:36].decode('cp932', 'replace')
             btn = r[36:38].decode('cp932', 'replace')
             out.append({'code': f'{code:04d}', 'area': area, 'name': r[13:33].decode('cp932', 'replace'),
-                        'body': r[5], 'flag': chr(r[11]) if 32 <= r[11] < 127 else ' ',
+                        'body': r[5], 'grades': r[6:11].decode('latin1', 'replace').strip().upper(),
+                        'flag': chr(r[11]) if 32 <= r[11] < 127 else ' ',
                         'div': int(dv[0]) if dv[0].strip() else 0, 'type': int(dv[1]) if dv[1].strip() else 0,
                         'pcode': int(dv[2]) if dv[2].strip() else 0, 'btn': int(btn) if btn.strip() else 0})
         return out
+
+    def _by_grade(self, rows: list) -> list:
+        """20.DB の行をグレード条件で絞り、この車のグレードの専用行を先に並べる（専用行 → 条件なしの行）。
+        グレードが分からない車・条件の合う行が 1 つも無いときは元のまま（従来どおり）。
+        **ボディがグレードより優先**なので、ここでは絞り込みと並べ替えだけにして、行を決めるのは後段のボディの選び方に任せる
+        （U92 ボディ 50・グレード C の 4300: ボディ共通・グレード CD の行 200 より、ボディ 50 専用・条件なしの行 226 が実機。
+        専用行だけに絞ると 226 を落とす）"""
+        g = str(getattr(self, 'grade', '') or '').strip().upper()
+        if not g or not rows or not any(r.get('grades') for r in rows):
+            return rows
+        ok = [r for r in rows if not r.get('grades') or g in r['grades']]
+        if not ok:
+            return rows
+        return [r for r in ok if r.get('grades')] + [r for r in ok if not r.get('grades')]
 
     def _note_areas(self, rows: list, note: bool = True) -> None:
         """同じコード・同じ条件の行が複数あって**面積が違う**ときは控える。
@@ -133,6 +151,12 @@ class PaintIndex:
         2026-09-12 に 20.DB を全走査して集計）"""
         if not note or len(rows) < 2:
             return
+        g = str(getattr(self, 'grade', '') or '').strip().upper()
+        if g and rows[0].get('grades') and g in rows[0]['grades']:
+            # グレードの専用行で決まった（_by_grade が先頭に並べた）。条件なしの行と面積が違っても「選べなかった」ではない（Codex 指摘）
+            rows = [r for r in rows if r.get('grades') and g in r['grades']]
+            if len(rows) < 2:
+                return
         areas = sorted({int(r.get('area') or 0) for r in rows})
         if len(areas) > 1:
             self._note_unresolved(rows[0]['code'], [], areas=areas)
@@ -147,6 +171,7 @@ class PaintIndex:
         選んだ先に面積の違う行が残っていたら控える（黙って先頭を採らない）"""
         if not rows:
             return None
+        rows = self._by_grade(rows)
         b = self.body_code
         if b:
             hit = [r for r in rows if r.get('body') == b]
@@ -181,7 +206,7 @@ class PaintIndex:
         入れると W90 のボディ 20 で body 10 の行が見つかって「連動する」と判定してしまい、上の実機確認と食い違う。
         この関数は面積を決めるためではなく**連動するかどうかを決める**ためのもの"""
         c = str(code).zfill(4)
-        rows = [r for r in self.panels if r['code'] == c]
+        rows = self._by_grade([r for r in self.panels if r['code'] == c])
         b = self.body_code
         if not rows:
             return None
@@ -207,7 +232,7 @@ class PaintIndex:
 
     def panel(self, code: str) -> Optional[dict]:
         code = re.sub(r'\D', '', code or '')[:4].zfill(4)
-        same = [r for r in self.panels if r['code'] == code]
+        same = self._by_grade([r for r in self.panels if r['code'] == code])
         b = self.body_code
         if same and not b:
             self._note_areas(same, True)   # 同じコードで面積が割れていたら知らせる（黙って先頭を採らない）
@@ -220,8 +245,8 @@ class PaintIndex:
             # このボディ専用の行が**枝番違いにある**なら、そちらへ進む（後段。W90 ハイエース: 4800 = ボディ 10 /
             # 4801 = ボディ 20）。枝番が無いときだけ、**ボディ以下でいちばん大きいボディ** → 全ボディ共通 の順で選ぶ
             # （2026-09-21。W44 ボディ 40 の 5000 クオータは ボディ 0 が面積 73・ボディ 30 が 79 で実機は 79）
-            _br = [r for r in self.panels if r['code'][:3] == code[:3] and r['code'] != code
-                   and r.get('body') == b and _panel_key(r['name']) == _panel_key(same[0]['name'])]
+            _br = self._by_grade([r for r in self.panels if r['code'][:3] == code[:3] and r['code'] != code
+                                  and r.get('body') == b and _panel_key(r['name']) == _panel_key(same[0]['name'])])  # 枝番の行にもグレード条件を当てる（Codex 指摘）
             if not _br:
                 _und = [r for r in same if 0 < int(r.get('body') or 0) < b]
                 _mx = max((int(r.get('body') or 0) for r in _und), default=0)
@@ -233,7 +258,7 @@ class PaintIndex:
             # 同じコードに、このボディ用も全ボディ共通も無い（他ボディ専用しか無い）。
             # そのときは枝番違いにこのボディ用の行があることがある
             # （W90 ハイエース: 4800 = ボディ 10 専用 / 4801 = ボディ 20 専用）
-        pre = [r for r in self.panels if r['code'][:3] == code[:3]]
+        pre = self._by_grade([r for r in self.panels if r['code'][:3] == code[:3]])  # 枝番の行にもグレード条件を当てる（Codex 指摘）
         if b and same:
             # 枝番へ飛ぶのは **同じパネル名** のときだけ。3 桁が同じでも別物のことがある
             # （4800 ｸｵ-ﾀﾊﾟﾈﾙ と 4801 ｸｵ-ﾀﾊﾟﾈﾙ(工賃) のような組）
