@@ -238,6 +238,16 @@ PAINT_WAGE_KEYS = ('base', 'booth', 'bumper_front', 'bumper_rear', 'bumper_base'
 TAX_AUTO_RATE = 10
 """自動で割り戻す税率（％）。生成器の消費税は 10% 固定（Setting.TaxRate=10）なので、8% などは自動で直さず止める（10-4）"""
 _UNIT_RE = re.compile(r'(unit\s*[=:]\s*)([\d,]+)')
+# 税込で印字された見積書の、各行の印字額（税抜に直す前）を行のメモに残す印。draft_estimate が拾って price_in / wage_in にし、
+# 生成器が内税の行の税込額としてそのまま使う（税抜から作り直すと 1 行あたり約 9% の確率で 1 円ずれるため。2026-09-21）
+TAX_IN_RE = re.compile(r'\s*\[税込 部品=(-?\d*) 工賃=(-?\d*)\]')
+
+
+def tax_in_mark(price, wage) -> str:
+    pi, wi = _int(price), _int(wage)
+    if not ((pi and pi > 0) or (wi and wi > 0)):
+        return ''
+    return f" [税込 部品={pi if pi and pi > 0 else ''} 工賃={wi if wi and wi > 0 else ''}]"
 
 
 def tax_excluded_amount(v, rate: int = 10):
@@ -281,12 +291,21 @@ def to_tax_excluded(rd: dict, rate: int = 10, warn=None) -> int:
         rows = b.get('rows') or []
         for i, r in enumerate(rows):
             if isinstance(r, dict):
+                mk = tax_in_mark(r.get('price'), r.get('wage'))
+                if mk and not TAX_IN_RE.search(str(r.get('comment') or '')):
+                    r['comment'] = (str(r.get('comment') or '') + mk).strip()
                 d_keys(r, ('price', 'wage', 'unit'))
                 d_keys(r.get('recycle'), ('price', 'stock_price'))  # リサイクル部品の売価・仕入値（生成器が部品計に入れる）
                 if r.get('comment'):
                     r['comment'] = d_unit_comment(str(r['comment']))
             elif isinstance(r, str) and '|' in r:  # 短縮記法 code|name|method|parts_no|index|qty|price|wage|flags|comment
                 p = r.split('|')
+                mk = tax_in_mark(p[6] if len(p) > 6 else None, p[7] if len(p) > 7 else None)
+                if mk and len(p) > 10 and not any(x.strip() for x in p[10:]):
+                    p = p[:10]   # 末尾に空の列が余分な行（draft は空の余りを無視して受ける）も 10 列にそろえてから印を残す（Codex 指摘）
+                if mk and len(p) <= 10 and not TAX_IN_RE.search(p[9] if len(p) > 9 else ''):
+                    p += [''] * (10 - len(p))   # 末尾のメモ欄を省いた行（draft は足りない列を空で補う）にも印を残す
+                    p[9] = (p[9] + mk).strip()
                 for idx in (6, 7):
                     if len(p) > idx and _int(p[idx]) is not None:
                         p[idx] = str(d(p[idx]))

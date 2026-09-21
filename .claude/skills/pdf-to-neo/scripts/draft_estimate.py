@@ -324,7 +324,29 @@ def expand_row(row) -> dict:
     """reading.json の行は dict か、'code|name|method|parts_no|index|qty|price|wage|flags|comment' の文字列（転記の手間を減らす短縮記法）。
     空欄は空文字。flags: M=manual、R=reserve、N=注記行（name を note にする）。数値は int/float に変換。
     comment は転記メモ（NEO に書かない）。見積書に印字された明細コメントは 'NEO:※JAS在庫使用' のように先頭に NEO: を付ける（dict 行は neo_comment でも可）"""
-    return _split_neo_comment(_expand_row(row))
+    return _split_neo_comment(_take_tax_in(_expand_row(row)))
+
+
+def _take_tax_in(d: dict) -> dict:
+    """税込で印字された見積書で、税抜に直す前の印字額（reading_check.to_tax_excluded がメモに残す `[税込 部品=… 工賃=…]`）を
+    price_in / wage_in に移し、メモからは消す。生成器が内税の行の税込額としてそのまま使う（1 円のずれを出さないため。2026-09-21）"""
+    from reading_check import TAX_IN_RE  # noqa: E402  reading_check が draft_estimate を読むので中で import する
+    c = d.get('comment')
+    if not c:
+        return d
+    m = TAX_IN_RE.search(str(c))
+    if not m:
+        return d
+    if m.group(1):
+        d['price_in'] = int(m.group(1))
+    if m.group(2):
+        d['wage_in'] = int(m.group(2))
+    rest = TAX_IN_RE.sub('', str(c)).strip()
+    if rest:
+        d['comment'] = rest
+    else:
+        d.pop('comment', None)
+    return d
 
 
 def _expand_row(row) -> dict:
@@ -992,6 +1014,11 @@ class Drafter:
                     if w not in ('', '0'):
                         pw = _num(prev.get('wage'))
                         prev['wage'] = int(float(w)) + (int(float(pw)) if pw not in ('', '0') else 0)
+                        # 税込で印字された見積書の印字額も合算する（片方に無ければ捨てる。生成器は割った値が工賃と一致するときだけ使う）
+                        if r.get('wage_in') is not None and (pw in ('', '0') or prev.get('wage_in') is not None):
+                            prev['wage_in'] = int(r['wage_in']) + (int(prev['wage_in']) if pw not in ('', '0') else 0)
+                        else:
+                            prev.pop('wage_in', None)
                         self._rev('判断', '行のまとめ', f'「{r.get("name")}」の技術料 {int(float(w)):,} 円を直前の「{prev.get("name")}」の工賃にまとめた'
                                   + (f'（この行にも工賃 {int(float(pw)):,} 円があったので合算）' if pw not in ('', '0') else ''), row=prev)
                         prev.setdefault('_revs', []).append(self.review[-1])  # 明細 No を付けるため、この行から作る item に後で結び付ける
@@ -1114,6 +1141,9 @@ class Drafter:
             if row.get('neo_comment'):  # NEO の明細コメント（見積書に印字された備考など、コグニの画面に出したいものだけ）
                 item['comment'] = str(row['neo_comment'])
             item['_page'] = row.get('_page') or ''
+            for _k in ('price_in', 'wage_in'):   # 税込で印字された見積書の印字額（生成器が内税の行の税込額に使う。_take_tax_in）
+                if row.get(_k) is not None:
+                    item[_k] = int(row[_k])
             if row.get('neo_name'):  # NEO の名称欄（24 バイト）に入れる短い名前（手入力行のみ効く。見積の印字は確認箇所シートに残す）
                 item['_neo_name'] = str(row['neo_name'])
             for _e in row.get('_revs') or []:  # 「〃 交換工賃」をまとめた記録をこの行の明細に結び付ける（確認箇所シートの明細 No）

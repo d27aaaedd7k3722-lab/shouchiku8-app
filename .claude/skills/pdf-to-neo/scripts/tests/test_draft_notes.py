@@ -515,6 +515,58 @@ def test_wage_round_1_and_material_rounding():
     assert 'material' not in p3 and p3.get('material_round') == {'unit': 10, 'mode': '切り捨て'}, p3
 
 
+def test_tax_included_keeps_the_printed_amount_of_each_row():
+    """税込で印字された見積書（内税）は、各行の税込額を印字どおりに NEO へ入れる（2026-09-21）。
+    税抜 45,455 から作り直すと 45,455 + 4,546 = 50,001 になり、内税の合計（各行の税込の合計）が印字の総額から 1 円ずれる。
+    本体は税込で入力された行を「税 = 丸め(税込 / 11)、税抜 = 税込 − 税」で持つ（AxUtil TTaxClass）"""
+    import tempfile
+    sys.path.insert(0, os.path.join(skill_env.FILES, 'claude_neo_pipeline', 'tests'))
+    from estimate_to_neo import NeoBuilder
+    import neo_diff
+    rd = {'source': 't', 'issuer': '', 'est_date': '20260921', 'format': 'A', 'labor_rate': 8800, 'vehicle': dict(VEH),
+          'blocks': [{'title': 'テスト', 'rows': ['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|50000|8800||', '0600|ﾎﾞﾝﾈｯﾄ|脱着|||1||4400||要確認: 写し']}],
+          'paint': {}, 'expenses': [], 'totals': {'parts': 50000, 'wage': 13200, 'taxable': 63200, 'tax': 5745, 'total': 63200}}
+    est = de.Drafter(rd).build()
+    it0 = est['items'][0]
+    assert it0.get('price') == 45455 and it0.get('price_in') == 50000 and it0.get('wage_in') == 8800, it0
+    assert '税込' not in str(est['items'][1].get('_memo') or ''), est['items'][1]   # 印はメモから消える（確認箇所シートに出さない）
+    neo, _rep = NeoBuilder().build(est, est['vehicle'], hints=est.get('hints'), labor_rate=est.get('labor_rate'), est_date='20260921', insurance={})
+    t = os.path.join(tempfile.gettempdir(), 'test_tax_included_rows.neo'); open(t, 'wb').write(neo)
+    em = neo_diff.load(t)['AnSvEm0001.sld']
+    r = em.execute("select PartsPriceOutTax, PartsPriceInTax, PartsPriceTax, WageInTax from ERParts where PartsCode='0800'").fetchone()
+    assert tuple(r) == (45455, 50000, 4545, 8800), tuple(r)
+    tot = em.execute('select SubTotal, Total from Total').fetchone()
+    assert tuple(tot) == (57455, 63200), tuple(tot)   # 総額が見積書の印字（63,200）と一致
+
+    def _neo_of(rd_):
+        e_ = de.Drafter(rd_).build()
+        n_, _ = NeoBuilder().build(e_, e_['vehicle'], hints=e_.get('hints'), labor_rate=e_.get('labor_rate'), est_date='20260921', insurance={})
+        open(t, 'wb').write(n_)
+        return e_, neo_diff.load(t)['AnSvEm0001.sld']
+
+    # 「〃 交換工賃」の続き行: 工賃の印字額も直前の行へ合算する（Codex 指摘）
+    rd2 = dict(rd, blocks=[{'title': 'テスト', 'rows': ['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|50000|||', '|〃 交換工賃||||||50000||']}],
+               totals={'parts': 50000, 'wage': 50000, 'taxable': 100000, 'tax': 9091, 'total': 100000})
+    e2, em2 = _neo_of(rd2)
+    assert e2['items'][0].get('wage_in') == 50000, e2['items'][0]
+    r2 = em2.execute("select WageOutTax, WageInTax, WageTax from ERParts where PartsCode='0800'").fetchone()
+    assert tuple(r2) == (45455, 50000, 4545), tuple(r2)
+    # 末尾のメモ欄を省いた短い行（'|' が 8 個）にも印字額が残る（Codex 指摘）
+    rd3 = dict(rd, blocks=[{'title': 'テスト', 'rows': ['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|50000|8800|']}],
+               totals={'parts': 50000, 'wage': 8800, 'taxable': 58800, 'tax': 5345, 'total': 58800})
+    e3, em3 = _neo_of(rd3)
+    assert e3['items'][0].get('price_in') == 50000, e3['items'][0]
+    rd3b = dict(rd3, blocks=[{'title': 'テスト', 'rows': ['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|50000|8800|||']}])   # 末尾に空の列が余分な行
+    e3b, _em = _neo_of(rd3b)
+    assert e3b['items'][0].get('price_in') == 50000, e3b['items'][0]
+    # 消費税が切り捨て設定の工場でも印字額を使う（税抜は読み取りが四捨五入で決めるので、確かめ方もそれに合わせる。Codex 指摘）
+    rd4 = dict(rd3, tax_round='切り捨て', blocks=[{'title': 'テスト', 'rows': ['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|50001|8800||']}],
+               totals={'parts': 50001, 'wage': 8800, 'taxable': 58801, 'tax': 5345, 'total': 58801})
+    e4, em4 = _neo_of(rd4)
+    r4 = em4.execute("select PartsPriceOutTax, PartsPriceInTax from ERParts where PartsCode='0800'").fetchone()
+    assert r4[1] == 50001, (tuple(r4), e4.get('tax_round'), e4['items'][0])
+
+
 def test_unit_price_fraction_rows_are_evidence():
     """単価に円未満の端数がある証拠の行（印字の金額が数量で割り切れない行）を拾う。
     2026-09-16 フリード: 単価 154.5 円 × 3 個 = 463.5 → 印字 464 で、部品計が印字より 2 円多くなった"""

@@ -136,6 +136,13 @@ def test_merge_divides_tax_included_estimate():
         assert rd is not None, msgs
         assert any('税込で印字された見積書' in m for m in msgs), msgs
         want, _ = rp.merge(plain)
+        # 各行の印字額（税抜に直す前）は行のメモに `[税込 部品=… 工賃=…]` で残る（内税の NEO で税込額をそのまま使う。2026-09-21）
+        import reading_check as _rc
+        rows_ = [r for blk in rd['blocks'] for r in blk['rows']]
+        assert all(_rc.TAX_IN_RE.search(r.split('|')[9]) for r in rows_), rows_
+        assert '[税込 部品=55000 工賃=13200]' in rows_[0], rows_[0]
+        for blk in rd['blocks']:
+            blk['rows'] = ['|'.join(r.split('|')[:9] + [_rc.TAX_IN_RE.sub('', r.split('|')[9]).strip()]) for r in blk['rows']]
         for k in ('blocks', 'pages', 'paint', 'expenses', 'totals', 'labor_rate'):
             assert rd[k] == want[k], (k, rd[k], want[k])
         assert rp.cmd_merge(case, False) == 0          # 直したあとは紙上検算にも通る

@@ -530,6 +530,33 @@ def _to_tax_included(rd: dict, rate: int = 10) -> dict:
     return rd
 
 
+def _tax_in_marks(rd):
+    """各行のメモに残った印字額の印（[税込 部品=… 工賃=…]）を集める"""
+    out = []
+    for blk in rd.get('blocks') or []:
+        for r in blk.get('rows') or []:
+            c = r.get('comment', '') if isinstance(r, dict) else (r.split('|')[9] if isinstance(r, str) and r.count('|') >= 9 else '')
+            m = rc.TAX_IN_RE.search(str(c or ''))
+            if m:
+                out.append(m.group(0))
+    return out
+
+
+def _strip_tax_in(rd):
+    """印を取り除いて、税抜に戻した読み取りを元と比べられるようにする"""
+    for blk in rd.get('blocks') or []:
+        rows = blk.get('rows') or []
+        for i, r in enumerate(rows):
+            if isinstance(r, dict) and r.get('comment') is not None:
+                c = rc.TAX_IN_RE.sub('', str(r['comment'])).strip()
+                if c:
+                    r['comment'] = c
+                else:
+                    r.pop('comment')
+            elif isinstance(r, str) and r.count('|') >= 9:
+                p = r.split('|'); p[9] = rc.TAX_IN_RE.sub('', p[9]).strip(); rows[i] = '|'.join(p)
+
+
 def test_tax_included_is_found_and_divided():
     """『各行の金額まで税込』で刷られた見積書（judgment_rules 10-4）を、印字の合計欄と明細の積み上げだけで見分けて税抜に直す
     （2026-09-17 トヨタ系 BP の概算見積書。同じ見積が税抜で読めた日と、印字のまま税込で読めた日があった）"""
@@ -542,6 +569,9 @@ def test_tax_included_is_found_and_divided():
     n = rc.to_tax_excluded(printed, 10)
     assert n == 24, n   # 明細 7 + ブロック小計 2 + ページ小計 4 + 塗装 2 + 費用 2 + 合計欄 6 + レバーレート 1
     assert printed['totals'] == BASE['totals'], printed['totals']          # tax / total は印字どおり、ほかは税抜に戻る
+    marks = _tax_in_marks(printed)   # 各行の印字額（税抜に直す前）はメモに残る。内税の NEO で税込額をそのまま使うため（2026-09-21）
+    assert marks and all(m for m in marks), marks
+    _strip_tax_in(printed)
     assert printed['blocks'] == BASE['blocks'] and printed['pages'] == BASE['pages']
     assert printed['paint'] == BASE['paint'] and printed['expenses'] == BASE['expenses']
     assert printed['labor_rate'] == 8000
@@ -593,7 +623,7 @@ def test_tax_included_divides_discount_frame_unit_and_bumper_base():
     assert printed['discount'] == {'parts': -10000, 'wage': 0}, printed['discount']
     assert printed['frame'] == rd['frame'], printed['frame']
     assert printed['blocks'][0]['rows'][1]['unit'] == 500, printed['blocks'][0]['rows'][1]
-    assert printed['blocks'][0]['rows'][1]['comment'] == 'unit=500', printed['blocks'][0]['rows'][1]
+    assert printed['blocks'][0]['rows'][1]['comment'] == 'unit=500 [税込 部品=5500 工賃=]', printed['blocks'][0]['rows'][1]
     assert printed['paint']['bumper_base'] == {'index': 1.0, 'wage': 8000}, printed['paint']
     assert not run(printed)['fail'], run(printed)['fail']
 

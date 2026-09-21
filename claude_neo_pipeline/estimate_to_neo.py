@@ -136,6 +136,18 @@ def tax_of(out: int) -> tuple[int, int]:
 _TAX_ROUND: contextvars.ContextVar = contextvars.ContextVar('neo_tax_round', default='四捨五入')
 
 
+def _tax_excluded_printed(p) -> Optional[int]:
+    """税込の印字額を税抜に直した値（reading_check.tax_excluded_amount と同じ四捨五入）。数値でなければ None"""
+    try:
+        p = int(p)
+    except (TypeError, ValueError):
+        return None
+    if p <= 0:
+        return None
+    r = int(round(TAX * 100))
+    return (p * 100 + (100 + r) // 2) // (100 + r)
+
+
 def _tax_round_name(v) -> str:
     """estimate['tax_round'] を 四捨五入 / 切り捨て / 切り上げ にそろえる（それ以外は既定の四捨五入。合計側の解釈と同じ）"""
     v = str(v or '四捨五入')
@@ -2385,6 +2397,7 @@ class NeoBuilder:
                 '_dmg_nokd': (parts.no_kd(ref) if ref is not None else False),  # 12.DB の可能作業に K も D も無い品目（DamageParts.PartsType 1・BlockCode 空）  # DamageParts.BlockCode 用。ERParts.BlockCode は W/S 版で空になることがあるが、損傷部品の部位は 12.DB の全版から引く（実機 cogni_CD98 0012）
                 'CommentFlag': 1 if it.get('comment') else 0, 'Comment1': _fit(it.get('comment', ''), 40),  # TEXT(40): コグニ保存時に 40 バイトで切詰（N-ONE 案件で確認）
                 '_recycle': it.get('recycle'), '_reserve': _flag(it.get('reserve'), 'items[].reserve'),
+                '_price_in': it.get('price_in'), '_wage_in': it.get('wage_in'),  # 税込で印字された見積書の印字額（内税。_tax_of_in を見よ）
                 'PartsNo': ((cp['pn'] if cp else (re.sub(r'\s*\(\d+\)\s*$', '', it.get('parts_no', '') or '') or (std_pn if dcode == 0 else ''))) if (pprice > 0 or it.get('reserve')) else (std_pn_raw if no_price_part else '')),  # 品番欄が無い取替行はコグニが標準品番を入れる（FRAME_p7。'-' 部品は生値 '     -'）
                 'PartsNoStandard': (std_pn_raw if std_pn.strip() == '-' else std_pn),  # '-' 部品は 11.DB 生値の右トリム（J52 '     -'、D88 '-'。他工場 NEO・FRAME_p7 1511）
                 '_sub_prefix': (pn_disp is None and is_sub),
@@ -2589,7 +2602,15 @@ class NeoBuilder:
                     it_, tx = tax_of(int(out))
                     if base == 'PartsUnitPrice':
                         tx = int(int(out) * TAX); it_ = int(out) + tx  # 単価欄の税だけ切捨（NONE_dc 155 → 15）
-                    if base == 'PartsPrice' and int(rec.get('PartsCount') or 0) > 1 and int(rec.get('PartsUnitPriceOutTax') or 0) > 0 and int(rec['PartsUnitPriceOutTax']) * int(rec['PartsCount']) == int(out):
+                    _pin = r.get('_price_in') if base == 'PartsPrice' else (r.get('_wage_in') if base == 'Wage' else None)
+                    if getattr(self, '_tax_included', False) and _pin is not None and int(rec.get('PartsCount') or 1) <= 1 and _tax_excluded_printed(_pin) == int(out):
+                        # 内税: 本体は税込で入力された行を「税 = 丸め(税込 × 率 / (100 + 率))、税抜 = 税込 − 税」で持つ（AxUtil TTaxClass 412350）。
+                        # 税抜から作り直すと 1 行あたり約 9% の確率で税込が 1 円ずれ、合計（内税は各行の税込の合計）が印字の総額からずれる。
+                        # 印字の税込額を割った値が今の税抜額と一致するときだけ使う（下書きが金額を直した行では古い印字額を使わない）。
+                        # 割り方は読み取り側（reading_check.tax_excluded_amount。常に四捨五入）と同じにする。消費税が切り捨て設定の工場でも
+                        # 税抜は読み取りが決めた値なので、ここで設定の丸め方を使うと一致しなくなり印字額が捨てられる（Codex 指摘）
+                        tx = int(_pin) - int(out); it_ = int(_pin)
+                    elif base == 'PartsPrice' and int(rec.get('PartsCount') or 0) > 1 and int(rec.get('PartsUnitPriceOutTax') or 0) > 0 and int(rec['PartsUnitPriceOutTax']) * int(rec['PartsCount']) == int(out):
                         tx = _tax_amount(int(rec['PartsUnitPriceOutTax'])) * int(rec['PartsCount']); it_ = int(out) + tx  # 数量行の税 = 単価の税（消費税設定の丸め。既定 四捨五入）×数量（コグニ実機: 155×10 → 税 160、185×9 → 171。単価欄 PartsUnitPriceTax は切捨 15 のまま）
                     rec[base + 'InTax'] = it_; rec[base + 'Tax'] = tx
                 else:
