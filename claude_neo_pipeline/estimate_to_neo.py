@@ -1365,6 +1365,8 @@ class AddataParts:
             H, B = self.e.HEADER_11, self.e.RECORD_11
             p = os.path.join(self.e.root, self.car[0], self.car, f'{self.car}11.DB')
             raw = open(p, 'rb').read(); ks = LCG(self.e._read_seed(self.car)).keystream(B)
+            if len(raw) > H and (len(raw) - H) % B:  # レコード長の違う版（AdVer 0430 = 89 バイト）を黙って読まない
+                raise ValueError(f'{self.car}11.DB の長さが不正（本体 {len(raw) - H} バイトは {B} の倍数でない。ADDATA の形式版 COM\\AdVer を確認）')
             for ri in range((len(raw) - H) // B):
                 off = H + ri * B; rec = bytes(a ^ b for a, b in zip(raw[off:off + B], ks)); ref = struct.unpack_from('<H', rec, 0)[0]
                 if not ref:

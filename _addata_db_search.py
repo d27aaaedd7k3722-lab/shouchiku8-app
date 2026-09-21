@@ -90,6 +90,44 @@ class LCG:
         return bytes(self.next_byte() for _ in range(length))
 
 
+def read_adver(root: str) -> Optional[int]:
+    """ADDATA の形式版（COM\\AdVer。平文 4 バイト '0410'）を数値で返す。ファイルが無ければ None。
+    データ版（COM\\AnVer.DB の '2026/09'）とは別物で、こちらは **レコードの長さ**を決める"""
+    try:
+        with open(os.path.join(root, 'COM', 'AdVer'), 'rb') as f:
+            return int(f.read(4).decode('ascii').strip())
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def adver_layout_11(n: int) -> int:
+    """11/13/83.DB を本体がどの版の配置で読むか（AxDBAcsCarDat.dll の SearchXXX11/13/83 の寄せ方）。
+    0410 以上 0430 未満は **310 系**に、0430 以上は 330 系に寄せる。
+    310 系: 11.DB 72 / 13.DB 189 / 83.DB 201 バイト。330 系: 11.DB 89 / 13.DB 206 / 83.DB 218 バイト"""
+    if 410 <= n < 430:
+        return 310
+    if n >= 430:
+        return 330
+    return 330 if n >= 330 else 320 if n >= 320 else 310 if n >= 310 else 300
+
+
+ADVER_CHECKED = (310,)  # 列の位置まで確かめた配置。これ以外の ADDATA は読むと標準品番・指数が黙って壊れる
+
+
+def check_adver(root: str) -> Optional[int]:
+    """生成器が確かめていない ADDATA の形式版なら止める（2026-09-21。本体の逆アセンブルと ADDATA 3 版の実測で確定）。
+    AdVer が 0430 に上がると 11.DB のレコードが 72 → 89 バイトになり、今の読み方では **例外にならずに**
+    別の列を品番・価格として読んでしまう。ファイルが無いときは判定できないので止めない（各表の長さ検査に任せる）"""
+    n = read_adver(root)
+    if n is not None and adver_layout_11(n) not in ADVER_CHECKED:
+        raise ValueError(
+            f'ADDATA の形式版 COM\\AdVer = {n:04d} は生成器が確かめていない形式です'
+            f'（本体はこの版の 11/13/83.DB を {adver_layout_11(n)} 系の配置で読む。確かめてあるのは 0410 = 310 系だけ）。'
+            f'レコードの長さが変わっているので、このまま読むと標準品番・指数が黙って壊れます。'
+            f'生成器を対応させるまでは AdVer 0410 の ADDATA を使ってください（ADDATA: {root}）')
+    return n
+
+
 class AddataSearchEngine:
     """Addata汎用データベース検索エンジン"""
 
@@ -106,6 +144,7 @@ class AddataSearchEngine:
             from addata_vehicle_resolver import find_addata_root
             addata_root = find_addata_root()
         self.root = addata_root
+        self.adver = check_adver(addata_root) if addata_root else None
         self._cache = {}
 
     def _vehicle_folder(self, vehicle_code: str) -> str:
@@ -143,6 +182,9 @@ class AddataSearchEngine:
 
         if len(raw) <= self.HEADER_11:
             return []
+        if (len(raw) - self.HEADER_11) % self.RECORD_11:  # 13/83.DB と同じ検査。レコード長の違う版（AdVer 0430 = 89 バイト）を黙って読まない
+            raise ValueError(f'{vehicle_code}11.DB の長さが不正（本体 {len(raw) - self.HEADER_11} バイトは {self.RECORD_11} の倍数でない。'
+                             f'ADDATA の形式版 COM\\AdVer = {self.adver} を確認）')
 
         seed = self._read_seed(vehicle_code)
         total = (len(raw) - self.HEADER_11) // self.RECORD_11
