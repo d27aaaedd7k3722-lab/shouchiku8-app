@@ -206,6 +206,38 @@ def main() -> int:
     except OSError:
         pass
 
+    # パネル別塗り数値の表（77/87/97/99.DB）: 装備（EVA）別の行を選べること。
+    # J57 のテールゲート 4300 は 無条件 2.5 / EVA 'Z'（4WD）2.3（ADDATA 2026/08。実案件 NEO とも一致）
+    import paint_index as _pi
+    _root = NeoBuilder().engine.root
+    try:
+        _p0 = _pi.PaintIndex(_root, 'J57')
+        _p1 = _pi.PaintIndex(_root, 'J57')
+        _p1.eva = {'Z'}
+        _r0, _r1 = _p0.panel87('4300', 3, 0), _p1.panel87('4300', 3, 0)
+    except Exception:
+        _r0 = _r1 = None
+    if _r0 is None or _r1 is None:
+        print('     （この PC の ADDATA に J57 の 77.DB が無いので飛ばす）')
+    else:
+        fails = _cmp('77.DB 無条件の行', _r0.get('new_multi'), 2.5, fails)
+        fails = _cmp('77.DB 4WD(Z) の行', _r1.get('new_multi'), 2.3, fails)
+        fails = _cmp('77.DB の出どころ', _r0.get('src'), '77.DB', fails)
+    # 装備が複数条件の行（M89 4500 ボディ 20: 無条件 5.3 / R 3.5 / W 5.7 / WR 4.0）は**具体的な行**を採る
+    try:
+        _m = {}
+        for _e in (frozenset(), frozenset('R'), frozenset('W'), frozenset('WR')):
+            _p = _pi.PaintIndex(_root, 'M89', body='20')
+            _p.eva = set(_e)
+            _m[_e] = (_p.panel87('4500', 3, 0) or {}).get('new_multi')
+    except Exception:
+        _m = {}
+    if not _m or _m.get(frozenset()) is None:
+        print('     （この PC の ADDATA に M89 の 77.DB が無いので飛ばす）')
+    else:
+        for _e, _v in ((frozenset(), 5.3), (frozenset('R'), 3.5), (frozenset('W'), 5.7), (frozenset('WR'), 4.0)):
+            fails = _cmp(f'77.DB 装備 {sorted(_e) or "なし"}', _m.get(_e), _v, fails)
+
     print('unit_paint_screen:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
 

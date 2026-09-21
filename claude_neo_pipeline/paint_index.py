@@ -74,8 +74,7 @@ class PaintIndex:
             hh_ = os.path.join(os.environ.get('WINDIR', ''), 'hh.exe')
             print(f'★ 塗装指数表（CHM）を展開できない: {self.car}。修正塗装の標準指数が取れないので '
                   f'paint.panels[].index を見積書の値で書くこと（{hh_} が使えるか確認）')
-        self._r87: Optional[dict] = None   # <car>87.DB（パネル別の塗り数値。溶剤系。収録のある車種だけ）
-        self._r97: Optional[dict] = None   # <car>97.DB（同・水性）
+        # <car>77/87/97/99.DB（パネル別の塗り数値。収録のある車種だけ）は要求時に読む（_load_panel_tbl）
         self._chm_water: Optional[list[dict]] = None  # 水性ページ（CHM「車種別補修塗装指数（水性）」）は要求時に読む
 
     # ------------------------------------------------------------ 20.DB: 塗装パネルマスタ
@@ -523,46 +522,96 @@ class PaintIndex:
             out[key] = None if (not abn or abn == (0, 0)) else self._r1((abn[1] + abn[0] * Sn / 1000) * C2 / 100000 + self._hju(div, typ, int(math.ceil(Sn / 3 - 1e-9))))
         return out
 
-    def _load_87(self, water: bool = False) -> dict:
-        """パネル別の塗り数値の表: **<car>87.DB（溶剤系）/ <car>97.DB（水性）**。
-        XOR 0xff の CSV で 車種, 年式群, ボディ, グレード, EVA, 部品コード, 取替複数塗, 取替単体塗, 修正1/1, 1/2, 1/3, 高機能塗装…（各 ×100）。
-        87.DB は ADDATA 2026/08 で 1,307 車種中 27 車種（日産 P/Q 系 = COM/S_Est.DB の 2 桁目が 1・2）だけが持つ。
-        97.DB（水性）はもっと多くの車種が持ち、**値は CHM の水性ページと一致する**（J87 ボンネット 1.2/1.6/2.1/1.6/1.5 で確認）。
-        97.DB は列が 1 つ多く（高機能らしき値が 2 つ）、どちらがどの高機能塗装かは未同定なので、
-        **水性では塗り数値だけを使い、高機能加算は CHM・係数表に任せる**。
-        0000 は CHM の '-' と同じ「収録なし」なので None にする（ロッカパネル等の 1/2・1/3。Codex 指摘）"""
-        key = '_r97' if water else '_r87'
+    PANEL_TABLES = {(False, False): '77', (True, False): '97', (False, True): '87', (True, True): '99'}
+
+    def _load_panel_tbl(self, suf: str) -> dict:
+        """パネル別の塗り数値の表（`<car>77/87/97/99.DB`）。XOR 0xff の CSV で
+        `車種, 年式群, ボディ, グレード, EVA, 部品コード, 取替複数塗, 取替単体塗, 修正1/1, 1/2, 1/3, 高機能塗装[, 高機能塗装2]`（各 ×100）。
+
+        | 表 | 収録車種（ADDATA 2026/08） | 塗料 | 高機能塗装の列 |
+        |---|---|---|---|
+        | 77.DB | 434 | 溶剤系 | 6 列目・**7 列目 = 耐スリ傷**（2 列が違う 92 行はすべて 7 列目が実案件と一致） |
+        | 97.DB | 357 | 水性 | 同上 |
+        | 87.DB | 27（日産 P/Q 系） | 溶剤系 | 6 列目（スクラッチ） |
+        | 99.DB | 27（同） | 水性 | 同上 |
+
+        値は CHM の「塗り数値」表と一致する（J87 ボンネット 1.0/1.4/2.0/1.5/1.3・水性 1.2/1.6/2.1/1.6/1.5 で確認）ので、
+        **CHM を展開できない PC でもこの表があれば標準指数が出せる**。`0000` は CHM の '-' と同じ「収録なし」なので None にする"""
+        key = '_rtbl_' + suf
         if getattr(self, key, None) is not None:
             return getattr(self, key)
         out: dict = {}
-        p = os.path.join(self.car_dir, self.car + ('97' if water else '87') + '.DB')
+        p = os.path.join(self.car_dir, self.car + suf + '.DB')
         if os.path.exists(p):
             for l in _xor_lines(p):
                 f = [x.strip() for x in l.split(',')]
                 if len(f) < 12 or not f[5].isdigit():
                     continue
-                vals = [(int(x) / 100.0 if (x.isdigit() and int(x)) else None) for x in f[6:13]]   # 97.DB は 1 列多い（7 列目 = 水性の高機能塗装）
-                out.setdefault(f[5], []).append({'body': f[2], 'grade': f[3], 'eva': f[4], 'vals': vals})
+                vals = [(int(x) / 100.0 if (x.isdigit() and int(x)) else None) for x in f[6:13]]
+                out.setdefault(f[5], []).append({'grp': f[1], 'body': f[2], 'grade': f[3], 'eva': f[4], 'vals': vals})
         setattr(self, key, out)
         return out
 
-    def panel87(self, code: str, paint: int = 3) -> Optional[dict]:
-        """87.DB（溶剤）/ 97.DB（水性）の行を CHM 表の行と同じ形で返す（無ければ None）。
-        ボディ専用行 → 共通行（'00'）の順で選び、どちらも無ければ使わない（他ボディの値を当てない）"""
-        water = int(paint or 0) == 4
-        rows = self._load_87(water).get(str(code).zfill(4))
-        if not rows:
-            return None
+    def _pick_panel_row(self, rows: list) -> Optional[dict]:
+        """77/87/97/99.DB の行をこの車で選ぶ。ボディ専用行 → 共通行（'00'）、その中で
+        **装備（EVA）・グレードの条件に合う行**を優先する（条件のある行 > 無条件の行）。
+        同じ部品コードに装備別の行がある例: J57 4300 テールゲート = 無条件 2.5 / EVA 'Z'（4WD）2.3
+        （ADDATA 2026/08 の 77.DB では 3,952 コード中 291 コードが複数行。2026-09-21）"""
         b = '%02d' % self.body_code if self.body_code else ''
-        pick = next((r for r in rows if b and r['body'] == b), None) or next((r for r in rows if r['body'] in ('00', '')), None)
-        if pick is None:
-            return None
-        v = pick['vals'] + [None] * 7
-        # 高機能塗装: 溶剤表（87.DB）は 6 列目、水性表（97.DB）は **7 列目**（6 列目は別の値で、実案件では 0 や 1 段小さい値）。
-        # 実案件 NEO の水性 × 耐スリ傷 40 行で 7 列目が一致（6 列目は 0000 の行が 12 行ある）
-        return {'no': 0, 'name': '', 'area': None, 'new_multi': v[0], 'new_single': v[1],
-                'r11': v[2], 'r12': v[3], 'r13': v[4], 'hf': (v[6] if water else v[5]),
-                'src': '97.DB' if water else '87.DB'}
+        evas = {str(x).strip().upper() for x in (getattr(self, 'eva', None) or set()) if str(x).strip()}
+        grade = str(getattr(self, 'grade', '') or '').strip().upper()
+
+        ygrp = str(getattr(self, 'year_grp', '') or '').strip()
+
+        def fits(r):
+            e = str(r.get('eva') or '').strip().upper()
+            g = str(r.get('grade') or '').strip().upper()
+            y = str(r.get('grp') or '').strip()   # 年式群（8,359 行中 47 行だけ条件がある）
+            return ((not e or all(ch in evas for ch in e)) and (not g or (grade and grade in g))
+                    and (not y or y == ygrp))
+
+        # ボディ専用行 → 共通行（'00'）の順に、**条件に合う行**を探す。
+        # ボディ専用行が装備専用しか無くてこの車に合わないときは共通行の無条件行を使う（Codex 指摘 2026-09-21）
+        for grp in ([r for r in rows if b and r['body'] == b], [r for r in rows if r['body'] in ('00', '')]):
+            fit = [r for r in grp if fits(r)]
+            if not fit:
+                continue
+            # **条件の具体的な行を優先**（EVA の文字数 → グレードの文字数）。
+            # 例 M89 4500 ボディ 20: 無条件 / 'R' / 'W' / 'WR' の 4 行。装備 W と R の車は 'WR' の行が正しい（Codex 指摘）
+            fit.sort(key=lambda r: (len(str(r.get('eva') or '').strip()), len(str(r.get('grade') or '').strip()),
+                                    1 if str(r.get('grp') or '').strip() else 0), reverse=True)
+            return fit[0]
+        # どの行もこの車の装備・グレードに合わない（合わない行は当てずに CHM・係数表へ）
+        return None
+
+    def panel87(self, code: str, paint: int = 3, hf: int = 0) -> Optional[dict]:
+        """パネル別塗り数値の表の行を、CHM 表の行と同じ形で返す（無ければ None）。
+        塗料（溶剤/水性）と高機能塗装の種類（スクラッチかどうか）で表を選び、
+        ボディ専用行 → 共通行（'00'）の順で選ぶ。どちらも無ければ使わない（他ボディの値を当てない）"""
+        water = int(paint or 0) == 4
+        scratch = (int(hf or 0) == 3) or (self.car_hf_kind() == 3)
+        # なぜ None を返したかを残す（'none' = 表にこのパネルが無い / 'mismatch' = 行はあるが装備・グレードが合わない）。
+        # 呼び出し側は 'mismatch' のとき別の表を見に行かない（Codex 指摘 2026-09-21）
+        self.panel_tbl_reason = 'none'
+        # 目的の表 → 同じ塗料の別の表（塗り数値は同じ値だが高機能の列の意味が違うので、そのときは高機能を返さない）
+        order = [(self.PANEL_TABLES[(water, scratch)], True), (self.PANEL_TABLES[(water, not scratch)], False)]
+        for suf, same_kind in order:
+            rows = self._load_panel_tbl(suf).get(str(code).zfill(4))
+            if not rows:
+                continue
+            pick = self._pick_panel_row(rows)
+            if pick is None:
+                # その表にこのパネルの行はあるのに、この車の装備・グレードに合う行が無い
+                # → 別の表の無条件行を当てに行かず、CHM・係数表に落とす（Codex 指摘 2026-09-21）
+                self.panel_tbl_reason = 'mismatch'
+                return None
+            v = pick['vals'] + [None] * 7
+            # 高機能塗装: スクラッチの表（87/99）は 6 列目、通常の表（77/97）は **7 列目 = 耐スリ傷**。
+            # 種類の違う表に落ちたときは高機能を返さない（呼び出し側が Scrach.DB / CHM / 係数表で出す）
+            hv = (v[5] if suf in ('87', '99') else v[6]) if same_kind else None
+            return {'no': 0, 'name': '', 'area': None, 'new_multi': v[0], 'new_single': v[1],
+                    'r11': v[2], 'r12': v[3], 'r13': v[4], 'hf': hv, 'src': suf + '.DB'}
+        return None
 
     def car_hf_kind(self) -> Optional[int]:
         """この車種で使う高機能塗装の種類を COM/S_Est.DB から引く（2 = 耐スリ傷 / 3 = スクラッチ）。分からなければ None。
@@ -613,17 +662,23 @@ class PaintIndex:
         # 車種の表（87/97.DB・CHM）の高機能列は「**その車種の**高機能塗装」の値。見積の指定が車種の種類
         # （COM/S_Est.DB の 2 桁目）と食い違うときは使わない —— 加算基礎（T_KEI_3 の T 列 / S 列）と
         # ちぐはぐな値になるので、種類ごとの式（F_S / Scrach.DB）で出す（Codex 指摘 2026-09-21）
-        _kind_ok = self.car_hf_kind() in (None, int(hf))
+        # 車種の表（77/97/87/99.DB・CHM）の高機能列は「その車種の高機能塗装」= 耐スリ傷かスクラッチの値。
+        # **フッ素（1）はこの列を使わない**（F_S.DB の F 行で出す。実案件 1,800 本にフッ素の例が無く裏が取れないため。Codex 指摘）
+        _kind_ok = int(hf) in (2, 3) and self.car_hf_kind() in (None, int(hf))
         if _kind_ok and pn and pn.get('code'):  # 87.DB / 97.DB（収録のある車種だけ。CHM より優先）
             # 溶剤表（87.DB）の高機能列を先に見る: スクラッチの車（日産 P/Q 系）は水性の見積でもこの値だった
             # （実案件 P31 3100: 実測 0.9 = 87.DB。97.DB の 7 列目は 1.1）
-            r87 = self.panel87(pn['code'], 3)
+            r87 = self.panel87(pn['code'], paint, hf)
             if r87 and r87.get('hf') is not None:
                 return r87['hf']
-            if int(paint or 0) == 4:
-                r97 = self.panel87(pn['code'], 4)
-                if r97 and r97.get('hf') is not None:
-                    return r97['hf']
+            # 水性でその車に水性の表が無い（＝この部品の行が 1 つも無い）ときだけ、溶剤の表を見る。
+            # 実案件 U15（77.DB だけ持つ車）の水性の見積は溶剤表の値 1.5 / 1.3 が実測と一致した。
+            # 水性の表に**行はあるのに高機能の欄が空**のときは溶剤の値を当てない（水性と溶剤で値が違うため。Codex 指摘 2026-09-21）。
+            # 「装備・グレードが合わない」と分かったときも見に行かない（その車の変種が無いだけ）
+            if int(paint or 0) == 4 and r87 is None and getattr(self, 'panel_tbl_reason', 'none') == 'none':
+                r87s = self.panel87(pn['code'], 3, hf)
+                if r87s and r87s.get('hf') is not None:
+                    return r87s['hf']
         if _kind_ok and pn:  # CHM の高機能列（面積が一致する行だけ採る。近似で拾った別パネルの値は使わない）
             row = self.chm_row_for(pn, paint)
             if row and row.get('hf') is not None and row.get('area') == pn.get('area'):
@@ -661,7 +716,7 @@ class PaintIndex:
         pn = self.panel(code)
         if not pn:
             return None
-        row = self.panel87(pn['code'], paint)   # 87.DB（溶剤）/ 97.DB（水性）→ CHM → 係数表 の順。**解決後のパネルコード**で引く（Codex 指摘）
+        row = self.panel87(pn['code'], paint, hf)   # 77/87/97/99.DB → CHM → 係数表 の順。**解決後のパネルコード**で引く
         if row is not None:
             row = dict(row, area=pn['area'], name=pn['name'].strip())
         else:

@@ -3744,6 +3744,11 @@ class NeoBuilder:
         self._paint_index = None
         try:  # 塗装明細が無くても 20.DB のパネル一覧は要る（PaintingLinkParts は塗装をしない見積にも入る。実機 cogni_K1）
             self._paint_index = PaintIndex(self.resolver.root, car['CarCode'], body=car.get('BodyCode', ''))
+            # 77/87/97/99.DB（パネル別塗り数値）には装備・グレード別の行があるので、この車の装備を渡す
+            self._paint_index.eva = set(eva or ())
+            self._paint_index.grade = str(car.get('GradeCode', '') or '')
+            _yc = str(car.get('YearCode', '') or '').strip()
+            self._paint_index.year_grp = _yc[-1] if (_yc.isdigit() and int(_yc)) else ''
         except Exception as ex:
             if self._paint_detail:
                 print('PaintIndex skip', ex)
