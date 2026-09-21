@@ -61,7 +61,7 @@ python .claude/skills/pdf-to-neo/scripts/env_check.py --save --install-skill
 
 自動検出できない PC ではパスを指定する: `env_check.py --addata "D:\Addata" --cogni "D:\Audatex\Auda7\Bin\AudaMenu.exe" --neo-check "D:\NEO_check" --save --install-skill`
 
-4. `[OK]` が並び「使える」と出れば完了（自己テストで N BOX JF1 の車両特定と雛形 NEO の読込まで確認する）。`hh.exe` が無い・使えない PC は塗装パネルの標準指数（CHM）が取れない。その PC では生成時に `★ 塗装指数表（CHM）を展開できない` と出るので、**修正塗装の行は `paint.panels[].index` に見積書の指数を必ず書く**（書かないと塗装計が静かにずれる）
+4. `[OK]` が並び「使える」と出れば完了（自己テストで N BOX JF1 の車両特定と雛形 NEO の読込まで確認する）。`hh.exe` が無い・使えない PC は塗装指数表（CHM）を展開できない。その PC では生成時に `★ 塗装指数表（CHM）を展開できない` と出る。ただし **`<car>77/97/87/99.DB`（パネル別塗り数値の表）がある車種は CHM が無くても標準指数が出せる**（ADDATA 2026/08 で溶剤 434 車種・水性 357 車種。2026-09-21 に対応）。★ が出て、その車種にこの表も無いときだけ **修正塗装の行は `paint.panels[].index` に見積書の指数を必ず書く**（書かないと塗装計が静かにずれる）
 5. 受け入れ確認（推奨）: `python .claude/skills/pdf-to-neo/scripts/env_check.py --self-test` で、その PC の ADDATA を使って生成器の単体テスト 9 本（引き継ぎ文書との整合を含む）を通す（10 秒ほど）。`自己診断: すべて合格` なら開発機と同じ NEO が作れる。`ADDATA データ版`（例 2026/08）も控えて社内で揃える
 
 補足: ADDATA が複数ある PC（古い `C:\Addata` と別ドライブの本番データ）では、**既定で走査した候補の中から** `COM\AnVer.DB` が最新のものを選ぶ。既定の走査は「よくある置き方」で 1 つ見つかった時点で止まるので、**古い `C:\Addata` を残したまま本番データを深い場所に置いている PC では古い方を選ぶ**。`env_check.py` が毎回 深い場所まで調べて「ADDATA 他の候補」で知らせるので、導入時に必ず 1 回実行する。使いたいものを固定するなら `--addata` で明示（`ADDATA_SCAN_DEEP=1` でも毎回深く探せるが数十秒かかる）。`--install-skill` は古いコピーや別の場所を指すジャンクションを退避・付け替える。配布 zip は `python .claude/skills/pdf-to-neo/scripts/make_bundle.py` で作る（NEO_check・実 NEO は入らない。雛形 NEO 1 本だけ同梱）。
