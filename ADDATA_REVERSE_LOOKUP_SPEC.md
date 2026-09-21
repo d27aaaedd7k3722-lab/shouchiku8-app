@@ -547,3 +547,74 @@ ADDATA の側では `(ref, カラーコード, フラグ)` が同じで品番が
 
 **車種別 DB の番号は 34 種で、未知の番号は 1 つも無い**（01/05-13/15/17/19/20/21/23/24/25/26/29/55/56/66/67/76/77/83/87/89/93/96/97/99）。
 `HELP\*LTB.CHM` 137 本は `COM/SK_TBL.DB` の 137 行と一致し、**車種フォルダを持たない車（輸入車・トラック・旧型）の指数はここにしかない**。
+
+
+---
+
+## 15. コグニ本体の平文ファイルと処理の流れ（2026-09-21）
+
+### 15-1. 逆アセンブルなしで読める「正本」が 4 つある
+
+| ファイル | 中身 |
+|---|---|
+| `Bin\Msg\AnMsgStr.ini` | **全 568 メッセージ**（`M11521` のような番号つき）。コグニが弾く入力の条件がここに全部ある |
+| `Bin\Msg\AnErrID.ini` / `AnFuncID.ini` | エラー番号・機能番号 |
+| `AudaData\Const\AnDefine.ini` | **修理方法 → 区分コードの正本**・費用欄の固定名・塗装の既定 |
+| `AudaData\AnOption.ini` | 工賃単価・消費税・塗装の**初期設定**（新規作成時の既定値） |
+| `Bin\Dfm\*.dlf`（81 本） | 画面のフォーム定義（平文） |
+| `Template\AnDBVersion.ini` | NEO のスキーマ版（`AnSvIf=3 / AnSvEm=3 / AnSvIg=1`） |
+
+`AnDefine.ini` の `[WorkSheet]` が修理方法の正本:
+
+```
+Repair0=0,0,取替,K,1    Repair1=1,1,脱着,D,1    Repair2=2,2,修理,S,1
+Repair3=3,6,板金,S,1    Repair4=4,3,脱着修理,DS,1   Repair5=5,3,脱着板金,DS,0
+Repair6=6,4,点検,C,0    Repair7=7,4,調整,C,0    Repair8=8,4,点検調整,C,1
+Repair9=9,5,分解調整,OH,1
+```
+
+**板金は区分 6**・脱着修理/脱着板金は 3・点検系は 4・分解調整は 5。生成器の `DISPOSAL` と一致している。
+
+`AnDefine.ini` の `[WorkItemConfirm] AutoMakerCodes=I` … **関連作業（89.DB）の自動計上はメーカー I の車だけ**で、
+他のメーカーは画面でオペレータに聞く。生成器が 89.DB を使わないことの根拠になる。
+
+### 15-2. 生成器が踏み得る制約（`AnMsgStr.ini` より）
+
+| ID | 文言 | 意味 |
+|---|---|---|
+| `M11522` | 指数が 100 を超えています | 1 行の指数の上限 |
+| `M11531` | 構成関係にある部品が既に選択されています | 24.DB の ConstructCode |
+| `M11552` | 部品が重複しています | 同じ部品コード × 修理方法 |
+| `M11554` | 内板骨格修正で既に登録されています | 明細と骨格の二重計上 |
+| `M11650` | 書込み可能な文字数を超えています | 列の TEXT(n) 超過 |
+| `M31541` | パネル総数が規定値を超えました | PaintingPanel の件数上限 |
+| `M31580` | **車種データに存在しない作業が計上されています** | ADDATA に無い WorkCode を書くと出る |
+| `M41210` | データベースが破壊されています | 開けない NEO |
+| `M21002` / `M21506` | 古い形式で保存されています → コンバートしますか | **雛形の DB 版が古いと毎回出る** |
+
+### 15-3. 処理の流れ（明細に 1 行足したとき）
+
+```
+InsertLstRec / RegistLstRec
+ → FindPartsInfo(11/13/83.DB) → FindWageInfo(15.DB) → CheckWorkCode / CheckWorkItem
+ → CheckChild / CheckChildForRelationalParts (24.DB)
+ → 損傷ブロック（AnBlkBL）→ 塗装（AnPntBL: PaintingLinkParts）→ 内板骨格（AnRLFBL）
+ → CalculateTimeWage / CalculateChangeCost / CalculateGaihanWage
+ → AnMainBL.ListChange → RelationalList{Paint,Frame,ADAS} → TotalSumChange → AnTsmBL.CalculatTotal
+```
+
+塗装ページを開くと `CreatePanelByPartsData` が走るので、**明細に無いパネルはそこで消える**
+（生成器が `AddedFrom` を明細の有無で決めているのは本体と同じ動き）。
+
+### 15-4. 工賃単価は 4 本立て
+
+`AnComBL.TBL_Common` が `CalculateChangeWage`（脱着・取替）/ `CalculateGaihanWage`（外板修正）/
+`CalculateNaihanWage`（内板骨格）/ `CalculatePaintingWage`（塗装）を持ち、呼ぶモジュールが完全に分かれている。
+**ADAS の再設定・調整は「脱着・取替単価」**で計算される。
+実案件では `Setting.wi_Price*` が全件 0（区分別単価を使っている工場が無い）ので、生成器が 1 本で計算していても実害は無い。
+
+### 15-5. `Com\AdVer` による版分岐（未対応）
+
+`TRC_XXX01 / XXX11 / XXX13 / XXX26 / XXX66 / XXX83 / XXX96` はレコードの第 1 フィールドが `AdVer` で、
+`SearchXXX26/66/96` は `Addata\Com\AdVer` を読んで `0300 / 0310 / 0320 / 0330` で分岐する。
+この PC の `AdVer` は **0410**。生成器は `AnVer.DB` は読むが `AdVer` は読んでいない。

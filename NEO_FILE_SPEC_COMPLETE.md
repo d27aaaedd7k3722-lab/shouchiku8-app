@@ -168,9 +168,23 @@ PolicyNo, ContractorName, AgencyName, AccidentDate/Era/EraYear, PresenceDate（�
 
 ### Expense（36 行固定）
 LineNo 1-8 は固定名（文字書き/内張り/配線配管/ショートパーツ/レッカー1/レッカー2/写真代他/その他控除、NameFix=1）、9-36 は任意名（NameFix=0）。`PartsEnabled/PartsPrice*` と `WageEnabled/Wage*`、`OutTaxFlag`（非課税）。Name は 20 バイト。
+固定名の出どころは実行ファイル側の定義（`C:\Program Files (x86)\Audatex\Auda7\AudaData\Const\AnDefine.ini` の `[CostItem]` の `Line1`〜`Line8`）。`Attribute` は LineNo と同じ値が入る（レッカー代1 なら LineNo=5 / Attribute=5）。
+
+**費用行の消費税は「請求書単位と同じ端数処理」に従う（`Setting.tx_ArrangeFlag`）。行ごとに常に四捨五入するのは誤り。**
+コグニセブン実機で確認（2026-09-21・トヨタ アイシス 5ドアワゴン ZNM10 L 1800 の新規見積に「レッカー代1」= 105 円を入れ、
+消費税設定の計算単位だけを変えて 2 本保存し、中身を読んだ）:
+
+| 消費税設定 | tx_ArrangeFlag | Expense.PartsPriceOutTax | PartsPriceTax | PartsPriceInTax | Total.hy_Wrecker1Tax | 画面の消費税 |
+|---|---|---|---|---|---|---|
+| 四捨五入 | 1 | 105 | **11** | 116 | 11 | ¥11 |
+| 切り捨て | 2 | 105 | **10** | 115 | 10 | ¥10 |
+
+画面には「費用行ごとの税額」という欄は無く、費用は小計に入って請求書単位で課税される。
+NEO の行ごとの Tax 列は、その端数処理で計算した値が入る。
+（設定の場所: 見積画面 → ツールバー「その他」→「消費税設定(T)」→ 計算単位。`AnOption.ini` の `[ConsumptionTax] TaxUnit` が既定値）
 
 ### Total（1 行）
-`ms_PartsTotal*`（Σ部品、税は行ごとの PartsPriceTax の合計。行税は四捨五入、数量行は 四捨五入(単価×0.1)×数量 §6）, `ms_WageTotal*`, `ms_RecyclePartsTotal*`, `pn_Total*`（塗装計）, `pn_MaterialTotal*`, `nk_Total*`（内板）, `hy_PartsNoTax/WageNoTax/PartsTax/WageTax Total*`（費用）, `hy_Wrecker1/2*`, `pt_Extra*`（部品値引 Flag=1 Unit=1 ArrangeFlag=1 IncludeRecycle=1）, `wg_Extra*`（工賃値引）, `tx_TotalOutTax/InTax` = SubTotal×10% を四捨五入（751,595 → 75,160、598,965 → 59,897。§6）
+`ms_PartsTotal*`（Σ部品、税は行ごとの PartsPriceTax の合計。数量行は 端数処理(単価×0.1)×数量 §6）, `ms_WageTotal*`, `ms_RecyclePartsTotal*`, `pn_Total*`（塗装計）, `pn_MaterialTotal*`, `nk_Total*`（内板）, `hy_PartsNoTax/WageNoTax/PartsTax/WageTax Total*`（費用）, `hy_Wrecker1/2*`, `pt_Extra*`（部品値引 Flag=1 Unit=1 ArrangeFlag=1 IncludeRecycle=1）, `wg_Extra*`（工賃値引）, `tx_TotalOutTax/InTax` = SubTotal×10% を四捨五入（751,595 → 75,160、598,965 → 59,897。§6）
 
 ### リサイクル部品（RCParts / RCLinkParts、コグニ「リサイクル部品登録」で確定。根拠 = コグニ実機 2026-09-04 の保存版 NEO_check/案件 C01_CHR/CHR_ETO_exp.neo・CHR_ETO_exp2.neo（RCParts 1 行）。証拠パック neo_CHR_ETO_exp.json に収録）
 - 元の ERParts 行は削除して末尾に追加し直す（他行の RecordNo は据え置き、LineNo だけ 10 刻みで振り直し、追加行は RecordNo=最大+1）
