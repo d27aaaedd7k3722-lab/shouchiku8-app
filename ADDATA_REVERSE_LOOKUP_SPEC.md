@@ -84,7 +84,7 @@ CarCode・YearCode・BodyCode・GradeCode・FVACode が 7/7 完全一致し、PD
 | FVAName / FVANameByUser | 08.DB | ✅ |
 | CarName / CarNameByUser | 01.DB | ✅ |
 | BodyImageCode | 07.DB 末尾 2 桁 | ✅ |
-| SBaseCode / LBaseCode | = BodyCode / '00'（11 件すべて） | ✅ |
+| SBaseCode / LBaseCode | 01.DB のレコードの `00`（NUL） の次の 1 バイト / '00'（ふつうは BodyCode と同じだが、ボディ 40 → 30 のような上位区分を持つ車種は違う。実案件 1,253 本すべてで一致。2026-09-21 に訂正。以前は「= BodyCode（11 件すべて）」と書いていたが 1.4% で違う） | ✅ |
 | ColorCode / ColorName / ColorRGB1 | 26.DB | ✅ |
 | PartsPriceDate | 01.DB 先頭レコードの価格適応日 | ✅ |
 | CarFormCode / FormCode1 / FormCode2 / FinishCode | `<car>25.DB` の 4 桁（§9-1。J52 = 7/2/5/2、実 NEO 9 台一致）。BAN/BOOTH/T_KEI/SIRU のキー | ✅ 確定 |

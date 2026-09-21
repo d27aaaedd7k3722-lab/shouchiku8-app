@@ -75,5 +75,18 @@ print('-- 車台番号の車種・年式が KA81 に無ければ、今までど�
 res = run([old, new], [{'car_code': 'J99', 'year_code': '05', 'model': 'JF1', 'range': (1, 9)}], '2018/2')
 chk(got(res)[0] == '02', f'KA81 の期間で選ぶはずが {got(res)}')
 
+print('-- Car.SBaseCode は 01.DB の値（BodyCode と同じとは限らない）--')
+R = AddataVehicleResolver()
+if os.path.isdir(os.path.join(R.root, 'W', 'W12')):   # 上位区分を持つ車種（ボディ 40 → 30）。実案件 1,253 本すべてで一致（2026-09-21）
+    yrs = sorted({y for (y, b, g, f) in (R.header_db('W12').get('records') or {}) if b == '40'})
+    chk(yrs and R.sbase_code('W12', yrs[0], '40') == '30', f"W12 ボディ 40 の SBase {yrs and R.sbase_code('W12', yrs[0], '40')}（30 のはず）")
+    chk(R.sbase_code('W12', yrs[0], '10') == '10', 'W12 ボディ 10 の SBase は 10 のはず')
+else:
+    print('   W12 が無い ADDATA なので飛ばす')
+chk(R.sbase_code(CAR, '99', '99') == '99', '01.DB に無い組合せは BodyCode のまま')
+if os.path.isdir(os.path.join(R.root, 'Y', 'Y91')):   # 同じ年式・ボディ・グレードでも駆動＋エンジンで SBase が違う車（Codex 指摘）
+    for (y, b, g, f), v in (R.header_db('Y91').get('records') or {}).items():
+        chk(R.sbase_code('Y91', y, b, g, f) == v['sbase'], f'Y91 {y}/{b}/{g}/{f!r} の SBase {R.sbase_code("Y91", y, b, g, f)}（{v["sbase"]} のはず）')
+
 print('unit_vehicle_serial: all ok' if ok else 'unit_vehicle_serial: NG')
 sys.exit(0 if ok else 1)

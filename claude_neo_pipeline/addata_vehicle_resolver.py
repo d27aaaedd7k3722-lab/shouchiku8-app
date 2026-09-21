@@ -395,7 +395,9 @@ class AddataVehicleResolver:
     @lru_cache(maxsize=None)
     def header_db(self, car: str) -> dict:
         """01.DB（平文・車種ヘッダ）: NEO CarName の元となる半角車名レコード。
-        レコード: [grade 1][body 1B][year 1][駆動+エンジン 2][00][?]['    '][半角車名 24][型式+グレード名 22][排気量 4][価格適応日 6]
+        レコード: [grade 1][body 1B][year 1][駆動+エンジン 2][00][SBase 1B]['    '][半角車名 24][型式+グレード名 22][排気量 4][価格適応日 6]
+        SBase は NEO の Car.SBaseCode（ボディの上位区分。W12 のボディ 40 → 30、S73 の 20 → 10、D41 の 10 → 00）。
+        2026-09-21 にコグニ本体 DBSEARCH.dll（ボディ条件 10001DF0）の逆アセンブルと実案件 1,253 本の Car 表で確定
         戻り値: {'title': {...}, 'records': {(year, body, grade, fva2): {...}}}"""
         p = os.path.join(self.root, car[0], car, f'{car}01.DB')
         out = {'title': {}, 'records': {}}
@@ -406,15 +408,31 @@ class AddataVehicleResolver:
         m = re.search(rb'A\x00   \x00\x00    (.{24})(.{26})(\d{6})', b, re.S)
         if m:
             out['title'] = {'name': self._d(m.group(1)), 'series': self._d(m.group(2)), 'price_date': m.group(3).decode()}
-        for m in re.finditer(rb'([A-Z])([\x01-\x7f])([ 0-9])([A-Z ][A-Z ])\x00.    (.{24})(.{22})(.{4})(\d{6})', b, re.S):
+        for m in re.finditer(rb'([A-Z])([\x01-\x7f])([ 0-9])([A-Z ][A-Z ])\x00(.)    (.{24})(.{22})(.{4})(\d{6})', b, re.S):
             grade = m.group(1).decode(); body = f'{m.group(2)[0]:02d}'
             yr = m.group(3).decode(); year = '00' if yr == ' ' else f'0{yr}'
             f2 = m.group(4).decode('latin1')
             out['records'][(year, body, grade, f2)] = {
-                'name': self._d(m.group(5)), 'model_grade': self._d(m.group(6)),
-                'cc': m.group(7).decode('cp932', 'replace'), 'price_date': m.group(8).decode(),
+                'name': self._d(m.group(6)), 'model_grade': self._d(m.group(7)),
+                'cc': m.group(8).decode('cp932', 'replace'), 'price_date': m.group(9).decode(),
+                'sbase': f'{m.group(5)[0]:02d}',
             }
         return out
+
+    def sbase_code(self, car: str, year: str, body: str, grade: str = '', fva2: str = '') -> str:
+        """NEO の Car.SBaseCode。01.DB のレコードの値。見つからなければ BodyCode
+        （実案件 1,253 本の 98.6% は BodyCode と同じ。違うのはボディ 40 → 30 のような上位区分を持つ車種）。
+        同じ年式・ボディ・グレードでも駆動＋エンジン（fva2）で値が違う車がある（Y91 年式 01 ボディ 40 グレード D は
+        A/C/F/WC/ZA が 40、ZC/ZF が 30。Codex 指摘）ので、(年式, ボディ, グレード, fva2) の完全一致を先に引き、
+        無ければ候補の値がそろうときだけ使う（割れるなら BodyCode のまま）"""
+        recs = self.header_db(car).get('records') or {}
+        exact = recs.get((year, body, grade, fva2)) if grade and fva2 else None
+        if exact and exact.get('sbase'):
+            return exact['sbase']
+        hit = [v for (y, b, g, _f), v in recs.items() if y == year and b == body and (not grade or g == grade)] or \
+              [v for (y, b, g, _f), v in recs.items() if y == year and b == body]
+        vals = {v.get('sbase') for v in hit if v.get('sbase')}
+        return vals.pop() if len(vals) == 1 else body
 
     def katashiki(self) -> list[tuple[str, str, str, str, str, str]]:
         """COM.CAB 内 Katashiki.DB: (CarCode, 年式, ボディ, グレード, 駆動+エンジン, 型式)。
@@ -833,7 +851,7 @@ class AddataVehicleResolver:
                 'CarCode': best.car_code, 'YearCode': best.year_code, 'BodyCode': best.body_code,
                 'GradeCode': best.grade_code, 'FVACode': (('Z' + best.fva_code) if best.four_wd else best.fva_code), 'FVAName': best.fva_name,  # 4WD は 'Z'+区分（コグニ生成 NEO: ハイゼット S510P 4WD → 'ZA'）
                 'CarName': car_name, 'CarNameByUser': car_name + '\u3000', 'FVANameByUser': best.fva_name,
-                'BodyImageCode': best.body_image_code, 'LBaseCode': '00', 'SBaseCode': best.body_code,
+                'BodyImageCode': best.body_image_code, 'LBaseCode': '00', 'SBaseCode': self.sbase_code(best.car_code, best.year_code, best.body_code, best.grade_code, self.fva2(best.four_wd, best.fva_code) if best.grade_code else ''),
                 'CarFormCode': car_form, 'FormCode1': form1, 'FormCode2': doors or '5', 'FinishCode': fc.get('FinishCode', '2'),
                 'ColorCodeFlag': 1 if col else 0, 'ColorCode': col.get('code', color_code or ''),
                 'ColorName': col.get('name', ''), 'ColorRGB1': col.get('rgb', ''),

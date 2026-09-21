@@ -74,7 +74,7 @@ XOR 0xFF したビット列を左シフトして格納した 2 ブロック。`d
 | FVAName / FVANameByUser | `08.DB` |
 | CarName / CarNameByUser | `01.DB` の半角車名レコード `{車名} {型式 グレード名} {排気量 右詰4}`。末尾の全角空白は状態依存（工場のコグニ生成 NEO と車名変更後の保存では付く、新規見積直後の NEW1 では付かない）。コグニはどちらも読む。生成器は全角空白付き |
 | BodyImageCode | `07.DB` 末尾 2 桁 |
-| LBaseCode / SBaseCode | '00' / = BodyCode |
+| LBaseCode / SBaseCode | '00' / **01.DB の値**（ふつうは BodyCode と同じ。W12・W44・W92 のボディ 40 → 30、S73 の 20 → 10、D41 の 10 → 00 のように違う車種がある。実案件 1,253 本の 1.4%。2026-09-21 に訂正） |
 | CarFormCode / FormCode1 / FormCode2 / FinishCode | **`25.DB`**（例 7252） |
 | ColorCodeFlag / ColorCode / ColorName / ColorRGB1 | `26.DB` |
 | ColorRGB2 / UColor* / LColor* | ツートン用。通常空 |
