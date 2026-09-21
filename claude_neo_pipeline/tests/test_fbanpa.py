@@ -16,12 +16,21 @@ OBS = [((4, '新品', 0, 0), 2.6), ((4, '新品', 0, 1), 3.0), ((4, '新品', 0,
        ((4, '変形修正', 0, 1), 5.0), ((4, '変形修正', 1, 1), 4.9), ((4, '外傷修正', 0, 1), 4.5), ((4, '外傷修正', 1, 1), 4.4)]
 ok = 0
 for (coat, kind, form, col), exp in OBS:
-    got = pi.bumper_time_generic(coat, kind, form, col)
+    got = pi.bumper_time_generic(coat, kind, form, col, bumper_only=True)  # 実機実験は塗装パネル 0 枚（バンパだけ）= v4..v6 群
     ok += (got is not None and abs(got - exp) < 0.001) or print('NG', coat, kind, form, col, got, exp) is not None
 print('FBANPA unit', ok, '/', len(OBS))
+# 塗装パネルがある見積は v1..v3 群（加算基礎はパネル側に立つ）。実案件 20 行すべてこちら（2026-09-21）
+# 車形6 塗膜4 新品: v1..v3 = 2.0 / 2.4 / 2.1、v4..v6 = 2.6 / 3.0 / 3.3
+ok2 = 0
+PANEL = [((4, '新品', 0, 0), 2.0), ((4, '新品', 0, 1), 2.4), ((4, '新品', 0, 2), 2.1), ((4, '新品', 1, 0), 1.9),
+         ((2, '新品', 0, 0), 1.8), ((2, '変形修正', 0, 0), 3.5), ((2, '外傷修正', 0, 0), 2.9)]
+for (coat, kind, form, col), exp in PANEL:
+    got = pi.bumper_time_generic(coat, kind, form, col, bumper_only=False)
+    ok2 += (got is not None and abs(got - exp) < 0.001) or print('NG panel', coat, kind, form, col, got, exp) is not None
+print('FBANPA unit(パネルあり)', ok2, '/', len(PANEL))
 nb = e.NeoBuilder()
 est = {'labor_rate': 10000, 'index_policy': 'auto', 'items': [{'code': '0600', 'name': '', 'method': '取替', 'qty': 1}], 'expenses': [], 'totals': {},
-       'paint': {'paint': 3, 'coat': '３コートパール', 'material_rate': 15, 'panels': [{'code': '0600', 'method': '取替'}],
+       'paint': {'paint': 3, 'coat': '３コートパール', 'material_rate': 15, 'panels': [],  # 実機の保存 NEO は塗装パネル 0 枚（バンパだけ）＝ FBANPA の v4..v6 群
                  'bumper_front': {'method': '外傷修正', 'form': '標準', 'color': '黒ライン', 'draft': '無し'}, 'bumper_rear': {'method': '新品', 'form': '大型', 'color': '黒ライン'}}}
 veh = {'model_code': 'GJ3', 'serial_no': 'GJ3-1200001', 'desig': '', 'category': '', 'reg_date': '2007/1', 'color_code': ''}
 neo, rep = nb.build(est, veh, hints={'grade_name': 'EL'}, labor_rate=10000)

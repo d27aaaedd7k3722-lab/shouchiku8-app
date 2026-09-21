@@ -2734,7 +2734,9 @@ class NeoBuilder:
                 sbt = pi.bumper_time(pfx == 'fb', coat_c, disp_name, two, paint=paint_c) if pi else None  # 水性(4)は <car>93.DB
                 if sbt is None and pi is not None and disp_code != 0 and not has_tbl:  # 車種別の表が無い車種だけ汎用表（表はあるが値が無い行は標準なしのまま）
                     # 23.DB の無い車種は COM/FBANPA.DB（形状 大型/標準 × 一色/黒ライン/二色、外傷修正は 小/大 の区別なし = fb_Disposal 3。コグニ実機 J69 2026-09-06 夕）
-                    g_ = pi.bumper_time_generic(coat_c, disp_name, form_code if form_code >= 0 else 0, col_code)
+                    # 列は 2 群あり、塗装パネルが 1 行も無い（バンパだけ塗る）ときだけ加算基礎込みの v4..v6 を使う（実案件 23 行で確定。2026-09-21）
+                    g_ = pi.bumper_time_generic(coat_c, disp_name, form_code if form_code >= 0 else 0, col_code,
+                                                bumper_only=_bumper_only)
                     if g_ is not None:
                         sbt = g_
                         if disp_code in (4, 5):

@@ -775,7 +775,15 @@ class PaintIndex:
         return None
 
     def bumper_time(self, front: bool, coat: int, kind: str = '取替', two_tone: bool = False, paint: int = 3) -> Optional[float]:
-        """<car>23.DB（溶剤）/ <car>93.DB（水性 paint=4、同形）: F/R, 塗膜クラス → [取替一色, 取替二色, 外傷大一色, 外傷大二色, 外傷小一色, 外傷小二色, 変形一色, 変形二色]"""
+        """<car>23.DB（溶剤）/ <car>93.DB（水性 paint=4、同形）のバンパ塗装標準指数。
+
+        行 = `23/93, 車種, 年式群, ボディ, グレード, 装備(EVA), F/R, 塗膜クラス, 値×8, 予備`
+        （RTTI の列名 Year / Body / Grade / EVA と同じ並び。パネル表 77/97/87/99.DB とも同じ）。
+        値の並びは [取替一色, 取替二色, 外傷大一色, 外傷大二色, 外傷小一色, 外傷小二色, 変形一色, 変形二色]。
+
+        **同じ車種に 年式群・ボディ・グレード・装備 別の行がある**（1,430 ファイル中 316 ファイル。
+        例: D62 は 無条件 / グレード A / B / H の 4 組で F メタリック取替一色 2.5 対 2.2）。
+        パネル表と同じ規則で絞る（2026-09-21。それまでは先頭行を当てていたので、条件行のある車で標準指数がずれていた）"""
         p = os.path.join(self.car_dir, f'{self.car}{93 if paint == 4 else 23}.DB')
         if not os.path.exists(p):
             return None
@@ -784,22 +792,40 @@ class PaintIndex:
         if base_idx is None:
             return None  # '外傷修正'（小/大の区別なし）は 23.DB 車種では選べない（FBANPA 車種専用）
         idx = base_idx + (1 if two_tone else 0)
+        cand = []
         for l in _xor_lines(p):
             f = [x.strip() for x in l.split(',')]
             if len(f) >= 16 and f[6] == ('F' if front else 'R') and f[7] == str(cls):
-                v = int(f[8 + idx] or 0)
-                return v / 100.0 if v > 0 else None  # 0 埋めは未収録扱い
-        return None
+                cand.append({'grp': f[2], 'body': f[3], 'grade': f[4], 'eva': f[5],
+                             'vals': [int(x or 0) / 100.0 for x in f[8:16]]})
+        if not cand:
+            return None
+        pick = self._pick_panel_row(cand)  # 行が 1 つでも通す: 条件行しか無い車（ボディ・年式限定）で
+                                          # その行を無条件に当てない（Codex 指摘 2026-09-21）
+        if pick is None:  # この車の装備・グレードに合う行が無い（無条件行も無い）→ 標準なし
+            return None
+        v = pick['vals'][idx]
+        return v if v > 0 else None  # 0 埋めは未収録扱い
 
 
     def has_bumper_table(self, paint: int = 3) -> bool:
         """車種別のバンパ表（<car>23.DB、水性は 93.DB）があるか。無い車種は COM/FBANPA.DB（bumper_time_generic）"""
         return os.path.exists(os.path.join(self.car_dir, f'{self.car}{93 if paint == 4 else 23}.DB'))
 
-    def bumper_time_generic(self, coat: int, kind: str = '新品', form_code: int = 0, col_code: int = 0) -> Optional[float]:
-        """<car>23.DB の無い車種（586 車種 = 01.DB を持つ 1,299 車種中、うち 20.DB あり 489。例: ミニキャブ・パートナー・アクティ・ダイナ等）の樹脂バンパ塗装 = COM/FBANPA.DB（コグニ実機 J69 2026-09-06 夕）。
-        行 `車形 0, K/S, 塗膜クラス 1-4, 副区分(S: 1=変形修正 2=外傷修正), v1..v6`。v4/v5/v6 = 大型 の 一色/黒ライン/二色、標準 = 大型 − 0.1（3コートパール 新品: 大型 2.6/3.0/3.3、標準 2.5/2.9/3.2。
-        メタリック 変形 大型黒ライン 4.6 = S,2,1 の v5、外傷 4.0 = S,2,2 の v5、標準一色 3.8/3.2 = v4 − 0.1）。v1..v3 の用途は未同定（小型と推定）。絞模様有りは呼び出し側で +0.4"""
+    def bumper_time_generic(self, coat: int, kind: str, form_code: int, col_code: int,
+                            bumper_only: bool) -> Optional[float]:
+        """<car>23.DB の無い車種（586 車種 = 01.DB を持つ 1,299 車種中、うち 20.DB あり 489。例: ミニキャブ・パートナー・アクティ・ダイナ等）の樹脂バンパ塗装 = COM/FBANPA.DB。
+        行 `車形 0, K/S, 塗膜クラス 1-4, 副区分(S: 1=変形修正 2=外傷修正), v1..v6`。
+        **6 つの値は 3 列ずつ 2 群**で、どちらを使うかは「塗装パネルがあるか」で決まる（2026-09-21 実案件 23 行で確定）:
+
+        - **塗装パネルがある見積 → v1/v2/v3**（一色/黒ライン/二色）。パネル側に加算基礎が立つので、バンパは単体の値。
+          実案件 20 行すべてこちら（うち 1 行はバンパ加算基礎 0.4 も別に立っている）
+        - **バンパだけを塗る見積（塗装パネル 0 枚）→ v4/v5/v6**。加算基礎相当（v4 − v1 ＝ 塗膜別 0.3/0.4/0.4/0.6
+          ＝ バンパ加算基礎 − 0.1）が内包されている。実案件 2 行と、コグニ実機 J69（2026-09-06 夕。画面 19 値・
+          保存 NEO FBANPA_J69.neo。どちらも塗装パネル 0 枚）がこちら
+
+        標準形状は 大型 − 0.1（実機 3コートパール 新品: 大型 2.6/3.0/3.3、標準 2.5/2.9/3.2。
+        メタリック 変形 大型黒ライン 4.6 = S,2,1 の v5、外傷 4.0 = S,2,2 の v5）。絞模様有りは呼び出し側で +0.4"""
         cls = COAT_CLASS_BUMPER.get(coat, 2)
         ks = 'K' if kind in ('取替', '新品') else 'S'
         sub = '0' if ks == 'K' else ('1' if kind.startswith('変形') else '2')
@@ -808,7 +834,7 @@ class PaintIndex:
         cand = [f for f in rows if len(f) >= 10 and f[0].strip() == form] or [f for f in rows if len(f) >= 10 and f[0].strip() == '0']
         for f in cand:
             if f[1].strip() == ks and f[2].strip() == str(cls) and f[3].strip() == sub:
-                v = int(f[4 + 3 + min(max(col_code, 0), 2)] or 0)  # v4..v6
+                v = int(f[4 + (3 if bumper_only else 0) + min(max(col_code, 0), 2)] or 0)  # パネルがあれば v1..v3、バンパだけなら v4..v6
                 if v <= 0:
                     return None
                 t = v / 100.0 - (0.1 if form_code == 1 else 0.0)

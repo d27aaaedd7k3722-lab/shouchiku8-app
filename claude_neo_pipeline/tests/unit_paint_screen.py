@@ -247,6 +247,19 @@ def main() -> int:
                          ((0, 1, 4), 0.2), ((0, 2, 4), 0.3), ((1, 2, 4), 0.6)):
         fails = _cmp(f'2コートソリッド {_args}', _E.two_coat_solid_time(*_args), _want, fails)
 
+    # バンパ 23.DB は 年式群・ボディ・グレード・装備でも行が分かれる（2026-09-21。実案件 127/127 一致）。
+    # D62: 無条件 / グレード A / B / H。F メタリック取替一色 = 無条件 2.5、グレード A 2.2
+    from paint_index import PaintIndex as _PI
+    _root = os.environ.get('ADDATA_ROOT') or r'C:\Addata'
+    _d = _PI(_root, 'D62')
+    fails = _cmp('23.DB グレード無し', _d.bumper_time(True, 2, '取替'), 2.5, fails)
+    _d.grade = 'A'
+    fails = _cmp('23.DB グレード A', _d.bumper_time(True, 2, '取替'), 2.2, fails)
+    _d.grade = 'B'
+    fails = _cmp('23.DB グレード B', _d.bumper_time(True, 2, '取替'), 2.2, fails)
+    _d.grade = 'X'  # どの条件行にも当たらないグレード → 無条件行
+    fails = _cmp('23.DB 該当しないグレード', _d.bumper_time(True, 2, '取替'), 2.5, fails)
+
     print('unit_paint_screen:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
 

@@ -411,7 +411,9 @@ def _inspect(path: str, out_json: str = '') -> int:
                 bt = pi.bumper_time(front, coat_c, disp_name, two_tone=(col_code == 2), paint=paint_c)
                 src_b = '<car>23/93.DB'
                 if bt is None and not has_tbl:  # 車種別表が無い車種は COM/FBANPA.DB（外傷修正は小/大の区別なし）
-                    bt = pi.bumper_time_generic(coat_c, disp_name, form_code, col_code)
+                    # 汎用表は「塗装パネルがあるか」で使う列が変わる（paint_index の説明。2026-09-21）
+                    bt = pi.bumper_time_generic(coat_c, disp_name, form_code, col_code,
+                                                bumper_only=not (p.get('panels') or []))
                     src_b = 'COM/FBANPA.DB（汎用表）'
                 if bt is not None and draft:
                     bt = round(bt + BUMPER_DRAFT_ADD, 1)
