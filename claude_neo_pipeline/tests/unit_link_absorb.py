@@ -89,6 +89,16 @@ def main() -> int:
             if not ok:
                 fails += 1
             print(('ok  ' if ok else 'FAIL'), tag, code, 'got', got, 'expected', (t, ts, wc, wm, ct))
+    # 重ね文字のリンク（`LL`/`MM`）は偶数 `X0` として奇数 `X1` を抑止する（2026-09-21。W90 の +7.7h の正体）
+    from estimate_to_neo import AddataParts as _AP
+    for _link, _want in (('LL', 'L0'), ('MM', 'M0'), ('II', 'I0'), ('L0', 'L0'), ('L1', 'L1'), ('', ''), ('AB', 'AB')):
+        got = _AP._link_even_form(_link)
+        if got != _want:
+            fails += 1
+            print('FAIL 重ね文字リンク', _link, 'got', got, 'expected', _want)
+        else:
+            print('ok   重ね文字リンク', _link, '→', got)
+
     print('unit_link_absorb:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
 

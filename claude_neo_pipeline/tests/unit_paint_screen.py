@@ -274,6 +274,20 @@ def main() -> int:
     fails = _cmp('66.DB 高機能（耐スリ傷の色）', _i3['hf'], ['T'], fails)
     fails = _cmp('66.DB 無い色は行 0', _r.color_paint_info('W66', 'ZZZZ')['rows'], 0, fails)
 
+    # 25.DB は 13 バイトのレコードで、ボディで車形が変わる（2026-09-21）
+    _w66 = _PI(_root, 'W66')
+    fails = _cmp('25.DB 車形（ボディなし）', ''.join(_w66.form_codes()), ''.join(_PI(_root, 'W66').form_codes()), fails)
+    for _car, _b1, _b2 in (('C34', '00', '10'), ('D88', '00', '20')):
+        _p1 = _PI(_root, _car, body=_b1)._chm_path() or ''
+        _p2 = _PI(_root, _car, body=_b2)._chm_path() or ''
+        fails = _cmp(f'{_car} はボディで CHM が変わる', _p1 != _p2 and bool(_p1) and bool(_p2), True, fails)
+
+    # 暫定指数の車種（S_Est の 1 桁目が 2）は塗装パネルの印が `$`
+    fails = _cmp('S_Est 1 桁目（W66）', _PI(_root, 'W66').car_paint_kind(), 1, fails)
+    fails = _cmp('S_Est 1 桁目（C10）', _PI(_root, 'C10').car_paint_kind(), 5, fails)
+    fails = _cmp('汎用車種は塗装指数なし', _PI(_root, 'Z10').car_paint_kind(), 0, fails)
+    fails = _cmp('暫定でない車は False', _PI(_root, 'W66').car_paint_provisional(), False, fails)
+
     print('unit_paint_screen:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
 
