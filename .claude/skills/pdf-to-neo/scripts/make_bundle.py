@@ -168,6 +168,7 @@ SELFTEST_TESTS = [  # 配布先でも動く自己診断（ADDATA だけで完結
     'unit_handoff.py',  # 引き継ぎ文書（HANDOFF.md）の主張と実装・ADDATA の突き合わせ（3〜4 秒）
     'unit_paint_screen.py',  # 塗装画面（実機 2026-09-20 の全機能入り見積と同じ NEO になるか）
     'unit_expense_lines.py',  # 費用 36 行の割付（固定行 1〜8 / 自由行 9〜36 は名前で合わせる / レッカーは自由行）
+    'unit_vehicle_serial.py',  # 車両特定: 車台番号で年式が決まったら初度登録は見ない（本体どおり）。confirmed は 1 台に決まるときだけ
     'unit_adver.py',  # ADDATA の形式版（COM\AdVer）。確かめていない版は止め、11.DB の長さも検査する
     'neo_diff.py',  # 上記テストが使う NEO 差分ツール
 ]

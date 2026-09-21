@@ -662,17 +662,38 @@ class AddataVehicleResolver:
                     added += 1
                 if not added:
                     cands.append(Candidate(r['car_code'], r['year_code'], '', '', '', False, [], reasons=['KA81 未ヒット: 車種のみ確定']))
-        # 3) 採点
+        # 3) 本体と同じ絞り込み（コグニ AxCarSrcUIProof.bpl SearchCarFromCarSerialNo 0x410D74 / SearchCar 0x410664 を
+        #    逆アセンブルして確定。2026-09-21）:
+        #    - 車台番号で（車種・年式）が決まったら、KA81 をその（車種・年式）で引き直し、**初度登録は見ない**。
+        #      在庫期間のある車（生産終了後に登録）は初度登録が KA81 の生産期間の外になり、点数で比べると隣の年式に負けていた
+        #      （実案件で 16 本。しかも確度 confirmed で外していた）
+        #    - 車台番号で決まらないときは、初度登録で生産期間を**厳密に**絞る（0 件なら絞らない）
         reg = parse_reg_date(reg_date)
         serial_keys = {(r['car_code'], r['year_code']) for r in by_serial}
         serial_cars = {r['car_code'] for r in by_serial}
+        by_serial_year = False
+        if by_desig and serial_keys:
+            hit = [c for c in cands if (c.car_code, c.year_code) in serial_keys]
+            if hit:
+                cands = hit; by_serial_year = True
+                ev.append(f'車台番号で（車種・年式）が決まったので KA81 をそれだけに絞った（初度登録は見ない。本体と同じ）: {len(hit)} 候補')
+        if by_desig and not by_serial_year and reg:
+            v_ = (reg[0] - 1900) * 12 + reg[1]
+            inper = [c for c in cands if c.period and c.period[0] and c.period[0] <= v_ and (not c.period[1] or v_ <= c.period[1])]
+            if inper and len(inper) < len(cands):
+                ev.append(f'初度登録 {reg} で KA81 の生産期間を絞った: {len(cands)} → {len(inper)} 候補')
+                cands = inper
+        # 絞り込み後に残った車（ヒントで選ぶ前）。1 台に決まるときだけ確度 confirmed にする（本体はここで複数なら人に選ばせる）
+        narrowed = {(c.car_code, c.year_code, c.body_code, c.grade_code, c.fva_code, c.four_wd) for c in cands}
         for c in cands:
             c.year_name = self.year_names(c.car_code).get(c.year_code, '')
             if (c.car_code, c.year_code) in serial_keys:
                 c.score += 5; c.reasons.append('車台番号レンジ一致(CarCode+Year)')
             elif c.car_code in serial_cars:
                 c.score += 2; c.reasons.append('車台番号レンジ一致(CarCodeのみ)')
-            if reg and c.period and c.period[0]:
+            if by_serial_year:
+                pass   # 車台番号で年式が決まった候補は初度登録で比べない（本体と同じ）
+            elif reg and c.period and c.period[0]:
                 v = (reg[0] - 1900) * 12 + reg[1]
                 x, y = c.period
                 if x <= v and (not y or v <= y):
@@ -756,7 +777,11 @@ class AddataVehicleResolver:
             distinct = {(c.car_code, c.year_code, c.body_code, c.grade_code, c.fva_code, c.four_wd) for c in top}
             expanded = any('01.DB のグレード一覧から候補' in r for r in (best.reasons or []))
             if len(distinct) == 1 and best.grade_code:
-                conf = 'confirmed' if by_desig and by_serial else ('medium' if expanded else 'high')
+                if by_desig and by_serial:
+                    # 本体の絞り込みで 1 台に決まったときだけ confirmed。複数残ってヒント（グレード名など）で選んだときは high
+                    conf = 'confirmed' if len(narrowed) == 1 else 'high'
+                else:
+                    conf = 'medium' if expanded else 'high'
             elif best.grade_code and not expanded:
                 conf = 'medium'
             else:
