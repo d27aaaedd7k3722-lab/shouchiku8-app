@@ -1477,7 +1477,7 @@ class AddataParts:
         if not hit and rows and ctx:
             y = str(ctx.get('year') or '').strip()
             grp = y[-1] if y.isdigit() and int(y) else ''
-            srow = self._std_row(ref_no, dcode, ctx.get('grade', ''), ctx.get('fva', ''), set(ctx.get('eva') or ()), grp, ctx.get('body'))
+            srow = self._cogni_row(ref_no, dcode, ctx.get('grade', ''), ctx.get('fva', ''), set(ctx.get('eva') or ()), grp, ctx.get('body'))
             if srow and srow.get('pn'):
                 hit = [r for r in rows if self.norm_pn(r['parts_no']) == self.norm_pn(srow['pn'])]
                 return (hit[0] if hit else rows[0]), [r for r in rows if r not in hit]
@@ -1541,6 +1541,11 @@ class AddataParts:
                     raise ValueError(f'{self.car}{src}.DB の索引が本体の範囲外（to={max(idx_to)}, ブロック数 {nblocks}）')
                 ks = LCG(self.e._read_seed(self.car)).keystream(blen)
                 body = raw[base:]
+                sub_of = {}
+                for i in range(n):
+                    _r, _s, _f, _t = struct.unpack_from('<HHHH', raw, 2 + i * 8)
+                    for _k in range(_f, _t + 1):
+                        sub_of[_k] = (i, _s)   # 索引の何番目のグループか（SearchKA13/83 はグループごとに 1 行を選ぶ）
                 for k in range(len(body) // blen):
                     dec = bytes(a ^ c for a, c in zip(body[k * blen:(k + 1) * blen], ks))
                     ref = struct.unpack_from('<H', dec, 0)[0]
@@ -1579,6 +1584,7 @@ class AddataParts:
                     if price and not price.isdigit():  # 空欄（価格未設定）は 0、非空の不正値だけ例外
                         raise ValueError(f'{src}.DB ブロック {k}: 価格欄が数値でない {price!r}')
                     out.setdefault(ref, []).append({'flags': fl, 'name': name, 'name20': name20, 'pn': pn, 'price': int(price) if price else 0, 'cgroup': cg, 'color': color,
+                                                    'grp': chr(dec[4]).strip(), 'body': dec[5], 'group': sub_of.get(k, (('orphan', k), 0))[0],   # dec[4] 年式群・dec[5] ボディ（DBSEARCH SearchKA13 10005344/10005361）
                                                     'src': src, 'from': frm, 'to': to, 'note': note, 'period_invalid': bad_period,
                                                     'serial_from': s_frm, 'serial_to': s_to})
             except ValueError:
@@ -1611,7 +1617,7 @@ class AddataParts:
         pn = self.norm_pn(std_pn or '')
         if ctx:
             y = str(ctx.get('year') or '').strip(); grp = y[-1] if y.isdigit() and int(y) else ''
-            srow = self._std_row(ref, 0, ctx.get('grade', ''), ctx.get('fva', ''), set(ctx.get('eva') or ()), grp, b)
+            srow = self._cogni_row(ref, 0, ctx.get('grade', ''), ctx.get('fva', ''), set(ctx.get('eva') or ()), grp, b)
             if srow and self.norm_pn(srow.get('pn', '')) == pn:
                 return int(srow.get('color_flag') or 0) & 1
         rows = [r for r in self._load_11_raw().get(ref, []) if r.get('disp') == 'K' and self.norm_pn(r['pn']) == pn and int(r.get('body') or 0) in _bset(b_)]
@@ -1620,7 +1626,7 @@ class AddataParts:
         rows.sort(key=lambda r: _brank(r.get('body'), b_), reverse=True)
         return int(rows[0].get('color_flag') or 0) & 1
 
-    def colored_part(self, ref: int, color: str, grade: str, fva: str, eva: set, std_pn: str = '', reg_ym: str = '', serial_no: str = '') -> Optional[dict]:
+    def colored_part(self, ref: int, color: str, grade: str, fva: str, eva: set, std_pn: str = '', reg_ym: str = '', serial_no: str = '', year: Optional[str] = None) -> Optional[dict]:
         """色別・期間別部品（83.DB / 13.DB）。フラグ（グレード/FVA/EVA 文字）が車両条件に合う行を優先、無条件行を次点。
         規則（コグニ実機 COLOR_D98.neo 2026-09-06 夜 と工場 NEO 6 件の突合せ tests/test_color13.py）:
           1. 車両カラーの行。無ければ色なし行（生産期間・仕様違いの品番: W66 4525 69350-52391/52401、W64 2450 87940-B1B60/B1502）
@@ -1633,6 +1639,48 @@ class AddataParts:
         allrows = self._load_83_raw().get(ref, [])
         if not allrows:
             return None
+        if getattr(self, 'cogni_color_rule', True):
+            # コグニ本体: SearchKA13/83（DBSEARCH 10004FE0 / 10006130）は索引のグループごとに、条件（年式群 dec[4]・ボディ dec[5]・グレード・装備）に合う
+            # 最良の 1 行を返し（優先 10003CC0 = 11.DB と同じ）、AnLstBLMng FindColorPluralInfo（0040BF94）が全グループを一覧にする。
+            b = str(getattr(self, 'vehicle_body', '') or '').strip()
+            b_ = _bparse(b, self._sbase_for(b))
+            y = str(year or '').strip()   # 年式（YearCode）。渡されなければ年式群 '0' 扱い（群付きの行は外れる）
+            g_ = y[-1] if y.isdigit() and int(y) else ''
+            groups = {}
+            for r in allrows:
+                groups.setdefault(r.get('group', 0), []).append(r)
+            bests = [x for x in (self._cogni_pick(groups[gk], grade, fva, eva, g_, b_) for gk in groups) if x]
+            if not bests:
+                return None
+            # 車両カラーのグループがあればその中から、無ければ（色なしの期間・仕様違い、またはカラー未設定）色なしのグループから選ぶ。
+            # 別の色のグループは使わない（カラー未設定の車に W19 などの色付き品番を当てない。代替レビュー指摘 2026-09-22）
+            col = (color or '').strip()
+            pool = [x for x in bests if col and x['color'] == col] or [x for x in bests if not x['color']]
+            if std_pn:   # 11.DB で選んだ品番と語幹が違う行は使わない（W66 3870 52151-52010 / 13.DB 52151-52030-E1 → コグニは 52010。U52 974 など）
+                pool = [x for x in pool if self._same_stem(x['pn'], std_pn)]
+            if not pool:
+                return None
+            # グループが 2 つ以上残れば本体は「複数部品選択」ダイアログでグループの最良行を並べ、既定は先頭
+            # （実機 TUPXV 6000: 11.DB 最良 73101-TY0-J20 → 13.DB 先頭グループ 73101-TY0-J00）。
+            # 担当者は車台番号・初度登録の期間に合う行を選ぶ（実案件 12151249 0182・12051345 4570）ので、1 つに絞れればそれ、無理なら先頭。
+            # 候補の品番が 2 つ以上なら人が選ぶ行なので、呼び出し側が ★ で知らせる（_plural）
+            pick, how = pool[0], '既定の先頭'
+            if len(pool) > 1:
+                sn = self._norm_serial(serial_no)
+                ins = [x for x in pool if (x.get('serial_from') or x.get('serial_to')) and self._serial_in(sn, x.get('serial_from', ''), x.get('serial_to', ''))] if sn else []
+                ym = str(reg_ym or '').strip()
+                inp = [x for x in pool if not x.get('period_invalid') and (x.get('from') or x.get('to'))
+                       and (not x.get('from') or x['from'] <= ym) and (not x.get('to') or ym <= x['to'])] if (ym.isdigit() and len(ym) == 6) else []
+                if len(ins) == 1:
+                    pick, how = ins[0], '車台番号で選んだ'
+                elif len(inp) == 1:
+                    pick, how = inp[0], '初度登録の期間で選んだ'
+            out = dict(pick)
+            pns = list(dict.fromkeys(x['pn'] for x in pool))
+            out['_plural'] = len({self.norm_pn(x) for x in pns})
+            out['_plural_list'] = pns[:6]
+            out['_plural_how'] = how
+            return out
         rows = [r for r in allrows if color and r['color'] == color.strip()] or [r for r in allrows if not r['color']]
         if not rows:
             return None
@@ -1734,23 +1782,68 @@ class AddataParts:
         g = [ch for ch in fl[0:5] if ch.strip()]; e = [ch for ch in fl[5:7] if ch.strip()]
         return (1 if (g and grade in g) else 0, sum(1 for ch in e if ch == fva), sum(1 for ch in e if ch == fva or ch in (eva or ())), 1 if e else 0)
 
-    DISP_LETTER = {0: 'K', 1: 'D', 2: 'S', 6: 'S', 3: 'DS', 5: 'OH'}  # 脱着修理(3) は DS 変種行だけを見る。分解調整(5) = 11.DB の 'OH'（オーバーホール）行（J97 7600 'I7O7' 3.0h、D88 7900 'D6J6' 3.2h = 04011103/04011141）。'C' 行は点検調整(4) 用で区分レター無し = 標準なし（監査 42）
+    def _cogni_pick(self, rows: list, grade: str, fva: str, eva, grp: str, b_) -> Optional[dict]:
+        """コグニ本体 DBSEARCH.dll の行選び（11.DB は SearchBuhin 100077A0、13/83.DB は SearchKA13/83 のグループごと）。
+        条件 10004BC0: 年式群 10001DB0（行の群が空欄か、車の群以下）・ボディ 10001DF0（行のボディが BodyCode/SBase/LBase のどれか）・
+        グレード 10001E20（車のグレードが空欄か、行のグレード欄の 1 文字目が空欄か、5 文字のどれかに一致）・装備 10001E60（行の装備 2 文字の空欄でない文字がすべて車の装備にある）。
+        優先 10004DA0 / 10003CC0: 年式群の大きい方 → ボディの大きい方 → グレード一致 → 装備（10001F80: 1 文字目が数字の方、1 文字目の文字コードの大きい方、一致数、2 文字目）。同順位は先の行"""
+        g_car = (grp or '').strip()[:1] or '0'
+        equip = set(eva or ()) | set(fva or '')
+        gr = (grade or '').strip()[:1]
+        bset = _bset(b_)
 
-    def _std_row(self, ref: int, dcode: int, grade: str, fva: str, eva: set, grp: str, body: Optional[str] = None) -> Optional[dict]:
-        """11.DB の標準行（変種）: 群 → フラグ → ボディ固有（rec[7] == 車両ボディ）> 共通（0）の順。他ボディの行は候補にしない。
-        body 未指定なら vehicle_body（build 時に車両の BodyCode を入れる）。'' なら共通行だけ"""
+        def ok(r):
+            rg = (r.get('grp') or '').strip()[:1]
+            if rg and not ('0' <= g_car <= '9' and g_car >= rg):
+                return False
+            if int(r.get('body') or 0) not in bset:
+                return False
+            fl = (r.get('flags') or '').ljust(7)
+            if gr and fl[0] != ' ' and gr not in fl[0:5]:
+                return False
+            return all(ch == ' ' or ch in equip for ch in fl[5:7])
+
+        def better(c, b):
+            cg, bg = (c.get('grp') or '').strip()[:1] or ' ', (b.get('grp') or '').strip()[:1] or ' '
+            if cg != bg:
+                return cg > bg
+            cb, bb = int(c.get('body') or 0), int(b.get('body') or 0)
+            if cb != bb:
+                return cb > bb
+            cf, bf = (c.get('flags') or '').ljust(7), (b.get('flags') or '').ljust(7)
+            gc, gb = bool(gr) and gr in cf[0:5], bool(gr) and gr in bf[0:5]
+            if gc != gb:
+                return gc
+            c0, b0 = cf[5], bf[5]
+            cd, bd = '1' <= c0 <= '9', '1' <= b0 <= '9'   # '0' を数字に含めるかは DBSEARCH 10001F80 で未確認（2026-09-22 代替レビュー。実データの装備欄に '0' は未確認）
+            if cd != bd:
+                return cd
+            if c0 != b0:
+                return c0 > b0
+            nc = sum(1 for ch in cf[5:7] if ch != ' ' and ch in equip); nb = sum(1 for ch in bf[5:7] if ch != ' ' and ch in equip)
+            if nc != nb:
+                return nc > nb
+            return cf[6] > bf[6]
+
+        best = None
+        for r in rows:
+            if ok(r) and (best is None or better(r, best)):
+                best = r
+        return best
+
+    def _cogni_row(self, ref: int, dcode: int, grade: str, fva: str, eva: set, grp: str, body: Optional[str] = None) -> Optional[dict]:
+        """11.DB の標準行をコグニ本体と同じ規則で選ぶ（_cogni_pick）"""
         tok = self.DISP_LETTER.get(dcode)
-        if not tok:  # 点検調整(4) など標準指数の対象外
+        if not tok:
             return None
         b = str(body if body is not None else getattr(self, 'vehicle_body', '') or '').strip()
         b_ = _bparse(b, self._sbase_for(b))
-        rows = [r for r in self._load_11_raw().get(ref, []) if r['disp'] == tok and int(r.get('body') or 0) in _bset(b_)]
-        for g_ in ([grp, ''] if grp else ['']):
-            cand = [r for r in rows if r['grp'] == g_ and self._flags_ok(r['flags'], grade, fva, eva, True)]
-            if cand:
-                cand.sort(key=lambda r: (self._flags_rank(r['flags'], grade, fva), _brank(r.get('body'), b_)), reverse=True)
-                return cand[0]
-        return None
+        return self._cogni_pick([r for r in self._load_11_raw().get(ref, []) if r['disp'] == tok], grade, fva, eva, grp, b_)
+
+    DISP_LETTER = {0: 'K', 1: 'D', 2: 'S', 6: 'S', 3: 'DS', 5: 'OH'}  # 脱着修理(3) は DS 変種行だけを見る。分解調整(5) = 11.DB の 'OH'（オーバーホール）行（J97 7600 'I7O7' 3.0h、D88 7900 'D6J6' 3.2h = 04011103/04011141）。'C' 行は点検調整(4) 用で区分レター無し = 標準なし（監査 42）
+
+    def _std_row(self, ref: int, dcode: int, grade: str, fva: str, eva: set, grp: str, body: Optional[str] = None) -> Optional[dict]:
+        return self._cogni_row(ref, dcode, grade, fva, eva, grp, body)
 
     def _pick_row15(self, ref: int, sc: str, grade: str, fva: str, eva: set, grp: str, body: str = '', host_only: bool = False) -> Optional[dict]:
         """この部品の 15.DB 行（host = 自分、または sub = 自分）から区分 sc の行を 1 つ選ぶ。
@@ -2330,6 +2423,7 @@ class NeoBuilder:
         parts.vehicle_lbase = str((getattr(self, '_row_ctx', None) or {}).get('lbase', '') or '')  # LBaseCode も同じ
         self._blocks17 = parts.blocks
         self._last_parts = parts
+        self._plural_parts = []   # 本体が「複数部品選択」ダイアログを出す行（13/83.DB の候補が複数で車両カラーで決まらない）。run_case が ★ で出す
         try:  # 20.DB 塗装パネルの集合（板金行の DamageRank 既定値 'A' の判定に使う）
             paint_codes = set(str(d.get('code')) for d in PaintIndex(self.engine.root, car_code)._load_20())
         except Exception as _e20c:  # noqa: BLE001  20.DB が無い車種はある。黙って空にすると板金行の既定ランクが変わる
@@ -2455,7 +2549,11 @@ class NeoBuilder:
                     if std_pn and parts.variant_color_flag(ref, std_pn, ctx.get('body'), ctx):  # 初度登録年月（reg_ym）で 13.DB の生産期間を絞る
                         # 品番が無い／83.DB に無い品番のときは車両のカラーコードに合う色別品番（コグニの部品検索と同じ）
                         # カラー未設定の車両でも色なし（期間・仕様別）行は対象（コグニの「複数部品選択」はカラーに依らず出る）。色付き行は colored_part 側でカラー一致のときだけ使う
-                        cp = parts.colored_part(ref, ctx.get('color', '') or '', ctx.get('grade', ''), ctx.get('fva', ''), set(ctx.get('eva') or ()), std_pn, ctx.get('reg_ym', ''), ctx.get('serial', ''))
+                        cp = parts.colored_part(ref, ctx.get('color', '') or '', ctx.get('grade', ''), ctx.get('fva', ''), set(ctx.get('eva') or ()), std_pn, ctx.get('reg_ym', ''), ctx.get('serial', ''), year=ctx.get('year', ''))
+                        if cp and cp.get('_plural', 0) > 1:   # 本体は「複数部品選択」ダイアログを出す（既定の先頭を採った）
+                            _pl = f"{ref:04d} 候補 {' / '.join(cp['_plural_list'])}（{cp.get('_plural_how', '既定の先頭')} {cp['pn']} を採用）"
+                            self._plural_parts.append(_pl)
+                            w['why'] = (w.get('why') or '') + ' ★複数部品選択: ' + _pl
                         if cp and pn_in:
                             w['why'] = (w.get('why') or '') + f" 色別品番 {cp['pn']}（見積 {it.get('parts_no')} は {cp.get('src', '83')}.DB に無い）"
                 if cp:
@@ -2658,7 +2756,8 @@ class NeoBuilder:
                  'matched': sum(1 for r in rows if r['PartsCode']), 'total': len(rows),
                  'option_pos': dict(opt_pos), 'option_neg': dict(opt_neg), 'evidence': evidence,
                  # build_rows を直に呼ぶ検査・スクリプトからも握り潰しに気づけるようにする（build は report['silent_errors'] にも載せる）
-                 'silent_errors': list(self._sil_call or [])}
+                 'silent_errors': list(self._sil_call or []),
+                 'plural_parts': list(getattr(self, '_plural_parts', None) or [])}
         return rows, stats
 
     # ------------------------------------------------------------ SQLite helpers

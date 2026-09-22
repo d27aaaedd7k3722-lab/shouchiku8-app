@@ -50,7 +50,7 @@ def run():
                 continue
             var, _ = parts.variant(ref, '', ctx, 0)
             std_pn = str(var['parts_no']) if var else ''
-            cp = parts.colored_part(ref, color, ctx['grade'], ctx['fva'], ctx['eva'], std_pn, ctx['reg_ym']) if parts.variant_color_flag(ref, std_pn, ctx['body'], ctx) else None
+            cp = parts.colored_part(ref, color, ctx['grade'], ctx['fva'], ctx['eva'], std_pn, ctx['reg_ym'], year=ctx['year']) if parts.variant_color_flag(ref, std_pn, ctx['body'], ctx) else None
             truth_pn = (r.get('PartsNoStandard') or r.get('PartsNo') or '').replace('*', '').strip()
             truth_price = int(r.get('PartsPriceStandardOutTax') or 0)
             if not truth_pn:  # 品番の無い行（保留・手入力）は比較しない
@@ -81,12 +81,14 @@ KNOWN = {
     ('12051345.neo', '4300'): '67005-52E60',   # ﾊﾞﾂｸｶﾒﾗ付車（仕様違い）
     ('12151249.neo', '0010'): '52119-B2G40-C0',  # 旧データ版（2025.12）の '*' 付き品番
     ('12151249.neo', '0094'): '52722-B2121-C0',  # 同上
+    # 13.DB の色なしグループ（期間違い）はコグニが「複数部品選択」ダイアログを出し、既定は先頭。担当者は初度登録に合う行を選ぶので、
+    # 生成器は期間で 1 つに絞れればそれを採り、★ で知らせる（2026-09-22 差分 B）。下は既定の先頭のままにした実験
     ('COLOR_D98.neo', '0182'): '52561-B2030',  # ダイアログで 1 行目を選んだ実験（生成器は初度登録 2025.01 を含む B2031）
 }
 
 
 # 期待値（2026-09-06 夜の確定状態。NEO 11 本すべてが揃っていること、pn 94/102、既知 8 例外、価格差 42 = 旧データ版の価格改定分）
-EXPECTED = {'files': 11, 'ok': 94, 'ng': 8, 'price_diff': 42}
+EXPECTED = {'files': 11, 'ok': 94, 'ng': 8, 'price_diff': 42}   # 2026-09-22: 13/83.DB を本体どおりグループごとに選んでも同じ（期間で絞る規則は残す）
 
 
 if __name__ == '__main__':
