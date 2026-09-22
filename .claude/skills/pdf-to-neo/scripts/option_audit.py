@@ -44,7 +44,8 @@ def audit(est: dict, rep: dict, nb: Optional[NeoBuilder] = None) -> dict:
     """戻り値 {'eva': [...], 'rows': n, 'checked': n, 'match': n, 'mismatch': [...], 'candidates': [{'change', 'gain', 'loss', 'rows'}], 'warnings': [...]}"""
     car = rep.get('car') or {}
     car_code = car.get('CarCode')
-    out: dict = {'eva': sorted(rep.get('eva') or []), 'rows': 0, 'checked': 0, 'match': 0, 'mismatch': [], 'candidates': [], 'warnings': []}
+    out: dict = {'eva': sorted(rep.get('eva') or []), 'rows': 0, 'checked': 0, 'match': 0, 'mismatch': [], 'candidates': [], 'warnings': [],
+                 'parts_infer': rep.get('parts_infer') or {}}
     if not car_code or flag((est.get('vehicle') or {}).get('generic'), 'vehicle.generic'):
         out['warnings'].append('装備監査: 汎用車種か車両未特定のため省略')
         return out
@@ -110,9 +111,19 @@ def audit(est: dict, rep: dict, nb: Optional[NeoBuilder] = None) -> dict:
             if gain:
                 cands.append({'change': f"{L}={opts.get(L, '?')} を{op_}", 'letter': L, 'op': op_, 'gain': gain, 'loss': loss, 'rows': fixed})
     _excl_now = set(str(x).strip() for x in ((est.get('hints') or {}).get('eva_exclude') or []) if str(x).strip())  # 既に除外指定されているレター
+    # 品番の逆引き（生成器の parts_vehicle_infer: 本体の行選びを装備の組合せごとに回した結果）で有・無が決まった装備は、
+    # 1 文字ずつ足し引きするこの監査より強い（実案件 080801 の 569 本で、品番で決まる装備の正答 99.2%、この監査の ★ を全部採ると 95.5%）。
+    # 食い違う提案は ★ にせず、理由を添えて控えにする
+    _pinf = rep.get('parts_infer') or {}
+    _alt = {ch for a in (_pinf.get('eva_alt') or []) for ch in a}   # 「どれかが付く」で仮に採った装備は決まっていないので、監査の提案を抑えない
+    _on = set(_pinf.get('eva_on') or []) - _alt; _off = set(_pinf.get('eva_off') or [])
     cands.sort(key=lambda c: (-(c['gain'] - c['loss']), -c['gain']))
     out['candidates'] = cands
     for c in cands:
+        if c['gain'] > c['loss'] and ((c.get('op') == '追加' and c['letter'] in _off) or (c.get('op') == '除外' and c['letter'] in _on)):
+            out['warnings'].append(f"装備 {c['change']} の提案は採らない: 品番の逆引き（本体の行選び）では {c['letter']} は"
+                                   f"{'無' if c['letter'] in _off else '有'}で見積の品番すべてと整合する")
+            continue
         if c['gain'] > c['loss']:
             # 除外は eva_codes では書けない。逆に、既に eva_exclude にあるレターは eva_codes に足しても効かない
             # （生成器は eva_exclude を先に引き、eva_codes 側でも `c not in _excl` で弾く。判断規則 10-9）
@@ -130,6 +141,17 @@ def audit(est: dict, rep: dict, nb: Optional[NeoBuilder] = None) -> dict:
 
 def format_lines(res: dict) -> list[str]:
     L = [f"装備 {res.get('eva')}: 判定対象 {res.get('checked')} 行（取替・印字品番が 11.DB にある行）のうち 標準品番一致 {res.get('match')} 行"]
+    pi = res.get('parts_infer') or {}
+    if pi.get('n_ev'):
+        nm = pi.get('names') or {}
+        f = lambda xs: ', '.join(f'{c}={nm.get(c, "?")}' for c in xs) or 'なし'  # noqa: E731
+        L.append(f"  品番の逆引き（証拠 {pi['n_ev']} 行・整合 {pi.get('score')}）: 有 {f(pi.get('eva_on') or [])} / 無 {f(pi.get('eva_off') or [])} / 品番では決まらない {f(pi.get('eva_open') or [])}")
+        if pi.get('eva_alt'):
+            alts = ' / '.join('+'.join(c + '=' + nm.get(c, '?') for c in a) for a in pi['eva_alt'])
+            L.append('  ★ 見積の品番は ' + alts + ' のどれかが付いた車と整合する（品番ではどれか決まらない）。生成器はファイル上で先の行の組合せを仮に採った。'
+                     '車の実態と違えば reading の hints.eva_codes / eva_exclude で直す')
+        if pi.get('bad'):
+            L.append(f"  本体の行選びと合わない品番: {', '.join(pi['bad'][:6])}（版違い・手入力・車両の取り違い）")
     for m in res.get('mismatch') or []:
         L.append(f'  不一致: {m}')
     for c in res.get('candidates') or []:

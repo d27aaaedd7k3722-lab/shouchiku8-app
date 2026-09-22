@@ -9,6 +9,9 @@
     cd files
     python .claude/skills/pdf-to-neo/scripts/pick_grade.py "<NEO_check>/<案件>/estimate.json"
 
+あわせて「品番整合」（見積の品番のうち、その候補で本体の行選びが同じ品番を選ぶ行 − 選ばない行。
+parts_vehicle_infer.py。装備はその候補で最もよく合う組合せ）を出し、**品番整合 → 金額の一致数**の順で並べる。
+品番整合は実案件 080801 の 546 本（型式指定・類別なし）で、最高点が 1 台に決まれば 97.6% 正解（金額の一致数だけだと 90%）。
 一致数が並んだら、それ以上は金額では決まらない（外装部品はグレードで変わらないことが多い）。
 車検証・型式の表記・装備（ホイールキャップの有無など）で決め、決め手を報告に書く。
 結果は `hints.grade_name` に書いて確定させる。
@@ -83,9 +86,11 @@ def score(nb, est: dict, cand: dict) -> dict:
     got = (rep.get('vehicle') or {}).get('best') or {}
     used = {k: str(got.get(k) or '').strip() for k in TEXT_KEYS}
     used['four_wd'] = bool(got.get('four_wd'))
+    pinf = rep.get('parts_infer') or {}
     return {'label': cand.get('label') or cand['grade'], 'grade': cand['grade'],
             'code': used.get('grade_code', ''), 'pinned': used == cand['pin'],
-            'n': len(pairs), 'ok': sum(1 for x in pairs if x)}
+            'n': len(pairs), 'ok': sum(1 for x in pairs if x),
+            'inf': pinf.get('score') if pinf.get('n_ev') else None, 'eva_on': pinf.get('eva_on') or []}
 
 
 def main(argv: list) -> int:
@@ -125,12 +130,16 @@ def main(argv: list) -> int:
         rows.append(r)
     if not rows:
         return 1
-    best = max(r['ok'] for r in rows)
-    print(f"{'候補':<28}{'標準価格の一致':>14}")
-    for r in sorted(rows, key=lambda x: -x['ok']):
-        mark = ' ←' if r['ok'] == best else ''
-        print(f"  {r['label']:<28}{r['ok']:>3}/{r['n']:<3}{mark}")
-    top = [r for r in rows if r['ok'] == best]
+    def _key(x):   # 品番整合（本体の行選び）→ 金額の一致数
+        return (x['inf'] if x.get('inf') is not None else -10 ** 6, x['ok'])
+    best = max(_key(r) for r in rows)
+    print(f"{'候補':<28}{'品番整合':>8}{'標準価格の一致':>14}")
+    for r in sorted(rows, key=lambda x: tuple(-v for v in _key(x))):
+        mark = ' ←' if _key(r) == best else ''
+        inf = '-' if r.get('inf') is None else str(r['inf'])
+        eva = f"  装備 {''.join(r['eva_on'])}" if r.get('eva_on') else ''
+        print(f"  {r['label']:<28}{inf:>8}{r['ok']:>6}/{r['n']:<3}{mark}{eva}")
+    top = [r for r in rows if _key(r) == best]
     # 同点の並びは「グレード名(記号)」でまとめて読む（2WD/4WD・年式違いは部品金額に出ないことが多い）
     names = sorted({f"{r['grade']}({r['code']})" for r in top})
     if truncated:

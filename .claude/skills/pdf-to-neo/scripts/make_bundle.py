@@ -166,6 +166,7 @@ SELFTEST_TESTS = [  # 配布先でも動く自己診断（ADDATA だけで完結
     'unit_era.py',  # 元号は改元日で分ける（2019-01〜04 は平成 31）
     'unit_cab.py',  # 元号は改元日で分ける（2019-01〜04 は平成 31）
     'unit_handoff.py',  # 引き継ぎ文書（HANDOFF.md）の主張と実装・ADDATA の突き合わせ（3〜4 秒）
+    'unit_parts_infer.py',  # 品番からの車両・装備の逆引き（本体の行選び。parts_vehicle_infer.py）
     'unit_paint_screen.py',  # 塗装画面（実機 2026-09-20 の全機能入り見積と同じ NEO になるか）
     'unit_expense_lines.py',  # 費用 36 行の割付（固定行 1〜8 / 自由行 9〜36 は名前で合わせる / レッカーは自由行）
     'unit_vehicle_serial.py',  # 車両特定: 車台番号で年式が決まったら初度登録は見ない（本体どおり）。confirmed は 1 台に決まるときだけ

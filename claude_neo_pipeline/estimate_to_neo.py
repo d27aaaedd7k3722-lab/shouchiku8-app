@@ -2366,6 +2366,120 @@ class NeoBuilder:
                                      reg_date=v.get('reg_date', ''), color_code=v.get('color_code', ''),
                                      hints=hints or {})
 
+    def _vehicle_from_parts(self, estimate: dict, vehicle_inputs: dict, hints: Optional[dict], veh: dict, car: dict) -> tuple:
+        """見積の品番（無ければ単価）を、本体の部品の行選び（DBSEARCH SearchBuhin / SearchKA13・83）に候補の車ごとに通し、
+        印字と同じ品番が選ばれる車・装備を探す（parts_vehicle_infer.py）。
+
+        - 車検証で 1 台に決まっている（confirmed）か、確度 high・固定した（hints.candidate）ときは車両を変えない
+        - 車両のヒント（grade_name / four_wd / engine / hybrid）があるときも替えない。品番と合わなければ evidence に ★
+        - それ以外（medium / low）は、最高点の候補に今の車が入っていればそのまま、入っていなければ最高点の候補の先頭に固定し直す。
+          最高点が 1 台で点 2 以上なら確度 high、それ以外は medium（残った候補は evidence に書く）
+        - 最後に、決まった車で装備を逆引きして self._parts_infer に置く（行生成の EVA と CarEVA に使う）。
+          人の指定（hints.eva_codes / eva_exclude）は組合せの条件にし、指定が品番と食い違えば ★
+        実案件 NEO 080801 638 本のうち型式指定・類別の無い 546 本（車台番号だけ）: 車両全体の一致 29% → 53%、残る候補 9.2 → 5.2 台、
+        最高点が 1 台のときの正答 97.6%。装備: 品番で決まる文字の正答 99.2%（旧方式 88.1%）"""
+        from parts_vehicle_infer import PartsVehicleInference
+        items = estimate.get('items') or []
+        try:
+            pvi = PartsVehicleInference(AddataParts(self.engine, car['CarCode']), self.resolver)
+            evs = pvi.evidence(items)
+        except Exception as ex:  # noqa: BLE001  逆引きできない車種（11.DB の読めない版など）は従来の流れに任せる
+            self._note_silent('品番からの車両・装備の逆引き', ex, '品番で車両・装備を絞れない（車検証とヒントだけで決めた）')
+            return veh, car
+        if not evs:
+            return veh, car
+        conf = veh.get('confidence')
+        given = set(str(x) for x in ((hints or {}).get('eva_codes') or []) if x)
+        excl = set(str(x).strip() for x in ((hints or {}).get('eva_exclude') or []) if str(x).strip())
+        # 人が車両のヒント（グレード名・4WD・エンジン・ハイブリッド）を書いたときは、品番の点数だけで車を替えない（ヒントは resolver の点数に効くが、
+        # 型式指定の無い車では確度が medium/low のままなので、替えるとヒントが黙って負ける。代替レビュー指摘 2026-09-22）。食い違えば ★ で知らせる
+        _hinted = any(str((hints or {}).get(k) or '').strip() for k in ('grade_name', 'four_wd', 'engine', 'hybrid'))
+        if conf not in ('confirmed', 'high') and not (hints or {}).get('candidate'):   # 人（pick_grade）が候補を固定したときは車両を変えない
+            try:
+                allv = self.resolve_vehicle(vehicle_inputs, dict(hints or {}, candidate_limit=0))
+            except Exception as ex:  # noqa: BLE001
+                self._note_silent('品番の逆引き: 候補の一覧', ex, '品番で車両を絞れない（車検証とヒントだけで決めた）')
+                allv = {}
+            cands = [c for c in (allv.get('candidates') or []) if c.get('car_code') == car.get('CarCode') and c.get('grade_code')]
+            rk = None
+            if len(cands) > 1:
+                try:
+                    rk = pvi.rank(evs, cands, required=given, forbidden=excl)
+                except Exception as ex:  # noqa: BLE001
+                    self._note_silent('品番の逆引き: 候補の採点', ex, '品番で車両を絞れない（車検証とヒントだけで決めた）')
+            if rk is not None:
+                key = lambda c: (c['year_code'], c['body_code'], c['grade_code'], c['fva_code'], bool(c.get('four_wd')))  # noqa: E731
+                top = [cands[i] for i in rk['top']]
+                tkeys = list(dict.fromkeys(key(c) for c in top))
+                cur = (car.get('YearCode'), car.get('BodyCode'), car.get('GradeCode'), str(car.get('FVACode') or '')[-1:], str(car.get('FVACode') or '').startswith('Z'))
+                best_sc = rk['scores'][rk['top'][0]]['score'] if rk['top'] else 0
+                note = (f'品番の逆引き（本体の行選び）: 証拠 {len(evs)} 行・候補 {len(dict.fromkeys(key(c) for c in cands))} 台のうち最高点 {best_sc} は {len(tkeys)} 台'
+                        + ('' if len(tkeys) > 6 else ' ' + ', '.join(f'{k[0]}/{k[1]}/{k[2]}/{"Z" if k[4] else ""}{k[3]}' for k in tkeys)))
+                if tkeys and cur not in tkeys and _hinted:
+                    veh['evidence'] = list(veh.get('evidence') or []) + [f'★ {note}。今の候補 {"/".join(str(x) for x in cur[:4])} は品番と合わないが、'
+                                                                          '車両のヒント（hints.grade_name など）を優先して替えなかった。ヒントと車の実態を確かめる']
+                elif tkeys and cur not in tkeys:
+                    c0 = top[0]
+                    h2 = dict(hints or {})
+                    h2['candidate'] = {'car_code': c0['car_code'], 'year_code': c0['year_code'], 'body_code': c0['body_code'],
+                                       'grade_code': c0['grade_code'], 'fva_code': c0['fva_code'], 'four_wd': bool(c0.get('four_wd'))}
+                    try:
+                        veh2 = self.resolve_vehicle(vehicle_inputs, h2)
+                    except Exception:  # noqa: BLE001
+                        veh2 = {}
+                    c2 = veh2.get('neo_car') or {}
+                    if c2 and c2.get('CarCode') == car.get('CarCode'):
+                        veh2['confidence'] = 'high' if (len(tkeys) == 1 and best_sc >= 2) else 'medium'   # 証拠 1 行・点 0 以下で high にしない
+                        # 固定（hints.candidate）すると resolver は他の候補を捨てるので、人に見せる候補一覧は元の全候補（最高点の候補を先頭）に戻す
+                        _full = list(allv.get('candidates') or [])
+                        _tops = [c for c in _full if c.get('car_code') == car.get('CarCode') and c.get('grade_code') and key(c) in tkeys]
+                        _full = _tops + [c for c in _full if c not in _tops]
+                        try:
+                            _lim = int((hints or {}).get('candidate_limit', 12))
+                        except (TypeError, ValueError):
+                            _lim = 12
+                        veh2['candidates'] = _full if _lim <= 0 else _full[:_lim]
+                        veh2['candidates_total'] = len(_full)
+                        veh2['evidence'] = list(veh2.get('evidence') or []) + [note + f' → 今の候補 {"/".join(str(x) for x in cur[:4])} は品番と合わないので {c0["year_code"]}/{c0["body_code"]}/{c0["grade_code"]}/{c0["fva_code"]} に替えた']
+                        veh, car = veh2, c2
+                else:
+                    if len(tkeys) == 1 and best_sc >= 2 and conf in ('medium', 'low', 'unknown'):
+                        veh['confidence'] = 'high'
+                    veh['evidence'] = list(veh.get('evidence') or []) + [note + ('（今の候補は最高点に入っている）' if tkeys else '')]
+        # 決まった車で装備を逆引き
+        fva = str(car.get('FVACode') or '')
+        try:
+            r = pvi.score(evs, car.get('YearCode', ''), str(car.get('BodyCode', '') or ''), car.get('GradeCode', ''), fva, str(car.get('SBaseCode', '') or ''),
+                          required=given, forbidden=excl)   # 人が付けた・外した装備は組合せの条件（仮に採る組合せと人の指定が二重に付かない）
+        except Exception as ex:  # noqa: BLE001
+            self._note_silent('品番からの装備の逆引き', ex, '装備は人のヒントだけで決めた')
+            return veh, car
+        self._parts_infer = {'n_ev': len(evs), 'score': r['score'], 'eva_on': set(r['eva_on']) - excl, 'eva_off': set(r['eva_off']),
+                             'eva_open': set(r['eva_open']), 'eva_alt': list(r.get('eva_alt') or []), 'bad': list(r['bad'])[:12],
+                             'names': {c: pvi.names.get(c, '') for c in (set(r['eva_on']) | set(r['eva_off']) | set(r['eva_open']))}}
+        alt = list(r.get('eva_alt') or [])
+        if alt:  # どれかは付いているはずだが品番では決まらない（人の指定でも決まらない）
+            def _nm(a):
+                return '+'.join(c + '=' + pvi.names.get(c, '?') for c in a)
+            veh['evidence'] = list(veh.get('evidence') or []) + ['★ 装備: 見積の品番は ' + ' / '.join(_nm(a) for a in alt)
+                                                                  + ' のどれかが付いた車と整合する（品番ではどれか決まらない）。ファイル上で先の行の '
+                                                                  + ''.join(sorted(set(r['eva_on']) - excl - given)) + ' を仮に採った。車の実態と違えば hints.eva_codes / eva_exclude で直す']
+        # 人の指定した装備が見積の品番と食い違うか: 指定を外して採点し直し、「無」と決まる・指定で点が下がるなら ★
+        # （指定込みの採点では指定した文字を探索しないので eva_off に入らない。代替レビュー 2 周目の指摘）
+        clash = []
+        if given:
+            try:
+                r0 = pvi.score(evs, car.get('YearCode', ''), str(car.get('BodyCode', '') or ''), car.get('GradeCode', ''), fva, str(car.get('SBaseCode', '') or ''),
+                               forbidden=excl)
+                clash = sorted(given & set(r0['eva_off']))
+                if not clash and r['score'] < r0['score']:
+                    clash = sorted((given & (set(r0['eva_on']) | set(r0['eva_off']) | set(r0['eva_open']))) - set(r0['eva_on']))   # 品番に関係し、指定を外した最良の組合せに入らない指定
+            except Exception as ex:  # noqa: BLE001
+                self._note_silent('品番からの装備の逆引き（人の指定との照合）', ex, '人の装備指定と品番の食い違いを確かめられない')
+        if clash:  # 人の指定した装備が、見積の品番では「無」と決まる（または指定すると品番と合わない行が増える）
+            veh['evidence'] = list(veh.get('evidence') or []) + [f'★ 装備 {clash} は hints.eva_codes にあるが、見積の品番とは「無」で整合する（本体の行選び）。車の実態を確かめる']
+        return veh, car
+
     # ------------------------------------------------------------ 明細
     GENERIC_MODELS = {'Z10': ('乗用車', '10', '03'), 'Z20': ('１ＢＯＸ', '10', '10'), 'Z30': ('トラック', '10', '21')}
     MAKER_NAMES = {'A': '三菱', 'B': 'ダイハツ', 'C': 'スバル', 'D': 'ホンダ', 'E': 'いすゞ', 'F': 'マツダ', 'G': '日産', 'H': 'スズキ', 'I': 'トヨタ', 'J': 'フォルクスワーゲン'}
@@ -4088,8 +4202,11 @@ class NeoBuilder:
                 car = veh['neo_car']
         if not car:
             raise RuntimeError(f"車両特定失敗: {veh['evidence']}")
-        if not _generic and veh.get('confidence') not in ('confirmed', 'high') and car.get('CarCode'):
-            # 車検証だけでグレード等が絞れない（medium/low）ときは、見積の品番から 11.DB 変種行の条件を逆引きしてヒントに加え、もう一度特定する
+        self._parts_infer = None
+        if not _generic and car.get('CarCode'):
+            veh, car = self._vehicle_from_parts(estimate, vehicle_inputs, hints, veh, car)
+        if not _generic and self._parts_infer is None and veh.get('confidence') not in ('confirmed', 'high') and car.get('CarCode'):
+            # 品番の証拠が 1 行も無い（品番の無い見積・ADDATA に無い品番だけ）ときは、従来の逆引き（11.DB 変種行の文字を集める）でヒントを足す
             try:
                 inf = AddataParts(self.engine, car['CarCode']).infer_from_parts(estimate.get('items') or [])
             except Exception:
@@ -4123,7 +4240,8 @@ class NeoBuilder:
         self._row_ctx = {'year': car.get('YearCode', ''), 'body': str(car.get('BodyCode', '') or ''), 'sbase': str(car.get('SBaseCode', '') or ''), 'lbase': str(car.get('LBaseCode', '') or ''), 'reg_ym': str(car.get('ps_CarRegDate', '') or '')[:6],
                          'serial': str(car.get('ps_CarSerialNo', '') or ''),   # 83.DB は車台番号でも期間が切られる（2026-09-21）
                          'color': car.get('ColorCode', '') if car.get('ColorCodeFlag') else '', 'grade': car.get('GradeCode', ''), 'fva': (car.get('FVACode', '') or '')[-1:],  # 4WD は 'ZA' なので照合は末尾 1 文字
-                         'eva': (set(str(x) for x in ((hints or {}).get('eva_codes') or []) if x) | ({'Z'} if car.get('four_wd') else set()))
+                         'eva': (set(str(x) for x in ((hints or {}).get('eva_codes') or []) if x) | ({'Z'} if car.get('four_wd') else set())
+                                 | set((self._parts_infer or {}).get('eva_on') or ()))  # 品番の逆引きで「有」と決まった装備（本体の行選び。2026-09-22）
                                 - set(str(x).strip() for x in ((hints or {}).get('eva_exclude') or []) if str(x).strip())}  # 色別部品の装備条件は build 前に分かる EVA（hints と 4WD の 'Z'）で判定。**eva_exclude はここにも効かせる** —— 行生成（11/13/83.DB の変種選択）に使うので、最終 CarEVA だけ直しても品番・価格がずれる（Codex 指摘 2026-09-12）
         self._tax_round = estimate.get('tax_round')  # 消費税の計算単位（Setting.tx_ArrangeFlag と消費税額。write_ansvif / write_ansvem が参照）
         self._man_rows_std = None   # 標準指数の手入力行の集合（汎用車種の build や前の build の値を持ち越さない。Codex 指摘）
@@ -4149,6 +4267,12 @@ class NeoBuilder:
         opts = car.get('options_available', {})
         # 装備コード: 肯定証拠（一致変種だけが持つ）が否定証拠（他変種だけが持つ）を上回るものだけ。A-E はグレード/エンジン文字
         eva = [c for c, n in stats['option_pos'].items() if c in opts and c not in ('A', 'B', 'C', 'D', 'E') and n > stats['option_neg'].get(c, 0)]
+        _pinf = getattr(self, '_parts_infer', None)
+        if _pinf is not None:
+            # 品番の逆引き（本体の行選びを候補の装備の組合せごとに回す）で「有」と決まった装備だけを採る（2026-09-22）。
+            # 旧方式（一致した変種 1 行が持つ文字 − 他の変種だけが持つ文字 の多数決）は、同じ品番の行が複数あると先頭行の文字を拾い、
+            # 実案件 080801 の 573 本で CarEVA の完全一致 41.9%（装備を 1 つも付けない場合 57.1% より低い。誤って付けた装備 345 文字）だった
+            eva = [c for c in sorted(_pinf.get('eva_on') or ()) if c in opts]
         _excl = set(str(x).strip() for x in ((hints or {}).get('eva_exclude') or []) if str(x).strip())  # hints.eva_exclude: 部品証拠から拾った装備を明示的に外す（品番が別の理由で一致するとき）
         if _excl:
             eva = [c for c in eva if c not in _excl]
@@ -4537,6 +4661,7 @@ class NeoBuilder:
         # ファイルの CarEVA に実際に書いた装備（FVA が Z 始まりの車は Z を落としてある）。
         # report['eva'] は内部の照合用（Z を含む）なので、人に見せる「装備」はこちらを使う（Codex 4 周目）
         report['eva_write'] = list(eva_write)
+        report['parts_infer'] = {k: (sorted(v) if isinstance(v, (set, frozenset)) else v) for k, v in (getattr(self, '_parts_infer', None) or {}).items()}
         return neo, report
 
 
