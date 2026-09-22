@@ -1206,8 +1206,12 @@ class Drafter:
             inh = next(iter(_gs)) if (not side and ctx_block and len(_gs) == 1 and is_small_name(name_raw, (price // qty) if price > 0 and qty > 0 else 0)
                                       and not str(row.get('code') or '').strip() and not pn) else ''
             # コグニ印刷（書式 A）の部品コードは find_ref の code 引数で解決する（12.DB を正に検証。無効なら品番/名称に落ちる）
-            ref, why = self.parts.find_ref(code_in, pn, name, context_block=ctx_block, price=(price // max(1, qty) if price else None),
-                                           qty=(qty if qty > 1 else None), year=self.year)
+            self.parts._row_disp = dcode   # 生成器 build_rows と同じ手掛かり（作業区分。12.DB の可能作業に無い候補を後回し）
+            try:
+                ref, why = self.parts.find_ref(code_in, pn, name, context_block=ctx_block, price=(price // max(1, qty) if price else None),
+                                               qty=(qty if qty > 1 else None), year=self.year)
+            finally:
+                self.parts._row_disp = None
             if code_in and (ref is None or ref != int(code_in)):
                 self.notes.append(f'印字の部品コード {code_in} をそのまま使えない（{why}）→ {ref}: {name}')
                 code_in = ''
@@ -1272,7 +1276,11 @@ class Drafter:
             if ref is None and not code_in and price > 0 and qty == 1 and dcode == 0:
                 # 数量 1 のまま複数個分の金額（クリップ 1,300 円 = 100 円 × 13）は、find_ref の価格整合（標準の 2.2 倍超は別部品）で落ちる。
                 # 価格を外して名称で引き直し、標準単価の整数倍（小物）なら採る（数量は下の _price_fit が直す。Codex 指摘）
-                ref_np, why_np = self.parts.find_ref('', pn, name, context_block=ctx_block, price=None, qty=None, year=self.year)
+                self.parts._row_disp = dcode
+                try:
+                    ref_np, why_np = self.parts.find_ref('', pn, name, context_block=ctx_block, price=None, qty=None, year=self.year)
+                finally:
+                    self.parts._row_disp = None
                 # 名前が完全に同じ部品か、同じ部位の小物で名前がほぼ同じ（0.9 以上）ときだけ。名前が近いだけの別部品（TV アンテナフィルム 6,000 円 →
                 # リヤドアのフィルム 100 円 × 60 個）を数量で合わせない（2026-09-14 スペーシア）
                 _w_np = re.sub(r'^語順入替「.*?」\s*', '', why_np or '')

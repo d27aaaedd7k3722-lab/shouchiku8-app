@@ -750,6 +750,24 @@ def display_name(std: str) -> str:
 #   ボディ（10001DF0）: 行のボディが 0（共通）か、車の BodyCode・LBaseCode・SBaseCode のどれかに一致すれば通す。複数当たれば値の大きい方
 #                       （W12 などボディ 40 の車は SBase 30 の行も使う。これまでは BodyCode しか見ておらず 8 行外していた）
 #   年式群（10001DB0）: 行の群が空欄か、車の群**以下**なら通す。群の大きい方を優先（これまでは一致だけで 3 行外していた）
+def _is_pn(s) -> bool:
+    """11.DB の品番欄が品番か。ハイフン付き（従来どおり。'     -' の行も変種として残す = 標準品番 '-' を書く修理行 W66 4802）か、
+    ハイフンが無くても英数字 6 桁以上・数字 3 つ以上（スバル '909140063'・三菱 'MB861140'・輸入車。11.DB の品番行の約 2 割）。
+    それまでハイフンの無い品番は索引にも変種にも入らず、スバル・三菱の部品は品番で引けず、標準品番・標準価格も空になっていた"""
+    t = str(s or '')
+    if '-' in t:
+        return True
+    n = re.sub(r'[^0-9A-Z]', '', unicodedata.normalize('NFKC', t).upper())
+    return len(n) >= 6 and sum(ch.isdigit() for ch in n) >= 3
+
+
+def _real_pn(s) -> bool:
+    """見積の品番欄が本物の品番らしいか（英数字とハイフンだけで数字 4 つ以上・6 桁以上）。タイヤサイズ '175/65R15'・容量 '2.0L'・'0.4kg'・'参考価格' は品番でない"""
+    t = unicodedata.normalize('NFKC', str(s or '')).strip().upper()
+    n = re.sub(r'[^0-9A-Z]', '', t)
+    return bool(re.fullmatch(r'[0-9A-Z][0-9A-Z\- ]*', t)) and len(n) >= 6 and sum(ch.isdigit() for ch in n) >= 4
+
+
 class _Body(int):
     """車のボディ（int として BodyCode の値を持ち、.set に照らしてよいボディの集合 {0, BodyCode, SBaseCode} を持つ）"""
 
@@ -815,11 +833,14 @@ class AddataParts:
         self.block_by_ref = self._load_12_blocks(car_code)
         self.by_ref: dict[int, list] = {}
         self.by_pn: dict[str, list] = {}
+        self._pn_hy: set[str] = set()   # ハイフン付きの品番（部品群・枝番の近似はこれだけに使う。三菱 MZ556366/MZ556367 のようなハイフン無しの品番は末尾違いが別部品）
         for r in self.p11:
             self.by_ref.setdefault(r['ref_no'], []).append(r)
             pn = self.norm_pn(r['parts_no'])
-            if pn and '-' in str(r['parts_no']):
+            if pn and _is_pn(r['parts_no']):
                 self.by_pn.setdefault(pn, []).append(r)
+                if '-' in str(r['parts_no']):
+                    self._pn_hy.add(pn)
         self.pair_left = {v: k for k, v in self.pair_right.items()}  # 右 ref → 左 ref
         self.qty_by_ref = {ref: int(rec.get('quantity') or 1) for ref, rec in self.p12.items()}
         # 11.DB 名称欄（20 文字: [0] L/R [1] F/R + 名称 + 括弧内の修飾）→ コグニの PartsName 形。工場見積・コグニ書式の見積の名称と完全一致させる索引
@@ -1245,6 +1266,8 @@ class AddataParts:
         raw_est = re.sub(r'\s+', '', hw(name or ''))
         grp = str(year).strip()[-1] if str(year or '').strip().isdigit() and int(year) else ''  # 年式群 = YearCode の下 1 桁
         import difflib
+        _rd = getattr(self, '_row_disp', None)   # この行の修理方法（DISPOSAL のコード）
+        _need = {1: 'D', 3: 'DS', 2: 'S', 6: 'S'}.get(_rd)
 
         def key(ref: int):
             n20s = self.name20_by_ref.get(ref) or set()
@@ -1271,7 +1294,9 @@ class AddataParts:
             rows_y = self._load_11_raw().get(ref) or []
             year_exact = 1 if (grp and any((r.get('grp') or '') == grp for r in rows_y)) else 0  # 車両の年式群そのものの変種行がある
             year_bad = 1 if (grp and rows_y and all((r.get('grp') or '') not in ('', grp) for r in rows_y)) else 0  # 別の年式群しか無い
-            return (-side_ok, side_bad, -n20_exact, -qual_ok, qual_bad, year_bad, qty_bad, -qty_ok, -fr_ok, price_bad, -price_ok, -ctx_ok, -round(raw_sim, 2), -round(sim, 2), -year_exact, self.order_by_ref.get(ref, 1 << 30), ref)  # 年式群の一致は最後のタイブレーク（先に置くと共通行（群 ''）の正しい候補を落とし 714→713・693→687 に悪化: 2026-09-06 実測）
+            _cap = self.disp_by_ref.get(ref)
+            disp_bad = 1 if (_need and _cap is not None and _cap.strip() and not any(ch in _cap for ch in _need)) else 0   # 12.DB の可能作業（[52:55]）に無い作業（脱着なのに D が無い部品）は後回し
+            return (-side_ok, side_bad, disp_bad, -n20_exact, -qual_ok, qual_bad, year_bad, qty_bad, -qty_ok, -fr_ok, price_bad, -price_ok, -ctx_ok, -round(raw_sim, 2), -round(sim, 2), -year_exact, self.order_by_ref.get(ref, 1 << 30), ref)  # 年式群の一致は最後のタイブレーク（先に置くと共通行（群 ''）の正しい候補を落とし 714→713・693→687 に悪化: 2026-09-06 実測）
         return sorted(refs, key=key)
 
     @staticmethod
@@ -1296,10 +1321,15 @@ class AddataParts:
         pn = self.norm_pn(re.sub(r'\s*\(\d+\)\s*$', '', parts_no or ''))
         pn_known = False
         if pn:
-            exact = self.by_pn.get(pn, [])
-            if not exact:  # 11.DB に無く 83.DB（色別部品）にだけある品番（N-ONE FAX の 71101-T4G-N00ZG 等）も ref の根拠にする
-                exact = [{'ref_no': ref, 'parts_no': r['pn'], 'price': r['price']} for ref, rows in self._load_83_raw().items() for r in rows if self.norm_pn(r['pn']) == pn]
-            near = [] if exact else [r for k, rows in self.by_pn.items() if k[:-2] == pn[:-2] and len(k) == len(pn) for r in rows]
+            exact = list(self.by_pn.get(pn, []))
+            _r11 = {r['ref_no'] for r in exact}
+            _nm = self.norm_name(name)
+            if not any(self.norm_name(cogni_parts_names(n)[0]) == _nm for r_ in _r11 for n in (self.name20_by_ref.get(r_) or ())):
+                # 11.DB に無く 83/13.DB（色別・期間別部品）にだけある品番（N-ONE FAX の 71101-T4G-N00ZG 等）も ref の根拠にする。
+                # 11.DB で同じ品番を持つ部品の名称欄が見積の名称と合わないときも、83/13.DB でその品番を持つ部品を候補に加える
+                # （ﾌｱｽﾅ L33X-13-209 は 11.DB では ﾘﾍﾞﾂﾄ 4979、13.DB では ﾌｱｽﾅ 0171。実案件 600 本で直り 8・壊れ 0）
+                exact += [{'ref_no': ref, 'parts_no': r['pn'], 'price': r['price']} for ref, rows in self._load_83_raw().items() if ref not in _r11 for r in rows if self.norm_pn(r['pn']) == pn]
+            near = [] if exact else [r for k, rows in self.by_pn.items() if k in self._pn_hy and k[:-2] == pn[:-2] and len(k) == len(pn) for r in rows]
             cands = exact or near
             if cands and not exact and price and price > 0:  # 枝番違い（OCR 誤読含む）の候補は単価も照合し、大きく違う部品は除く
                 cands = [r for r in cands if int(r.get('price') or 0) <= 0 or (price <= int(r['price']) * 2.2 and price * 2.2 >= int(r['price']))]
@@ -1333,7 +1363,8 @@ class AddataParts:
                 return None, f'未一致（付属品の本体 {n0} が 11.DB に無い）'
         if exact20 and pn and pn_known is False:  # 見積の品番が ADDATA に無い: 品番の先頭 5 桁（部品群）が違う候補は別部品として除く
             def _pn_family_ok(ref_: int) -> bool:
-                cand_pns = [self.norm_pn(r['parts_no']) for r in self.by_ref.get(ref_, []) if '-' in str(r.get('parts_no', ''))]
+                cand_pns = [self.norm_pn(r['parts_no']) for r in self.by_ref.get(ref_, []) if _is_pn(r.get('parts_no', '')) and (self.norm_pn(r['parts_no']) or _real_pn(parts_no))]  # 品番 '-' だけの行（タイヤ・LLC・ガス）は、見積の品番欄が品番でない（'175/65R15'・'2.0L'・'参考価格'）ときは照合に使わない
+                cand_pns = [k for k in cand_pns if k == '' or k in self._pn_hy]   # 部品群（先頭 5 桁）で比べられるのはハイフン付きの品番（と従来どおり品番 '-' の行）だけ
                 return not cand_pns or any(k[:5] == pn[:5] for k in cand_pns)
             exact20 = [r_ for r_ in exact20 if _pn_family_ok(r_)]
         if fuzoku and not exact20:
@@ -1401,8 +1432,9 @@ class AddataParts:
             if side == 'R' and ref in self.pair_right:  # 右指定なら 12.DB ペアの右 ref（品番・価格は右 ref で検証する）
                 ref = self.pair_right[ref]
             if pn:  # 見積に品番があり、候補の 11.DB 品番と一致しないなら別部品（O リング 80872-ST7-000 vs 46134-SNC-A01）。ADDATA に無い品番（年式違い・色別 52119-B5100-A1 等）は先頭 5 桁（部品群）が同じなら同じ部品
-                cand_pns = [self.norm_pn(r['parts_no']) for r in self.by_ref.get(ref, []) if '-' in str(r.get('parts_no', ''))]
-                if cand_pns and not any(k == pn or (len(k) == len(pn) and k[:-2] == pn[:-2]) or (not pn_known and k[:5] == pn[:5]) for k in cand_pns):
+                cand_pns = [self.norm_pn(r['parts_no']) for r in self.by_ref.get(ref, []) if _is_pn(r.get('parts_no', '')) and (self.norm_pn(r['parts_no']) or _real_pn(parts_no))]  # 同上。見積に本物の品番（'90942-05009'）があれば品番 '-' の部品（ﾀｲﾔ）とは別部品として従来どおり捨てる
+                cand_pns = [k for k in cand_pns if k == '' or k == pn or k in self._pn_hy]   # ハイフン無しの品番（スバル・三菱）は新品番への切替を見分けられないので、名称の候補を捨てる根拠にしない（従来どおり）
+                if cand_pns and not any(k == pn or (k in self._pn_hy and ((len(k) == len(pn) and k[:-2] == pn[:-2]) or (not pn_known and k[:5] == pn[:5]))) for k in cand_pns):
                     reject = reject or f'名称候補 {std} は品番不一致（見積 {parts_no} / 標準 {cand_pns[0]}）'
                     continue
             if price and price > 0:  # 価格整合: 名称だけの照合で単価が標準の 2.2 倍超／半分未満なら別部品
@@ -1431,7 +1463,7 @@ class AddataParts:
     def variant(self, ref_no: int, parts_no: str, ctx: Optional[dict] = None, dcode: int = 0) -> tuple[Optional[dict], list[dict]]:
         """ref の 11.DB 変種のうち PDF 品番と一致するものと、それ以外。品番が無い／一致しないときは車両条件（年式群→フラグ）で
         コグニの部品検索と同じ変種を選ぶ（ctx = {'grade','fva','eva','year'}。コグニ実機 FRAME_p8 1904: 年式 01 → 群 1 の 61160-T4G-J00ZZ 14,100）"""
-        rows = [r for r in self.by_ref.get(ref_no, []) if '-' in str(r['parts_no'])]
+        rows = [r for r in self.by_ref.get(ref_no, []) if _is_pn(r['parts_no'])]
         b = str((ctx or {}).get('body') or getattr(self, 'vehicle_body', '') or '').strip()
         b_ = _bparse(b, self._sbase_for(b))  # 未確定・非数値のボディは 0（共通行だけ）= _std_row と同じ扱い（Codex 99）
         raw11 = self._load_11_raw().get(ref_no, [])
@@ -2307,6 +2339,7 @@ class NeoBuilder:
         work = []
         ctx_block = ''
         for it in items:
+            parts._row_disp = DISPOSAL.get(str(it.get('method') or '').strip())
             # 真偽値欄はここで 1 回だけ正規化する。以降は正規化済みの値を見るので、
             # 後段に生の `it.get('manual')` が残っていても文字列 "false" で挙動が変わらない（Codex 指摘）
             it = dict(it)
@@ -2323,6 +2356,7 @@ class NeoBuilder:
             if ref is not None:
                 ctx_block = parts.block_of(ref) or ctx_block
             work.append({'item': it, 'ref': ref, 'why': why})
+        parts._row_disp = None
         # 2) レバーレート推定（工賃 ÷ 指数 の最頻値）
         rate_votes = Counter()
         idx_pairs = []  # (指数, 印字工賃): 見積書に指数が印字された行。候補レートごとに「指数×レートを丸め単位で丸めると印字工賃になる行数」で選ぶ（100 円丸めの工場でも 11,200 に誤らない）

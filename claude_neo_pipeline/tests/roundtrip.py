@@ -81,6 +81,7 @@ def parts_test(parts, rows, mode, year=''):
         price = r.get('PartsUnitPriceOutTax') if (r.get('PartsCount') or 0) > 1 else r.get('PartsPriceOutTax')
         price = int(price) if price and price > 0 and mode in ('a', 'b') else None
         qty = int(r.get('PartsCount') or 1) if (r.get('PartsCount') or 0) > 1 else None
+        parts._row_disp = r.get('DisposalCode')   # 12.DB の可能作業で候補を選ぶ（find_ref の disp_bad）
         try:
             ref, why = parts.find_ref('', pn, name, context_block=prev_block, price=price, qty=qty, year=year)
         except Exception as ex:
@@ -91,6 +92,7 @@ def parts_test(parts, rows, mode, year=''):
         out['ok' if ok else ('none' if ref is None else 'wrong')] += 1
         if not ok:
             miss.append({'truth': truth, 'name': name, 'pn': r.get('PartsNo'), 'price': price, 'disp': r.get('DisposalCode'), 'got': ref, 'why': why[:120]})
+        parts._row_disp = None
         if ref is not None:  # 本番と同じく、照合できた ref の部位を次行の文脈にする（正解の BlockCode は使わない）
             prev_block = parts.block_of(ref) or prev_block
     return out, miss
