@@ -25,7 +25,7 @@ skill_env.apply()
 sys.path.insert(0, os.path.join(skill_env.FILES, 'claude_neo_pipeline'))
 import neo_container as nc  # noqa: E402
 from skill_env import flag  # noqa: E402
-from estimate_to_neo import _code4, _fit, hw  # noqa: E402
+from estimate_to_neo import _code4, _fit, _real_pn, hw  # noqa: E402
 
 
 def _open(neo_path: str) -> tuple[sqlite3.Connection, sqlite3.Connection, list]:
@@ -184,6 +184,13 @@ def check(est: dict, neo_path: str) -> dict:
                 w_got = _int(r.get('WageOutTax'))
                 if (w_got != wage_want) and not (wage_want == 0 and w_got in (0, -1)):
                     bad('工賃', wage_want, w_got)
+            # 品番欄の文字（'再封印'・'参考価格'）: 部品コードのある行はその文字が NEO の品番欄に入るはず。
+            # 明細コメントに回すと印刷で次の行に出て、見積書と位置が違う（2026-09-28 シエンタ 3800。判断規則 10-29）
+            _pn_txt = str(it.get('parts_no') or '').strip()
+            if _pn_txt and _pn_txt != '-' and not _real_pn(_pn_txt) and not manual and str(r.get('PartsCode') or '').strip():
+                _pn_got = str(r.get('PartsNo') or '').strip()
+                if _pn_got != _fit(_pn_txt, 17).strip():
+                    soft.append(_e('要確認', '品番欄が変わった', f'品番欄: 意図「{_pn_txt}」/ NEO「{_pn_got}」（見積書に刷られた品番欄の文字）', rec, nm, '', page))
             c_want = str(it.get('comment') or '')
             c_got = str(r.get('Comment1') or '').strip()
             if bool(c_want) != bool(_int(r.get('CommentFlag'), 0)):

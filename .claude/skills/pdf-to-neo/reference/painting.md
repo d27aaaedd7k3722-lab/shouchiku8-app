@@ -9,7 +9,7 @@
 
 | コグニの画面 | 何を入れる所か | NEO の表 | 生成器に渡すキー |
 |---|---|---|---|
-| **塗装条件** | 塗料・塗膜・高機能塗装・材料代割合・ブース・2トーン・低隠蔽性塗色・**入力方式（指数/実額/参考）** | `PaintingPlan` | `paint.paint` / `coat` / `hf` / `material_rate` / `material_round` / `booth` / `two_tone` / `input_type` |
+| **塗装条件** | 塗料・塗膜・高機能塗装・材料代割合・**材料代単価/係数**・ブース・2トーン・低隠蔽性塗色・**入力方式（指数/実額/参考）** | `PaintingPlan` | `paint.paint` / `coat` / `hf` / `material_rate` / `material_unit` / `material_coefficient` / `material_round` / `booth` / `two_tone` / `input_type` |
 | **外板パネル** | 塗る外板パネルの一覧（取替・修理・板金）と塗装面積 1/1・1/2・1/3、**行追加**（20.DB に無い部位の手入力） | `PaintingPanel` | `paint.panels[]`（`manual: true` が行追加） |
 | （外板パネルの下） | **加算基礎数値**（枚数で決まる基礎指数）・**ブース加算** | `PaintingPlan.Base*` / `Booth*` | `paint.base` / `paint.booth` |
 | **バンパ** | 前後バンパの塗装（新品・変形修正・外傷修正小/大 × 一色/二色 × 絞模様）と**バンパ加算基礎** | `PaintingBumper` / `PaintingPlan.BumperBase*` | `paint.bumper_front` / `bumper_rear` / `bumper_base` |
@@ -23,6 +23,7 @@
 ```
 塗装工賃計 = 外板パネル + 加算基礎 + ブース + バンパ（+バンパ加算） + 内板骨格塗装 + 付加塗装
 塗装材料代 = 塗装工賃計 × 材料代割合（端数処理は工場ごと。§7）
+             または **塗装指数計 × 材料代単価 × 材料代係数 × 材料代割合**（単価方式。§7-3）
 塗装費用計 = 塗装工賃計 + 塗装材料代 + 追加塗装費用計（= 追加項目の工賃）
 ```
 - **追加項目（PaintingOther）は材料代の対象外**で、`PaintingTotal.WageTotal` にも入らない（`Total` にだけ足す）
@@ -509,3 +510,22 @@ M89 パネル 4500 で 1.3h）。`PaintIndex.set_vehicle(car, eva)` にまとめ
 
 「1 桁目がこの値なら塗り数値はこの表から」という対応は**無い**（どの層でも 77/97.DB・CHM・係数表が混ざる）。
 層で変わるのは経路の構成比だけで、それは CHM ページの有無から決まる。
+
+## 7-3. 材料代の「単価 × 係数」方式（2026-09-28 に対応。実機未確認）
+
+見積書に **「材料代単価 9,500円」「材料代係数 1.30」** が刷られる工場がある（コグニの塗装条件の欄）。この書式では
+
+    材料代 = 塗装指数計 × 材料代単価 × 材料代係数 × 材料代割合（端数処理は工場ごと。既定 10 円四捨五入）
+
+で戻る。**塗装指数計**は `PaintingTotal.TimeTotal` と同じ範囲 —— パネル＋バンパ塗装＋付加塗装＋加算基礎＋内板骨格塗装＋ボデーシーリング
+（**ブース加算と追加項目（PaintingOther）は入らない**）。
+
+reading には印字どおり `paint.material_unit` / `paint.material_coefficient` を書く。生成器は
+**計算が見積書の材料代とぴったり一致したときだけ** `PaintingPlan.MaterialUnitFlag=1 / MaterialUnit / MaterialCoefficient` を書き、
+材料代の手入力の印（`MaterialTotalbyManual`）を外す。一致しない・塗装明細が無い（一括計上）・実額のときは書かない
+（従来どおり見積書の額を手入力で渡す）。
+
+実例（2026-09-28 ジムニー）: 6.9 × 9,500 × 1.30 × 38% = 32,381.7 → 10 円丸めで **32,380 円**（見積書と一致）。
+
+**未確認**: `MaterialUnitFlag=1` の NEO は実案件 7,215 本に 1 本も無い。コグニで開いたときに材料代が変わらないか、
+`MaterialRateType` が 1 のままか、参考見積でも使うかは実機で確かめる（HANDOFF の「実機で確かめる」表）。

@@ -52,7 +52,7 @@ pi.base_time('6', paint=3, coat=3, hf=2, n_panels=4)  # → 3.7
 ### estimate.json の形（run_case.py）
 
 `vehicle`（車検証）/ `customer` / `insurance` / `labor_rate` / `items`（code, name, parts_no, method, qty, price, wage, index）/
-`paint`（total, material, material_rate, paint, coat, hf, panels[{code, name, method, area, ratio, index, wage}], booth, base, bumper_front{method, color, form, index, wage}, wax{count, index, wage}）/
+`paint`（total, material, material_rate, material_unit, material_coefficient, paint, coat, hf, panels[{code, name, method, area, ratio, index, wage}], booth, base, bumper_front{method, color, form, index, wage}, wax{count, index, wage}）/
 `expenses`（name, amount, kind, taxfree）/ `totals`（照合用）
 
 非収録車: `vehicle.generic=true` + `car_code`（Z10 乗用車/Z20 1BOX/Z30 トラック）+ `maker_code` + `car_name` + `engine` + `color_code`。`items[].manual=true` で ADDATA 照合をせず見積書の名称を使う。
