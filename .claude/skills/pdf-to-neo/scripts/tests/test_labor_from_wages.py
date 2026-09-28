@@ -75,6 +75,31 @@ def test_declared_round_10_yields_to_one_yen_evidence():
     assert [r for r in e.get('_review', []) if r.get('level') == '要確認' and r.get('kind') == 'レバーレート'], 'レートの要確認が出ていない'
 
 
+def test_manual_wage_rows_do_not_block_the_rate():
+    """印 * （手入力工賃）の行の技術料はレート × 指数でなくてよい。全部では決まらないとき * の行を除いて探す
+    （2026-09-28 t12・k03: 2,500 / 10,000 / 2,204 の * 行があるだけでレートが決まらず、# 行の指数を起こせなかった）"""
+    if not _s89_available():
+        print('   skip test_manual_wage_rows_do_not_block_the_rate（この ADDATA に S89 が無い）')
+        return
+    rows = ROWS_10YEN + ['|ﾌﾛｱﾏｯﾄ|取替|||1|5000|2204|*|']
+    e = _draft(rows)
+    assert e.get('labor_rate') == 7620, f"* の行を除けば 7,620 に決まる（{e.get('labor_rate')}）"
+    assert e.get('wage_round', 10) == 10, f"丸め単位は * の無い行で決める（{e.get('wage_round')}）"
+
+
+def test_low_cover_lines_become_paint_low_cover():
+    """低隠蔽性塗色の印字 3 行（工賃つき 1 行 ＋ 枚数 2 行）は paint.low_cover 1 つにまとめる（2026-09-28 t09）"""
+    if not _s89_available():
+        print('   skip test_low_cover_lines_become_paint_low_cover（この ADDATA に S89 が無い）')
+        return
+    paint = {'paint': '2K', 'coat': 'ソリッド', 'total': 9460,
+             'lines': [{'name': '低隠蔽性塗色 ﾙｰﾌ なし', 'wage': 9460}, {'name': 'ﾙｰﾌ以外 取替 2枚', 'wage': None}, {'name': 'ﾙｰﾌ以外 修理 3枚', 'wage': None}]}
+    e = de.Drafter(dict(READING, labor_rate=7620, paint=paint, blocks=[{'title': 'x', 'rows': ROWS_10YEN[:1]}])).build()
+    lc = (e.get('paint') or {}).get('low_cover') or {}
+    assert lc.get('roof') == 'なし' and lc.get('change') == 2 and lc.get('repair') == 3 and lc.get('wage') == 9460, f'low_cover {lc}'
+    assert not (e.get('paint') or {}).get('other'), f"枚数の行を追加項目にしない {(e.get('paint') or {}).get('other')}"
+
+
 def test_tax_round_without_printed_taxable():
     """課税小計の印字が無い見積でも、総合計 − 消費税 から切り捨ての工場を判定する（2026-09-15 アプリのバグハント O11。
     判定しないと 1 円差で不合格になり、逃げ道のベタ打ちでも切り捨ては作れない）"""

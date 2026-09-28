@@ -96,6 +96,37 @@ def test_finds_the_four_kinds_of_difference():
         chk(w in d, f'{w} の差を見つけていない: {d}')
 
 
+def test_parse_print_pdf_reads_by_word_position():
+    """コグニの「PDF(通常)」出力は名称と区分が 1 語にくっつき、文字列の並びも崩れる。語の座標で欄を読む（2026-09-28）。
+    PyMuPDF が無い PC では飛ばす"""
+    try:
+        import fitz  # type: ignore  # noqa: PLC0415
+    except ImportError:
+        print('   skip test_parse_print_pdf_reads_by_word_position（PyMuPDF が無い）')
+        return
+    import tempfile
+    doc = fitz.open()
+    pg = doc.new_page(width=595, height=842)
+    def put(x, y, t):
+        pg.insert_text((x, y), t + ' ', fontname='japan', fontsize=8)   # コグニの PDF も欄の間に空白がある（語が分かれる）
+    for x, t in ((31, 'ｺｰﾄﾞ'), (87, '修理項目／部品名称'), (266, '修理方法／部品番号'), (419, '部品価格(円)'), (496, '工賃(円)')):
+        put(x, 300, t)
+    put(27, 330, '0030'); put(54, 330, '左Frﾊﾞﾝﾊﾟｻｲﾄﾞｽﾍﾟ-ｻ取替'); put(253, 330, '71280-3M0-003'); put(463, 330, '640')
+    put(27, 346, '0186'); put(54, 346, 'ｽｸﾘﾕｸﾞﾛﾒﾂﾄ'); put(202, 346, '取替'); put(253, 346, '90682-SDA-A01'); put(343, 346, '(02)'); put(465, 346, '250')
+    put(54, 362, '配線修理'); put(470, 362, '240'); put(521, 362, '4,000')
+    put(54, 378, '合計'); put(521, 378, '1,102,977'); put(560, 378, '*')
+    path = os.path.join(tempfile.mkdtemp(), 'p.pdf')
+    doc.save(path)
+    pr = pc.parse_print_pdf(path)
+    chk(pr is not None, 'PDF を読めない')
+    rows = {r['code']: r for r in pr['rows']}
+    chk(rows.get('0030', {}).get('method') == '取替' and rows['0030']['name'].endswith('ｽﾍﾟ-ｻ') and rows['0030']['pn'] == '71280-3M0-003',
+        f"名称と区分のくっついた語を分ける {rows.get('0030')}")
+    chk(rows.get('0186', {}).get('qty') == '2' and rows['0186']['money'] == [250], f"数量と金額 {rows.get('0186')}")
+    chk([(e['name'], e['money']) for e in pr['expenses']] == [('配線修理', [240, 4000])], f"費用名は区分で切らない {pr['expenses']}")
+    chk(pr['totals'].get('total') == 1102977, f"合計 {pr['totals']}")
+
+
 for _n, _f in sorted((k, v) for k, v in dict(globals()).items() if k.startswith('test_')):
     _f()
     print('ok  ', _n)

@@ -540,7 +540,7 @@ def paint_frame_line(n: str):
         return 'front_pillar', side
     if side and re.search(r'(センタ[ー\-]?|Ｃ|C)ピラ[ー\-]?', n):
         return 'center_pillar', side
-    if re.search(r'フロア', n) and re.search(r'[1１一]\s*台\s*(小|大)修正', n):
+    if re.search(r'フロア', n) and re.search(r'([1１一]\s*台\s*)?(小|大)修正', n):   # '1台' の抜けた写し（'リヤフロア 大修正'。t11 をコグニで刷って判明）も
         return 'rear_floor', 2 if '大修正' in n else 1
     return None
 
@@ -1426,7 +1426,7 @@ class Drafter:
         return out
 
     # 生成器が印字の名前のまま書く作業区分（コグニの作業区分の画面にある名前。estimate_to_neo の disp_name と同じ並び）
-    KEEP_METHODS = ('取替', '脱着', '修理', '脱着修理', '脱着板金', '点検', '調整', '点検調整', '分解調整', '板金')
+    KEEP_METHODS = ('取替', '脱着', '修理', '脱着修理', '脱着板金', '点検', '調整', '点検調整', '分解調整', '分解', '板金')   # 分解: 工場のコグニ印刷に「分解」（区分 5）がある（2026-09-28 t12）
 
     def _keep_printed_method(self, it: dict) -> None:
         """区分は印字の語で書く（2026-09-19 本番検証: 印字「調整」が「点検調整」に、「再封印」が「脱着」に置き換わっていた）。
@@ -1439,6 +1439,8 @@ class Drafter:
         if not mp or not cur or mp == cur:
             return
         if mp in DISPOSAL:
+            if mp == '分解' and str(self.rd.get('format') or '').strip().upper()[:1] != 'A':
+                return   # 「分解」を区分名のまま刷るのはコグニ印刷（書式 A）の工場だけ。ほかの書式の「分解」はコグニの既定名 分解調整（アクセラ 書式 B）
             if mp in self.KEEP_METHODS and DISPOSAL.get(mp) == DISPOSAL.get(cur):
                 it['method'] = mp
             return
@@ -1511,6 +1513,19 @@ class Drafter:
             hits = [r for r, _ in guess(wages, unit=unit)]
             if hits:
                 break
+        if not hits:
+            # コグニ印刷の印 * は「工賃（か金額）を手入力した行」: その工賃はレート × 指数でなくてよい（2026-09-28 t12: 2,500 / 10,000 だけが * 行で、
+            # 残り 10 種類はすべて 11,000 × 0.1 刻み）。* の無い行の技術料が 3 種類以上あるときだけ、それで探し直す
+            plain = sorted({int(it['wage']) for it in rows if int(it['wage']) > 0 and '*' not in str(it.get('_mark') or '')})
+            if len(plain) >= 3 and len(plain) < len(wages):
+                # 丸め単位も * の無い行で決め直す（* 行の 2,204 のような 1 円単位の手入力工賃に引きずられない。k03）
+                units_p = (self.wage_round,) if (self.wage_round or 10) != 10 else ((1,) if any(w % 10 for w in plain) else (10, 100))
+                for unit in units_p:
+                    hits = [r for r, _ in guess(plain, unit=unit)]
+                    if hits:
+                        self.notes.append(f'レバーレート: 印 * （手入力工賃）の行の技術料 {", ".join(f"{w:,}" for w in wages if w not in plain)} を除いて探した')
+                        rows = [it for it in rows if '*' not in str(it.get('_mark') or '')]
+                        break
         if hits and unit != (self.wage_round or 10):
             self.wage_round = unit
             self.notes.append(f'工賃の丸め単位 {unit} 円（技術料が 0.1 刻みの指数 × レートの {unit} 円丸めでだけ説明できる）→ estimate.wage_round')
@@ -1683,6 +1698,35 @@ class Drafter:
         auto_manual: list = []  # 下書きが作った手入力の塗装行（rec, 見積の名前）
         _tcs_used: set = set()  # 2 コートソリッド加算の「ルーフ以外 N 枚」に使った行
         frame_from_lines_w = 0  # 塗装行から内板骨格塗装に振り分けた工賃（塗装工賃計に二重に足さないため）
+        # 低隠蔽性塗色（付加塗装）: 「低隠蔽性塗色 ルーフ なし/取替/修理」の行（工賃つき）と、金額の無い「ルーフ以外 取替 N枚」「ルーフ以外 修理 N枚」の行で 1 つ。
+        # 拾わないと 3 行とも追加項目・手入力の塗装行に落ちる（2026-09-28 t09 をコグニで刷って判明）
+        for ln in lines:
+            n0 = _nfkc(_hw_kana(ln.get('name') or '')).replace(' ', '')
+            if not re.search(r'低隠[蔽ぺい]', n0) or 'low_cover' in out:
+                continue
+            m_r = re.search(_ROOF + r'(?!以外)\s*(なし|取替|修理)', n0)
+            rec = {'roof': m_r.group(1) if m_r else 'なし'}
+            for l2 in lines:
+                if l2 is ln or _num(l2.get('wage')) != '':
+                    continue
+                n2 = _nfkc(_hw_kana(l2.get('name') or '')).replace(' ', '')
+                m2 = re.search(_ROOF + r'以外\s*(取替|修理)\s*([0-9]+)\s*枚', n2)
+                if m2:
+                    rec['change' if m2.group(1) == '取替' else 'repair'] = int(m2.group(2))
+                    _tcs_used.add(id(l2))
+            if rec['roof'] == 'なし' and not rec.get('change') and not rec.get('repair'):
+                continue   # 枚数が読めない: 今までどおり（追加項目）にして人が見る
+            w_ = int(float(_num(ln['wage']))) if _num(ln.get('wage')) != '' else None
+            t_ = float(_num(ln['index'])) if _num(ln.get('index')) != '' else None
+            if t_ is None and w_:
+                t_ = index_from_wage(w_, getattr(self, 'labor', 0) or 0, getattr(self, 'wage_round', 10) or 10)
+            if t_ is not None:
+                rec['index'] = t_
+            if w_ is not None:
+                rec['wage'] = w_
+            self._put_special(out, 'low_cover', rec, ln.get('name') or '')
+            _tcs_used.add(id(ln))
+            self.notes.append(f"塗装 {ln.get('name')}: 低隠蔽性塗色（付加塗装）として書いた（ルーフ {rec['roof']} / ルーフ以外 取替 {rec.get('change', 0)} 枚・修理 {rec.get('repair', 0)} 枚）")
         for ln in lines:
             name = _hw_kana(ln.get('name') or '')
             t = float(_num(ln['index'])) if _num(ln.get('index')) != '' else None

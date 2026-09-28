@@ -44,7 +44,7 @@ sys.path.insert(0, os.path.join(skill_env.FILES, 'claude_neo_pipeline'))
 from estimate_to_neo import _name_key, hw  # noqa: E402
 
 ROW_KEYS = ('code', 'name', 'method', 'parts_no', 'index', 'qty', 'price', 'wage', 'flags', 'comment')
-METHODS = ('脱着修理', '脱着板金', '点検調整', '分解調整', '取替', '脱着', '修理', '調整', '点検', '板金', '修正')
+METHODS = ('脱着修理', '脱着板金', '点検調整', '分解調整', '取替', '脱着', '修理', '調整', '点検', '板金', '修正', '分解')
 
 
 def _text_pages(pdf: str) -> list:
@@ -125,6 +125,104 @@ def parse_print(pages: list) -> dict:
     return {'rows': rows, 'expenses': expenses, 'frame': frame, 'totals': tot, 'price_date': pdate}
 
 
+_MONEY_W = re.compile(r'^([\d,]+)円?([#*$@n]*)$')
+_TOTAL_LBL = (('小計', 'sub'), ('課税額計', 'taxable'), ('消費税', 'tax'), ('合計', 'total'))
+
+
+def parse_print_pdf(pdf: str):
+    """印刷 PDF を語の座標で読む（PyMuPDF）。parse_print と同じ形。PyMuPDF が無い・表の見出しが無ければ None。
+    表の見出し（ｺｰﾄﾞ 修理項目 …）より上（顧客欄）は読まない。欄は語の中身で決める（帳票の版で x 位置が違う）"""
+    try:
+        import fitz  # type: ignore  # noqa: PLC0415
+    except ImportError:
+        return None
+    rows, expenses, frame, tot, pdate = [], [], [], {}, ''
+    seen = False
+    for page in fitz.open(pdf):
+        ws = page.get_text('words')
+        for w in ws:   # 部品価格適応日（見出しより下の欄外にある）
+            pass
+        m = re.search(r'部品価格適応日\s*(\d+)\s*年\s*(\d+)\s*月\s*(\d+)\s*日', page.get_text())
+        if m:
+            pdate = f'{int(m.group(1)) % 100:02d}{int(m.group(2)):02d}{int(m.group(3)):02d}'
+        hd = {}
+        for w in ws:
+            for k, pat in (('code', 'ｺｰﾄﾞ'), ('name', '修理項目'), ('price', '部品価格'), ('wage', '工賃')):
+                if k not in hd and w[4].startswith(pat):
+                    hd[k] = w
+        if len(hd) < 4:
+            continue
+        seen = True
+        top = hd['code'][3]
+        lines: dict = {}
+        for w in ws:
+            if w[1] > top + 1:
+                lines.setdefault(round((w[1] + w[3]) / 2 / 3), []).append(w)
+        sect = ''
+        for y in sorted(lines):
+            code, names, meth, after, money, mark, qty = '', [], '', [], [], '', ''
+            for w in sorted(lines[y], key=lambda w: w[0]):
+                t = w[4].replace('\u3000', ' ').strip()
+                if not t:
+                    continue
+                cx = (w[0] + w[2]) / 2
+                mm = _MONEY_W.match(t)
+                if not code and not names and w[2] < hd['name'][0] and re.fullmatch(r'\d{4}|保留', t):
+                    code = t
+                elif re.fullmatch(r'[#*$@n]+', t):
+                    mark += t
+                elif mm and cx > hd['price'][0] - 20:
+                    money.append(_money(mm.group(1))); mark += mm.group(2)
+                elif re.fullmatch(r'\(\d\d\)', t):
+                    qty = str(int(t[1:3]))
+                elif not meth and names and t in METHODS:
+                    meth = t
+                elif meth:
+                    after.append(t)
+                else:
+                    names.append(t)
+            if not meth and code:   # 名称と区分がくっついた語（'…ｻｲﾄﾞｽﾍﾟ-ｻ取替'）。その後ろの語は品番欄。費用名（'配線修理'）は切らない
+                for i_, t_ in enumerate(names):
+                    m_ = next((m_ for m_ in METHODS if t_.endswith(m_) and len(t_) > len(m_)), None)
+                    if m_:
+                        after = names[i_ + 1:] + after
+                        names = names[:i_] + [t_[:-len(m_)]]
+                        meth = m_
+                        break
+            nm = ' '.join(names).strip()
+            if not (nm or code or money):
+                continue
+            if re.search(r'ページ小計|前頁|次頁', nm):
+                continue
+            h = re.search(r'【(.+?)】', nm)
+            if h:
+                sect = 'frame' if '内板骨格' in h.group(1) else 'paint' if '塗装' in h.group(1) else 'expense' if '費用' in h.group(1) else sect
+                continue
+            key = next((k for lbl, k in _TOTAL_LBL if nm.replace(' ', '') == lbl), None)
+            if key and money:
+                tot[key] = money if key == 'sub' else money[-1]
+                continue
+            if sect == 'paint' and not code:
+                continue
+            if code and sect != 'paint':
+                pn_text = ' '.join(x for x in after if not re.fullmatch(r'[\d.,]+', x))
+                mp = re.search(r'([0-9A-Z]{5}-[0-9A-Z\-]+)', pn_text)
+                rec = {'code': code, 'name': nm, 'method': meth, 'pn': mp.group(1) if mp else '', 'pn_text': pn_text,
+                       'qty': qty, 'mark': mark, 'money': [v for v in money if v >= 10], 'raw': ' '.join([code, nm, meth, pn_text])}
+                (frame if sect == 'frame' else rows).append(rec)
+            elif not code and meth and nm and sect not in ('paint', 'expense'):
+                # 部品コードの無い手入力の明細行（区分が刷られる）。コードは空で拾う（Codex 指摘）
+                pn_text = ' '.join(x for x in after if not re.fullmatch(r'[\d.,]+', x))
+                mp = re.search(r'([0-9A-Z]{5}-[0-9A-Z\-]+)', pn_text)
+                rows.append({'code': '', 'name': nm, 'method': meth, 'pn': mp.group(1) if mp else '', 'pn_text': pn_text,
+                             'qty': qty, 'mark': mark, 'money': [v for v in money if v >= 10], 'raw': ' '.join([nm, meth, pn_text])})
+            elif not code and not meth and money and sect != 'paint':
+                expenses.append({'name': nm, 'money': [v for v in money if v >= 10]})
+    if not seen:
+        return None
+    return {'rows': rows, 'expenses': expenses, 'frame': frame, 'totals': tot, 'price_date': pdate}
+
+
 def print_from_neo(neo_path: str) -> dict:
     """NEO の中身から、コグニが印刷する 明細・費用・内板骨格・合計 を組み立てる（parse_print と同じ形）。
     印刷 PDF を待たずに compare() に掛けられる（2026-09-28: 印刷してから名称・費用名・骨格・品番欄の違いに気づく往復を無くす）。
@@ -195,9 +293,13 @@ def compare(rd: dict, pr: dict) -> list:
         for r in p_by[c]:
             diffs.append(f"余分な行: 印刷 {c} {r['name']} が見積書の写しに無い")
     for c in sorted(set(p_by) & set(r_by)):
-        if len(p_by[c]) != len(r_by[c]):
-            diffs.append(f'行数: {c} 見積書 {len(r_by[c])} 行 / 印刷 {len(p_by[c])} 行')
-        for r, p in zip(r_by[c], p_by[c]):
+        if c:
+            if len(p_by[c]) != len(r_by[c]):
+                diffs.append(f'行数: {c} 見積書 {len(r_by[c])} 行 / 印刷 {len(p_by[c])} 行')
+            pairs = list(zip(r_by[c], p_by[c]))
+        else:
+            pairs = []
+        for r, p in pairs:
             nm_r = re.sub(r'\s*[（(]\s*各?\s*\d+\s*個?\s*[)）]\s*$', '', hw(str(r.get('name') or '')))
             nm_p = str(p['name'])
             if _name_key(nm_r) != _name_key(nm_p):
@@ -220,12 +322,45 @@ def compare(rd: dict, pr: dict) -> list:
                 v = _money(r.get(k))
                 if v > 0 and v not in p['money']:
                     diffs.append(f"{lbl}: {c} 見積書 {v:,} / 印刷 {p['money']}")
+    # 部品コードの無い手入力の行: 並びが揃わず、自由な区分（'施工'）の行は印刷で名称とくっつき費用の形にも見える。
+    # 金額がすべて印刷の金額に含まれ、名称が前方一致する印刷の行（無ければ費用の形の行）と組む。組めなければ行落ち、印刷にだけある行は余分な行（Codex 指摘）
+    _p_manual = list(p_by.get('', []))
+    _p_exp = list(pr['expenses'])
+    for r in r_by.get('', []):
+        _nm = re.sub(r'\s*[（(]\s*各?\s*\d+\s*個?\s*[)）]\s*$', '', hw(str(r.get('name') or ''))).strip()
+        _k = _name_key(_nm)
+        _amts = [v for v in (_money(r.get('price')), _money(r.get('wage'))) if v > 0]
+
+        def _ok(p):
+            pk = _name_key(str(p['name']))
+            return bool(_k and pk) and (pk.startswith(_k) or _k.startswith(pk)) and all(v in p['money'] for v in _amts)
+        p = next((p for p in _p_manual if _ok(p)), None)
+        if p is not None:
+            _p_manual.remove(p)
+            _mr, _mp = hw(str(r.get('method') or '')).strip(), str(p.get('method') or '')
+            if _mr and _mp and _name_key(_mr) != _name_key(_mp):
+                diffs.append(f"修理方法: 手入力の行 {_nm} 見積書「{_mr}」/ 印刷「{_mp}」")
+            continue
+        _mr = _name_key(hw(str(r.get('method') or '')).strip())
+        # 費用の形の行は名称と区分の語がくっついている: 写しの区分（'施工'）が印刷の名称の後ろにあること（Codex 指摘）
+        p = next((p for p in _p_exp if _ok(p) and (not _mr or _name_key(str(p['name'])).endswith(_mr))), None)
+        if p is not None:
+            _p_exp.remove(p)
+            continue
+        p = next((p for p in _p_exp if _ok(p)), None)
+        if p is not None:
+            _p_exp.remove(p)
+            diffs.append(f"修理方法: 手入力の行 {_nm} 見積書「{hw(str(r.get('method') or '')).strip()}」が印刷に無い（印刷「{p['name']}」）")
+            continue
+        diffs.append(f'行落ち: 見積書 手入力の行 {_nm} が印刷に無い')
+    for p in _p_manual:
+        diffs.append(f"余分な行: 印刷 手入力の行 {p['name']} が見積書の写しに無い")
     # 費用
     for ex in rd.get('expenses') or []:
         amt = _money(ex.get('amount'))
         if not amt:
             continue
-        hit = [e for e in pr['expenses'] if amt in e['money']]
+        hit = [e for e in _p_exp if amt in e['money']]   # 手入力の行と組んだ費用の形の行は使わない（二重に数えない。Codex 指摘）
         if not hit:
             diffs.append(f"費用: 見積書「{ex.get('name')}」{amt:,} 円が印刷に無い")
         elif not any(_name_key(hw(str(ex.get('name') or ''))) == _name_key(e['name']) for e in hit):
@@ -249,8 +384,8 @@ def main(argv: list) -> int:
         print(__doc__); return 2
     case, pdf = argv[1], argv[2]
     rd = json.load(io.open(os.path.join(case, 'reading.json'), encoding='utf-8'))
-    pr = print_from_neo(argv[argv.index('--neo') + 1]) if '--neo' in argv else parse_print(_text_pages(pdf))
-    if not pr['rows']:
+    pr = print_from_neo(argv[argv.index('--neo') + 1]) if '--neo' in argv else (parse_print_pdf(pdf) or parse_print(_text_pages(pdf)))
+    if not pr['rows'] and not pr['expenses'] and not pr['totals']:   # 手入力の行だけの見積（汎用車種）は費用の形で読める
         print('この PDF から明細を読めなかった（コグニの印刷 PDF か、文字層のある PDF を渡す）'); return 2
     diffs = compare(rd, pr)
     print(f"印刷 {len(pr['rows'])} 行 / 見積書の写し {len(read_rows(rd))} 行 / 費用 {len(pr['expenses'])} / 内板骨格 {len(pr['frame'])}")

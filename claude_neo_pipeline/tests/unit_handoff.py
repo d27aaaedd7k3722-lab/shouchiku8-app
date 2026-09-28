@@ -62,6 +62,7 @@ _NOT_IN_REPO = {
     'reading.json', 'estimate.json', 'inspect.json', 'reading_check.json', 'report.md',
     'BUNDLE_README.md', 'pdf-to-neo.local.json',
     'shouchiku_guideline.json',  # 社内の見積ガイドライン（PC ごと・NEO_check/_reference。git に入れない）
+    'cases.json',  # ocr_eval の案件一覧（NEO_check/_ocr_eval。実案件の PDF を指すので git に入れない）
 }
 # 配布 zip（BUNDLE_README.md がある展開先）には入れない開発機専用のもの: 実機 NEO・案件フォルダを前提にする検証一式
 _BUNDLE = os.path.exists(os.path.join(ROOT, 'BUNDLE_README.md'))

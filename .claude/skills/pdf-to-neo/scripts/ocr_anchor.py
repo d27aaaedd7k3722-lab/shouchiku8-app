@@ -55,7 +55,7 @@ import reading_pages  # noqa: E402
 UNVERIFIED = 'OCR未確認'
 METHODS = ('脱着修理', '脱着板金', '脱着鈑金', '鈑金修正', '点検調整', '分解調整', '取替', '交換', '取換', '脱着', '取外', '取付', '板金', '鈑金',
            '修理', '補修', '修正', '点検', '調整', '診断', '分解')  # 生成器の DISPOSAL の語（長い語から）。印字どおりに写す
-END_RE = re.compile(r'塗装費用|塗装明細|【塗装|【費用|ページ小計|頁小計|次頁|前頁繰越|課税額計|消費税|御見積額')
+END_RE = re.compile(r'塗装費用|塗装明細|【塗装|【費用|明細】|【.{0,2}用】|ページ小計|頁小計|ジ小計|次頁|前頁繰越|課税額計|消費税|御見積額')  # 見出しは OCR で崩れる（'【奘明細】' '【豊用】'）
 FRAME_RE = re.compile(r'ランク|ﾗﾝｸ|基本内|基本修正')
 END2_RE = re.compile(r'ページ小計|頁小計|ジ小計|次頁|前頁繰越|課税額計|消費税|御見積額')  # 区画（塗装明細・費用）の下端
 # 塗装明細の行（見出しの「塗装費用計」が OCR で崩れても、ここから下は部品の明細ではない）
@@ -156,12 +156,17 @@ def layout_a(lines: list[dict], W: int) -> Optional[list[dict]]:
     幅の比で確かめ、合わなければ None（書式 A ではない）"""
     if len(lines) < 6:
         return None
-    for i in range(len(lines) - 5):
-        L = lines[i:i + 6]
+    import itertools  # noqa: PLC0415
+    best = None
+    # 並びを保ったまま 6 本を選ぶ（表の途中の短い縦線 = 見出しの枠などを飛ばす。ハイエース C14の PDF 出力で 1 本混じっていた）。
+    # 比が合う組のうち、線の長さの合計がいちばん長いもの
+    for L in itertools.combinations(lines[:16], 6):
         w = [(L[k + 1]['x'] - L[k]['x']) / W for k in range(5)]
         if 0.025 <= w[0] <= 0.08 and 0.15 <= w[1] <= 0.35 and 0.2 <= w[2] <= 0.45 and 0.06 <= w[3] <= 0.18 and 0.06 <= w[4] <= 0.18:
-            return L
-    return None
+            tot = sum(ln['len'] for ln in L)
+            if best is None or tot > best[0]:
+                best = (tot, list(L))
+    return best[1] if best else None
 
 
 COLS = ('code', 'name', 'mid', 'price', 'wage', 'mark')
@@ -203,14 +208,17 @@ def text_rows(words: list[dict]) -> list[dict]:
 def detail_region(trows: list[dict], L: list[dict], H: int) -> tuple[float, float, Optional[dict]]:
     """明細（部品の行）の上端・下端と、ページ小計の行"""
     top = None
-    for r in trows:
-        if HEADER_RE.search(r['text']):
-            top = r['y'] + 20
-            break
+    # 表の見出しの行 = 見出しの語が 2 つ以上ある行（注記「部品番号・価格再度確認」の '部品番号' 1 語で上の車両欄まで明細にしていた）。
+    # 2 語の行が無ければ（FAX で崩れた）1 語の最初の行
+    _hits = [(len(set(HEADER_RE.findall(r['text']))), r) for r in trows]
+    _two = next((r for n_, r in _hits if n_ >= 2), None)
+    _one = next((r for n_, r in _hits if n_ >= 1), None)
+    if _two is not None or _one is not None:
+        top = (_two if _two is not None else _one)['y'] + 20
     if top is None:
         top = min((p[0] for p in L[1]['pts']), default=0)
     # 表の下端 = 名称と修理方法の間の縦線の終わり（ページ小計の枠・部品価格適応日の行は表の外。'ページ小計' の字は OCR で崩れやすい）
-    table_end = max((p[0] for p in L[2]['pts']), default=H) + 40
+    table_end = max((p[0] for p in L[2]['pts']), default=H) + 100  # 線の終わりは 120 画素の帯の中心なので最大 60 画素浅い（最後の行が切れていた: ハイエース C14）。ページ小計の行は END_RE で止まる
     bottom, sub = table_end, None
     for r in trows:
         if r['y'] <= top:
@@ -730,8 +738,18 @@ def vote_money(texts: list[str]) -> tuple[Optional[int], int, str]:
     return best[0][0], best[0][1], marks
 
 
-def second_pass(clean_img, L: list[dict], slots: list[dict], sub: Optional[dict]) -> dict:
-    """崩れた金額・印の欄と、ページ小計の欄を読み直す。読み直しで きれいな数字 になった欄だけ置き換える。戻り値 = ページ小計"""
+def second_pass(clean_img, L: list[dict], slots: list[dict], sub: Optional[dict], exact: bool = False) -> dict:
+    """崩れた金額・印の欄と、ページ小計の欄を読み直す。読み直しで きれいな数字 になった欄だけ置き換える。戻り値 = ページ小計。
+    exact（文字層の字）のときは読み直さず、小計は字のまま"""
+    if exact:
+        subtotal: dict = {'_cands': {}, '_nest': {}}
+        if sub is not None:
+            for c in ('price', 'wage'):
+                ws = sorted((w for w in sub['w'] if col_of(L, w['x'] + w['w'] / 2, sub['y']) == c), key=lambda w: w['x'])
+                v, _clean = _money_text(''.join(w['text'] for w in ws))
+                if v is not None:
+                    subtotal['parts' if c == 'price' else 'wage'] = v
+        return subtotal
     boxes, where = [], []
     cells = []  # (slot, 列, 欄, 字の幅, OCR の字)
     for s in slots:
@@ -824,7 +842,7 @@ def second_pass(clean_img, L: list[dict], slots: list[dict], sub: Optional[dict]
     return subtotal
 
 
-def read_totals(clean_img, L: list[dict], trows: list[dict], sub: Optional[dict]) -> dict:
+def read_totals(clean_img, L: list[dict], trows: list[dict], sub: Optional[dict], exact: bool = False) -> dict:
     """合計欄（表の下: ページ小計 → 小計 → 課税額計 → 消費税 → 合計 → 部品価格適応日）→ {'taxable', 'tax', 'total'} と 検算の結果。
     数字は崩れやすい（'33,77' '371,48:'）ので、欄を読み直した票と、税（10%・四捨五入/切り捨て/切り上げ）と 合計 = 課税額計 + 消費税 の関係で
     辻褄の合う組を選ぶ。合う組が無ければ why に理由（header.totals.comment が OCR未確認 になる）"""
@@ -840,7 +858,7 @@ def read_totals(clean_img, L: list[dict], trows: list[dict], sub: Optional[dict]
     for r in tax_rows:
         xs = [x_at(ln, r['y']) for ln in L]
         boxes.append((xs[3] + (xs[4] - xs[3]) * 0.3, r['y'] - hh * 0.7, xs[5] - 6, r['y'] + hh * 0.7))
-    texts = reocr_cells(clean_img, boxes)
+    texts = [[''.join(w['text'] for w in r['w'] if col_of(L, w['x'] + w['w'] / 2, r['y']) in ('price', 'wage'))] * 2 for r in tax_rows] if exact else reocr_cells(clean_img, boxes)
     first = [tentative(''.join(w['text'] for w in r['w'] if col_of(L, w['x'] + w['w'] / 2, r['y']) in ('price', 'wage'))) for r in tax_rows]
     votes = [money_votes(tt) for tt in texts]
 
@@ -870,21 +888,58 @@ def read_totals(clean_img, L: list[dict], trows: list[dict], sub: Optional[dict]
     return {'taxable': best[1], 'tax': best[2], 'total': best[3], 'why': []}
 
 
-def read_page_a(png: str, clean_img, L: list[dict], words: list[dict], H: int) -> dict:
+def fitz_text_pages(pdf: str, odir: str, pages) -> dict:
+    """文字層のあるページ（コグニの PDF 出力）を PyMuPDF で読む: {ページ: (画像, 語)}。
+    語は OCR と同じ形（x, y, w, h, text。画像の画素の座標）。PyMuPDF が無い・文字層の無いページは入れない（従来の OCR）。
+    2026-09-28: Z: の直近の見積 PDF 約 1,180 件のうち 1,118 件が文字層つき（大半がコグニ印刷）だった"""
+    try:
+        import fitz  # type: ignore  # noqa: PLC0415
+    except ImportError:
+        return {}
+    out = {}
+    try:
+        doc = fitz.open(pdf)
+    except Exception:  # noqa: BLE001
+        return {}
+    for i, page in enumerate(doc, start=1):
+        if pages and i not in pages:
+            continue
+        ws = page.get_text('words')
+        try:   # スキャンした画像に OCR の文字層を重ねた PDF は「正確な字」ではない: ページの半分以上を覆う画像があれば従来の OCR にまかせる（Codex 指摘）
+            _pa = abs(page.rect.width * page.rect.height) or 1
+            # 画像の面積の合計で見る（帯・タイルに分けて埋め込んだスキャンもある。Codex 指摘）
+            if sum(abs((b['bbox'][2] - b['bbox'][0]) * (b['bbox'][3] - b['bbox'][1])) for b in page.get_image_info()) > _pa * 0.5:
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        joined = ''.join(w[4] for w in ws)
+        if len(ws) < 20 or not re.search(r'修理項目|部品価格|工賃', joined):
+            continue
+        zoom = 3456 / page.rect.width  # FAX の画像と同じくらいの大きさ（罫線の検出・欄の切り出しの閾値をそのまま使う）
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csGRAY)
+        png = os.path.join(odir, f'page_{i}.text.png')   # ocr_prefill.extract_pages の page_N.png と別名（上書きされると語の座標と画像の縮尺がずれる。Codex 指摘）
+        pix.save(png)
+        words = [{'x': int(w[0] * zoom), 'y': int(w[1] * zoom), 'w': max(1, int((w[2] - w[0]) * zoom)), 'h': max(1, int((w[3] - w[1]) * zoom)),
+                  'text': w[4], 'line': int(w[5]) * 1000 + int(w[6])} for w in ws]
+        out[i] = (png, words)
+    return out
+
+
+def read_page_a(png: str, clean_img, L: list[dict], words: list[dict], H: int, exact: bool = False) -> dict:
     trows = text_rows(words)
     top, bottom, sub = detail_region(trows, L, H)
     slots = slots_of(words, L, top, bottom)
-    subtotal = second_pass(clean_img, L, slots, sub)
+    subtotal = second_pass(clean_img, L, slots, sub, exact)
     tail = [r['text'] for r in trows if r['y'] > bottom]
     # 塗装明細・【費用】の区画: 明細の下端（区画の見出し）から、表の下端かページ小計・次頁まで
-    table_end = max((p[0] for p in L[2]['pts']), default=H) + 40
+    table_end = max((p[0] for p in L[2]['pts']), default=H) + 100  # 線の終わりは 120 画素の帯の中心なので最大 60 画素浅い（最後の行が切れていた: ハイエース C14）。ページ小計の行は END_RE で止まる
     sec_end = table_end
     for r in trows:
         if r['y'] > bottom + 10 and END2_RE.search(r['text']):
             sec_end = min(sec_end, r['y'] - 20)
             break
     sec_slots = slots_of(words, L, bottom - 30, sec_end) if bottom < table_end - 60 else []
-    if sec_slots:
+    if sec_slots and not exact:
         second_pass(clean_img, L, sec_slots, None)
     est_date = ''
     for r in trows[:40]:  # 帳票の上の「作成日 令和8年9月8日」
@@ -914,7 +969,7 @@ def ink(img, box, min_rows: float = 0.0) -> float:
     return sum(hist[:128]) / max(1, (x1 - x0) * (y1 - y0))
 
 
-def judge(slots: list[dict], an: Optional[Anchor], page_sub: dict, clean_img, L: list[dict], others: Optional[list] = None) -> list[dict]:
+def judge(slots: list[dict], an: Optional[Anchor], page_sub: dict, clean_img, L: list[dict], others: Optional[list] = None, exact: bool = False) -> list[dict]:
     """行ごとに 出力する値 と 要確認の理由 を決める"""
     out = []
     items, idx = [], []
@@ -940,6 +995,10 @@ def judge(slots: list[dict], an: Optional[Anchor], page_sub: dict, clean_img, L:
         qty = mid['qty'] or 1
         row = {'code': s.get('code4') or '', 'name': s['name'], 'method': mid['method'], 'parts_no': mid['parts_no'], 'index': mid.get('index') or '',
                'qty': qty, 'price': None, 'wage': None, 'flags': ''.join(sorted(set(marks), key='$#*@'.index)), 'comment': ''}
+        if s.get('_manual'):
+            row['flags'] += 'M'
+        if s.get('_free_method'):
+            row['method'] = mid['method'] = s['_free_method']
         yc, ph = s['y'], s['pitch']
         xs = [x_at(ln, yc) for ln in L]
         ink_price = ink(clean_img, (xs[3] + 8, yc - ph * 0.3, xs[4] - 8, yc + ph * 0.3), ph * 0.22)  # ±0.3 行: 上の見出し（工賃(円)）の字を拾わない
@@ -1024,7 +1083,7 @@ def judge(slots: list[dict], an: Optional[Anchor], page_sub: dict, clean_img, L:
                     row['price'] = exp
                     row['_ocr']['price_from_std'] = True
                 elif price is None:
-                    row['price'] = None  # 部品価格の欄が空（取替でも価格を入れない行がある: C-HR 7990 の *）
+                    row['price'] = 0  # 部品価格の欄が空（取替でも価格を入れない行がある: C-HR 7990 の *）。空のままだと下書きが標準価格を補うので 0（人の写しも 0）
                 elif price and unit and price % unit == 0 and not mid['qty']:
                     row['price'] = price; row['qty'] = price // unit  # 数量の印字 (0N) を OCR が落とした（確定はページ小計で）
                     row['_ocr']['qty_from_price'] = True
@@ -1062,6 +1121,8 @@ def judge(slots: list[dict], an: Optional[Anchor], page_sub: dict, clean_img, L:
         if not price_clean and row['price'] is None:
             why.append(f'部品価格が読めない（{s["price"]}）')
         row['wage'] = wage
+        if wage is None and ink_wage <= 0.004 and not re.search(r'\d', s['wage']):
+            row['wage'] = 0  # 工賃の欄が空 = 工賃なし（上の行に含む・吸収）。空のままだと下書きが標準の工賃を補う（シエンタ 4802/5002 で +104,000。人の写しも 0）
         if ink_wage > 0.004 and wage is None:
             row['_unread']['wage'] = True
             why.append(f'工賃の欄に字があるが読めない（{s["wage"]}）')
@@ -1069,8 +1130,59 @@ def judge(slots: list[dict], an: Optional[Anchor], page_sub: dict, clean_img, L:
             row['_wage_unclean'] = True
         row['_why'] = why
         out.append(row)
+    if exact:
+        # 文字層の字は正確: 名称は印字どおり（ADDATA の名称と違えば neo_name に。工場の書き換え）。読みの疑いの理由は付けない
+        _nk = an.e._name_key if (an is not None and an.ok) else (lambda x: re.sub(r'\s+', '', nfkc(x)))
+        for s, r in zip(slots, out):
+            printed = ' '.join(w['text'] for w in sorted((w for w in s['w'] if w['col'] == 'name'), key=lambda w: w['x'])).strip()
+            if printed and (not s['_mid']['method'] or (r.get('_ocr') or {}).get('method_from_price')):   # 部品価格から「取替」と補った行も
+                # 名称と区分が 1 語にくっついた字（'…ｻｲﾄﾞｽﾍﾟ-ｻ取替'）: 区分の欄が空なら語尾の区分を切り出す（Codex 指摘）
+                _pm = next((m_ for m_ in sorted(EXACT_METHODS, key=len, reverse=True) if nfkc(printed).endswith(m_) and len(nfkc(printed)) > len(m_)), None)
+                if _pm:
+                    printed = printed[:len(printed) - len(_pm)].strip()
+                    r['method'] = s['_mid']['method'] = _pm
+            if printed:
+                std = (r.get('_std') or {}).get('name') or ''
+                r['name'] = printed
+                if std and _nk(printed) != _nk(std):
+                    r['neo_name'] = printed
+            if (r.get('_std') or {}).get('pn') and s['_mid']['parts_no']:
+                r['parts_no'] = s['_mid']['parts_no']  # 品番も印字どおり
+            elif (r.get('_std') or {}).get('pn') and not s['_mid']['parts_no']:
+                # 品番欄に品番でない文字（'ﾓﾃﾞﾘｽﾀ' '再封印'）: 印字どおり（判断規則 10-29。t15 をコグニで刷って判明）
+                _rest = re.sub(r'\(\d{1,3}\)|\d+(?:\.\d+)?', ' ', s['mid'])
+                if s['_mid']['method']:
+                    _rest = _rest.replace(s['_mid']['method'], ' ', 1)
+                _rest = re.sub(r'\s+', ' ', _rest).strip()
+                if _rest and not re.search(r'd[m㎡]|/', _rest):
+                    r['parts_no'] = _rest
+        # 字は正確でも、字の無いインク・空欄を 0 とした欄・ADDATA の補完は字では裏付けられない。
+        # ページ小計（文字層の字）と明細＋費用＋骨格の合計が列ごとに一致したときだけ全部の理由を消す（Codex 指摘）
+        _allc = out + list(others or [])
+        _keys = [(c, k) for c, k in (('price', 'parts'), ('wage', 'wage')) if page_sub.get(k) is not None]
+        _sub_match = bool(_keys) and all(sum(int(x.get(c) or 0) for x in _allc) == int(page_sub[k]) for c, k in _keys)
+        # 文字層では意味の無い理由: 名称・金額は字のまま（区分の欄が空なら空）、工場の書き換えた名称は上で neo_name に・品番は印字どおりに写している
+        _moot = re.compile(r'画像で写す|修理方法が読めない|名称を工場が書き換え|名称が ADDATA|^品番 OCR|^品番の読めた部分')
+        _amount = re.compile(r'部品価格|工賃|金額|価格')
+        for x in _allc:
+            x['_why'] = [w for w in x.get('_why') or [] if not _moot.search(w) and not (_sub_match and _amount.search(w))]   # 小計が裏付けるのは金額だけ（印・コードの注意は残す。Codex 指摘）
+            if _sub_match:
+                for col, _k in _keys:   # confirm_by_subtotal と同じく、小計で裏付けた列は確定（塗装の行の検査が見る。Codex 指摘）
+                    x.setdefault('_sure', {})[col] = True
+            else:
+                # 小計で裏付けられないときは、字で読んでいない金額（標準単価で埋めた・字の無いインク）に理由を必ず付ける（Codex 指摘）
+                if (x.get('_ocr') or {}).get('price_from_std') and x.get('price'):
+                    x['_why'].append(f"部品価格の欄に字が無いので標準単価×数量 {x['price']:,} を入れた（ページ小計なし・画像で確かめる）")
+                for col, lbl in (('price', '部品価格'), ('wage', '工賃')):
+                    if (x.get('_unread') or {}).get(col) and not any(lbl in w and '読めない' in w for w in x['_why']):
+                        x['_why'].append(f'{lbl}の欄に字の無いインクがある（画像で確かめる）')
+            x['comment'] = f'{UNVERIFIED}: ' + ' / '.join(dict.fromkeys(x['_why'])) if x['_why'] else ''
+        return out
     confirm_by_subtotal(out, others or [], page_sub)
     return out
+
+
+EXACT_METHODS = ('脱着修理', '脱着板金', '点検調整', '分解調整', '取替', '脱着', '修理', '調整', '点検', '板金')
 
 
 def confirm_by_subtotal(rows: list[dict], others: list[dict], page_sub: dict) -> None:
@@ -1138,7 +1250,15 @@ def confirm_by_subtotal(rows: list[dict], others: list[dict], page_sub: dict) ->
             r['comment'] = f'{UNVERIFIED}: ' + ' / '.join(dict.fromkeys(r['_why']))
 
 
-COATS = (('3コート', '3コートパール'), ('2コート', '2コートパール'), ('メタリック', 'メタリック'), ('ソリッド', 'ソリッド'))
+# 塗膜の印字 → reading の coat。'2コートソリッド' はコグニの塗膜 ソリッド ＋ 付加塗装の 2コートソリッド加算（塗装条件で指定すると塗膜欄に
+# '2コートソリッド' と刷られる）。'2コート' より先に見ないと 2コートパール になる（2026-09-28 生成 NEO をコグニで刷って判明: k02・t09）
+COATS = ((r'2\s*コ[ー\-]?ト\s*ソリ', 'ソリッド'), (r'3\s*コ[ー\-]?ト', '3コートパール'), (r'2\s*コ[ー\-]?ト', '2コートパール'),
+         ('メタリック', 'メタリック'), ('ソリ[ッツ]ド', 'ソリッド'))
+
+
+def coat_of(text: str) -> str:
+    t = nfkc(text or '')
+    return next((full for pat, full in COATS if re.search(pat, t)), '')
 
 
 def _money_any(t: str) -> Optional[int]:
@@ -1157,6 +1277,63 @@ def _paren_index(t: str) -> Optional[float]:
     """'ブース加算 (0.50)' 'ブース有n(0,5の' → 0.5"""
     m = re.search(r'\(?\s*(\d{1,2})[.,](\d{1,2})', nfkc(t))
     return float(f'{m.group(1)}.{m.group(2)}') if m else None
+
+
+# 塗装明細の「名称」「修理方法の欄」に出る決まった語（painting.md §6 の下書きが振り分ける形）
+PAINT_BASES = ('フロント樹脂バンパ', 'リヤ樹脂バンパ', 'フロントバンパ', 'リヤバンパ', 'ラジエータサポート', 'フロントフェンダエプロン', 'フロントピラー',
+               'センターピラー', 'リヤフロア', '防錆ワックス', 'ボデーシーリング')
+PAINT_MID_WORDS = ('片側新品または修正', '両側新品または修正', '両側新品', '片側新品', '１台小修正', '大修正', '新品', '修正', '一色', '二色', '変形修正', '外傷修正小', '外傷修正大')
+
+
+def reread_paint_mid(img, L: list[dict], slots: list[dict]) -> int:
+    """塗装行（部品コードの無い行）の 修理方法の欄 を、元の画像（罫線を消す前）で線の右から読み直す。
+    罫線を消すと線に接した頭の字が欠ける（C-HR: '両側新品 1.50' が '1.50' に）。読み直しの多数決（空でない読みの最頻値）で置き換える"""
+    from collections import Counter  # noqa: PLC0415
+    tgt = [x for x in slots if not re.sub(r'\D', '', x['code']) and (x['name'].strip() or x['mid'].strip())]
+    if not tgt:
+        return 0
+    boxes = []
+    for x in tgt:
+        xs = [x_at(ln, x['y']) for ln in L]
+        boxes.append((xs[2] + 9, x['y'] - x['pitch'] * 0.4, xs[3] - 10, x['y'] + x['pitch'] * 0.4))
+    n = 0
+    for x, tt in zip(tgt, reocr_cells(img, boxes)):
+        c = Counter(t for t in tt if t)
+        if not c:
+            continue
+        best, k = c.most_common(1)[0]
+        if k >= 2 and len(best) >= len(nfkc(x['mid']).replace(' ', '')):
+            x['_mid_orig'] = x['mid']
+            x['mid'] = best
+            n += 1
+    return n
+
+
+def paint_line_name(name: str, mid: str) -> tuple[str, bool, dict]:
+    """塗装行の名称と欄の字 → ('ラジエータサポート 両側新品', 決まった語に寄せられたか, {'index': 1.5, 'count': 4})"""
+    extra: dict = {}
+    md = nfkc(mid).replace(' ', '')
+    m = re.search(r'(\d{1,2})[.,\-](\d{2})\(?$', md)
+    if m:
+        extra['index'] = float(f'{m.group(1)}.{m.group(2)}'); md = md[:m.start()]
+    m = re.search(r'(\d+)枚', md)
+    if m:
+        extra['count'] = int(m.group(1)); md = md.replace(m.group(0), '')
+    base, ok = _snap(name, list(PAINT_BASES))
+    words = []
+    m = re.search(r'(\d+(?:\.\d+)?)m$', md)
+    if m:
+        words.append(f'{m.group(1)}m'); md = md[:m.start()]  # シーリングの長さ（'4.00m'）は名称に残す（下書きが長さから指数を出す）
+    rest = md
+    for w in sorted(PAINT_MID_WORDS, key=len, reverse=True):   # 長い語から（'外傷修正小' '変形修正' を汎用の '修正' より先に。Codex 指摘）
+        w = nfkc(w)   # 欄の字は NFKC にしてある（'１台小修正' → '1台小修正'。そろえないと汎用の '修正' が先に当たる: Codex 指摘）
+        if w in rest:
+            words.append(w); rest = rest.replace(w, ' ')
+    if base in ('フロント樹脂バンパ', 'リヤ樹脂バンパ', 'フロントバンパ', 'リヤバンパ') and not any(w in words for w in ('一色', '二色')):
+        ok = False  # 一色 / 二色 で指数が変わる。読めなければ人に回す
+    if base in ('ラジエータサポート', 'フロントフェンダエプロン', 'フロントピラー', 'センターピラー', 'リヤフロア') and not words:
+        ok = False
+    return (base + (' ' + ' '.join(words) if words else '')).strip(), ok, extra
 
 
 def paint_vocab() -> dict:
@@ -1187,6 +1364,11 @@ def _snap(raw: str, vocab: list[str]) -> tuple[str, bool]:
     return nfkc(raw).strip(), False
 
 
+def is_expense_heading(nm: str) -> bool:
+    """【費用】の見出し（OCR で '【豊用】' 'ー質用】' と崩れたものも）"""
+    return bool(re.search(r'費用】|質用】|【費', nm) or (len(nm) <= 5 and re.search(r'.用】', nm)))
+
+
 def parse_sections(slots: list[dict], labor: Optional[int], vocab: dict, an=None) -> dict:
     """【塗装明細】と【費用】の区画の行 → {'paint': reading の paint（無ければ None）, 'exp_slots': 費用の行, 'labor': 指数から逆算したレート, 'why': [...]}
     コグニ印刷の並び（2026-09-28 ジムニー・C-HR・ハイエース）:
@@ -1210,7 +1392,7 @@ def parse_sections(slots: list[dict], labor: Optional[int], vocab: dict, an=None
         txt = nm + md
         if not txt and wg is None and pr is None:
             continue
-        if re.search(r'費用】|質用】|【費', nm) or (state != 'expense' and re.fullmatch(r'【?費用】?', nm)):
+        if is_expense_heading(nm) or (state != 'expense' and re.fullmatch(r'【?費用】?', nm)):  # '【豊用】' 'ー質用】'も（ハイエース 2026-09-28）
             state = 'expense'
             s['kind'] = 'heading'  # 区画の見出し（塗装の行として数えない。Codex 指摘）
             s['_head'] = 'expense'
@@ -1227,8 +1409,19 @@ def parse_sections(slots: list[dict], labor: Optional[int], vocab: dict, an=None
             continue
         seen_any = True
         if state == 'head':
+            if re.fullmatch(r'塗装費用', nm) and wg is not None and not heads:
+                # 塗装が一式（'塗装費用 202,230' の 1 行だけ）。コグニはこの下に【費用】の見出しを付けずに費用を並べることがある（ハイエース C14）
+                heads['paint_total'] = wg
+                s['_paint_head'] = 'paint_total'
+                s['_pv'] = wg  # 工賃の欄に刷られた額（ページ小計に入る）
+                state = 'expense'
+                continue
             if '塗料' in nm:
                 brand = md; continue
+            if re.match(r'塗装方法', nm):
+                if md:
+                    pa['type_note'] = md   # 塗装条件の注記（'ｱﾝﾀﾞｰｺｰﾄ含み'）。金額の行ではない（t07）
+                continue
             if '塗膜' in nm or (re.search(r'コート|ソリッド|メタリック|パール', md) and wg is None):
                 coat = md; state = 'body'; continue
             if '円' in md or (md and _money_any(md) is not None and not re.search(r'dm|\(', md)) or (wg is not None and not s['code'].strip()):
@@ -1246,15 +1439,25 @@ def parse_sections(slots: list[dict], labor: Optional[int], vocab: dict, an=None
                 s['_pv'] = wg  # この行が工賃の欄に刷った額（ページ小計はこれの合計）
             elif re.search(r'\d', s['wage']):
                 s['_pv_tent'] = tentative(s['wage'])  # 読みの決まらない工賃の欄（仮の値）
+        if re.match(r'塗装方法', nm) and wg is None:
+            if md:
+                pa['type_note'] = md   # 塗膜の行の後に刷られる書式もある
+            continue
         if state == 'body':
             if re.search(r'耐スリ|フッ素|セラミック|高機能', txt) and wg is None:
                 pa['hf'] = '耐スリ傷' if '耐スリ' in txt else ('フッ素' if 'フッ素' in txt else pa.get('hf', 'しない'))
                 continue
             if re.search(r'料代', nm) and not re.search(r'割合|単価|係数|計', nm) and wg is not None:
-                pa['material'] = wg; state = 'material'; continue
-            if re.search(r'ブース', txt) or (re.search(r'加算|基礎|数値', txt) and _paren_index(md) is not None):
-                idx = _paren_index(md)
-                name = 'ブース加算' if 'ブース' in txt else '加算基礎数値'
+                pa['material'] = wg; state = 'material'
+                if '*' in mark:
+                    pa['_mat_manual'] = True   # 材料代を手入力（*）: 刷られた割合は材料代 ÷ 工賃計 と合わなくてよい（コグニは割合を刷ったまま。k02 25.0%・k05 23.0%）
+                    if not s.get('_exact'):
+                        pa['_mat_manual_ocr'] = True   # OCR の割合は裏付けが無い（'25.0%' を '250%' と読んでも通ってしまう。Codex 指摘）
+                continue
+            _both = txt + nfkc(s.get('_mid_orig') or '')  # 読み直す前の字も見る（読み直しで 'ブース' が崩れた: ジムニー 2026-09-28）
+            if re.search(r'ブース', _both) or (re.search(r'加算|基礎|数値', _both) and (_paren_index(md) is not None or _paren_index(s.get('_mid_orig') or '') is not None)):
+                idx = _paren_index(md) if _paren_index(md) is not None else _paren_index(s.get('_mid_orig') or '')
+                name = '加算基礎数値' if (re.search(r'基礎|数値', _both) and not re.search(r'ブース', _both)) else ('ブース加算' if re.search(r'ブース|ブ', _both) else '加算基礎数値')
                 ln = {'name': name, 'wage': wg}
                 if idx is not None:
                     ln['index'] = idx
@@ -1277,9 +1480,14 @@ def parse_sections(slots: list[dict], labor: Optional[int], vocab: dict, an=None
                 if mark:
                     ln['mark'] = mark
                 pa['lines'].append(ln); continue
-            nm2, ok = _snap(f"{s['name']} {s['mid']}".strip(), vocab.get('lines') or []) if vocab.get('lines') else (f"{s['name']} {s['mid']}".strip(), False)
+            nm2, ok, _ex = paint_line_name(s['name'], s['mid'])  # 決まった語（ラジエータサポート 両側新品 / 防錆ワックス 4 枚 …）に寄せる
+            if not ok and vocab.get('lines'):
+                nm3, ok3 = _snap(f"{s['name']} {s['mid']}".strip(), vocab.get('lines') or [])
+                if ok3:
+                    nm2, ok = nm3, True
             ln = {'name': nm2 if ok else re.sub(r'\s+', ' ', f"{nfkc(s['name'])} {nfkc(s['mid'])}").strip(), 'wage': wg}
-            if _mid_index(md) is not None:
+            ln.update(_ex)
+            if 'index' not in ln and _mid_index(md) is not None:
                 ln['index'] = _mid_index(md)
             if mark:
                 ln['mark'] = mark
@@ -1303,6 +1511,8 @@ def parse_sections(slots: list[dict], labor: Optional[int], vocab: dict, an=None
             if wg is not None:
                 state = 'other'
                 nm2, ok = _snap(s['name'], vocab.get('other') or [])
+                if s.get('_exact') and s['name'].strip():
+                    nm2, ok = re.sub(r'\s+', ' ', s['name']).strip(), True   # 文字層の字は正確: 印字どおり（語彙に寄せると 'ｱﾝﾀﾞｰｺｰﾄ処理' が 'ｱﾝﾀﾞｰｺｰﾄ' に）
                 o = {'name': nm2, 'wage': wg}
                 if _mid_index(md) is not None:
                     o['index'] = _mid_index(md)
@@ -1318,7 +1528,10 @@ def parse_sections(slots: list[dict], labor: Optional[int], vocab: dict, an=None
         v = heads.get('paint_total') if heads.get('paint_total') is not None else heads.get('total')
         if v is None:
             return {'paint': None, 'exp_slots': exp_slots, 'labor': None, 'why': []}
-        return {'paint': {'total': v, 'material': 0, 'paint': '2K', 'hf': 'しない'}, 'exp_slots': exp_slots, 'labor': None, 'paint_total': v,
+        _pa1 = {'total': v, 'material': 0, 'paint': '水性' if '水性' in brand else '2K', 'hf': pa.get('hf') or 'しない'}
+        if coat_of(coat):
+            _pa1['coat'] = coat_of(coat)   # 一式でも塗膜は刷られる（書かないとコグニの印刷が 塗膜 ソリッド になる: t04 2コートパール）
+        return {'paint': _pa1, 'exp_slots': exp_slots, 'labor': None, 'paint_total': v,
                 'why': [f'塗装は一式（{v:,} 円）だけ印字。明細から塗装パネルを起こすなら paint.auto_panels（手順 5）']}
     # レート: 指数が刷られた行（ブース加算・加算基礎数値）の 工賃 ÷ 指数
     rates = {round(ln['wage'] / ln['index'] / 10) * 10 for ln in pa['lines'] if ln.get('index') and ln.get('wage')}
@@ -1327,16 +1540,21 @@ def parse_sections(slots: list[dict], labor: Optional[int], vocab: dict, an=None
         if 'index' not in ln and ln.get('wage') and rate and ln.get('code'):  # シーリング（長さで決まる）などには付けない
             ln['index'] = round(ln['wage'] / rate, 2)
     pa['paint'] = '水性' if '水性' in brand else '2K'
-    pa['coat'] = next((full for key, full in COATS if key in nfkc(coat)), '') or coat
+    pa['coat'] = coat_of(coat) or coat
     pa['hf'] = pa.get('hf') or 'しない'
     if 'total' in heads:
         pa['total'] = heads['total']
     if 'material' not in pa and heads.get('material_sum') is not None:
         pa['material'] = heads['material_sum']
-    if pa.get('material') and heads.get('total') and pa.get('material_rate') is not None and 'material_unit' not in pa:
+    _mat_manual = pa.pop('_mat_manual', False)
+    if pa.pop('_mat_manual_ocr', False) and pa.get('material_rate') is not None:
+        why.append(f"材料代が手入力（*）なので割合 {pa['material_rate']}% を材料代から確かめられない。画像で割合を確かめる")
+    if _mat_manual and pa.get('material_rate') is None:
+        why.append('材料代が手入力（*）で、材料代割合の印字が読めない（割合を画像で写す。書かないと生成器の既定の割合になる）')
+    if pa.get('material') and heads.get('total') and pa.get('material_rate') is not None and 'material_unit' not in pa and not _mat_manual:
         if abs(pa['material'] - heads['total'] * float(pa['material_rate']) / 100) > 10:
             pa.pop('material_rate')  # 読んだ割合が 材料代 ÷ 工賃計 と合わない（'400%' = 40.0%）: 下で計算し直す
-    if 'material_rate' not in pa and pa.get('material') and heads.get('total'):  # 割合の字が崩れた（'3L0%'）: 材料代 ÷ 工賃計 が 0.1% 刻みなら割合
+    if 'material_rate' not in pa and pa.get('material') and heads.get('total') and not _mat_manual:  # 割合の字が崩れた（'3L0%'）: 材料代 ÷ 工賃計 が 0.1% 刻みなら割合
         r_ = pa['material'] / heads['total'] * 100
         if abs(round(r_, 1) - r_) < 0.005:
             pa['material_rate'] = round(r_, 1) if round(r_, 1) != int(round(r_, 1)) else int(round(r_, 1))
@@ -1358,11 +1576,51 @@ def parse_sections(slots: list[dict], labor: Optional[int], vocab: dict, an=None
         why.append('塗装行・追加項目の名称が読み切れない行がある（' + ' / '.join(x['name'] for x in pa['lines'] + pa['other'] if x.get('_unsure')) + '）')
     if not pa['coat']:
         why.append('塗膜が読めない')
+    for _nm in ('ブース加算', '加算基礎数値'):
+        if sum(1 for ln in pa['lines'] if ln.get('name') == _nm) > 1:
+            why.append(f'{_nm} が 2 行ある（ブース加算と加算基礎数値の取り違え？）')
     for x in pa['lines'] + pa['other']:
         x.pop('_unsure', None)
     if not pa['other']:
         pa.pop('other')
     return {'paint': pa, 'exp_slots': exp_slots, 'labor': rate if not labor else None, 'paint_total': heads.get('paint_total'), 'why': why}
+
+
+def method_glyph(img, L: list[dict], s: dict):
+    """修理方法の欄の字の形（白黒・字の外枠で切って 64×32 にそろえる）。字が無ければ None。元の画像で見る（罫線を消すと線に接した字の端が欠ける）"""
+    xs = [x_at(ln, s['y']) for ln in L]
+    ph = s['pitch']
+    t = img.crop((int(xs[2] + 10), int(s['y'] - ph * 0.35), int(xs[2] + (xs[3] - xs[2]) * 0.13), int(s['y'] + ph * 0.35))).convert('L').point(lambda v: 0 if v < 160 else 255)
+    bb = t.point(lambda v: 255 - v).getbbox()
+    if not bb or (bb[2] - bb[0]) < 20:
+        return None
+    return t.crop(bb).resize((64, 32))
+
+
+def glyph_diff(a, b) -> float:
+    pa, pb = a.load(), b.load()
+    return sum(1 for x in range(64) for y in range(32) if (pa[x, y] < 128) != (pb[x, y] < 128)) / (64 * 32)
+
+
+def methods_by_shape(items: list) -> int:
+    """items = [(slot, 字の形)]。OCR で読めた修理方法の字の形を手本にして、読めなかった欄を形で決める。
+    1 位の違いが 0.2 以下で、2 位と 0.15 以上離れているときだけ採る（C-HR で 13 欄すべて正しく、2 位との差は 0.2 以上だった）。戻り値 = 決めた欄の数"""
+    tpl: dict = {}
+    for s, g in items:
+        m = parse_mid(s['mid'])['method']
+        if m and g is not None:
+            tpl.setdefault(m, []).append(g)
+    n = 0
+    for s, g in items:
+        if g is None or parse_mid(s['mid'])['method'] or len(tpl) < 2:
+            continue
+        sc = sorted((min(glyph_diff(g, t) for t in ts), k) for k, ts in tpl.items())
+        if sc[0][0] <= 0.2 and (len(sc) == 1 or sc[1][0] - sc[0][0] >= 0.15):
+            s['mid'] = sc[0][1] + s['mid']
+            s['_mid'] = parse_mid(s['mid'])
+            s['_method_shape'] = round(sc[0][0], 3)
+            n += 1
+    return n
 
 
 def classify(slots: list[dict], paint_open: bool = False) -> None:
@@ -1372,15 +1630,25 @@ def classify(slots: list[dict], paint_open: bool = False) -> None:
     for s in slots:
         s['_mid'] = parse_mid(s['mid'])
         ctext = nfkc(s['code'])
+        if re.fullmatch(r'0000', re.sub(r'\s', '', ctext)):
+            s['code'] = ctext = ''  # 部品コード 0000 = コグニの手入力の行（ホンダ系の工場: t12）。コードの無い行として扱う
+            s['_manual'] = True  # 工場がコグニで手入力した行: 名称の近い別の部品コードを下書きに当てさせない（M）
+        _fm = re.sub(r'\s+', '', nfkc(s['mid']))
+        if (s.get('_exact') and not re.search(r'\d', ctext) and not s['_mid']['method'] and _fm and not re.search(r'\d', _fm)
+                and 1 <= len(_fm) <= 8 and (re.search(r'\d', s['price']) or re.search(r'\d', s['wage']))):
+            s['_manual'] = True
+            s['_free_method'] = re.sub(r'\s+', '', s['mid'])   # 手入力の作業行の区分（コグニに無い語でも印字どおり。生成器が区分コード -1 で書く）
         txt = nfkc(s['mid'] + s['name'])
-        if paint_on or PAINT_NAME_RE.search(nfkc(s['name'])) or PAINT_MID_RE.search(nfkc(s['mid'])):
+        if paint_on or PAINT_NAME_RE.search(nfkc(s['name'])) or (PAINT_MID_RE.search(nfkc(s['mid'])) and not re.search(r'鈑金|板金|付加', nfkc(s['mid']))):  # 板金の行の損傷面積（2dm2 B 付加）は塗装面積ではない
             s['kind'] = 'paint'; paint_on = True  # ③ で読む。いまは header に写す
         elif re.search(r'保|留', ctext):
             s['kind'] = 'reserve'
         elif frame_on or FRAME_RE.search(txt) or (re.search(r'[nｎ]', s['mark']) and not re.search(r'\d{4}-', s['_mid']['parts_no'])):
             s['kind'] = 'frame'; frame_on = True
-        elif not re.search(r'\d', ctext) and not s['_mid']['method'] and (re.search(r'\d', s['price']) or re.search(r'\d', s['wage'])):
-            s['kind'] = 'expense'
+        elif not re.search(r'\d', ctext) and not s['_mid']['method'] and (re.search(r'\d', s['price']) or re.search(r'\d', s['wage'])) and not s.get('_manual'):
+            s['kind'] = 'expense'   # 部品コード 0000 の行（工場がコグニの明細に手入力した作業・費用）は明細の行のまま（コグニ印刷どおり。t12）
+        elif not re.search(r'\d', ctext) and not s['_mid']['method'] and not re.search(r'\d', s['price'] + s['wage']) and not s['_mid']['parts_no']:
+            s['kind'] = 'note'  # コードも修理方法も金額も無い = 注記の行（'※一部脱着※'）。明細の行数に数えない
         else:
             s['kind'] = 'part'
 
@@ -1408,7 +1676,7 @@ def _cell(val, unread: bool, raw: str, clean: bool) -> dict:
             '_ocr': {'wage': raw}, 'comment': '', **({'_wage_unclean': True} if (val is not None and not clean) else {})}
 
 
-def build_expenses(slots: list[dict], clean_img, L: list[dict], vocab: list[str]) -> list[dict]:
+def build_expenses(slots: list[dict], clean_img, L: list[dict], vocab: list[str], exact: bool = False) -> list[dict]:
     """費用の行 → reading の expenses（{name, amount, in}）。部品価格の欄 = 部品計、工賃の欄 = 作業計。
     名称は語彙の近いものに寄せ（OCR の '与具代他' → '写真代他'）、寄せきれない名称は 要確認"""
     out = []
@@ -1417,9 +1685,9 @@ def build_expenses(slots: list[dict], clean_img, L: list[dict], vocab: list[str]
         scored = sorted(((difflib.SequenceMatcher(None, _kana_skel(raw), _kana_skel(v)).ratio(), -k, v) for k, v in enumerate(vocab)), reverse=True)
         top1 = scored[0] if scored else (0, 0, '')
         second = next((x for x in scored[1:] if _kana_skel(x[2]) != _kana_skel(top1[2])), (0, 0, ''))
-        ok_name = top1[0] >= 0.6 or (top1[0] >= 0.5 and top1[0] - second[0] >= 0.15)
+        ok_name = exact or top1[0] >= 0.6 or (top1[0] >= 0.5 and top1[0] - second[0] >= 0.15)
         best = (top1[0] if ok_name else 0.0, top1[2])
-        name = top1[2] if ok_name else raw
+        name = raw.strip() if exact else (top1[2] if ok_name else raw)
         yc, ph = s['y'], s['pitch']
         xs = [x_at(ln, yc) for ln in L]
         for col, where, x0, x1 in (('price', '部品計', xs[3], xs[4]), ('wage', '作業計', xs[4], xs[5])):
@@ -1489,9 +1757,12 @@ def exps_rowish(exps: list[dict], slots: list[dict]) -> list[dict]:
     return out
 
 
-def short_row(r: dict) -> str:
+def short_row(r: dict):
     def f(v):
         return '' if v in (None, '') else str(v)
+    if r.get('neo_name'):  # 印字の名称（工場の書き換え）は dict の行の neo_name に
+        d = {k: r.get(k) for k in ('code', 'name', 'neo_name', 'method', 'parts_no', 'index', 'qty', 'price', 'wage', 'flags', 'comment')}
+        return {k: v for k, v in d.items() if v not in (None, '')}
     name = f(r['name']).replace('|', '/')
     qty = '' if r['qty'] in (None, 1) else str(r['qty'])
     return '|'.join([f(r['code']), name, f(r['method']), f(r['parts_no']), f(r['index']), qty, f(r['price']), f(r['wage']), f(r['flags']), f(r['comment']).replace('|', '/')])
@@ -1546,7 +1817,13 @@ def anchor_pdf(pdf: str, case: str, pages: Optional[set[int]], overwrite: bool, 
             print('元案件フォルダに速報・確報（文字層のある報告書）が無い。header.json の車両は手で書く')
     header = reading_pages.load_json(hdr_path) if os.path.exists(hdr_path) else {}
     labor = labor or (int(header['labor_rate']) if str(header.get('labor_rate') or '').isdigit() else None)
-    imgs = ocr_prefill.extract_pages(pdf, odir, pages, scale)
+    ftx = fitz_text_pages(pdf, odir, pages)  # 文字層のページ（コグニの PDF 出力）は OCR せず字をそのまま使う
+    if ftx:
+        print(f'文字層のあるページ {sorted(ftx)}: OCR の代わりに PDF の文字を使う（読み違いは起きない）')
+    imgs = ocr_prefill.extract_pages(pdf, odir, pages, scale) if len(ftx) < (len(pages) if pages else 10 ** 6) else []
+    _have = {pg for pg, _p, _t in imgs}
+    imgs = [(pg, ftx[pg][0] if pg in ftx else png, t) for pg, png, t in imgs] + [(pg, ftx[pg][0], '') for pg in sorted(ftx) if pg not in _have]
+    imgs.sort(key=lambda x: x[0])
     an = Anchor(header, labor)
     if not an.ok:
         print(f'ADDATA 照合なし: {an.why}。OCR の値だけで下書きする（全行 要確認）')
@@ -1567,25 +1844,57 @@ def anchor_pdf(pdf: str, case: str, pages: Optional[set[int]], overwrite: bool, 
         clean, vert = remove_rules(img)
         L = layout_a(long_vlines(vert, H), W)
         if L is None:
+            # 表の見出し（部品価格・工賃・修理方法 …）の字が無いページだけ「表の無いページ」（送り状・再封印申請書: シエンタ 6 ページ目で番号から余計な行ができていた）。
+            # 縦線の数だけでは決めない（線のかすれた見積のページを捨てないため。Codex 指摘）
+            if pg in ftx:
+                _words = ftx[pg][1]
+            else:
+                _cp = os.path.join(odir, f'page_{pg}.clean.png')
+                clean.save(_cp)
+                _words = ocr_prefill.run_ocr(_cp)
+            _txt = nfkc(''.join(w['text'] for w in _words)).replace(' ', '')
+            _no_table = not re.search(r'部品価格|工賃|技術料|修理方法|部品番号|品番|数量|単価|金額', _txt)
+            if _no_table:
+                print(f'ページ {pg}: 見積の表の無いページ（送り状・申請書など）→ 明細なしとして扱う')
+                _dst = os.path.join(pdir, f'page_{pg}.json')
+                if overwrite or not os.path.exists(_dst):
+                    reading_pages.save_json(_dst, {'page': pg, 'rows_printed': 0, 'blocks': [{'title': '', 'rows': []}], 'note': '表の無いページ（送り状など）。明細なし'})
+                continue
             print(f'ページ {pg}: 書式 A の罫線の並びではない → 従来の OCR 先読み（ocr_prefill）にまかせる')
             fallback.append(pg)
             continue
         cpng = os.path.join(odir, f'page_{pg}.clean.png')
         clean.save(cpng)
-        words = ocr_prefill.run_ocr(cpng)
-        pr = read_page_a(png, clean, L, words, H)
+        exact = pg in ftx
+        words = ftx[pg][1] if exact else ocr_prefill.run_ocr(cpng)
+        pr = read_page_a(png, clean, L, words, H, exact)
+        if not header.get('format'):
+            header['format'] = 'A'   # コグニ印刷の表を読んだ（下書きの「分解」を印字どおりにする判定などに使う）
+            reading_pages.save_json(hdr_path, header)
         if pr.get('est_date') and not header.get('est_date'):
             header['est_date'] = pr['est_date']  # 見積書の作成日
             reading_pages.save_json(hdr_path, header)
             print(f"見積日（作成日）{pr['est_date']} を header.json の est_date に書いた")
+        for x in pr['slots']:
+            x['_exact'] = exact
         classify(pr['slots'], paint_open)
         if any(x['kind'] == 'paint' for x in pr['slots']):
             pr['has_paint'] = True
         psl = [x for x in pr['slots'] if x['kind'] == 'paint'] + pr.get('sec_slots', [])
+        if not exact:
+            reread_paint_mid(img, L, psl)
         if psl:
-            paint_open = not any(re.search(r'費用】|質用】|【費', nfkc(x['name'])) for x in psl)
-        pdata.append({'pg': pg, 'png': png, 'img': img, 'clean': clean, 'cpng': cpng, 'L': L, 'pr': pr, 'psl': psl})
+            paint_open = not any(is_expense_heading(nfkc(x['name'])) for x in psl)   # parse_sections と同じ判定（崩れた '【豊用】' も。Codex 指摘）
+        pdata.append({'pg': pg, 'png': png, 'img': img, 'clean': clean, 'cpng': cpng, 'L': L, 'pr': pr, 'psl': psl, 'exact': exact})
+    # 修理方法の欄の字の形で、読めなかった欄を決める（見積全体の読めた欄が手本）
+    _items = [(x, method_glyph(d['img'], d['L'], x)) for d in pdata for x in d['pr']['slots'] if x.get('kind') in ('part', 'reserve')]
+    _nm = methods_by_shape(_items)
+    if _nm:
+        print(f'修理方法を字の形で {_nm} 欄決めた（同じ見積の中で読めた欄が手本）')
     # 2) 塗装明細はページをまたいでまとめて解釈する
+    for d in pdata:
+        for x in d['psl']:
+            x['_exact'] = bool(d.get('exact'))
     sec = parse_sections([x for d in pdata for x in d['psl']], labor, pvocab, an if an.ok else None)
     for x in sec['exp_slots']:
         x['kind'] = 'expense'
@@ -1600,7 +1909,7 @@ def anchor_pdf(pdf: str, case: str, pages: Optional[set[int]], overwrite: bool, 
         pg, png, img, clean, cpng, L, pr = d['pg'], d['png'], d['img'], d['clean'], d['cpng'], d['L'], d['pr']
         slots = [x for x in pr['slots'] if x['kind'] in ('part', 'reserve')]
         exp_sl = [x for x in pr['slots'] if x['kind'] == 'expense'] + [x for x in d['psl'] if x.get('kind') == 'expense']
-        exps = build_expenses(exp_sl, clean, L, vocab)
+        exps = build_expenses(exp_sl, clean, L, vocab, d.get('exact', False))
         pcells = []
         for x in d['psl']:
             if x.get('kind') == 'expense':
@@ -1620,7 +1929,7 @@ def anchor_pdf(pdf: str, case: str, pages: Optional[set[int]], overwrite: bool, 
         decide_codes(slots, an if an.ok else None)
         # 塗装明細の区画はあるのに行を読めていないページ（塗装欄が読めない）では小計を使わない
         _sub_ok = not d['psl'] or bool(pcells) or all(x.get('kind') == 'expense' or x.get('_paint_head') for x in d['psl'] if (x.get('wage') or '').strip())
-        rows = judge(slots, an if an.ok else None, pr['subtotal'] if _sub_ok else {}, clean, L, exps + fcells + pcells)
+        rows = judge(slots, an if an.ok else None, pr['subtotal'] if _sub_ok else {}, clean, L, exps + fcells + pcells, d.get('exact', False))
         if pcells and not all(c['_sure']['wage'] for c in pcells):
             paint_unsure_pages.append(pg)
         for c in fcells:  # 小計から逆算した工賃を骨格にも戻す
@@ -1638,7 +1947,8 @@ def anchor_pdf(pdf: str, case: str, pages: Optional[set[int]], overwrite: bool, 
         marks: dict = {}
         for r in rows:
             for ch in r['flags']:
-                marks[ch] = marks.get(ch, 0) + 1
+                if ch in '$#*@':   # 印字の印だけ数える（M 手入力 / R 保留 は転記の印で、印字の右端には無い）
+                    marks[ch] = marks.get(ch, 0) + 1
         page_json = {'page': pg, 'rows_printed': len(rows), 'marks': marks, 'blocks': [{'title': '', 'rows': [short_row(r) for r in rows]}]}
         if exps:
             page_json['expenses'] = [{'name': e['name'], 'amount': e[e['_col']], 'in': e['in']} | ({'comment': e['comment']} if e['comment'] else {}) for e in exps]
@@ -1692,14 +2002,16 @@ def anchor_pdf(pdf: str, case: str, pages: Optional[set[int]], overwrite: bool, 
     _all_pages = [pg_ for pg_, _png, _t in imgs]
     last_is_a = bool(pdata) and pdata[-1]['pg'] == max(_all_pages)  # 最終ページまで書式 A として読めた
     whole = pages is None and bool(pdata)                            # --pages で一部だけ回していない
+    totals_found = False
     # 合計欄（最終ページ）: 課税額計・消費税・合計 を header.totals に（既にあれば書かない）
     if whole and not _filled(header.get('totals')):
         d = pdata[-1]
-        tt = read_totals(d['clean'], d['L'], d['pr']['_trows'], d['pr']['_sub'])
+        tt = read_totals(d['clean'], d['L'], d['pr']['_trows'], d['pr']['_sub'], d.get('exact', False))
         if not last_is_a and not tt.get('taxable'):
             # 最後の書式 A のページに合計欄が無く、その後ろに読めないページがある: 合計欄はそちらかもしれない。値は書かず、止める印だけ残す（Codex 指摘）
             tt = {'why': ['合計欄を読めなかった（最終ページが書式 A でない）。最終ページの画像から header の totals に写す']}
             d = {'pg': max(_all_pages)}
+        totals_found = bool(tt.get('taxable'))
         if tt.get('taxable') or tt.get('why'):
             tot_ = {k: tt[k] for k in ('taxable', 'tax', 'total') if tt.get(k)}
             tot_['page'] = d['pg']  # 合計欄が刷られたページ（validate がそのページで OCR未確認 を止める）
@@ -1711,7 +2023,7 @@ def anchor_pdf(pdf: str, case: str, pages: Optional[set[int]], overwrite: bool, 
                                 if tt.get('taxable') else tot_.get('comment', '')))
     # 塗装明細（header.paint）: 区画の中の検算（工賃計・追加計・費用計）と、ページ小計での確かめ
     # 塗装明細は、区画が【費用】の見出しで閉じている（＝全部読んだ）か、最終ページまで読めたときだけ書く（途中の読みを固定しない。Codex 指摘）
-    paint_closed = any(x.get('_head') == 'expense' for d_ in pdata for x in d_['psl'])
+    paint_closed = any(x.get('_head') == 'expense' for d_ in pdata for x in d_['psl']) or totals_found  # 合計欄が読めた = 表はそこで終わっている（シエンタの塗装一式）
     if sec['paint'] is not None and not (whole and (paint_closed or last_is_a)):
         print('※ 塗装明細の区画を最後まで読めていない（--pages 指定か、区画の終わりが見えない）ので header に書かない。全ページで回すか画像から写す')
         _fp = next((d_['pg'] for d_ in pdata if any(x.get('kind') not in ('expense', 'heading', 'noise') for x in d_['psl'])), None)
@@ -1724,6 +2036,8 @@ def anchor_pdf(pdf: str, case: str, pages: Optional[set[int]], overwrite: bool, 
                 reading_pages.save_json(_fpath, _pj)
     if whole and (paint_closed or last_is_a) and sec['paint'] is not None:
         pw = list(sec['why'])
+        if all(d.get('exact') for d in pdata if d['psl']):
+            pw = [w for w in pw if '読み切れない' not in w]
         if paint_unsure_pages:
             pw.append(f'ページ {paint_unsure_pages} の小計で塗装行の額を確かめられない')
         first = next((d['pg'] for d in pdata if d['psl']), None)

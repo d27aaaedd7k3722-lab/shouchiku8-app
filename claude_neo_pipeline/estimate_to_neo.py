@@ -2650,7 +2650,7 @@ class NeoBuilder:
                 # 区分だけ -1 にすると「区分 -1 なのに部品コードがある」という実機に無い形になるので、
                 # 揃えるなら照合ごと手入力にする必要がある（影響が大きいので保留。HANDOFF に記録）
                 dcode = 0
-            disp_name = _m if (_m in ('取替', '脱着', '修理', '脱着修理', '脱着板金', '点検', '調整', '点検調整', '分解調整', '板金') and DISPOSAL.get(_m, dcode) == dcode) else DISPOSAL_NAME.get(dcode, method)  # W/S の名称をそのまま（NEW2: 脱着板金/脱着修理、点検/調整）。別名（部品・交換・取付 等）は既定名
+            disp_name = _m if (_m in ('取替', '脱着', '修理', '脱着修理', '脱着板金', '点検', '調整', '点検調整', '分解調整', '分解', '板金') and DISPOSAL.get(_m, dcode) == dcode) else DISPOSAL_NAME.get(dcode, method)  # W/S の名称をそのまま（NEW2: 脱着板金/脱着修理、点検/調整）。別名（部品・交換・取付 等）は既定名
             if free_method:   # コグニに無い修理方法（再封印 など）は手入力の作業行として印字の語を写す
                 dcode = -1; disp_name = free_method
             if it.get('manual') and not _m.strip():  # 修理方法が空欄の手入力行（塗装費用・産廃・材料代を明細に手入力する工場）: コグニ実機 2026-09-08 exp_manual.neo = DisposalCode -1・名称欄空
@@ -3732,20 +3732,32 @@ class NeoBuilder:
             cur.execute('UPDATE PaintingEtcetera SET BSealing=?, BSealingTime=?, BSealingTimeStandard=?, BSealingWageOutTax=?, BSealingWageInTax=?, BSealingWageTax=?, '
                         'BSealingWageStandardOutTax=?, BSealingWageStandardInTax=?, BSealingWageStandardTax=?', (int(cnt), t, t, *t3i(w), *t3i(w)))
             add_etc_t += t; add_etc_w += w
+        _other_used: set = set()   # 1 つのテンプレート行に 2 つの追加項目を入れない（後の行が前の行を上書きしていた。2026-09-28 t07）
         for o in pdx.get('other') or []:
             nm = unicodedata.normalize('NFKC', o.get('name', '')).replace('ー', '-')
             line = None
             for ln, n_ in cur.execute('SELECT LineNo, Name FROM PaintingOther').fetchall():
                 tn = unicodedata.normalize('NFKC', n_).replace('ー', '-')
+                if ln in _other_used:
+                    continue
                 if tn and (tn in nm or nm in tn):
-                    line = ln; break
+                    line = ln
+                    if tn != nm and o.get('name'):
+                        # 見積書の名称で刷る（テンプレートの 'ヒンジ塗装' に見積書の 'ヒンジ' を入れると、コグニは NEO の名称 'ヒンジ塗装' を刷る。
+                        # 工場のコグニ印刷は 'ヒンジ'。2026-09-28 生成 NEO をコグニで印刷して見積書と突き合わせて判明）
+                        cur.execute('UPDATE PaintingOther SET Name=? WHERE LineNo=?', (_fit(hw(str(o.get('name'))), 20), line))
+                    break
             if line is None:  # テンプレートに無い追加項目は空き行（Time=-1）へ名称ごと入れる
                 free = [ln for ln, tm in cur.execute('SELECT LineNo, Time FROM PaintingOther ORDER BY LineNo').fetchall() if (tm is None or tm < 0) and ln > 0]
                 if not free:
                     raise ValueError(f'塗装追加項目の空き行が無い: {o.get("name")}')
+                free = [ln for ln in free if ln not in _other_used]
+                if not free:   # 使った行に重ねると前の追加項目が消える（Codex 指摘）
+                    raise ValueError(f'塗装追加項目の空き行が無い: {o.get("name")}')
                 line = free[-1]
                 cur.execute('UPDATE PaintingOther SET Name=? WHERE LineNo=?', (_fit(hw(str(o.get('name') or '')), 20), line))  # 追加塗装の工程名も半角カナ（実機 2,915 行中 2,864 行）
                 notes.append(f'塗装追加項目 {o.get("name")} はテンプレートに無いため行 {line} に名称を入れて計上')
+            _other_used.add(line)
             t = float(o.get('index') or 0); w = int(o.get('wage') or rp2(t))
             cur.execute('UPDATE PaintingOther SET Time=?, WageOutTax=?, WageInTax=?, WageTax=?, WageByManual="#" WHERE LineNo=?', (t, *t3i(w), line))
             add_other_t += t; add_other_w += w
@@ -3950,6 +3962,8 @@ class NeoBuilder:
                 line = ln_ if (ln_ is not None and (ln_, kind_) not in used) else None
             if line is None:  # 雛形の自由行に同じ名前（か、その名前で始まる行）があればそこへ
                 line = _pick_template_line(fixed, nm, used)
+                # 注: 前方一致で寄せた行は雛形の名前（'ｴｰﾐﾝｸﾞ費用'）で刷られ、工場のコグニ印刷（'ｴｰﾐﾝｸﾞ'）とは違う（2026-09-28 生成 NEO を
+                # コグニで刷って確認: t06・t11・t15・sol）。社内の実機 NEO（cogni_CXA）が雛形の名前のまま運用しているので、それに合わせている
             if line is None:
                 # 自由行は 36 から後ろへ使う（**実機がこの向き**: 変えると実機保存 NEO との全ファイル一致が 24/25 → 2/25 に落ちた。2026-09-28 に実測）。
                 # そのため見積書に刷られた費用の順と NEO の行順は逆になることがある（印刷の並びだけの違い）

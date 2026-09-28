@@ -604,6 +604,8 @@ class Checker:
         for pg, sub in (pages.items() if isinstance(pages, dict) else ((str(x.get('page')), x) for x in pages)):
             rows = [r for r in self.rows if str(r.get('_page')) == str(pg)]
             if not rows:
+                if str((sub or {}).get('rows')) == '0' and not any(k in sub for k in ('parts', 'wage')):
+                    continue   # 明細の無いページ（塗装明細・費用だけの最終ページ）と写してある: 小計ではない（2026-09-28 バッチで 5 件）
                 if any(r.get('_page') for r in self.rows):
                     self.fail(f'ページ {pg}: 小計があるのに、このページの行が無い（blocks[].page を確認）')
                 continue

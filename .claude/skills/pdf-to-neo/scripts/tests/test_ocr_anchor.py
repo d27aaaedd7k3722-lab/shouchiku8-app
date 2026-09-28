@@ -84,6 +84,14 @@ check([s['kind'] for s in sl] == ['part', 'reserve', 'expense', 'part', 'frame',
 sl = [slot('4300', 'ﾊﾞｯｸﾄﾞｱﾊﾟﾈﾙ', '取替'), slot('', '【奘明細】'), slot('4300', 'ﾊﾞｯｸﾄﾞｱﾊﾟﾈﾙ', '取替89dm')]
 oa.classify(sl)
 check([s['kind'] for s in sl] == ['part', 'paint', 'paint'], f"塗装明細の見出しが崩れても塗装欄 {[s['kind'] for s in sl]}")
+# 部品コード 0000 = 工場がコグニで手入力した行（t12）。金額だけの行も費用にせず明細（M）。金額も区分も無い行は注記
+sl = [slot('0000', '初期位置学習設定', '', '', '5,500', '#'), slot('0000', '※一部脱着※'), slot('', 'ｼｮｰﾄﾊﾟｰﾂ', '', '2,500')]
+oa.classify(sl)
+check([s['kind'] for s in sl] == ['part', 'note', 'expense'] and sl[0].get('_manual') and sl[0]['code'] == '', f"0000 の行 {[s['kind'] for s in sl]}")
+# 文字層のページ: コードが無く、修理方法の欄に自由な語（'施工'）がある行は手入力の作業行（t10）。OCR のページは従来どおり費用
+sl = [dict(slot('', 'ｾﾗﾐｯｸｺｰﾃｨﾝｸﾞ', '施工', '30,000', '80,000', '**'), _exact=True), slot('', 'ｾﾗﾐｯｸｺｰﾃｨﾝｸﾞ', '施工', '30,000', '80,000')]
+oa.classify(sl)
+check(sl[0]['kind'] == 'part' and sl[0].get('_free_method') == '施工' and sl[1]['kind'] == 'expense', f"自由な区分の行 {[s['kind'] for s in sl]}")
 
 frame, cells = oa.build_frame([slot('1371', '基本修正作業', '', '', '28,000', 'n'), slot('1388', 'x', '修正ランクB', '', '12,000', 'n'),
                                slot('1396', 'y', '修正基本内', '', '', 'n')], 8000)
@@ -193,6 +201,21 @@ check(sec['paint'] is None and [x['name'] for x in sec['exp_slots']] == ['写真
       f"費用だけの区画: 見出し・金額の無い行は塗装の行に数えない {[x.get('kind') for x in _sl]}")
 sec = oa.parse_sections([ps('', '塗装費用', '', '', '191,360')], None, {})
 check(sec['paint'] == {'total': 191360, 'material': 0, 'paint': '2K', 'hf': 'しない'} and sec['why'], f"塗装一式だけ {sec['paint']}")
+
+# 塗膜: '2コートソリッド' はコグニの塗膜 ソリッド（＋ 2コートソリッド加算）。'2コート' で 2コートパール にしない（k02・t09）
+check(oa.coat_of('2ｺｰﾄｿﾘｯﾄﾞ') == 'ソリッド' and oa.coat_of('２コートパール') == '2コートパール' and oa.coat_of('3ｺｰﾄﾊﾟｰﾙ') == '3コートパール'
+      and oa.coat_of('メタリック') == 'メタリック' and oa.coat_of('') == '', '塗膜の読み')
+# 塗装が一式だけでも塗膜は写す（t04: 書かないとコグニの印刷が 塗膜 ソリッド になる）
+sec = oa.parse_sections([ps('', '【塗装明細】'), ps('', '塗装費用計', '147,890円'), ps('', '塗料', '2K'), ps('', '塗膜', '2ｺｰﾄﾊﾟｰﾙ')], None, {})
+check(sec['paint'] and sec['paint'].get('coat') == '2コートパール' and sec['paint']['total'] == 147890, f"一式の塗膜 {sec['paint']}")
+# 塗装方法（注記）は追加項目にしない・材料代が手入力（*）なら刷られた割合をそのまま（t07・k02）
+sec = oa.parse_sections([ps('', '【塗装明細】'), ps('', '塗装費用計', '73,780円'), ps('', '<内訳>塗装工賃計', '50,970円'), ps('', '塗装材料代計', '11,890円'),
+                         ps('', '追加塗装費用計', '10,920円'), ps('', '塗料', '2K'), ps('', '塗膜', '2ｺｰﾄｿﾘｯﾄﾞ'), ps('', '塗装方法', 'ｱﾝﾀﾞｰｺｰﾄ含み'),
+                         ps('0600', 'ﾌｰﾄﾞ', '修理95dm(1/2)', '', '50,970'),
+                         ps('', '塗装材料代', '', '', '11,890', '*'), ps('', '材料代割合', '25.0%'), ps('', '内板調色', '', '', '10,920', '#')], None, {})
+pa = sec['paint']
+check(pa.get('type_note') == 'アンダーコート含み' and pa.get('material_rate') == 25 and pa.get('material') == 11890 and pa.get('coat') == 'ソリッド'
+      and [o['name'] for o in pa.get('other') or []] == ['内板調色'], f"塗装方法・手入力の材料代 {pa}")
 
 check(not oa._filled({'parts': None, 'taxable': None}) and not oa._filled({}) and oa._filled({'taxable': 1}), 'reading_pages init の雛形（値が全部 None）は空とみなす')
 
