@@ -724,6 +724,17 @@ def _same_part_name(a: str, b: str) -> str:
     return norm(a) == norm(b)
 
 
+def _name_key(s: str) -> str:
+    """明細名称が「同じ名前か」を比べる形（長音・ハイフン・空白・小書きカナ・全半角の違いを吸収）。
+    ADDATA は 'ﾊﾞﾂｸ'、見積書は 'ﾊﾞｯｸ' のように書き方が揺れるので、ここで吸収しないと
+    表記ゆれを「工場が書き換えた名称」と取り違える"""
+    t = unicodedata.normalize('NFKC', s or '')
+    for ch in ('ー', 'ｰ', '—', '−', '‐', '-'):
+        t = t.replace(ch, '')
+    t = t.translate(str.maketrans('ァィゥェォャュョッヮ', 'アイウエオヤユヨツワ'))
+    return re.sub(r'\s+', '', t)
+
+
 def side_letter(name: str) -> str:
     """見積の名称が示す左右を 1 文字で返す（'L' / 'R' / 不明なら ''）。
     'RRC'（Rear Cross Traffic）のように直後が英字の略語は左右ではないので拾わない"""
@@ -2538,6 +2549,8 @@ class NeoBuilder:
         self._blocks17 = parts.blocks
         self._last_parts = parts
         self._plural_parts = []   # 本体が「複数部品選択」ダイアログを出す行（13/83.DB の候補が複数で車両カラーで決まらない）。run_case が ★ で出す
+        self._renamed = []        # 見積書の名称（reading の neo_name）で書いた行
+        self._name_diff = []      # 見積書と ADDATA で名称が違う行（NEO は ADDATA の名称）
         try:  # 20.DB 塗装パネルの集合（板金行の DamageRank 既定値 'A' の判定に使う）
             paint_codes = set(str(d.get('code')) for d in PaintIndex(self.engine.root, car_code)._load_20())
         except Exception as _e20c:  # noqa: BLE001  20.DB が無い車種はある。黙って空にすると板金行の既定ランクが変わる
@@ -2758,10 +2771,32 @@ class NeoBuilder:
                     hit = [n for n in n20s if n[:1] == (want or ' ')]
                     if len(hit) == 1:
                         name20 = hit[0]
+            _nm_neo_row = ''   # この行に reading の neo_name を使ったか（_sub_prefix の判定に使う）
             if name20 and not it.get('manual'):
                 pn_disp, pn_std = cogni_parts_names(name20)
             else:
                 pn_disp, pn_std = None, None
+            if ref is not None and not it.get('manual'):
+                # コグニの明細名称（PartsName）は人が書き換えられる欄で、ADDATA の名称は PartsNameStandard に残る。
+                # 工場が書き換えた行（「ﾙｰﾌﾊﾟﾈﾙ ﾋﾝｼﾞ取付け部」「ﾙｰﾌﾍｯﾄﾞﾗｲﾆﾝｸﾞ一部脱着」「Rrﾗｲｾﾝｽﾌﾟﾚｰﾄ脱着修正」）は
+                # 見積書の名称をそのまま書かないと、こちらの印刷だけ ADDATA の名称になる
+                # （2026-09-28 シエンタ: 工場のコグニ印刷と 5 行食い違った）
+                _nm_addata = (pn_disp if pn_disp is not None else (('  ' if is_sub else '') + name_disp))
+                _nm_est = re.sub(r'\s*[（(]\s*各?\s*\d+\s*個?\s*[)）]\s*$', '', hw(str(it.get('name') or '')))   # 見積書に印字された名称（後ろの数量 '(4個)' は名称ではない）。
+                # name_disp は ADDATA（12.DB）の名称なので、見積書と比べるときは使わない（11.DB と 12.DB で名称が違う部品がある）
+                _nm_neo = hw(str(it.get('neo_name') or '')).strip()
+                if _nm_neo:
+                    # reading の neo_name = 見積書に印字された明細名称（工場がコグニの明細で書き換えた行）
+                    if len((('  ' if is_sub else '') + _nm_neo).encode('cp932w', 'replace')) > 24:   # 付属部品の 2 スペースを足すと 24 バイトを超える名前は黙って切らない
+                        raise ValueError(f"items[].neo_name '{_nm_neo}' が NEO の名称欄（24 バイト"
+                                         + ('、付属部品は先頭 2 スペースを含む' if is_sub else '') + "）に入らない。短い名前にする")
+                    self._renamed.append(f'{ref:04d} {_nm_addata.strip()} → {_nm_neo}（reading の neo_name）')
+                    pn_disp = ('  ' if is_sub else '') + _nm_neo; _nm_neo_row = _nm_neo
+                elif _nm_est.strip() and _name_key(_nm_addata) != _name_key(_nm_est):
+                    # 見積書の名称と ADDATA の名称が違う。ここで当て推量で書き換えると、読み取りの言い換え
+                    # （'ｶﾞﾗｽ接着剤' / '(ｱｯﾊﾟ)'）まで NEO に入ってしまうので、知らせるだけにする。
+                    # 工場が本当に書き換えている行（'…一部脱着' 等）は reading に neo_name を書く（2026-09-28 シエンタ）
+                    self._name_diff.append(f'{ref:04d} ADDATA「{_nm_addata.strip()}」/ 見積書「{_nm_est.strip()}」')
             if ref is None and it.get('index'):
                 wi_used = int(round(float(it['index']) * 100))
             time_h = (wi_used / 100.0) if wi_used > 0 else -1  # ref 無し・index 無しの行は指数を推定せず手入力工賃（Time=-1）
@@ -2788,7 +2823,7 @@ class NeoBuilder:
                 '_price_in': it.get('price_in'), '_wage_in': it.get('wage_in'),  # 税込で印字された見積書の印字額（内税。_tax_of_in を見よ）
                 'PartsNo': ((cp['pn'] if cp else (re.sub(r'\s*\(\d+\)\s*$', '', it.get('parts_no', '') or '') or (std_pn if dcode == 0 else ''))) if (pprice > 0 or it.get('reserve')) else (std_pn_raw if no_price_part else '')),  # 品番欄が無い取替行はコグニが標準品番を入れる（FRAME_p7。'-' 部品は生値 '     -'）
                 'PartsNoStandard': (std_pn_raw if std_pn.strip() == '-' else std_pn),  # '-' 部品は 11.DB 生値の右トリム（J52 '     -'、D88 '-'。他工場 NEO・FRAME_p7 1511）
-                '_sub_prefix': (pn_disp is None and is_sub),
+                '_sub_prefix': ((pn_disp is None or bool(_nm_neo_row)) and is_sub),   # neo_name で書いた行の 2 スペースも生成器が付けたもの（工賃付きになったら外す）
                 'PartsPriceOutTax': pprice if pprice > 0 else (0 if no_price_part else -1),  # 価格なし部品（11.DB 品番 '-'）の取替で価格未指定: コグニは 0（FRAME_p7 1511）
                 'PartsUnitPriceOutTax': (pprice // qty if qty > 1 and pprice > 0 else -1),
                 'PartsPriceStandardOutTax': (0 if std_pn.strip() == '-' else (std_price if std_price > 0 else (-1 if (pprice <= 0 or ref is None or no_std_price) else (pprice // qty if qty > 1 else pprice)))),  # 手入力行（部品コード無し）の標準価格は -1（コグニ実機 2026-09-08。工場 NEO の '*' 手入力行も -1）  # 標準価格は単価（数量倍しない。コグニ実機 NONE_dc Rec8: 単価 155×10 で標準 155）。品番 '-' の部品は入力価格に関わらず 0（他工場 NEO 17 行）
@@ -2871,7 +2906,9 @@ class NeoBuilder:
                  'option_pos': dict(opt_pos), 'option_neg': dict(opt_neg), 'evidence': evidence,
                  # build_rows を直に呼ぶ検査・スクリプトからも握り潰しに気づけるようにする（build は report['silent_errors'] にも載せる）
                  'silent_errors': list(self._sil_call or []),
-                 'plural_parts': list(getattr(self, '_plural_parts', None) or [])}
+                 'plural_parts': list(getattr(self, '_plural_parts', None) or []),
+                 'renamed': list(self._renamed),   # 見積書の名称をそのまま書いた行（ADDATA の名称と違う行）
+                 'name_diff': list(self._name_diff)}   # 見積書と ADDATA で名称が違う行（NEO は ADDATA の名称）
         return rows, stats
 
     # ------------------------------------------------------------ SQLite helpers
@@ -3789,11 +3826,27 @@ class NeoBuilder:
                             (t, t, *t3i(w), *t3i(w)))
                 nk_total += w
             cur.execute('DELETE FROM Frame')
+            _fr_used = set()
             for itf in fr.get('items') or []:
                 code = str(itf.get('code', '')); rank = str(itf.get('rank', 'A')).upper(); ri = {'A': 0, 'B': 1, 'C': 2}.get(rank, 0)
                 std = keis.get(code)
+                if std:
+                    ln = std[0]
+                else:   # N_KEI.DB に無い部位コード: 行番号がぶつかると INSERT OR REPLACE で前の行が消える（2026-09-28 代替レビュー）
+                    ln = next(x for x in range(100) if x not in _fr_used and x not in {v[0] for v in keis.values()})
+                if ln in _fr_used:
+                    raise ValueError(f"frame.items に同じ部位コード {code} が 2 行ある（コグニの内骨画面は 1 部位 1 行）")
+                _fr_used.add(ln)
+                if str(itf.get('rank', '')).strip() in ('基本内', '基本'):
+                    if _money(itf.get('index'), 'frame.items[].index') or _money(itf.get('wage'), 'frame.items[].wage'):
+                        raise ValueError(f"内板骨格 {code}: rank が「基本内」なのに指数・工賃がある。基本内は基本修正作業に含まれるので工賃を持たない"
+                                         '（見積書に工賃が刷られているならランク A/B/C のはず）')
+                    # 基本修正作業に含まれる部位（見積書の「基本内」）。指数・工賃は持たない
+                    # （実案件 NEO 2,500 本の Frame: DamageRank 1 の行は Time/TimeStandard/Wage* がすべて -1。2026-09-28）
+                    cur.execute('INSERT OR REPLACE INTO Frame (LineNo, PartsCode, PartsName, DamageRank, Time, TimeStandard, WageOutTax, WageInTax, WageTax, WageStandardOutTax, WageStandardInTax, WageStandardTax, WageByManual) '
+                                'VALUES (?,?,?,1,-1,-1,-1,-1,-1,-1,-1,-1,"")', (ln, code, itf.get('name') or (std[4] if std else '')))
+                    continue
                 t = float(itf.get('index') or (std[1 + ri] if std else 0)); w = int(itf.get('wage') or rp2(t))
-                ln = std[0] if std else len(fr.get('items') or [])
                 cur.execute('INSERT OR REPLACE INTO Frame (LineNo, PartsCode, PartsName, DamageRank, Time, TimeStandard, WageOutTax, WageInTax, WageTax, WageStandardOutTax, WageStandardInTax, WageStandardTax, WageByManual) '
                             'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,"")', (ln, code, itf.get('name') or (std[4] if std else ''), ri + 2, t, t, *t3i(w), *t3i(w)))
                 nk_total += w
@@ -3835,7 +3888,14 @@ class NeoBuilder:
                 continue
             nm = ex.get('name', '')
             kind_ = 'parts' if ex.get('kind') == 'parts' else 'wage'
-            line = next((ln for kw, ln in KEYMAP if kw in nm and (ln, kind_) not in used), None)
+            # 語が含まれるだけで寄せると、見積書の '配線修理' が '配線・配管費用' に化ける（2026-09-28 シエンタ。実機の工場 NEO は自由行に '配線修理'）
+            # 既定行（1〜8）の名前は変えられないので、**その行の名前が見積書の費用名で始まるとき**だけ寄せる
+            # （'写真代' → 行 7 '写真代他' は寄せる。'配線修理' を行 3 '配線・配管費用' に寄せると、見積書に刷られる
+            # 費用名が PDF の文言ではなくコグニの既定名に化ける。2026-09-28 シエンタ）。
+            # 下書きが半角カナに直した後で比べるので、ここだけは全半角をそろえて（NFKC）比べる（自由行 9〜36 は実機どおり別物のまま）
+            def _fx(x):
+                return _exp_key(unicodedata.normalize('NFKC', x or ''))
+            line = next((ln for kw, ln in KEYMAP if kw in nm and _fx(nm) and _fx(fixed.get(ln, '')).startswith(_fx(nm)) and (ln, kind_) not in used), None)
             if line is None:  # 同じ費用名を既に自由行へ載せていれば、別種別（部品⇔工賃）は同じ行に載せる
                 ln_ = placed.get(_exp_key(nm))
                 line = ln_ if (ln_ is not None and (ln_, kind_) not in used) else None
@@ -3848,7 +3908,7 @@ class NeoBuilder:
                     raise ValueError(f"費用の行が足りない（自由に使える行は 9〜36 の 28 行）。'{nm}' を入れられない。費用をまとめるか、明細の手入力行にする")
                 line = free_line; free_line -= 1
                 # Name TEXT(20) はバイト長。自由行の名前は半角カナ（判断規則 10-26。既定行 1〜8 の照合（上の KEYMAP）は
-                # 印字どおりの全角で当てるので、**行を決めたあとに**半角へ直す
+                # 全半角をそろえて（NFKC）当てるので、下書きが半角カナに直した後でも既定行に載る）
                 nm20 = _fit(hw(nm), 20)
                 cur.execute('UPDATE Expense SET Name=? WHERE LineNo=?', (nm20, line)); fixed[line] = nm20
             used.add((line, kind_))

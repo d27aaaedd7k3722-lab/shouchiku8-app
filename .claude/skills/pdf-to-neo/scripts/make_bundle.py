@@ -171,6 +171,7 @@ SELFTEST_TESTS = [  # 配布先でも動く自己診断（ADDATA だけで完結
     'unit_expense_lines.py',  # 費用 36 行の割付（固定行 1〜8 / 自由行 9〜36 は名前で合わせる / レッカーは自由行）
     'unit_vehicle_serial.py',  # 車両特定: 車台番号で年式が決まったら初度登録は見ない（本体どおり）。confirmed は 1 台に決まるときだけ
     'unit_adver.py',  # ADDATA の形式版（COM\AdVer）。確かめていない版は止め、11.DB の長さも検査する
+    'unit_frame_basic.py',  # 内板骨格の「基本内」（DamageRank 1・工賃なし）と、案件ごとの控えの初期化
     'neo_diff.py',  # 上記テストが使う NEO 差分ツール
 ]
 EXCLUDE_PIPELINE_TESTS = 'claude_neo_pipeline/tests/'  # 生成器の tests だけ除外（スキル同梱の scripts/tests は入れる）  # tests は元 PC の案件・実 NEO を前提にした開発用（スキルの回帰は scripts/regress_cases.py）

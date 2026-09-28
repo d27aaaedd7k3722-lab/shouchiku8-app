@@ -279,6 +279,10 @@ def main(path: str, out: str = ''):
         print(f"  ★ 塗装パネル {_u['code']}: ボディ {_u['body']} 用の行を選べなかった（{_c}）。"
               '面積＝塗装指数が実機とずれることがあるので、見積書の dm² と突き合わせる')
     print(f"部品 {t.get('parts')} 工賃 {t.get('wage')} 塗装 {t.get('paint')} 内骨 {t.get('frame')} 費用部品 {t.get('expense_parts')} 費用工賃 {t.get('expense_wage')} 値引 {t.get('discount')} 小計 {t.get('subtotal')} 税 {t.get('tax')} 合計 {t.get('total')}")
+    for _rn in (st.get('renamed') or []):   # 工場が明細の名称を書き換えた行（見積書どおりに書いた）
+        print(f'  名称は見積書どおり（ADDATA の名称と違う）: {_rn}')
+    for _nd in (st.get('name_diff') or []):
+        print(f'  ★ 名称の違い: {_nd} → NEO は ADDATA の名称。工場が明細で書き換えているなら reading の neo_name に印字の名称を書く')
     for _pl in (st.get('plural_parts') or []):   # 本体が「複数部品選択」ダイアログを出す行（生成器は既定の先頭を採った）
         print(f'  ★ 複数部品選択: {_pl}。見積書の品番・価格と突き合わせ、違えば items[].parts_no に見積書の品番を書く')
     if st.get('dup_refs'):

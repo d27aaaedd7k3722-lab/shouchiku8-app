@@ -161,5 +161,19 @@ ln5 = next(iter(u))
 chk(exp[ln5]['Name'] == 'ｴｰﾐﾝｸﾞ費用', f"雛形の行に寄っていない（'{exp[ln5]['Name']}'）")
 chk(exp[ln5]['WageOutTax'] == 15000 and exp[ln5]['PartsPriceOutTax'] == 3000, '同じ行の部品側・工賃側に入っていない')
 
+
+print('-- 既定行は「行の名前が費用名で始まるとき」だけ（2026-09-28 シエンタ: 見積書の費用名を既定名に化けさせない）--')
+exp, tot, _ = build([{'name': '配線修理', 'amount': 4000},
+                     {'name': '配線修理', 'amount': 240, 'kind': 'parts'},
+                     {'name': '写真代', 'amount': 2000}])
+u = used_lines(exp)
+chk(3 not in u, f"'配線修理' を既定行 3（配線・配管費用）に寄せている: {sorted(u)}")
+chk(7 in u, f"'写真代' が既定行 7（写真代他）に寄っていない: {sorted(u)}")
+_free = [ln for ln in u if ln >= 9]
+chk(len(_free) == 1 and exp[_free[0]]['Name'] == '配線修理',
+    f"'配線修理' が自由行にその名前で載っていない: {[(ln, exp[ln]['Name']) for ln in _free]}")
+chk(len(_free) == 1 and exp[_free[0]]['WageOutTax'] == 4000 and exp[_free[0]]['PartsPriceOutTax'] == 240,
+    '同じ費用名の部品側・工賃側が同じ行に載っていない')
+
 print('unit_expense_lines: all ok' if ok else 'unit_expense_lines: NG')
 sys.exit(0 if ok else 1)

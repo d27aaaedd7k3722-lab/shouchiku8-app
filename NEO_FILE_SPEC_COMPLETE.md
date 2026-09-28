@@ -200,7 +200,7 @@ NEO の行ごとの Tax 列は、その端数処理で計算した値が入る�
 
 ### 内板骨格修正（内骨画面 → FramePlan / Frame、Total.nk_*）
 - FramePlan: `FrameFlag=1, PartsCode='1371', Time=基本修正作業（COM/N_KIHON.DB 車形別 3.5h）, Wage*`
-- Frame: 部位区分ごと `LineNo=N_KEI の No−1, PartsCode(1372…), PartsName, DamageRank(2=A, 3=B, 4=C), Time（COM/N_KEI.DB の A/B/C 列）, Wage*`。工賃は四捨五入 10 円
+- Frame: 部位区分ごと `LineNo=N_KEI の No−1, PartsCode(1372…), PartsName, DamageRank(2=A, 3=B, 4=C), Time（COM/N_KEI.DB の A/B/C 列）, Wage*`。工賃は四捨五入 10 円。**`DamageRank=1` は「基本内」**（基本修正作業に含まれる部位。見積書に「修正　基本内」と刷られる）で、`Time / TimeStandard / Wage* がすべて -1`（実案件 NEO 2,500 本の Frame 行 66 件の内訳: ランク 1 が 3 件・すべて -1、2/3/4 は指数と工賃を持つ。2026-09-28）。生成器は reading の `frame.items[].rank` に `基本内` と書くとこの形で出す
 - Total: `nk_Total* = 基本 + Σ部位`。塗装側の内板骨格（下記）とは別
 
 ### 内板骨格塗装（塗装画面 内板骨格タブ → PaintingFrame）

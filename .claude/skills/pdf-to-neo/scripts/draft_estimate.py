@@ -1468,6 +1468,12 @@ class Drafter:
         reading の neo_name（人が付けた短い名前）か、shorten_name の自動短縮にして、印字の全文を確認箇所シートに残す"""
         short = it.pop('_neo_name', None)
         if it.get('code') and not it.get('manual'):
+            if short:   # 部品コードのある行でも、工場がコグニの明細で名称を書き換えていれば見積書の名称が正（2026-09-28 シエンタ）
+                s_hw = hw(short).strip()
+                if _cp932_len(s_hw) > PARTS_NAME_BYTES:
+                    raise ValueError(f'reading の neo_name {short!r} が NEO の名称欄 {PARTS_NAME_BYTES} バイトに入らない（{_cp932_len(s_hw)} バイト）。もっと短くする')
+                it['neo_name'] = s_hw
+                self._rev('判断', '名称', f'NEO の明細名称を見積書の印字「{s_hw}」にした（ADDATA の名称ではない）', item=it)
             return  # 部品コードのある行の名称は ADDATA の標準名称になる
         full = str(it.get('name') or '')
         if short:

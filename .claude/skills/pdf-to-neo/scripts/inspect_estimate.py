@@ -555,6 +555,8 @@ def _frame_wage(fr: dict, form_x: str, labor: int, warn: list[str]) -> int:
         t = float(fr.get('basic_index') or kihon)
         total += int(fr.get('basic_wage') or rp2(t))
     for itf in fr.get('items') or []:
+        if str(itf.get('rank', '')).strip() in ('基本内', '基本'):
+            continue   # 基本修正作業に含まれる部位（指数・工賃を持たない。2026-09-28）
         ri = {'A': 0, 'B': 1, 'C': 2}.get(str(itf.get('rank', 'A')).upper(), 0)
         std = keis.get(str(itf.get('code', '')))
         t = float(itf.get('index') or (std[ri] if std else 0))
