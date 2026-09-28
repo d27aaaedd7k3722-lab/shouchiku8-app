@@ -466,7 +466,19 @@ def _inspect(path: str, out_json: str = '') -> int:
             _u, _m = material_round_of(p.get('material_round'))
             print(f"   材料代: 工賃計 {wage_total_p} × {rate}% = コグニ計算({_u}円{_m}) {lump} / 行ごと1円四捨五入 {per_line} / 見積 {p.get('material')}"
                   + ('' if (int(p.get('material') or 0) or None) in (None, lump, per_line) else ' ★どちらとも違う（読み取りか割合を確認）'))
-            if ((int(p.get('material') or 0) or None) not in (None, lump, per_line) and not flag(p.get('auto_panels'), 'paint.auto_panels')  # auto_panels は材料代で工場の一式に合わせる設計（10-15）
+            # 材料代の単価方式（見積書に「材料代単価」「材料代係数」が刷られる工場）: 指数計 × 単価 × 係数 × 割合 で戻るなら差ではない
+            _by_unit = None
+            if p.get('material_unit'):
+                _u_ = int(re.sub(r'[^\d]', '', str(p.get('material_unit'))) or 0)
+                _c_ = float(p.get('material_coefficient') or 1)
+                def _idx(d):   # 指数の印字が無い項目（ボデーシーリングなど）は 工賃 ÷ レバーレート で戻す
+                    return float(d.get('index') or 0) or (round(int(d.get('wage') or 0) / labor, 1) if labor else 0)
+                # 生成器の塗装指数計（PaintingTotal.TimeTotal）と同じ範囲: パネル ＋ 加算基礎 ＋ ボデーシーリング（ブース加算・追加項目は入らない）
+                _t_ = sum(_idx(x) for x in (p.get('panels') or [])) + sum(_idx(p.get(k) or {}) for k in ('base', 'sealing'))
+                if _u_ and _t_:
+                    _by_unit = material_default(_t_ * _u_ * _c_, rate, p.get('material_round'))
+                    print(f'   材料代（単価方式）: 指数計 {_t_:g} × 単価 {_u_:,} × 係数 {_c_:g} × {rate}% = {_by_unit:,}')
+            if ((int(p.get('material') or 0) or None) not in (None, lump, per_line, _by_unit) and not flag(p.get('auto_panels'), 'paint.auto_panels')  # auto_panels は材料代で工場の一式に合わせる設計（10-15）
                     and not p.get('_material_from_target')):   # 協定額に合わせて下書きが決めた材料代は既定値と違って当然
                 warn.append(f"塗装 ★材料代 {p.get('material')} がコグニ既定 {lump} とも行ごと丸め {per_line} とも違う（割合 {rate}% か読み取りを確認）")
             if int(p.get('material') or 0) and int(p['material']) != lump:

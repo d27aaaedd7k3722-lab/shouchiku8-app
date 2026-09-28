@@ -396,6 +396,7 @@ BUMPER_DRAFT_ADD = 0.4  # 絞模様有り の加算（コグニ実機 N-ONE 2026
 COAT_CODES = {'ソリッド': 1, 'メタリック': 2, '2コートパール': 3, '3コートパール': 4}  # NFKC 正規化後の照合用
 COAT_DISPLAY = ['', 'ソリッド', 'メタリック', '２コートパール', '３コートパール']  # NEO に書く表記（コグニ CoatName と同じ全角数字）
 BUMPER_ONLY_KEYS = ('paint', 'coat', 'hf', 'panels', 'bumper_front', 'bumper_rear', 'bumper_base', 'material', 'material_rate', 'material_round',
+                    'material_unit', 'material_coefficient',   # 材料代の単価方式（金額の形は変えない）
                     'input_type', 'actual', 'total', 'note', 'auto_panels', '_note',
                     'type_note', 'paint_note', 'coat_note')  # パネル無しでバンパだけ塗る見積に許す paint のキー（注記欄は金額に関係しないので許す。Codex 指摘）（許可リスト。sealing / frame / other / 付加塗装が混じる組合せは実機未確認なので通さない）
 PAINT_DETAIL_KEYS = ('bumper_front', 'bumper_rear', 'wax', 'door_sash', 'stripe', 'low_cover', 'two_coat_solid', 'two_tone')  # パネル別指数（paint.panels）のときだけ書ける項目。frame / sealing / other は一括計上でも可
@@ -3775,6 +3776,48 @@ class NeoBuilder:
                 # 上の notes を出す print ループはもう終わっているので、ここで出して報告にも残す（Codex 第1周の指摘）
                 self._paint_notes = (getattr(self, '_paint_notes', None) or []) + [_msg]
                 print('塗装:', _msg)
+        # 材料代の「単価 × 係数」方式（コグニの塗装条件。見積書に「材料代単価 9,500円」「材料代係数 1.30」と刷られる工場）。
+        # 材料代 = 塗装指数計（内板骨格塗装・シーリングを足した後の TimeTotal）× 単価 × 係数 × 割合、を工場の丸めで。
+        # 2026-09-28 ジムニー: 6.9 × 9,500 × 1.30 × 38% = 32,381.7 → 10 円丸めで 32,380 = 見積書の材料代
+        _mu = _money((pdx or {}).get('material_unit'), 'paint.material_unit')
+        _mc_in = (pdx or {}).get('material_coefficient')
+        if str(_mc_in or '').strip() and not isinstance(_mc_in, bool):
+            try:
+                _mc = round(float(unicodedata.normalize('NFKC', str(_mc_in)).replace(',', '')), 2)   # 1.15 が 1.14 に落ちないよう四捨五入
+            except ValueError:
+                raise ValueError(f'paint.material_coefficient が数値でない: {_mc_in!r}（見積書の「材料代係数」を数字だけで書く）') from None
+            if _mc <= 0:
+                raise ValueError(f'paint.material_coefficient が 0 以下: {_mc_in!r}')
+        else:
+            _mc = 0.0
+        if _mu and not _mc:
+            _mc = 1.0   # 係数の印字が無い工場は 1.00（見積書に「材料代係数 1.00」と刷る書式もある）
+        if _mu:
+            _row = cur.execute('SELECT TimeTotal, MaterialTotalOutTax FROM PaintingTotal').fetchone()
+            _tt = float((_row[0] if _row else 0) or 0); _mat_now = int((_row[1] if _row else 0) or 0)
+            _rowp = cur.execute('SELECT MaterialRate FROM PaintingPlan').fetchone()
+            _mr = float((_rowp[0] if _rowp else 0) or 0)   # NEO に実際に書いた割合（見積に割合が無いときは既定値）
+            _itype_now = unicodedata.normalize('NFKC', str((pdx or {}).get('input_type') or '')).strip()
+            _calc = material_default(_tt * _mu * _mc, _mr, (pdx or {}).get('material_round')) if (_mr and _tt > 0) else 0
+            if _tt <= 0 or _itype_now == '実額' or _flag((pdx or {}).get('actual'), 'paint.actual'):
+                # 塗装明細の無い見積（一括計上・実額）はコグニの塗装条件を持たない。単価方式のフラグは書かない
+                _m = (f'材料代の単価 {_mu:,} 円・係数 {_mc:g} は、塗装明細の無い見積（{_itype_now or "一括計上"}）では使わない'
+                      '（コグニの塗装条件を持たないので、材料代は見積書の額のまま）')
+            elif _calc and _calc == _mat_now:
+                cur.execute('UPDATE PaintingPlan SET MaterialUnitFlag=1, MaterialUnit=?, MaterialCoefficient=?', (_mu, _mc))
+                cur.execute("UPDATE PaintingTotal SET MaterialTotalbyManual=''")   # 計算で出る額なので手入力の印は付けない
+                _m = f'材料代 {_mat_now:,} 円 = 塗装指数計 {_tt:g} × 単価 {_mu:,} 円 × 係数 {_mc:g} × 割合 {_mr:g}%（単価方式。手入力の印は付けない）'
+            else:
+                # 計算と 1 円でも違うなら単価方式にしない（フラグを書くとコグニが開いたときに再計算して額が変わる）
+                if (pdx or {}).get('material'):   # 見積書に材料代の印字がある行だけ手入力（*）。割合で自動計算した額には印を付けない
+                    cur.execute("UPDATE PaintingTotal SET MaterialTotalbyManual='*'")
+                    _m = (f'材料代 {_mat_now:,} 円は 単価 {_mu:,} 円 × 係数 {_mc:g} × 割合 {_mr:g}% の計算 {_calc:,} 円と違うので、'
+                          '単価方式にせず見積書の額を手入力（*）で渡した（単価・係数・割合の読み取りを確かめる）')
+                else:
+                    _m = (f'材料代の単価 {_mu:,} 円・係数 {_mc:g} は、割合で計算した材料代 {_mat_now:,} 円（計算 {_calc:,} 円）と合わないので使わなかった'
+                          '（単価・係数・割合の読み取りを確かめる）')
+            self._paint_notes = (getattr(self, '_paint_notes', None) or []) + [_m]
+            print('塗装:', _m)
         # 塗装条件の注記欄（印刷に出る自由入力。金額には影響しない）。実案件 600 本中 12 本が
         # PaintingTypeName = 'ｱﾝﾀﾞｰｺｰﾄ含み'、1 本が PaintNameAdded = '水性'（2026-09-21 の棚卸しで同定）
         _n_type = hw(str((pdx or {}).get('type_note') or '')).strip()
@@ -3908,6 +3951,8 @@ class NeoBuilder:
             if line is None:  # 雛形の自由行に同じ名前（か、その名前で始まる行）があればそこへ
                 line = _pick_template_line(fixed, nm, used)
             if line is None:
+                # 自由行は 36 から後ろへ使う（**実機がこの向き**: 変えると実機保存 NEO との全ファイル一致が 24/25 → 2/25 に落ちた。2026-09-28 に実測）。
+                # そのため見積書に刷られた費用の順と NEO の行順は逆になることがある（印刷の並びだけの違い）
                 while any(u[0] == free_line for u in used) and free_line > 9:
                     free_line -= 1
                 if free_line < 9 or any(u[0] == free_line for u in used):  # 空き行が尽きた: 黙って同じ行に重ねると Expense 表と合計欄が食い違う（監査 8）
@@ -4135,7 +4180,8 @@ class NeoBuilder:
                      dep, div, biz, ser, car.get('ps_CarSerialNo', ''), car.get('ps_CarMouldNo', ''), car.get('ps_CarKindNo', ''),
         # 所有者・使用者欄に入るのは owner_name / user_name だけ。customer.owner は車検証の所有者を控えるメモで、
         # コグニ運用では所有者欄に顧客名を入れることが多い（実機 cogni_R1/R2）ため自動では採用しない
-                     _fit(cust.get('user_name', '同上'), 20), _fit(cust.get('owner_name', cust.get('name', '')), 20), term, tera, tey, reg_date, era, ey, int(cust.get('kilometer') or 0)))
+                     _fit(cust.get('user_name', '同上'), 20), _fit(cust.get('owner_name', cust.get('name', '')), 20), term, tera, tey, reg_date, era, ey,
+                     int(cust.get('kilometer') or 0)))   # 走行キロ未記入は 0（コグニ実機の保存がそう: 実機実験 25 本すべて 0。-1 の実案件もあるが、こちらの入力経路では 0）
         # Insurance / FileInfo / Setting
         def _date8(v):
             """YYYYMMDD 以外（空・区切り付きで 8 桁にならないもの）は ''。区切り付きでも数字が 8 桁なら受ける。

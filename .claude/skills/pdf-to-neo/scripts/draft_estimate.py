@@ -1952,7 +1952,7 @@ class Drafter:
     # （残っていると生成器が実額にしない ＝ 今までどおりの一括計上になる）
     FORCE_ACTUAL_DROP = ('panels', 'lines', 'bumper_front', 'bumper_rear', 'bumper_base', 'base', 'booth',
                          'wax', 'door_sash', 'stripe', 'low_cover', 'two_coat_solid', 'two_tone', 'other',
-                         'auto_panels', 'material_rate', 'material_round', '_total_from_lines')
+                         'auto_panels', 'material_rate', 'material_round', 'material_unit', 'material_coefficient', '_total_from_lines')
 
     def _force_actual_paint(self, out: dict) -> dict:
         """reading が入力方式「実額」を**指定した**ときは、塗装の内訳があっても実額で入れる

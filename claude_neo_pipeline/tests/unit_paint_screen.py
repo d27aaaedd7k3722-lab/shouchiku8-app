@@ -13,7 +13,7 @@ import sys
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 import neo_diff  # noqa: E402
-from estimate_to_neo import NeoBuilder  # noqa: E402
+from estimate_to_neo import NeoBuilder, material_default  # noqa: E402
 
 VEH = {'model_code': 'JF1', 'serial_no': 'JF1-0000001', 'desig': '17075', 'category': '0061', 'reg_date': 'H28.10', 'color_code': ''}
 RATE = 80000
@@ -310,6 +310,47 @@ def main() -> int:
         _pU0 = _PI(_root, 'U92', body='10')
         _pU0.set_vehicle({'CarCode': 'U92', 'YearCode': '00', 'BodyCode': '10', 'GradeCode': 'C', 'FVACode': 'C'}, ())
         fails = _cmp('20.DB ボディ専用が無ければグレード専用（U92 ボディ 10 グレード C → 200）', (_pU0.panel('4300') or {}).get('area'), 200, fails)
+
+    # 材料代の「単価 × 係数」方式（見積書に「材料代単価」「材料代係数」が刷られる工場。2026-09-28 ジムニー）
+    def _mat_case(extra, material=None):
+        b = NeoBuilder()
+        pp = dict(PAINT); pp.update(extra)
+        if material is not None:
+            pp['material'] = material
+        ee = dict(est); ee['paint'] = pp
+        neo_, _r = b.build(ee, VEH, hints={}, labor_rate=RATE, est_date='20260928', insurance={})
+        t_ = os.path.join(os.environ.get('TEMP', HERE), f'unit_paint_mat_{os.getpid()}.neo')
+        open(t_, 'wb').write(neo_)
+        em_ = next(v for k, v in neo_diff.load(t_).items() if k.endswith('AnSvEm0001.sld'))
+        return _row(em_, 'PaintingPlan'), _row(em_, 'PaintingTotal')
+
+    _pl0, _pt0 = _mat_case({})                       # 単価も係数も無い従来の見積: 出力は変わらない
+    fails = _cmp('単価方式のキーが無ければフラグは 0', _pl0['MaterialUnitFlag'], 0, fails)
+    _tt = float(_pt0['TimeTotal'] or 0)
+    _mr = float(_pl0['MaterialRate'] or 0)
+    _unit = 9500
+    _want = material_default(_tt * _unit * 1.3, _mr, None)
+    _pl1, _pt1 = _mat_case({'material_unit': _unit, 'material_coefficient': 1.3}, material=_want)
+    fails = _cmp('単価方式: 計算と一致したらフラグを立てる', (_pl1['MaterialUnitFlag'], _pl1['MaterialUnit'], round(float(_pl1['MaterialCoefficient']), 2)), (1, _unit, 1.3), fails)
+    fails = _cmp('単価方式: 一致したら材料代の手入力の印を外す', (_pt1['MaterialTotalbyManual'], _pt1['MaterialTotalOutTax']), ('', _want), fails)
+    _pl2, _pt2 = _mat_case({'material_unit': _unit, 'material_coefficient': 1.3}, material=_want + 100)
+    fails = _cmp('単価方式: 計算と違えばフラグを立てない', _pl2['MaterialUnitFlag'], 0, fails)
+    fails = _cmp('単価方式: 計算と違えば手入力（*）で残す', (_pt2['MaterialTotalbyManual'], _pt2['MaterialTotalOutTax']), ('*', _want + 100), fails)
+    _pl3, _pt3 = _mat_case({'material_unit': _unit, 'material_coefficient': 1.3, 'input_type': '実額'}, material=_want)
+    fails = _cmp('単価方式: 実額の見積にはフラグを立てない', _pl3['MaterialUnitFlag'], 0, fails)
+
+    # 固定値（2026-09-28 ジムニーの実例と同じ算術）: 指数計 6.9 × 単価 9,500 × 係数 1.30 × 38% = 32,381.7 → 10 円丸めで 32,380
+    fails = _cmp('単価方式の算術（ジムニーの実例）', material_default(6.9 * 9500 * 1.30, 38, None), 32380, fails)
+    fails = _cmp('単価方式の算術（係数 1.00 = 係数なし）', material_default(6.9 * 9500 * 1.0, 38, None), 24910, fails)
+    _pl4, _pt4 = _mat_case({'material_unit': _unit, 'material_coefficient': 1.3, 'actual': True}, material=_want)
+    fails = _cmp('単価方式: actual の実額にもフラグを立てない', _pl4['MaterialUnitFlag'], 0, fails)
+    # 係数 1.15 が 1.14 に落ちない（float の丸め）。計算どおりの額ならフラグが立つ
+    _w115 = material_default(_tt * _unit * 1.15, _mr, None)
+    _pl5, _pt5 = _mat_case({'material_unit': _unit, 'material_coefficient': 1.15}, material=_w115)
+    fails = _cmp('単価方式: 係数 1.15 を切り捨てない', (_pl5['MaterialUnitFlag'], round(float(_pl5['MaterialCoefficient'] or 0), 2)), (1, 1.15), fails)
+    # 見積書に材料代の印字が無い行には手入力（*）を付けない
+    _pl6, _pt6 = _mat_case({'material_unit': _unit, 'material_coefficient': 9.9})   # わざと合わない係数
+    fails = _cmp('単価方式: 印字の無い材料代に手入力の印を付けない', (_pl6['MaterialUnitFlag'], _pt6['MaterialTotalbyManual']), (0, ''), fails)
 
     print('unit_paint_screen:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
