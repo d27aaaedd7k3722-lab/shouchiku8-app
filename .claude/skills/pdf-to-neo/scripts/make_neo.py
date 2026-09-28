@@ -375,6 +375,19 @@ def main() -> int:
             print('意図との突き合わせで例外:', type(e).__name__, e)
     intent_ng = bool(intent['hard'])
     ok = ok and not intent_ng
+    # 5-2) 印刷を待たずに 印刷の突き合わせ（print_check --neo）: NEO から「コグニが刷る行」を組み立て、見積書の写し（reading.json）と比べる。
+    #      名称（工場の書き換え → neo_name）・費用名・内板骨格の行・品番欄の文字・合計 の違いは、金額の検算では捕まらない（2026-09-28）。合否には効かせず 要確認
+    if ok and os.path.exists(stage) and os.path.exists(os.path.join(case, 'reading.json')):
+        try:
+            import print_check
+            _rd = json.load(open(os.path.join(case, 'reading.json'), encoding='utf-8'))
+            _pd = print_check.compare(_rd, print_check.print_from_neo(stage))
+            print(f"== 印刷の予測との突き合わせ == 差 {len(_pd)} 件")
+            for _d in _pd[:20]:
+                print('  ★', _d)
+            intent['soft'] = list(intent['soft']) + [{'level': '要確認', 'kind': '印刷の予測', 'page': '', 'row': '', 'name': '', 'code': '', 'text': _d} for _d in _pd]
+        except Exception as e:  # noqa: BLE001  予測が組めなくても合否には影響させない
+            print('印刷の予測との突き合わせで例外（合否には影響しない）:', type(e).__name__, e)
     # 6) 過去 NEO の索引（corpus_lookup.py build で作る。無ければ何もしない）: 工場名の書き方が過去と違う・同じ案件らしい NEO がある → 確認箇所シートへ
     corpus_rev: list = []
     if ok and rep:
@@ -489,6 +502,31 @@ def main() -> int:
         delivered = dst
         print('納品:', dst)
         print('納品（確認箇所シート）:', dst_r)
+        # ⑥-a 納品した案件は回帰テストに登録する（納品の時点の reading は人が確かめた最終形。regress_cases --case --update と同じ）。
+        #      NEO_check の直下の案件だけ（_ で始まる作業フォルダ・別の場所の案件は登録しない）
+        _nc = os.path.normcase(os.path.abspath(ENV.get('NEO_CHECK_ROOT') or os.path.join(os.path.expanduser('~'), 'Documents', 'NEO_check')))
+        if os.path.normcase(os.path.dirname(os.path.abspath(case))) == _nc and not os.path.basename(case).startswith('_'):
+            rc_r, out_r = run([os.path.join(HERE, 'regress_cases.py'), '--case', os.path.basename(case), '--update'], FILES)
+            print('回帰テストに登録:' if rc_r == 0 else '回帰テストへの登録で失敗（納品には影響しない）:', (out_r.strip().splitlines() or [''])[-1])
+        # ⑥-b 納品先に、この案件を印刷した PDF（コグニ印刷の文字層がある PDF）があれば、見積書の写しと突き合わせる（前回の納品を印刷したもの）
+        try:
+            import print_check
+            _prints = []
+            for _f in os.listdir(dst_dir):
+                _p = os.path.join(dst_dir, _f)
+                if _f.lower().endswith('.pdf') and os.path.isfile(_p):
+                    _t = print_check._text_pages(_p)
+                    if _t and any('部品価格適応日' in x for x in _t) and any(re.search(r'修理方法|部品名称', x) for x in _t):
+                        _prints.append((os.path.getmtime(_p), _p, _t))
+            if _prints and os.path.exists(reading):
+                _mt, _p, _t = max(_prints)
+                _pd = print_check.compare(json.load(open(reading, encoding='utf-8')), print_check.parse_print(_t))
+                print(f'== 案件フォルダの印刷 PDF（{os.path.basename(_p)}）との突き合わせ == 差 {len(_pd)} 件'
+                      + ('（古い納品を印刷したものなら、今回直した点は差に出る）' if _pd else ''))
+                for _d in _pd[:20]:
+                    print('  ★', _d)
+        except (Exception, SystemExit) as e:  # noqa: BLE001  手掛かりなので合否・納品には影響させない（pypdf が無いと _text_pages が SystemExit。Codex 指摘）
+            print('印刷 PDF との突き合わせで例外（納品には影響しない）:', type(e).__name__, e)
     if check and not a.no_profile and os.path.exists(reading):  # 合格した案件の工場設定を記録（reading_check が FAIL なしのときだけ書く）
         rc, out2 = run([os.path.join(HERE, 'reading_check.py'), reading, '--save-profile', '--quiet'], FILES)
         line = next((l for l in out2.splitlines() if '工場プロファイル' in l), '')

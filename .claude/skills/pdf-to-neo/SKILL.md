@@ -36,6 +36,9 @@ description: 工場見積 PDF（どの書式でも）＋車検証から、コグ
 | `scripts/pdf_pages.py` | 見積 PDF をページごとの拡大画像（上下に分けたもの）と文字層に切り分ける。転記の下ごしらえ |
 | `scripts/review_sheet.py` | 確認箇所シート（xlsx: 確認箇所 / 手入力の行 / 下書きの判断 / 合計）を作る。make_neo が呼ぶ（openpyxl が無い PC は CSV） |
 | `scripts/reading_check.py` / `reading_pages.py` / `ocr_prefill.py` | 紙上検算 / ページ単位の転記 / Windows OCR 先読み（手順 4〜5） |
+| `scripts/ocr_eval.py` | ocr_anchor の評価。`<NEO_CHECK_ROOT>/_ocr_eval/cases.json` の案件を回し、人が写した正解と行ごとに比べる。**ocr_anchor を直したら必ず回す**（確定なのに違う＝0 が合格） |
+| `scripts/header_auto.py` | **元案件フォルダの速報・確報（文字層のある報告書）から header.json の車両・顧客・保険を埋める**（型式・車台番号・型式類別・初度登録・カラー・グレード・使用者（同上なら所有者）・登録番号・走行距離・有効期限・事故番号・契約者・事故日・画像鑑定）。既にある値は上書きしない。`ocr_anchor.py --src` からも呼ばれる |
+| `scripts/ocr_anchor.py` | **コグニ印刷（書式 A）の FAX を OCR ＋ ADDATA 照合で page_N.json に起こす**（手順 4 の最初）。罫線を消して OCR → 部品コードを ADDATA で確かめ（桁落ち・読み違いを並び・品番・名称で直す）→ 標準の名称・品番・単価と突き合わせ → ページ小計で金額をまとめて確定。人が見るのは `pages/ocr/check_page_N.png` に並ぶ 要確認 の行だけ。費用（コード・修理方法の無い行）は page の expenses、内板骨格は header の frame に書く |
 | `scripts/option_audit.py` | 装備監査（印字品番 vs 装備で決まる標準品番）。make_neo が生成後に呼ぶ |
 | `scripts/build_part_names.py` | 全車種 12.DB から 部品名 → 部品コード の別名辞書 `reference/part_code_names.json` を作る（ADDATA 更新後に 1 回） |
 | `<NEO_CHECK_ROOT>/_profiles/factory_profiles.json`（PC ごと・git に入れない） | 工場ごとの設定の学習データ（レート・工賃丸め・消費税丸め・費用の集計先・書式・手入力行モード）。make_neo が合格時に書き、reading_check が前回との差を WARN に出す（`--no-profile` で書かない） |
@@ -185,7 +188,31 @@ PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/reading_pages.py
 #   merge は費用行・塗装行が 2 ページに重複して写されていないかも見る（二重計上の検出）
 ```
 
-**OCR 先読み（Windows 標準 OCR。pypdf と Pillow が要る。無ければ手で写す。FAX でも品番・金額・指数は 9 割読める）** — 明細が多い見積は先に走らせ、数字は OCR、名称の確認は目で行う:
+**コグニ印刷（書式 A）の FAX は、まず `ocr_anchor.py --src <元案件フォルダ>`**（Windows 標準 OCR ＋ ADDATA 照合。pypdf と Pillow が要る）。
+`--src` を渡すと、元案件フォルダの速報・確報から header.json の車両・顧客・保険を先に埋め（`header_auto.py`。2026-09-28 に 15 案件で
+型式指定・類別・初度登録・車台番号が 15/15 一致）、見積書の「作成日」を est_date に書き、その車両で明細を ADDATA と照合する。
+報告書が無い案件は、先に `pages/header.json` に車両（車検証から）を書いておく（ADDATA 照合に車両が要る。無ければ全行 要確認）:
+
+```bash
+PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/ocr_anchor.py "<見積PDF>" "<NEO_CHECK_ROOT>/<案件>" --src "<元案件フォルダ>"
+#   速報・確報から header.json に 19 項目を書いた（車両・顧客・保険）/ 見積日（作成日）20260908 を header.json の est_date に書いた
+#   → header で人が足すのは issuer（工場名）・insurance.factory（「半角カナ略称 電話」。corpus_lookup の過去の書き方）・labor_rate だけ
+#   ページ N: 明細 42 行 / ADDATA・小計で確定 40 行 / 要確認 2 行（画像 pages/ocr/check_page_N.png）
+#   → check_page_N.png（要確認の行だけを並べた画像。左の r番号 = ページの何行目）を見て、page_N.json のその行を直し comment の「OCR未確認: …」を消す
+#   → 「名称を工場が書き換えている」行は、印字の名称を dict の行の neo_name に写す（判断規則 10-29）
+#   → 費用（page の expenses）・内板骨格（header の frame）・塗装明細（header の paint）・合計欄（header の totals）に付いた「OCR未確認」も同じ（validate / merge が止める）
+#   → 【塗装明細】（ページをまたいでも 1 つにまとめる）・【費用】・合計欄（課税額計・消費税・合計）も読む。塗装は 工賃計＝塗装行の合計、
+#      費用計＝工賃計＋材料代計＋追加計、ページ小計＝そのページの工賃の欄に刷られた額の合計（塗装行・材料代・追加項目・費用を含む）で確かめる
+```
+
+2026-09-28 の実測（コグニ印刷の FAX 4 件・291 行）: **262 行（90%）が人の確認なしで確定、見逃し（確定なのに違う）0 件**、1 件 8〜25 秒。
+塗装明細はジムニーで全項目が人の写しと一致、合計欄は 4 件とも一致。通しの試験（ジムニー: 自動読み取り → 要確認 4 か所だけ直す → merge → make_neo）で
+紙上検算 FAIL 0・検算全項目 OK・人が写して納品した NEO と明細 37/37 行一致。
+確定の根拠は ①部品コードが この車の ADDATA にある ②印 $ の無い行の部品価格が 標準単価 × 数量 と一致 ③ページ小計が 行＋費用＋骨格の合計と一致、のどれか。
+それ以外（$ 付きの価格・手入力の行・ADDATA の版の違いで価格が違う行・名称の書き換え・読めない欄）は 要確認 に回す。
+書式 A でないページ（縦線の並びが違う）は自動で下の ocr_prefill に回る。
+
+**OCR 先読み（書式 A 以外。Windows 標準 OCR。pypdf と Pillow が要る。無ければ手で写す。FAX でも品番・金額・指数は 9 割読める）** — 明細が多い見積は先に走らせ、数字は OCR、名称の確認は目で行う:
 
 ```bash
 PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/ocr_prefill.py "<見積PDF>" "<NEO_CHECK_ROOT>/<案件>"
@@ -225,6 +252,11 @@ PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/make_neo.py "<NE
 - `draft_estimate.py` が reading.json から estimate.json を作り、`_draft_notes`（名称照合で決めた行・左右分割・板金ランク・採用した装備・追加項目（paint.other）と手入力の塗装行にした塗装行・manual にした行）を表示する。**必ず読む**
 - 続けて `inspect_estimate.py` の突合せ（★ 要確認）と `run_case.py` の検算が出る。全部 OK なら「合格」
 - 生成後に **装備監査**（`option_audit.py`）が走る。生成器が選んだ装備で決まる標準品番と印字品番を突き合わせ、「装備 X を追加/除外すると一致する行が増える」行があれば ★ で出る。装備の取り違いは合計を変えずに標準品番・指数だけを変えるので、合計一致だけでは見つからない。★ が出たら 10.DB の装備名と見積の注記で採否を決め、採るなら reading の `hints.eva_codes` に書いて再実行
+- 生成の後に **印刷の予測との突き合わせ**（`print_check.print_from_neo`）が走る: NEO の中身から「コグニが刷る行」を組み立てて reading と比べ、
+  名称（工場の書き換え → neo_name）・費用名・内板骨格の行・品番欄の文字・合計 の違いを 確認箇所シートの 要確認 に出す（合否には効かせない。
+  2026-09-28 に印刷してから気づいた違いを、印刷せずに出す。手で回すなら `print_check.py <案件> - --neo <NEO>`）
+- **納品（--deliver）すると**、NEO_check 直下の案件は回帰テストに自動で登録される（`regress_cases.py --case <案件> --update` と同じ）。
+  納品先の案件フォルダに、前の納品をコグニで印刷した PDF（文字層のあるもの）があれば、いちばん新しいものを reading と自動で突き合わせて ★ を出す
 - 生成の後に **意図との突き合わせ**（`intent_check.py`）が走り、できあがった NEO を読み戻して estimate.json と 1 行ずつ比べる。部品コード・数量・金額・工賃・明細コメントが違えば不合格。名称・顧客名などが欄の長さで切れたものは確認箇所シートの 要確認（2026-09-13 に追加。合計が合っていても、手入力の作業名が 24 バイトで途中まで・顧客名が「…株式」までになっていた）
 - `report.md` ができる（不合格でも書かれるので、合格の行と合わせて読む）（車両・合計表・手入力行・判断点・要確認・印字の印との照合・紙上検算・装備監査）。**報告はこれを元に書く**。コグニ印刷（書式 A）で右端の印（$ # *）を flags に写しておくと、生成 NEO の印との差が出る（差ゼロ = コグニで作ったのと同じ書式）
 - 工場が塗装を「一式」でしか出していない見積書は、reading の paint に `auto_panels: true` を足すと
@@ -245,7 +277,7 @@ PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/make_neo.py "<NE
   いずれも reading.json を直して再実行する。
   なお `run_case.py` 単体で止まるのは前の 3 つで、低照合率は警告止まり（`make_neo.py` が合否に使う）——
   **生成器を直接呼ぶときは自分で確かめる**
-- 他のスクリプトの補助オプション: `ocr_prefill.py --pages/--scale/--overwrite`、`reading_check.py --json/--save-profile/--quiet`、`regress_cases.py --only/--update`、`reading_pages.py merge --force`、`build_part_names.py --out/--min-count`、`make_bundle.py --out`
+- 他のスクリプトの補助オプション: `ocr_anchor.py --src/--pages/--overwrite/--labor`、`header_auto.py --report/--overwrite`、`ocr_prefill.py --pages/--scale/--overwrite`、`reading_check.py --json/--save-profile/--quiet`、`regress_cases.py --only/--update`、`reading_pages.py merge --force`、`build_part_names.py --out/--min-count`、`make_bundle.py --out`
 
 `_draft_notes` と ★ を `reference/judgment_rules.md` の規則で一つずつ解決する。主な項目:
 

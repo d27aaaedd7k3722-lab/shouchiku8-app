@@ -298,6 +298,36 @@ def test_merge_refuses_ocr_unverified_rows_even_with_force():
         shutil.rmtree(d, ignore_errors=True)
 
 
+
+def test_ocr_anchor_marks_block_validate_and_merge():
+    """ocr_anchor が付ける「OCR未確認」: ページの費用・読んでいない区画（_todo）・header の内板骨格 も validate と merge で止める（Codex 指摘 2026-09-28）"""
+    import json, os, tempfile, shutil
+    from reading_pages import merge, validate_page
+    page = {'page': 1, 'rows_printed': 1, 'blocks': [{'title': '', 'rows': ['0100|ﾌｰﾄﾞ|取替||||50000|||']}]}
+    hdr = {'vehicle': {}, 'labor_rate': 8000}
+    assert validate_page(hdr, page)['ok'], validate_page(hdr, page)['fail']
+    p2 = dict(page, expenses=[{'name': '写真代他', 'amount': 2000, 'in': '作業計', 'comment': 'OCR未確認: 名称'}])
+    assert not validate_page(hdr, p2)['ok'], '未確認の費用が validate を通った'
+    p3 = dict(page, _todo='OCR未確認: 塗装明細を読んでいない')
+    assert not validate_page(hdr, p3)['ok'], '読んでいない区画（_todo）が validate を通った'
+    h2 = dict(hdr, frame={'page': 1, 'basic': True, 'basic_wage': 28000, 'items': [], 'comment': 'OCR未確認: 工賃'})
+    assert not validate_page(h2, page)['ok'], '未確認の内板骨格が validate を通った'
+    h3 = dict(hdr, totals={'page': 1, 'comment': 'OCR未確認: 合計欄が読めない'})
+    assert not validate_page(h3, page)['ok'], '未確認の合計欄が validate を通った'
+    h4 = dict(hdr, paint={'page': 1, 'total': 1000, 'comment': 'OCR未確認: 塗装'})
+    assert not validate_page(h4, page)['ok'], '未確認の塗装明細が validate を通った'
+    d = tempfile.mkdtemp(prefix='rp_anchor_')
+    try:
+        pages = os.path.join(d, 'pages'); os.makedirs(pages)
+        for hh, pg, why in ((hdr, p3, '_todo'), (h2, page, '骨格'), (hdr, p2, '費用')):
+            json.dump(hh, open(os.path.join(pages, 'header.json'), 'w', encoding='utf-8'), ensure_ascii=False)
+            json.dump(pg, open(os.path.join(pages, 'page_1.json'), 'w', encoding='utf-8'), ensure_ascii=False)
+            rd, msgs = merge(d, force=True)
+            assert rd is None, f'--force で未確認の{why}を束ねている（{msgs}）'
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == '__main__':
     fails = 0
     for name, fn in sorted(globals().items()):

@@ -51,7 +51,7 @@ PDF を読んだ Claude（人）は判断をせず、紙に書いてあるとお
 | subtotal.parts / wage | ページ小計が印字されていればその値（保留行を除く）。無いページは省略（合計欄との突合は merge で） |
 | marks | 印字の印の個数 `{"$": 1, "#": 3, "*": 2, "@": 1}`。転記した flags の数と突き合わせる |
 | blocks / rows | reading.json と同じ。merge が各ブロックに `page` を付け、reading.json の `pages` にページ小計を写す |
-| paint_lines / expenses | そのページに印字された塗装行・費用。merge が header の paint.lines / expenses の後ろに繋ぐ |
+| paint_lines / expenses | そのページに印字された塗装行・費用。merge が header の paint.lines / expenses の後ろに繋ぐ。`ocr_anchor.py` が書いた費用には `comment: "OCR未確認: …"` が付くことがある（画像で確かめて消す。残っていると validate / merge が止める。header の `frame.comment` も同じ） |
 
 reading.json を直接書くときも、`blocks[].page` と `pages: {"1": {"rows": 18, "parts": 363370, "wage": 63800, "marks": {...}}}` を書けば同じ検算が効く。ブロック単位の小計は `blocks[].subtotal: {"rows", "parts", "wage"}`。
 

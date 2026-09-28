@@ -148,6 +148,20 @@ def validate_page(header: dict, page: dict) -> dict:
     unverified = [r_ for r_ in ck.rows if str(r_.get('comment') or '').startswith('OCR未確認')]
     if unverified:
         res['fail'].append(f"OCR 下書きのまま未確認の行が {len(unverified)} 行（行{unverified[0]['_no']} ほか）。画像を見て名称と数値を確認し、comment の「OCR未確認」を消す")
+    unv_exp = [e for e in page.get('expenses') or [] if isinstance(e, dict) and str(e.get('comment') or '').startswith('OCR未確認')]
+    if unv_exp:  # ocr_anchor が費用（コードも修理方法も無い行）に付ける印
+        res['fail'].append(f"OCR 下書きのまま未確認の費用が {len(unv_exp)} 件（{unv_exp[0].get('name')} ほか）。画像を見て名称と金額を確認し、comment の「OCR未確認」を消す")
+    if str(page.get('_todo') or '').startswith('OCR未確認'):  # ocr_anchor が読まなかった塗装明細・【費用】の区画（Codex 指摘 2026-09-28）
+        res['fail'].append(f"{page['_todo']}")
+    _fr = header.get('frame') if isinstance(header.get('frame'), dict) else {}
+    if str(_fr.get('comment') or '').startswith('OCR未確認') and str(_fr.get('page') or pg) == str(pg):  # ocr_anchor が header.frame に付ける印
+        res['fail'].append(f"内板骨格（header.json の frame）が OCR 下書きのまま未確認: {_fr.get('comment')}。画像で確かめて comment を消す")
+    _tt = header.get('totals') if isinstance(header.get('totals'), dict) else {}
+    if str(_tt.get('comment') or '').startswith('OCR未確認') and str(_tt.get('page') or pg) == str(pg):  # ocr_anchor が header.totals に付ける印（Codex 指摘）
+        res['fail'].append(f"合計欄（header.json の totals）が OCR 下書きのまま未確認: {_tt.get('comment')}。画像で確かめて comment を消す")
+    _pa = header.get('paint') if isinstance(header.get('paint'), dict) else {}
+    if str(_pa.get('comment') or '').startswith('OCR未確認') and str(_pa.get('page') or pg) == str(pg):  # ocr_anchor が header.paint に付ける印
+        res['fail'].append(f"塗装明細（header.json の paint）が OCR 下書きのまま未確認: {_pa.get('comment')}。画像で確かめて comment を消す")
     r = ck.result()
     res['fail'] += [t for t in r['fail'] if t != '明細行が 1 行も無い（blocks[].rows）' or rows_printed]
     res['warn'] += r['warn']
@@ -270,6 +284,18 @@ def merge(case: str, force: bool = False) -> tuple[dict | None, list[str]]:
                or (isinstance(r, str) and 'OCR未確認' in r)]  # 短縮記法 "code|name|...|OCR未確認" の行も（Codex 指摘）
     if _unseen:
         msgs.append(f'OCR 未確認の行が {len(_unseen)} 行ある（例 {_unseen[0]}）。画像を見て確認し comment の「OCR未確認」を消してから束ねる。--force でも通さない')
+        return None, msgs
+    # ocr_anchor は 内板骨格（header.frame）と費用にも「OCR未確認」を付ける。これも --force で通さない
+    _fr = header.get('frame') if isinstance(header.get('frame'), dict) else {}
+    _todo_pages = [pg for pg, path in files if str((load_json(path) or {}).get('_todo') or '').startswith('OCR未確認')]
+    _pa = header.get('paint') if isinstance(header.get('paint'), dict) else {}
+    _unseen_x = ([f'内板骨格: {_fr.get("comment")}'] if str(_fr.get('comment') or '').startswith('OCR未確認') else []) + \
+        ([f'塗装明細: {_pa.get("comment")}'] if str(_pa.get('comment') or '').startswith('OCR未確認') else []) + \
+        ([f'合計欄: {(header.get("totals") or {}).get("comment")}'] if isinstance(header.get('totals'), dict) and str(header['totals'].get('comment') or '').startswith('OCR未確認') else []) + \
+        [f'ページ {pg} の読んでいない区画（_todo）' for pg in _todo_pages] + \
+        [f'費用 {e.get("name")}: {e.get("comment")}' for e in expenses if isinstance(e, dict) and str(e.get('comment') or '').startswith('OCR未確認')]
+    if _unseen_x:
+        msgs.append(f'OCR 未確認の骨格・費用が {len(_unseen_x)} 件ある（例 {_unseen_x[0][:80]}）。画像を見て確認し comment の「OCR未確認」を消してから束ねる。--force でも通さない')
         return None, msgs
     for label, seq, src in (('費用', expenses, src_exp), ('塗装行', lines, src_lines)):
         seen: dict = {}

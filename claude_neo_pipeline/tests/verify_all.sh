@@ -46,7 +46,7 @@ run '全ファイル一致（そのまま保存した実機 NEO）' bash -c 'set
 # スキルの単体テストは glob で全件回す（テストが増えたら自動で拾う。個別に列挙すると新しい分が静かに抜ける）。
 # 1 本も無いのは配布物が壊れているということなので失敗にする
 # 配布の要になるテストは名前で存在も確かめる（glob 実行だけだと、1 本落ちても他が残っていれば緑になる）
-for must in test_skill_env test_pick_grade test_find_ref_by_price test_guess_labor_rate test_reading_check test_reading_pages test_draft_notes test_draft_rules test_alias test_ocr_prefill; do
+for must in test_skill_env test_pick_grade test_find_ref_by_price test_guess_labor_rate test_reading_check test_reading_pages test_draft_notes test_draft_rules test_alias test_ocr_prefill test_ocr_anchor test_header_auto; do
   [ -f ".claude/skills/pdf-to-neo/scripts/tests/$must.py" ] || { echo "*** FAILED: 必須のスキルテスト $must.py が無い"; fail=1; }
 done
 skill_tests=$(ls .claude/skills/pdf-to-neo/scripts/tests/test_*.py 2>/dev/null | sort)

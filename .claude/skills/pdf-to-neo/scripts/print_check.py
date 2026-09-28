@@ -22,6 +22,10 @@
 
 出す差: 行落ち / 余分な行 / 名称 / 修理方法 / 品番 / 数量 / 金額 / 費用（名前と金額）/ 内板骨格 / 合計。
 表記のゆれ（長音・ハイフン・空白・小書きカナ・全半角）は同じものとみなす（生成器と同じ _name_key）。
+
+印刷を待たずに（NEO の中身から コグニが刷る行を組み立てて）突き合わせる:
+    PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/print_check.py <案件フォルダ> - --neo <生成した NEO>
+（make_neo が生成のあとに自動で回し、差を 確認箇所シートの 要確認 に出す）
 """
 from __future__ import annotations
 
@@ -121,6 +125,45 @@ def parse_print(pages: list) -> dict:
     return {'rows': rows, 'expenses': expenses, 'frame': frame, 'totals': tot, 'price_date': pdate}
 
 
+def print_from_neo(neo_path: str) -> dict:
+    """NEO の中身から、コグニが印刷する 明細・費用・内板骨格・合計 を組み立てる（parse_print と同じ形）。
+    印刷 PDF を待たずに compare() に掛けられる（2026-09-28: 印刷してから名称・費用名・骨格・品番欄の違いに気づく往復を無くす）。
+    明細は親の行だけ（PartsCodeSub = -1）。名称は PartsName（見積書の名称で書いた行は neo_name）、品番欄は PartsNo、金額は 部品価格・工賃"""
+    import intent_check  # noqa: PLC0415  NEO を開く処理を共有する
+    em, iff, tmps = intent_check._open(neo_path)
+    try:
+        rows = []
+        for r in em.execute('SELECT * FROM ERParts ORDER BY RecordNo'):
+            if r['PartsCodeSub'] not in (-1, None) and int(r['RecycleFlag'] or 0) != 1:
+                continue  # 子行は刷られない。リサイクル部品に置き換えた行（PartsCodeSub=1・RecycleFlag=1）は刷られる（Codex 指摘）
+            pn = str(r['PartsNo'] or '').strip()
+            cnt = int(r['PartsCount'] or 1) if str(r['PartsCount'] or '').lstrip('-').isdigit() else 1
+            money = [int(v) for v in (r['PartsPriceOutTax'], r['WageOutTax']) if v not in (None, '') and int(v) >= 10]
+            code = '保留' if int(r['ReserveFlag'] or 0) == 1 else str(r['PartsCode'] or '').strip()  # 保留の行はコードの代わりに「保留」と刷られる
+            rows.append({'code': code, 'name': str(r['PartsName'] or '').strip(), 'method': str(r['DisposalName'] or '').strip(),
+                         'pn': pn if re.search(r'[0-9A-Z]{3,}-[0-9A-Z]', pn) else '', 'pn_text': pn if pn not in ('-',) else '',
+                         'qty': str(cnt) if cnt > 1 else '', 'mark': '', 'money': money, 'raw': ''})
+        expenses = []
+        for e in em.execute('SELECT * FROM Expense ORDER BY LineNo'):
+            money = [int(v) for v in (e['PartsPriceOutTax'], e['WageOutTax']) if v not in (None, '') and int(v) >= 10]
+            if money:
+                expenses.append({'name': str(e['Name'] or '').strip(), 'money': money})
+        frame = [{'code': str(f['PartsCode'] or '').strip(), 'name': str(f['PartsName'] or ''), 'rank': f['DamageRank']} for f in em.execute('SELECT * FROM Frame ORDER BY LineNo')]
+        fp = em.execute('SELECT FrameFlag FROM FramePlan').fetchone()
+        if fp is not None and int(fp['FrameFlag'] or 0) == 1:
+            frame.insert(0, {'code': '1371', 'name': '基本修正作業', 'rank': None})
+        t = em.execute('SELECT SubTotal, tx_TotalOutTax, Total FROM Total').fetchone()
+        totals = {'taxable': int(t['SubTotal']), 'tax': int(t['tx_TotalOutTax']), 'total': int(t['Total'])} if t is not None else {}
+    finally:
+        em.close(); iff.close()
+        for tf in tmps:
+            try:
+                os.unlink(tf)
+            except OSError:
+                pass
+    return {'rows': rows, 'expenses': expenses, 'frame': frame, 'totals': totals, 'price_date': ''}
+
+
 def read_rows(rd: dict) -> list:
     out = []
     for b in rd.get('blocks') or []:
@@ -206,7 +249,7 @@ def main(argv: list) -> int:
         print(__doc__); return 2
     case, pdf = argv[1], argv[2]
     rd = json.load(io.open(os.path.join(case, 'reading.json'), encoding='utf-8'))
-    pr = parse_print(_text_pages(pdf))
+    pr = print_from_neo(argv[argv.index('--neo') + 1]) if '--neo' in argv else parse_print(_text_pages(pdf))
     if not pr['rows']:
         print('この PDF から明細を読めなかった（コグニの印刷 PDF か、文字層のある PDF を渡す）'); return 2
     diffs = compare(rd, pr)

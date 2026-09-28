@@ -71,10 +71,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--update', action='store_true')
     ap.add_argument('--only', default='', help='案件フォルダ名の部分一致（1 案件だけ回す）')
+    ap.add_argument('--case', default='', help='案件フォルダ名（完全一致）。make_neo が納品のあとに --update で回帰に登録するのに使う')
     a = ap.parse_args()
     if not os.path.isdir(NC):
         print('NEO_check が無い:', NC); return 1
-    cases = sorted(d for d in os.listdir(NC) if os.path.isfile(os.path.join(NC, d, 'reading.json')) and (not a.only or a.only in d))
+    cases = sorted(d for d in os.listdir(NC) if os.path.isfile(os.path.join(NC, d, 'reading.json')) and (not a.only or a.only in d)
+                   and (not a.case or d == os.path.basename(os.path.normpath(a.case))))
     if not cases:
         print('reading.json を持つ案件が無い'); return 0
     fail = 0

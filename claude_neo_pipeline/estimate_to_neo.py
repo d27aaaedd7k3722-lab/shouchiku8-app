@@ -4280,6 +4280,16 @@ class NeoBuilder:
         return t.encode('cp932w', 'replace')
 
     # ------------------------------------------------------------ 総合
+    def make_row_ctx(self, car: dict, hints: Optional[dict] = None, eva_on=()) -> dict:
+        """行生成（build_rows の 11/13/15/83.DB の変種選択）に使う車両条件。build と ocr_anchor（OCR の行を ADDATA で照合する）が同じ条件で引くために 1 か所にまとめた。
+        eva_on = 品番の逆引きで「有」と決まった装備（build だけが渡す）"""
+        return {'year': car.get('YearCode', ''), 'body': str(car.get('BodyCode', '') or ''), 'sbase': str(car.get('SBaseCode', '') or ''), 'lbase': str(car.get('LBaseCode', '') or ''), 'reg_ym': str(car.get('ps_CarRegDate', '') or '')[:6],
+                         'serial': str(car.get('ps_CarSerialNo', '') or ''),   # 83.DB は車台番号でも期間が切られる（2026-09-21）
+                         'color': car.get('ColorCode', '') if car.get('ColorCodeFlag') else '', 'grade': car.get('GradeCode', ''), 'fva': (car.get('FVACode', '') or '')[-1:],  # 4WD は 'ZA' なので照合は末尾 1 文字
+                         'eva': (set(str(x) for x in ((hints or {}).get('eva_codes') or []) if x) | ({'Z'} if car.get('four_wd') else set())
+                                 | set(eva_on or ()))  # 品番の逆引きで「有」と決まった装備（本体の行選び。2026-09-22）
+                                - set(str(x).strip() for x in ((hints or {}).get('eva_exclude') or []) if str(x).strip())}  # 色別部品の装備条件は build 前に分かる EVA（hints と 4WD の 'Z'）で判定。**eva_exclude はここにも効かせる** —— 行生成（11/13/83.DB の変種選択）に使うので、最終 CarEVA だけ直しても品番・価格がずれる（Codex 指摘 2026-09-12）
+
     def build(self, estimate: dict, vehicle_inputs: dict, hints: Optional[dict] = None, labor_rate: Optional[int] = None,  # noqa: D401
               est_date: Optional[str] = None, insurance: Optional[dict] = None) -> tuple[bytes, dict]:
         labor_rate = _money(labor_rate, 'labor_rate（レバーレート）') or None  # '8,000' のような写し方でも受ける
@@ -4349,12 +4359,7 @@ class NeoBuilder:
             if not codes:
                 raise ValueError(f"{car['CarCode']} には 29.DB（トリムコード一覧）が無い（trim_code {tc!r} は指定できない）")
             car['TrimCode'] = tc; car['TrimCodeFlag'] = 1
-        self._row_ctx = {'year': car.get('YearCode', ''), 'body': str(car.get('BodyCode', '') or ''), 'sbase': str(car.get('SBaseCode', '') or ''), 'lbase': str(car.get('LBaseCode', '') or ''), 'reg_ym': str(car.get('ps_CarRegDate', '') or '')[:6],
-                         'serial': str(car.get('ps_CarSerialNo', '') or ''),   # 83.DB は車台番号でも期間が切られる（2026-09-21）
-                         'color': car.get('ColorCode', '') if car.get('ColorCodeFlag') else '', 'grade': car.get('GradeCode', ''), 'fva': (car.get('FVACode', '') or '')[-1:],  # 4WD は 'ZA' なので照合は末尾 1 文字
-                         'eva': (set(str(x) for x in ((hints or {}).get('eva_codes') or []) if x) | ({'Z'} if car.get('four_wd') else set())
-                                 | set((self._parts_infer or {}).get('eva_on') or ()))  # 品番の逆引きで「有」と決まった装備（本体の行選び。2026-09-22）
-                                - set(str(x).strip() for x in ((hints or {}).get('eva_exclude') or []) if str(x).strip())}  # 色別部品の装備条件は build 前に分かる EVA（hints と 4WD の 'Z'）で判定。**eva_exclude はここにも効かせる** —— 行生成（11/13/83.DB の変種選択）に使うので、最終 CarEVA だけ直しても品番・価格がずれる（Codex 指摘 2026-09-12）
+        self._row_ctx = self.make_row_ctx(car, hints, (self._parts_infer or {}).get('eva_on') or ())
         self._tax_round = estimate.get('tax_round')  # 消費税の計算単位（Setting.tx_ArrangeFlag と消費税額。write_ansvif / write_ansvem が参照）
         self._man_rows_std = None   # 標準指数の手入力行の集合（汎用車種の build や前の build の値を持ち越さない。Codex 指摘）
         self._std_route_note = None  # 標準指数の時間の置き場が本体とずれている可能性（run_case が ★ で出す）
