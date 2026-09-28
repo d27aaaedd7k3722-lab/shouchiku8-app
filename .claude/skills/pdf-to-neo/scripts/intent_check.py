@@ -190,12 +190,54 @@ def check(est: dict, neo_path: str) -> dict:
                 bad('明細コメントの有無', c_want, c_got)
             elif c_want and c_got != c_want.strip():
                 soft.append(_e('要確認', '欄で切れた', f'明細コメント「{c_want}」が NEO では「{c_got}」（40 バイトの欄）', rec, nm, code_got, page))
-            if manual or generic:  # 手入力行（汎用車種は全行）は見積（下書き）の名称がそのまま NEO に出るはず（Codex 指摘）
-                want_nm = hw(nm).strip()
+            if manual or generic or it.get('neo_name'):  # 手入力行（汎用車種は全行）と、見積書の名称を指定した行（neo_name）は その名称が NEO に出るはず
+                want_nm = hw(str(it.get('neo_name') or nm)).strip()
                 got_nm = str(r.get('PartsName') or '').strip()
                 if got_nm != want_nm:
                     soft.append(_e('要確認', '欄で切れた' if want_nm.startswith(got_nm) else '名称が変わった',
                                    f'名称: 意図「{want_nm}」/ NEO「{got_nm}」', rec, nm, '', page))
+        # 費用（Expense）: 見積書に刷られる費用名は「載せた行の Name」。既定行に寄せると名前がコグニの文言に化けるので、
+        # 名前と金額の両方を突き合わせる（2026-09-28 シエンタ: '配線修理' が '配線・配管費用' になっていた）
+        if _has(em, 'Expense'):
+            ex_rows = [dict(r) for r in em.execute('SELECT LineNo, Name, PartsEnabled, PartsPriceOutTax, WageEnabled, WageOutTax FROM Expense')]
+            for ex in (est.get('expenses') or []):
+                amt = _amount(ex.get('amount'))
+                if not amt:
+                    continue
+                side = 'parts' if ex.get('kind') == 'parts' else 'wage'
+                want = hw(str(ex.get('name') or '')).strip()
+                hit = [r for r in ex_rows
+                       if (_int(r.get('PartsPriceOutTax')) == amt if side == 'parts' else _int(r.get('WageOutTax')) == amt)
+                       and (r.get('PartsEnabled') if side == 'parts' else r.get('WageEnabled'))]
+                if not hit:
+                    hard.append(_e('要確認', '意図との食い違い', f'費用「{want}」{amt:,} 円（{"部品側" if side == "parts" else "工賃側"}）が NEO の費用欄に無い'))
+                    continue
+                def _ok_name(got: str) -> bool:
+                    # 生成器は「行の名前が費用名で始まる」ときだけ既定行・雛形行に寄せる（'写真代' → 行 7 '写真代他'）。
+                    # その向きは意図どおりなので差にしない。逆向き（別の名前に化けた）は要確認
+                    import unicodedata as _u
+                    a_ = _u.normalize('NFKC', hw(got or '')).strip().replace(' ', '')
+                    b_ = _u.normalize('NFKC', want).replace(' ', '')
+                    return a_ == b_ or a_.startswith(b_)
+                if want and not any(_ok_name(str(r.get('Name') or '')) for r in hit):
+                    got = ' / '.join(sorted({str(r.get('Name') or '').strip() for r in hit}))
+                    soft.append(_e('要確認', '費用名が変わった', f'費用名: 意図「{want}」/ NEO「{got}」（見積書に刷られるのは NEO の名前）'))
+        # 内板骨格（Frame）: 行が落ちると明細が 1 行足りない見積書になる（金額に出ない。基本内の行は工賃を持たない）
+        if _has(em, 'Frame'):
+            fr_items = [x for x in ((est.get('frame') or {}).get('items') or [])]
+            fr_rows = [dict(r) for r in em.execute('SELECT PartsCode, DamageRank, WageOutTax FROM Frame')]
+            if len(fr_rows) != len(fr_items):
+                hard.append(_e('要確認', '意図との食い違い', f'内板骨格の行: 意図 {len(fr_items)} 行 / NEO {len(fr_rows)} 行'))
+            else:
+                got_codes = {str(r.get('PartsCode') or '').strip() for r in fr_rows}
+                want_codes = {str(x.get('code') or '').strip() for x in fr_items}
+                if got_codes != want_codes:
+                    hard.append(_e('要確認', '意図との食い違い', f'内板骨格の部位コード: 意図 {sorted(want_codes)} / NEO {sorted(got_codes)}'))
+                for x in fr_items:
+                    if str(x.get('rank', '')).strip() in ('基本内', '基本'):
+                        r = next((r for r in fr_rows if str(r.get('PartsCode') or '').strip() == str(x.get('code') or '').strip()), None)
+                        if r and (_int(r.get('DamageRank')) != 1 or _int(r.get('WageOutTax')) not in (-1, 0)):
+                            hard.append(_e('要確認', '意図との食い違い', f"内板骨格 {x.get('code')}「基本内」が NEO でランク {r.get('DamageRank')} / 工賃 {r.get('WageOutTax')}"))
         cust = est.get('customer') or {}
         ins = est.get('insurance') or {}
         c_row = dict(iff.execute('SELECT * FROM Customer').fetchone() or {}) if _has(iff, 'Customer') else {}

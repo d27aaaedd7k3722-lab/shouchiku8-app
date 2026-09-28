@@ -121,6 +121,38 @@ def test_intent_check_finds_hard_and_soft_differences():
 
 
 
+def test_intent_check_finds_expense_name_and_frame_row():
+    """2026-09-28 シエンタ: 合計が合っていても (1) 費用名がコグニの既定名に化ける (2) 骨格の行が落ちる
+    (3) 見積書の名称（neo_name）が ADDATA の名称になる —— のどれも検算では捕まらなかった。
+    意図との突き合わせがこの 3 つを見ることを固定する"""
+    if not _addata_ok():
+        print('   skip test_intent_check_finds_expense_name_and_frame_row（この PC の ADDATA で J87 が引けない）')
+        return
+    rd = _reading([{'code': '0100', 'name': 'Fﾊﾞﾝﾊﾟ ﾋﾝｼﾞ取付け部', 'method': '脱着', 'qty': 1, 'wage': 8000,
+                    'neo_name': 'Fﾊﾞﾝﾊﾟ ﾋﾝｼﾞ取付け部'}],
+                  expenses=[{'name': '配線修理', 'amount': 4000, 'in': '作業計'}],
+                  frame={'basic': True, 'basic_index': 3.5, 'basic_wage': 28000,
+                         'items': [{'code': '1372', 'name': 'ﾗｼﾞｴｰﾀｻﾎﾟｰﾄ', 'rank': 'A'},
+                                   {'code': '1374', 'name': '左ﾌﾛﾝﾄﾌｪﾝﾀﾞｴﾌﾟﾛﾝ', 'rank': '基本内'}]})
+    e = de.Drafter(rd).build()
+    neo = _build(e)
+    try:
+        r = ic.check(e, neo)
+        assert not r['hard'], r['hard']          # 見積書どおりに作れていれば差 0
+        assert not [x for x in r['soft'] if '費用名' in x['text']], r['soft']
+        # (1) 費用名が化けたら soft で出る
+        e1 = copy.deepcopy(e); e1['expenses'][0]['name'] = '配線・配管費用'
+        assert any('費用名' in x['text'] for x in ic.check(e1, neo)['soft']), ic.check(e1, neo)['soft']
+        # (2) 骨格の行が落ちたら hard で出る
+        e2 = copy.deepcopy(e); e2['frame']['items'].append({'code': '1396', 'name': 'ﾘﾔﾌﾛｱｸﾛｽﾒﾝﾊﾞ', 'rank': '基本内'})
+        assert any('内板骨格の行' in x['text'] for x in ic.check(e2, neo)['hard']), ic.check(e2, neo)['hard']
+        # (3) 見積書の名称（neo_name）と NEO の名称が違えば soft で出る
+        e3 = copy.deepcopy(e); e3['items'][0]['neo_name'] = 'Fﾊﾞﾝﾊﾟ 別の名前'
+        assert any('名称' in x['text'] for x in ic.check(e3, neo)['soft']), ic.check(e3, neo)['soft']
+    finally:
+        os.unlink(neo)
+
+
 def test_intent_check_with_recycle_rows():
     """リサイクル部品に置き換えた行は生成器が末尾へ動かす。それ以外の行は並び順で突き合わせ、取り違えは hard で見つける"""
     est = {'source': 't', 'est_date': '20260913', 'vehicle': dict(VEH), 'customer': {}, 'insurance': {}, 'labor_rate': 8000, 'paint': {}, 'expenses': [], 'totals': {},

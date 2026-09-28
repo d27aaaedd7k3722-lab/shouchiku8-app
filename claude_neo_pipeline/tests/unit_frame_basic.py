@@ -71,5 +71,17 @@ n1 = len(build(nb, FR, items=IT, name='3')[2]['stats']['renamed'])
 n2 = len(build(nb, FR, items=IT, name='4')[2]['stats']['renamed'])
 chk(n1 == 1 and n2 == 1, f'名称の控えが積み上がっている: 1 回目 {n1} / 2 回目 {n2}')
 
+print('-- 品番欄の文字（見積書の印字どおり。手入力行は空）--')
+PN_IT = [{'code': '0100', 'name': 'Fﾊﾞﾝﾊﾟ', 'method': '脱着', 'qty': 1, 'wage': 8000, 'parts_no': '再封印'},
+         {'name': '左Frﾌｪﾝﾀﾞｰ', 'method': '取替', 'qty': 1, 'parts_no': '新品', 'manual': True, 'price': 0, 'wage': 5000}]
+rows5, _t5, rep5 = build(nb, {}, items=PN_IT, name='5')
+er = rep5['rows']
+_coded = [r for r in er if str(r.get('PartsCode') or '').strip()]
+_manual = [r for r in er if not str(r.get('PartsCode') or '').strip()]
+chk(_coded and str(_coded[0].get('PartsNo') or '') == '再封印',
+    f"部品コードのある行の品番欄に見積書の文字が入っていない: {[r.get('PartsNo') for r in _coded]}")
+chk(_manual and not str(_manual[0].get('PartsNo') or '').strip(),
+    f"手入力行の品番欄が空でない（実機 R1 = 実案件オデッセイは空）: {[r.get('PartsNo') for r in _manual]}")
+
 print('unit_frame_basic:', 'all ok' if ok else 'NG')
 sys.exit(0 if ok else 1)

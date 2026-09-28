@@ -2739,6 +2739,7 @@ class NeoBuilder:
             name_disp = display_name(std_name) if std_name else hw(re.sub(r'(?<=[ｦ-ﾟ])S$', 'ｽ', it.get('name', '')))  # 半角カナの末尾の 'S' だけ 'ｽ' に（OCR の読み違い）。英字の品名 'SPL. S' は直さない（2026-09-13 ベンツ）
             if it.get('name') and ('左' in it['name'] or '右' in it['name']) and name_disp and name_disp[0] not in '左右':
                 name_disp = ('左' if '左' in it['name'] else '右') + name_disp
+            _pn_in = re.sub(r'\s*\(\d+\)\s*$', '', str(it.get('parts_no') or '')).strip()   # 見積書の品番欄（数量の '(2)' は落とす）。品番でない文字もそのまま持つ
             is_sub = pprice > 0 and wage == 0 and dcode == 0 and ref is not None  # 手入力行（部品コード無し）には付属部品の 2 スペース接頭辞を付けない（コグニ実機 2026-09-08）
             no_price_part = dcode == 0 and std_pn.strip() == '-' and pprice <= 0 and not it.get('reserve')  # 価格なし部品（11.DB 品番 '-'）の取替で部品代 0/空欄: PartsPrice 0・PartsNo '-'（合計は変わらない）
             std_pn_raw = next((r.get('pn_raw') for r in (parts._load_11_raw().get(ref, []) if ref is not None else []) if r.get('pn') == '-'), std_pn) if std_pn.strip() == '-' else std_pn
@@ -2821,7 +2822,12 @@ class NeoBuilder:
                 'CommentFlag': 1 if it.get('comment') else 0, 'Comment1': _fit(it.get('comment', ''), 40),  # TEXT(40): コグニ保存時に 40 バイトで切詰（N-ONE 案件で確認）
                 '_recycle': it.get('recycle'), '_reserve': _flag(it.get('reserve'), 'items[].reserve'),
                 '_price_in': it.get('price_in'), '_wage_in': it.get('wage_in'),  # 税込で印字された見積書の印字額（内税。_tax_of_in を見よ）
-                'PartsNo': ((cp['pn'] if cp else (re.sub(r'\s*\(\d+\)\s*$', '', it.get('parts_no', '') or '') or (std_pn if dcode == 0 else ''))) if (pprice > 0 or it.get('reserve')) else (std_pn_raw if no_price_part else '')),  # 品番欄が無い取替行はコグニが標準品番を入れる（FRAME_p7。'-' 部品は生値 '     -'）
+                # 品番欄: 部品代のある取替行はコグニが標準品番を入れる（FRAME_p7。'-' 部品は生値 '     -'）。
+                # 部品代の無い行でも、見積書の品番欄に**文字**（'再封印'・'参考価格'・'塗装費用に含む'）が刷られていれば
+                # コグニはそれをそのまま持つ（実案件 NEO 400 本で 59 行・25 種類。2026-09-28 シエンタ 3800）。
+                # ただし**手入力行（部品コード無し）の品番欄は空**（実機 R1 = 実案件オデッセイ: 見積書の '新品'・'板金' は NEO に入っていない）
+                'PartsNo': ((cp['pn'] if cp else (_pn_in or (std_pn if dcode == 0 else ''))) if (pprice > 0 or it.get('reserve'))
+                            else (std_pn_raw if no_price_part else (_fit(_pn_in, 17) if (_pn_in and not _real_pn(_pn_in) and ref is not None and not it.get('manual')) else ''))),
                 'PartsNoStandard': (std_pn_raw if std_pn.strip() == '-' else std_pn),  # '-' 部品は 11.DB 生値の右トリム（J52 '     -'、D88 '-'。他工場 NEO・FRAME_p7 1511）
                 '_sub_prefix': ((pn_disp is None or bool(_nm_neo_row)) and is_sub),   # neo_name で書いた行の 2 スペースも生成器が付けたもの（工賃付きになったら外す）
                 'PartsPriceOutTax': pprice if pprice > 0 else (0 if no_price_part else -1),  # 価格なし部品（11.DB 品番 '-'）の取替で価格未指定: コグニは 0（FRAME_p7 1511）
