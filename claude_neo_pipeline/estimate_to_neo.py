@@ -231,6 +231,18 @@ def paint_code_of(pd: dict) -> int:
 
 
 COAT_NAMES = {1: 'ソリッド', 2: 'メタリック', 3: '２コートパール', 4: '３コートパール'}
+
+
+def _explicit_zero(v) -> bool:
+    """見積書に 0 と書いてある（未指定の None・空欄とは別）。材料計 0・材料代割合 0 の見積（2026-09-29 nc05）"""
+    if v is None or isinstance(v, bool) or str(v).strip() == '':
+        return False
+    try:
+        # _money() と同じく '0円' '¥0' '０' も 0 とみる（Codex 指摘 2026-09-29。材料代割合は数値で書く）
+        t = unicodedata.normalize('NFKC', str(v)).replace(',', '').replace('¥', '').replace('円', '').strip()
+        return float(t) == 0
+    except ValueError:
+        return False
 HF_NAMES_TS = {2: '耐スリ傷', 3: 'ｽｸﾗｯﾁ'}
 
 
@@ -2651,6 +2663,12 @@ class NeoBuilder:
                 # 揃えるなら照合ごと手入力にする必要がある（影響が大きいので保留。HANDOFF に記録）
                 dcode = 0
             disp_name = _m if (_m in ('取替', '脱着', '修理', '脱着修理', '脱着板金', '点検', '調整', '点検調整', '分解調整', '分解', '板金') and DISPOSAL.get(_m, dcode) == dcode) else DISPOSAL_NAME.get(dcode, method)  # W/S の名称をそのまま（NEW2: 脱着板金/脱着修理、点検/調整）。別名（部品・交換・取付 等）は既定名
+            if (not free_method and it.get('manual') and method and _m in DISPOSAL
+                    and _m not in ('取替', '脱着', '修理', '脱着修理', '脱着板金', '点検', '調整', '点検調整', '分解調整', '分解', '板金')
+                    and not str(it.get('code') or '').strip() and not str(it.get('parts_no') or '').strip() and not it.get('index')):
+                # 手入力の作業行で、区分がコグニの区分の別名（'組立' → 脱着 など）: 印字の語のまま写す（区分コード -1）。
+                # 既定名に替えると見積書と違う語で刷られた（2026-09-29 コグニ以外の書式 nc14 '足場設置 組立' → 脱着）
+                free_method = _fit(hw(_m), 8)
             if free_method:   # コグニに無い修理方法（再封印 など）は手入力の作業行として印字の語を写す
                 dcode = -1; disp_name = free_method
             if it.get('manual') and not _m.strip():  # 修理方法が空欄の手入力行（塗装費用・産廃・材料代を明細に手入力する工場）: コグニ実機 2026-09-08 exp_manual.neo = DisposalCode -1・名称欄空
@@ -3450,7 +3468,7 @@ class NeoBuilder:
                         'MaterialRateType=1, MaterialRate=?, CalculateLevel_Panel=1, CalculateLevel_Base=1, CalculateLevel_Bumper=1',
                         (paint_c, paint_name, hf, HF_NAME.get(hf, 'しない'), 1 if booth_on else 0, bt if booth_on else -1, bt_std if booth_on else -1,
                          *(t3(bw) if booth_on else (-1, -1, -1)), *(t3(bw_std) if booth_on else (-1, -1, -1)), ('*' if (bw and bw != bw_std) else ''),
-                         *_base_vals, float(pd.get('material_rate') or default_material_rate(paint_c, coat_c, hf) or 26)))
+                         *_base_vals, (0.0 if _explicit_zero(pd.get('material_rate')) else float(pd.get('material_rate') or default_material_rate(paint_c, coat_c, hf) or 26))))
             bumper_w = 0; bumper_t = 0.0; bumper_ws = {'fb': 0, 'rb': 0}
             # バンパ部品（0010 / 3810）の明細行が暫定指数 '$'（標準工賃のまま）なら、バンパ塗装の工賃印も '$'（実機 2026-09-12 w66d_real: 0010 '$' → fb_WageByManual '$'、バンパ加算基礎も '$'。
             # cogni_R2: 0010 は Provisional '$' でも工賃手入力 '#' → fb は ''）。1 例からの推定
@@ -3624,7 +3642,12 @@ class NeoBuilder:
             # （実機 2026-09-20 cogni_pnt_A10: 明細 1,096,000 / 見積 1,304,000 と出たが、差 208,000 は 内板骨格 184,000 + シーリング 24,000）
             self._paint_wage_cmp = (wage_total_p, int(paint_total or 0))
             mr = float(pd.get('material_rate') or default_material_rate(paint_c, coat_c, hf) or 26)
-            if not paint_material:
+            _mat0 = _explicit_zero(pd.get('material')) or _explicit_zero(pd.get('material_rate'))   # 材料計 0 か 材料代割合 0（Codex 指摘: 割合 0 だけの見積も手入力 0）
+            if _mat0:
+                # 見積書の材料計が 0（工場が材料代を手入力 0 にした）: 既定の割合で材料代を足さない（2026-09-29 nc05: 0 を未指定とみて +11,033 円）
+                paint_material = 0
+                mr = 0.0 if not pd.get('material_rate') else mr   # 割合の印字が無い・0 なら 0（割合があればそのまま）
+            elif not paint_material:
                 paint_material = material_default(wage_total_p, mr, pd.get('material_round'))
                 mat_auto_rate = mr
                 if pd.get('material_rate') in (None, ''):  # 見積に材料代も割合も無い → 既定の割合で計算した（どの表の値かを残す）
@@ -3640,7 +3663,7 @@ class NeoBuilder:
                         'MaterialTotalOutTax=?,MaterialTotalInTax=?,MaterialTotalTax=?, MaterialTotalbyManual=?, TotalOutTax=?,TotalInTax=?,TotalTax=?',
                         (round(panel_time, 1), round(bumper_t, 1), round(etc_t, 1), round(panel_time + bumper_t + etc_t + other_t - bt, 1),  # ブース指数は指数計に含めない（コグニ保存版で確認）
                          *t3(panel_wage), *t3(bumper_w), *t3(etc_w), *t3(wage_total_p),
-                         paint_material, mt_in, mt_tax, ('*' if pd.get('material') else ''), pt_all, pt_in, pt_tax))
+                         paint_material, mt_in, mt_tax, ('*' if (pd.get('material') or _mat0) else ''), pt_all, pt_in, pt_tax))
             self._paint_notes = notes
             for n_ in notes:
                 print('塗装:', n_)
@@ -3662,6 +3685,12 @@ class NeoBuilder:
             self._paint_notes = _n0   # この見積の分で置き換える（NeoBuilder を使い回したとき前の案件の注記が残らないように。Codex 指摘）
             for _x in _n0:
                 print('塗装:', _x)
+            if _pdx0.get('paint') or _pdx0.get('hf'):
+                # 塗装が一式・実額でも、見積書の塗料・高機能塗装はコグニの塗装条件に書く（書かないと 2K・しない の既定のまま刷られる。
+                # 2026-09-29 コグニ以外の書式 nc06 の「水性・耐スリ傷」）。金額には効かない
+                _pc0 = paint_code_of(_pdx0)
+                cur.execute('UPDATE PaintingPlan SET Paint=?, PaintName=?, HFPainting=?, HFPaintingName=?',
+                            (_pc0, {1: '速乾', 3: '２Ｋ', 4: '水性'}.get(_pc0, '２Ｋ'), _hf0, HF_NAME.get(_hf0, 'しない')))
             _adds = [k for k in PAINT_DETAIL_KEYS + ('frame', 'sealing', 'other') if _pdx0.get(k)]
             _jitsu = (_truthy(_pdx0.get('actual')) or unicodedata.normalize('NFKC', str(_pdx0.get('input_type') or '')).strip() == '実額') and not _adds
             if _jitsu:
@@ -3816,9 +3845,11 @@ class NeoBuilder:
                 _m = (f'材料代の単価 {_mu:,} 円・係数 {_mc:g} は、塗装明細の無い見積（{_itype_now or "一括計上"}）では使わない'
                       '（コグニの塗装条件を持たないので、材料代は見積書の額のまま）')
             elif _calc and _calc == _mat_now:
-                cur.execute('UPDATE PaintingPlan SET MaterialUnitFlag=1, MaterialUnit=?, MaterialCoefficient=?', (_mu, _mc))
-                cur.execute("UPDATE PaintingTotal SET MaterialTotalbyManual=''")   # 計算で出る額なので手入力の印は付けない
-                _m = f'材料代 {_mat_now:,} 円 = 塗装指数計 {_tt:g} × 単価 {_mu:,} 円 × 係数 {_mc:g} × 割合 {_mr:g}%（単価方式。手入力の印は付けない）'
+                # コグニは単価方式のフラグを保持しない（2026-09-29 実機: 開いた時点で MaterialUnitFlag / MaterialUnit / MaterialCoefficient を 0 にし、
+                # 材料代を手入力（*）にして「保存しますか」を出す）。コグニが保存する形（フラグなし・手入力 *）で書く。額は同じ
+                cur.execute("UPDATE PaintingTotal SET MaterialTotalbyManual='*'")
+                _m = (f'材料代 {_mat_now:,} 円 = 塗装指数計 {_tt:g} × 単価 {_mu:,} 円 × 係数 {_mc:g} × 割合 {_mr:g}%（見積書の計算と一致）。'
+                      'コグニは単価方式を保持しないので、額を手入力（*）で書いた')
             else:
                 # 計算と 1 円でも違うなら単価方式にしない（フラグを書くとコグニが開いたときに再計算して額が変わる）
                 if (pdx or {}).get('material'):   # 見積書に材料代の印字がある行だけ手入力（*）。割合で自動計算した額には印を付けない

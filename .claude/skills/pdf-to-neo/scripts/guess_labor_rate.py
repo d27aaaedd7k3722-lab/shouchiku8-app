@@ -24,23 +24,24 @@ def rounded(value: float, unit: int) -> int:
     return int((value / unit) + 0.5) * unit
 
 
-def index_for(wage: int, rate: int, unit: int, max_index: float) -> float:
-    """その技術料を説明できる 0.1 刻みの指数。無ければ 0.0"""
-    n = int(round(max_index * 10))
+def index_for(wage: int, rate: int, unit: int, max_index: float, istep: float = 0.1) -> float:
+    """その技術料を説明できる istep 刻み（既定 0.1。トヨタ系の 0.25 は 0.05）の指数。無ければ 0.0"""
+    per = int(round(1 / istep))
+    n = int(round(max_index * per))
     for k in range(1, n + 1):
-        if rounded(rate * k / 10.0, unit) == wage:
-            return k / 10.0
+        if rounded(rate * k / per, unit) == wage:
+            return k / per
     return 0.0
 
 
 def guess(wages: list[int], unit: int = 10, lo: int = 5000, hi: int = 20000,
-          step: int = 10, max_index: float = 20.0) -> list[tuple[int, dict]]:
+          step: int = 10, max_index: float = 20.0, istep: float = 0.1) -> list[tuple[int, dict]]:
     """全部の技術料を説明できるレートを（レート, {技術料: 指数}）で返す"""
     out = []
     for rate in range(lo, hi + 1, step):
         got = {}
         for w in wages:
-            i = index_for(w, rate, unit, max_index)
+            i = index_for(w, rate, unit, max_index, istep)
             if not i:
                 got = {}
                 break

@@ -37,7 +37,7 @@ flag = skill_env.flag  # 人が書いた真偽値欄の厳密な読み取り（�
 sys.path.insert(0, os.path.join(FILES, 'claude_neo_pipeline'))
 
 from estimate_to_neo import (AddataParts, NeoBuilder, BUMPER_DISPOSAL, BUMPER_DRAFT_ADD, COAT_CODES, DISPOSAL, HF_CODE,  # noqa: E402
-                             _xor_lines_ref, bankin_time, default_material_rate, is_bumper_only_paint, material_default, material_round_of, r10, r10_even, wage_unit)
+                             _explicit_zero, _money, _xor_lines_ref, bankin_time, default_material_rate, is_bumper_only_paint, material_default, material_round_of, r10, r10_even, wage_unit)
 from paint_index import PaintIndex  # noqa: E402
 
 
@@ -595,8 +595,11 @@ def _totals(est: dict, warn: list[str], rep: dict, form_x: str = '', labor: int 
     else:  # 一括計上（total）または wage 無しのパネルがあって total を信じるとき: 追加項目は total の外（生成器は一括の塗装費用に追加項目を足す）
         mat_base_t = paint_base_from_total(p)
         paint_w = mat_base_t + other_t
-    if int(p.get('material') or 0):
-        material = int(p['material'])
+    _mat0 = _explicit_zero(p.get('material')) or _explicit_zero(p.get('material_rate'))   # 生成器と同じ判定（'0円' も 0）
+    if _money(p.get('material'), 'paint.material'):
+        material = _money(p['material'], 'paint.material')
+    elif _mat0:   # 見積書の材料計が 0（生成器も既定の割合で足さない。2026-09-29 nc05）
+        material = 0
     elif detailed:  # 生成器: 詳細塗装で material が 0/未指定なら material_rate → AnUsrTblPnt の既定率 → 26% で自動計算
         cc = coat_c if coat_c in (1, 2, 3, 4) else (_coat_code(p.get('coat', '')) or 2)
         mr = float(p.get('material_rate') or default_material_rate(_paint_code(p.get('paint', '２Ｋ')), cc, _hf_code(p.get('hf', 'しない'))) or 26)

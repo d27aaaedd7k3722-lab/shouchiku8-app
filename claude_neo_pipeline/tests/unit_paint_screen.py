@@ -331,8 +331,9 @@ def main() -> int:
     _unit = 9500
     _want = material_default(_tt * _unit * 1.3, _mr, None)
     _pl1, _pt1 = _mat_case({'material_unit': _unit, 'material_coefficient': 1.3}, material=_want)
-    fails = _cmp('単価方式: 計算と一致したらフラグを立てる', (_pl1['MaterialUnitFlag'], _pl1['MaterialUnit'], round(float(_pl1['MaterialCoefficient']), 2)), (1, _unit, 1.3), fails)
-    fails = _cmp('単価方式: 一致したら材料代の手入力の印を外す', (_pt1['MaterialTotalbyManual'], _pt1['MaterialTotalOutTax']), ('', _want), fails)
+    # コグニは単価方式のフラグを保持しない（2026-09-29 実機: 開くと 0 に戻して材料代を手入力 * にする）→ フラグは立てず、額を手入力（*）で
+    fails = _cmp('単価方式: 計算と一致してもフラグは立てない（コグニが保持しない）', _pl1['MaterialUnitFlag'], 0, fails)
+    fails = _cmp('単価方式: 一致した額を手入力（*）で書く', (_pt1['MaterialTotalbyManual'], _pt1['MaterialTotalOutTax']), ('*', _want), fails)
     _pl2, _pt2 = _mat_case({'material_unit': _unit, 'material_coefficient': 1.3}, material=_want + 100)
     fails = _cmp('単価方式: 計算と違えばフラグを立てない', _pl2['MaterialUnitFlag'], 0, fails)
     fails = _cmp('単価方式: 計算と違えば手入力（*）で残す', (_pt2['MaterialTotalbyManual'], _pt2['MaterialTotalOutTax']), ('*', _want + 100), fails)
@@ -347,11 +348,18 @@ def main() -> int:
     # 係数 1.15 が 1.14 に落ちない（float の丸め）。計算どおりの額ならフラグが立つ
     _w115 = material_default(_tt * _unit * 1.15, _mr, None)
     _pl5, _pt5 = _mat_case({'material_unit': _unit, 'material_coefficient': 1.15}, material=_w115)
-    fails = _cmp('単価方式: 係数 1.15 を切り捨てない', (_pl5['MaterialUnitFlag'], round(float(_pl5['MaterialCoefficient'] or 0), 2)), (1, 1.15), fails)
+    fails = _cmp('単価方式: 係数 1.15 でも計算が合えば額を手入力（*）で書く（フラグは立てない）', (_pl5['MaterialUnitFlag'], _pt5['MaterialTotalbyManual'], _pt5['MaterialTotalOutTax']), (0, '*', _w115), fails)
     # 見積書に材料代の印字が無い行には手入力（*）を付けない
     _pl6, _pt6 = _mat_case({'material_unit': _unit, 'material_coefficient': 9.9})   # わざと合わない係数
     fails = _cmp('単価方式: 印字の無い材料代に手入力の印を付けない', (_pl6['MaterialUnitFlag'], _pt6['MaterialTotalbyManual']), (0, ''), fails)
 
+    # 材料計 0・材料代割合 0 の見積（2026-09-29 nc05）: 既定の割合で材料代を足さない。割合 0 だけでも同じ（Codex 指摘）
+    _pl7, _pt7 = _mat_case({}, material=0)
+    fails = _cmp('材料計 0: 材料代 0・手入力（*）', (_pt7['MaterialTotalOutTax'], _pt7['MaterialTotalbyManual']), (0, '*'), fails)
+    _pl8, _pt8 = _mat_case({'material_rate': 0})
+    fails = _cmp('材料代割合 0: 材料代 0・割合 0', (_pt8['MaterialTotalOutTax'], float(_pl8['MaterialRate'] or 0)), (0, 0.0), fails)
+    _pl9, _pt9 = _mat_case({}, material='0円')   # _money() が受ける書き方の 0 も同じ（Codex 指摘）
+    fails = _cmp("材料計 '0円': 材料代 0・手入力（*）", (_pt9['MaterialTotalOutTax'], _pt9['MaterialTotalbyManual']), (0, '*'), fails)
     print('unit_paint_screen:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
 

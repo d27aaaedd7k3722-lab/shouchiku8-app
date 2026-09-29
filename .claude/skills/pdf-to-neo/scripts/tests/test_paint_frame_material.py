@@ -94,6 +94,29 @@ def test_material_mode():
     assert de.material_mode(263640, 65065) is None
 
 
+def test_other_software_paint_words():
+    """他システムの見積の塗装行の飾り（2026-09-29 コグニ以外の書式 17 件）: '新品 2P 塗装' '取替 単体' '取替 複数' '補修塗装' を外し、
+    区分の無い '1/1' は修理 1/1。指数も工賃も無い一覧の行（bare_ratio=False）は修理と読まない"""
+    cases = [
+        ('ﾊﾞｯｸﾄﾞｱ 新品 2P 塗装', 'ﾊﾞｯｸﾄﾞｱ 新品'),
+        ('左 ﾌﾛﾝﾄﾄﾞｱﾊﾟﾈﾙ 取替 単体', '左 ﾌﾛﾝﾄﾄﾞｱﾊﾟﾈﾙ 取替'),
+        ('ﾘﾔﾌｪﾝﾀﾞｰ 取替 複数', 'ﾘﾔﾌｪﾝﾀﾞｰ 取替'),
+        ('右 ﾘﾔﾌｪﾝﾀﾞｰ 1/1 2P 塗装', '右 ﾘﾔﾌｪﾝﾀﾞｰ 修理 1/1'),
+        ('Rrﾊﾟﾈﾙ修理20d㎡(1/2)', 'Rrﾊﾟﾈﾙ修理1/2'),
+    ]
+    bad = [(s, de._clean_panel_line(s), want) for s, want in cases if de._clean_panel_line(s) != want]
+    assert not bad, bad
+    assert de._clean_panel_line('Rﾊﾟﾈﾙ(1/3)', bare_ratio=False) == 'Rﾊﾟﾈﾙ1/3', de._clean_panel_line('Rﾊﾟﾈﾙ(1/3)', bare_ratio=False)
+
+
+def test_front_rear_and_area_words():
+    """'ｱｳﾀﾘﾔﾋﾞｭｰﾐﾗｰ'（ドアミラー）は後ろの部品ではない。名前の '(2000)' は面積ではない（2026-09-29）"""
+    assert de._fr_of('LH ｱｳﾀﾘﾔﾋﾞｭｰﾐﾗｰASSY') == '', de._fr_of('LH ｱｳﾀﾘﾔﾋﾞｭｰﾐﾗｰASSY')
+    assert de._fr_of('右 ﾘﾔﾊﾞﾝﾊﾟ') == 'R' and de._fr_of('ﾌﾛﾝﾄﾊﾞﾝﾊﾟ') == 'F'
+    assert de._clean_name('Rrｴﾝﾌﾞﾚﾑ(2000)') == 'Rrｴﾝﾌﾞﾚﾑ(2000)', de._clean_name('Rrｴﾝﾌﾞﾚﾑ(2000)')
+    assert de._clean_name('RH ﾌﾛﾝﾄﾌｪﾝﾀﾞ (5dm²)') == '右ﾌﾛﾝﾄﾌｪﾝﾀﾞ', de._clean_name('RH ﾌﾛﾝﾄﾌｪﾝﾀﾞ (5dm²)')
+
+
 def main() -> int:
     fails = 0
     for name, fn in sorted(globals().items()):

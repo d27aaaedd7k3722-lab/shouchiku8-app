@@ -90,7 +90,11 @@ def parse_report(text: str) -> dict:
     for i, ln in enumerate(lines):
         k = nfkc(ln).replace(' ', '').replace('　', '')
         if k in keys and keys[k] not in out:
-            out[keys[k]] = lines[i + 1].strip() if i + 1 < len(lines) else ''
+            val = lines[i + 1].strip() if i + 1 < len(lines) else ''
+            nxt = nfkc(lines[i + 2]).strip() if i + 2 < len(lines) else ''
+            if keys[k] == '登録番号' and re.fullmatch(r'[ぁ-んア-ン]\s*[\d・\-]{1,5}', nxt) and nfkc(nxt).replace(' ', '') not in keys:
+                val = f'{val} {nxt}'   # 文字層で改行された登録番号（'品川 300' / 'あ 1234' のように 2 行に割れる。2026-09-29 nc12 で 2 行目が落ちた）
+            out[keys[k]] = re.sub(r'[\x00-\x1f\x7f]', '', val).strip()   # NUL などの制御文字（確報のグレード名に混ざっていた。nc19）
     return out
 
 
@@ -127,7 +131,7 @@ def strip_emission(model: str) -> str:
 def build(fields: dict, case_name: str) -> dict:
     """報告書の項目 → header の差分（{'vehicle': {...}, 'customer': {...}, 'insurance': {...}, 'hints': {...}}）"""
     v, c, ins, h = {}, {}, {}, {}
-    if fields.get('型式'):
+    if fields.get('型式') and not re.fullmatch(r'[\s*＊※\-－]*', nfkc(fields['型式'])):   # '＊＊＊'（型式の記載なし）は写さない（nc03。見積書の型式を人が写す）
         v['model_code'] = strip_emission(fields['型式'])
     if fields.get('車台No.'):
         v['serial_no'] = nfkc(fields['車台No.']).strip().upper().replace(' ', '')

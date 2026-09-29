@@ -91,12 +91,18 @@ def _nfkc(s) -> str:
     return unicodedata.normalize('NFKC', str(s or ''))
 
 
-def _clean_panel_line(n: str) -> str:
+def _clean_panel_line(n: str, bare_ratio: bool = True) -> str:
     """コグニ印刷の塗装明細の書き方（'Rrﾊﾟﾈﾙ修理20d㎡(1/2)' — NFKC 後は ㎡ が m2）を「名前 修理 1/2」の形に寄せる。
     面積（塗装面積 dm²。20.DB のパネル面積とは別物なので捨てる）と括弧付きの比率を外す（2026-09-14）"""
     s = re.sub(r'[（(]\s*(1/[123])\s*[）)]', r'\1', n)                 # (1/2) → 1/2
     s = re.sub(r'[0-9]+(?:\.[0-9]+)?\s*d?m[2²]', '', s)                 # 20d㎡ / 121dm² / 20dm2
     s = re.sub(r'[0-9]+(?:\.[0-9]+)?\s*d㎡', '', s)
+    # 他システムの見積の塗装行の飾り（2026-09-29 コグニ以外の書式 17 件）: 'ﾊﾞｯｸﾄﾞｱ 新品 2P 塗装'（2P = 2 コートパール）・
+    # '左 ﾌﾛﾝﾄﾄﾞｱﾊﾟﾈﾙ 取替 単体' / '取替 複数'（単体塗り / 複数パネル）・'… 補修塗装'。付いたままだと 20.DB のパネルに当たらず塗装が一括計上に落ちた
+    s = re.sub(r'(\s*(単体|複数|[23]\s*[PＰ](?:\s*塗装)?|補修塗装|塗装))+\s*$', '', s).strip()
+    m = re.match(r'^(.*?)\s*(1/[123])$', s)
+    if bare_ratio and m and not re.search(r'(取替|新品|交換|修正|修理)\s*$', m.group(1)):
+        s = f'{m.group(1).strip()} 修理 {m.group(2)}'   # 区分の語が無く比率だけ（'右 ﾘﾔﾌｪﾝﾀﾞｰ 1/1'）= 修理（取替に比率は付かない）
     return s.strip()
 
 
@@ -177,6 +183,7 @@ def _fr_of(name: str) -> str:
     先頭の左右記号（RH / LH / 右 / 左）は前後ではないので先に外す。単独の 'R'（Rﾄﾞｱ）は右かリヤか決められないので '' """
     t = _nfkc(_hw_kana(name)).strip()
     t = re.sub(r'^(RH|LH|R/H|L/H|右|左)[\s.]*', '', t)
+    t = re.sub(r'(ﾘﾔ|ﾘｱ|リヤ|リア)[\s]*(ﾋﾞｭ|ﾋﾞﾕ|ビュ|ビユ)', '', t)   # ｱｳﾀﾘﾔﾋﾞｭｰﾐﾗｰ（ドアミラー）は後ろの部品ではない（前後食い違いの誤報。2026-09-29）
     if re.search(r'ﾌﾛﾝﾄ|フロント|前', t) or re.match(r'^[LR]?F(?![A-Za-z])', t) or re.match(r'^[LR]?Fr(?![a-z])', t):
         return 'F'
     if re.search(r'ﾘﾔ|ﾘｱ|リヤ|リア|後', t) or re.match(r'^[LR]?Rr(?![a-z])', t) or re.match(r'^[LR]R(?![A-Za-z])', t):
@@ -208,7 +215,7 @@ def _clean_name(name: str) -> str:
     t = _hw_kana(name).strip()
     t = re.sub(r'^(RH|R/H|R(?![a-z])[.\s/])\s*', '右', t)
     t = re.sub(r'^(LH|L/H|L(?![a-z])[.\s/])\s*', '左', t)
-    t = re.sub(r'\(\s*[\d.]+\s*d?m?[²2]?\s*\)', '', t)
+    t = re.sub(r'\(\s*\d{1,3}(?:\.\d+)?\s*d?m?[²2]?\s*\)', '', t)   # 面積は 3 桁まで（'ｴﾝﾌﾞﾚﾑ(2000)' の排気量・型式は名前の一部。2026-09-29 nc08）
     return t.strip()
 
 
@@ -224,7 +231,7 @@ def _area_of(name: str, row: dict) -> Optional[int]:
             return _round_half_up(float(row['area']))
         except (TypeError, ValueError):
             return None
-    m = re.search(r'\(\s*([\d.]+)\s*d?m?[²2]?\s*\)', _nfkc(name))
+    m = re.search(r'\(\s*(\d{1,3}(?:\.\d+)?)\s*d?m?[²2]?\s*\)', _nfkc(name))
     return _round_half_up(float(m.group(1))) if m else None
 
 
@@ -747,6 +754,99 @@ class Drafter:
     QTY_FROM_PRICE_MAX = 99   # 数量として読み替える上限（これより多い倍数は偶然の一致とみなす）
     QTY_FROM_PRICE_UNIT_MAX = 3000  # 数量を自動で読み替えるのは標準単価がこれ以下の小物だけ（それより高い部品の倍数一致は 要確認 に挙げるだけ。Codex 指摘）
 
+    # 部品名の言い換え（工場のソフトの名前 ↔ ADDATA の名前）。本体の候補を探すときの芯の語に足す（2026-09-29 コグニ以外の書式 nc04・nc17）
+    CORE_SYNONYMS = (('ｺﾝﾋﾞﾈｰｼｮﾝﾗﾝﾌﾟ', 'ﾃｰﾙﾗﾝﾌﾟ'), ('ﾃｰﾙﾗﾝﾌﾟ', 'ｺﾝﾋﾞﾈｰｼｮﾝﾗﾝﾌﾟ'), ('ｻｲﾄﾞｶﾞﾗｽ', 'ｻｲﾄﾞｳｲﾝﾄﾞ'),
+                     ('ﾘﾔｶﾞﾗｽ', 'ﾊﾞｯｸﾄﾞｱｶﾞﾗｽ'), ('ﾎｲﾙﾊｳｽ', 'ﾎｲｰﾙﾊｳｽ'), ('ﾍｯﾄﾞﾗｲﾄ', 'ﾍｯﾄﾞﾗﾝﾌﾟ'), ('ﾌｫｸﾞﾗｲﾄ', 'ﾌｫｸﾞﾗﾝﾌﾟ'))
+
+    def _ref_fr(self, ref: int) -> set:
+        """部品の前後（12.DB / 11.DB の名称の 2 文字目 F/R と、名前の 'ﾌﾛﾝﾄ' 'ﾘﾔ'）"""
+        out = set()
+        for x in self.parts.name20_by_ref.get(ref, ()):
+            f = _fr20(x) or _fr_of(x[1:] if x[:1] in ('L', 'R', ' ') else x)
+            if f:
+                out.add(f)
+        return out
+
+    def _alt_refs(self, name: str, side: str, pred, min_sim: float = 0.6, colored: bool = False) -> list:
+        """名前が近い（min_sim 以上）部品のうち pred(ref) を満たすもの。(名前の近さ, ref) の大きい順。colored = 色別部品（塗装済みバンパ等）も候補にする"""
+        out = []
+        for r in self.parts.name20_by_ref:
+            if r in (self.raw83 or {}) and not colored:
+                continue
+            sim = self._name_sim(name, r, side)
+            if sim >= min_sim and pred(r):
+                out.append((round(sim, 3), r))
+        out.sort(key=lambda x: (-x[0], x[1]))
+        return out
+
+    def _guard_ref(self, ref, why, name_raw, name, side, price, qty, dcode, ctx_block, title, used):
+        """名前だけで決めた部品コードの検査（品番・部品コードの印字が無い行）。戻り値 (ref, why, 何をしたか)。ref None = 手入力にする。
+        2026-09-29 コグニ以外の書式 17 件: 名前が近いだけの部品（前後違い・単価が桁違い・同名の行の重複）が 71/607 行あった"""
+        if ref is None:
+            return ref, why, ''
+        _s0 = AddataParts._why_score(re.sub(r'^語順入替「.*?」\s*', '', (why or '').split(' ← ')[0]))
+        # 前後
+        _f = _fr_of(name_raw) or _fr_of(title)
+        _rf = self._ref_fr(ref)
+        if _f and _rf and _f not in _rf:
+            # 前後の語を外した名前の芯（'ﾘﾔﾊﾞﾝﾊﾟ' → 'ﾊﾞﾝﾊﾟ'）を名前に含む、前後の合う部品。同点は標準単価の高い方（部位の主部品。
+            # 名前が近いだけの 'Rｼﾖﾂｸｱﾌﾞｿｰﾊﾞ' に化けないように）
+            core = self.parts.norm_name(re.sub(r'^(右|左|RH|LH|[LR](?=[\sｦ-ﾟ]))\s*', '', _nfkc(_hw_kana(name_raw))).strip())
+            core = re.sub(r'^(ﾌﾛﾝﾄ|ﾘﾔ|ﾘｱ|Fr|Rr|FR|RR|F|R)', '', core)
+            def _ok(r):
+                if _f not in self._ref_fr(r) or not core:   # 使用済みも候補（同じ部品の取替と脱着・板金の行がある）
+                    return False
+                return any(core in re.sub(r'^[LR ]?[FR ]?', '', self.parts.norm_name(x)) for x in self.parts.name20_by_ref.get(r, ()))
+            alts = self._alt_refs(name, side, _ok, 0.4, colored=True)
+            _sd = side or _side_of(name_raw)
+            alts.sort(key=lambda x: (-(1 if _sd and _sd in {_side20(n) for n in self.parts.name20_by_ref.get(x[1], ())} else 0),   # 左右の書いてある行は左右の合う部品（'右 ﾘﾔﾊﾞﾝﾊﾟ' → RRﾊﾞﾝﾊﾟﾌｪｲｽ）
+                                     -round(x[0], 1), -(self._std_unit(x[1]) or 0), x[1]))
+            if alts:
+                sim, r2 = alts[0]
+                return r2, f'前後の合う候補({sim:.2f}) ← {why}', (f'部品コード {ref:04d} は{"前" if _f == "R" else "後ろ"}の部品。'
+                                                               f'名前・見出しの{"後ろ" if _f == "R" else "前"}に合う {r2:04d} にした')
+        # 本体の作業の行（脱着・板金・修理。部品代なし）が、名前の近い小物（ｸﾘｯﾌﾟ・ﾎﾞﾙﾄ）に当たった（'右ﾘﾔｺﾝﾋﾞﾈｰｼｮﾝﾗﾝﾌﾟ 脱着' → ﾗﾝﾌﾟｸﾘｯﾌﾟ 0.77。nc04）:
+        # 行名が小物でなければ、名前を含む小物でない部品（同点は標準単価の高い本体）に替える
+        if price <= 0 and dcode in (1, 2, 3, 6) and _s0 < 1.0 and not is_small_name(name_raw)                 and any(is_small_name(x) for x in self.parts.name20_by_ref.get(ref, ())):
+            _core = self.parts.norm_name(re.sub(r'^(右|左|RH|LH|[LR](?=[\sｦ-ﾟ]))\s*', '', _nfkc(_hw_kana(name_raw))).strip())
+            _core = re.sub(r'^(ﾌﾛﾝﾄ|ﾘﾔ|ﾘｱ|Fr|Rr|FR|RR|F|R)', '', _core)
+
+            _cores = [_core] + [self.parts.norm_name(y) for x, y in self.CORE_SYNONYMS if self.parts.norm_name(x) in _core]
+
+            def _body(r):
+                n20 = self.parts.name20_by_ref.get(r, ())
+                return (bool(_core) and not any(is_small_name(x) for x in n20) and (self._std_unit(r) or 0) >= 3000   # 本体（小物・安い付属品でない）
+                        and any(c in re.sub(r'^[LR ]?[FR ]?', '', self.parts.norm_name(x)) for x in n20 for c in _cores if c)
+                        and (not _f or not self._ref_fr(r) or _f in self._ref_fr(r)))
+            _sd = side or _side_of(name_raw)
+
+            def _side_ok(r):
+                ss = {_side20(x) for x in self.parts.name20_by_ref.get(r, ()) if _side20(x)}
+                return not _sd or not ss or _sd in ss
+            alts = [r for r in self.parts.name20_by_ref if _body(r) and _side_ok(r)]
+            # 同じ部位ブロックを先に、同点は標準単価の高い本体
+            alts.sort(key=lambda r: (-(1 if self.parts.block_of(r) == self.parts.block_of(ref) else 0), -(self._std_unit(r) or 0), r))
+            if alts:
+                r2 = alts[0]
+                return r2, f'小物でない本体の候補 ← {why}', f'作業の行が小物の部品 {ref:04d} に当たったので、名前（言い換えを含む）を含む本体の {r2:04d} にした'
+        # 単価が桁違い（名前が近いだけで決めた行）
+        if price > 0 and qty > 0 and dcode == 0 and _s0 < 1.0:
+            u_in = price // qty
+            u0 = self._std_unit(ref)
+            if u_in and u0 and max(u_in, u0) >= 8 * min(u_in, u0):
+                def _near(r):
+                    u = self._std_unit(r)
+                    return bool(u) and max(u, u_in) < 2 * min(u, u_in) and (not _f or not self._ref_fr(r) or _f in self._ref_fr(r))
+                alts = self._alt_refs(name, side, _near, 0.6)
+                alts.sort(key=lambda x: (-(1 if ctx_block and self.parts.block_of(x[1]) == ctx_block else 0), -x[0], x[1]))
+                if alts:
+                    sim, r2 = alts[0]
+                    return r2, f'単価の近い候補({self._std_unit(r2):,} 円・名称 {sim:.2f}) ← {why}', (
+                        f'部品コード {ref:04d} は標準単価 {u0:,} 円で印字の単価 {u_in:,} 円と桁違い。名前が近く単価の近い {r2:04d} にした')
+                return None, why, (f'名前の近い部品 {ref:04d}（標準単価 {u0:,} 円）は印字の単価 {u_in:,} 円と桁違いで、単価の近い候補も無いので手入力の行にした。'
+                                   'ADDATA にある部品なら reading の code に書く')
+        return ref, why, ''
+
     def _price_fit(self, ref: int, why: str, name: str, side: str, price: int, qty: int, pn: str, may_switch: bool, ctx_block: str) -> tuple[int, str, int, str]:
         """印字の金額が標準単価 × 数量と合わない行を、(1) 単価の合う別の ref（名称が近いもの）へ直すか、
         (2) 数量 1 のまま複数個分の金額なら数量を直す。戻り値 (ref, why, qty, 何をしたか)。何もしなければ最後は ''"""
@@ -1092,6 +1192,19 @@ class Drafter:
                 self.notes.append(f'{name_raw}: 部品コード {_code_p} が印字された行に M（手入力）が付いていた。コグニの手入力行は部品コードが空なので、'
                                   'M を外して部品コードで作った（印字の印 * の写し違いとみる）')
                 row['manual'] = False
+            _W2M = {'交換': '取替', '鈑金': '板金', '修正': '修理'}
+            _split_back = None
+            if not str(row.get('code') or '').strip() and not self.generic and not row.get('manual'):
+                _mw = re.match(r'^(.*?[^\s(（・･/])\s*(脱着修理|脱着板金|点検調整|分解調整|交換|取替|脱着|鈑金|板金|修理|修正|調整|点検)$', _nfkc(_hw_kana(name_raw)).strip())
+                _m_col = _nfkc(str(row.get('method') or '')).strip().replace('鈑', '板')
+                _orig_method = row.get('method')
+                if _mw and len(_mw.group(1)) >= 2 and not re.search(r'一部\s*$', _mw.group(1))                         and (not _m_col or _m_col == _W2M.get(_mw.group(2), _mw.group(2)).replace('鈑', '板')):   # '…一部脱着' は工場が書き換えた名前（JPN タクシー）
+                    # 名前の末尾に作業の語が付いた書式（区分の列が無い工場: 'Rrﾊﾞﾝﾊﾟｰ交換' 'ｸﾘｯﾌﾟ交換' '左ｻｲﾄﾞｶﾞﾗｽ脱着'。2026-09-29 nc17）。
+                    # 付いたまま照合すると部品に当たらず手入力に落ち、後ろに続く小物の部位の文脈も作れなかった
+                    row = dict(row, method=row.get('method') or _W2M.get(_mw.group(2), _mw.group(2)))
+                    self.notes.append(f'{name_raw}: 名前の末尾の「{_mw.group(2)}」を区分として読んだ（区分の列の無い書式）')
+                    _split_back = (name_raw, _orig_method)
+                    name_raw = _mw.group(1).strip()
             name = _clean_name(name_raw)
             method = str(row.get('method') or ('' if row.get('manual') else '取替'))  # 手入力行で修理方法が空欄なら空のまま（コグニは DisposalCode -1 で保存。実機 2026-09-08）
             qty = int(float(_num(row.get('qty')) or 1))
@@ -1295,6 +1408,13 @@ class Drafter:
                 if _tr is not None and _tr[0] != ref:
                     self.notes.append(f'{name}: {_tr[1]}' + (f'（名称近似の {ref:04d} より優先）' if ref is not None else ''))
                     ref, why = _tr[0], _tr[1]
+            if ref is None and _split_back is not None:
+                # 名前の末尾の作業語を切り出しても部品に当たらなかった: 手入力の作業行なので印字の名前・区分に戻す（'配線修理'・'燃料誤給油点検'）
+                name_raw, _om = _split_back
+                item['name'] = _clean_name(name_raw); item['_name_raw'] = name_raw
+                item['method'] = '' if not str(_om or '').strip() else item['method']
+                item['_method_print'] = str(_om or '')
+                self.notes.append(f'{name_raw}: 作業語を切り出しても部品に当たらないので、印字の名前・区分のまま手入力の行にした')
             if ref is None:
                 if side and ((wage or 0) > 0 or (index or 0) > 0):   # 照合できなかった主作業も、左右があればどの部位の引き継ぎにも加える
                     grp_unknown.add(side)
@@ -1333,6 +1453,16 @@ class Drafter:
                         item['_qty_from_price'] = True
                     self.notes.append(f'{name_raw}: {did}')
                     self._rev('要確認' if (qty2 >= 20 and qty2 != qty0) else '判断', '数量' if ref == ref0 else '部品コード', did, row=row, item=item, code=f'{ref:04d}')   # 20 個以上に読み替えたら人が見る
+            if not code_in and not pn:
+                ref, why, _gd = self._guard_ref(ref, why, name_raw, name, side, price, qty, dcode, ctx_block, row.get('_block_title') or '', used)
+                if _gd:
+                    self.notes.append(f'{name_raw}: {_gd}')
+                    if ref is None:   # 単価が桁違いで替わりの候補も無い: 手入力の行にする（名前の印字どおり）
+                        self._rev('要確認', '部品コード', _gd, row=row, item=item)
+                        item['manual'] = True
+                        out.append(item)
+                        continue
+                    self._rev('判断', '部品コード', _gd, row=row, item=item, code=f'{ref:04d}')
             if not code_in and not pn and '辞書' not in (why or ''):  # 品番も部品コードも無い行（汎用小物など）は名称だけが根拠なので必ず見せる
                 self.notes.append(f'名称だけで決めた: {name} → {ref} '
                                   + '/'.join(sorted(self.parts.name20_by_ref.get(ref, ()))) + f'（{why}）。品番が無いので別の部品を選んでいないか確かめる')
@@ -1423,6 +1553,58 @@ class Drafter:
             it.pop('_bankin_area', None)
             self._keep_printed_method(it)
             self._fit_manual_name(it)
+        out = self._merge_work_part_rows(out)
+        self._items_last = out   # paint() が区分の無い塗装行の取替/修理を明細から補うのに使う
+        return out
+
+    def _merge_work_part_rows(self, items: list[dict]) -> list[dict]:
+        """作業の行（技術料だけ）と部品の行（部品代だけ）を別々に刷る書式（ディーラーの概算: 'ﾌﾛﾝﾄﾊﾞﾝﾊﾟ 取替 23,000' の次に 'ﾌﾛﾝﾄﾊﾞﾝﾊﾟｶﾊﾞｰ 43,600'。
+        作業の行をまとめて先に刷り、部品の行を後ろに並べる工場もある）: 工賃だけの取替の行の後ろ 8 行までに、同じ部品コードの部品代だけの取替の行があれば
+        1 行にまとめる（コグニでは 1 行。分けたままだと同じ部品が 2 行になる。2026-09-29 コグニ以外の書式 nc03・nc10・nc11）。
+        コグニ印刷（書式 A）と、書式の書いていない写し（従来の案件）では行わない（Codex 指摘）"""
+        if str(self.rd.get('format') or '').strip().upper()[:1] in ('', 'A'):
+            return items
+
+        def _work(x):
+            return (x.get('code') and not x.get('manual') and not x.get('reserve') and x.get('method') == '取替'
+                    and int(x.get('wage') or 0) > 0 and int(x.get('price') or 0) == 0)
+
+        def _part(x):
+            return (x.get('code') and not x.get('manual') and not x.get('reserve') and x.get('method') == '取替'
+                    and int(x.get('price') or 0) > 0 and int(x.get('wage') or 0) == 0 and not x.get('index'))
+        used: set = set()
+        merged: dict = {}
+        for i, a in enumerate(items):
+            if i in used or not _work(a):
+                continue
+            for k in range(i + 1, min(len(items), i + 9)):
+                b = items[k]
+                if k in used:
+                    continue
+                if _work(b) and b.get('code') == a.get('code'):
+                    break   # 同じ部品の次の作業の行が先に来た: そこまで
+                if _part(b) and b.get('code') == a.get('code'):
+                    m = dict(b)
+                    m['wage'] = a['wage']
+                    if a.get('index'):
+                        m['index'] = a['index']
+                    for key in ('_mark', '_memo'):
+                        if a.get(key) and not m.get(key):
+                            m[key] = a[key]
+                    merged[i] = m
+                    used.update({i, k})
+                    for _e in self.review:   # 確認箇所の結び付けも 1 行に
+                        if _e.get('_item') is a or _e.get('_item') is b:
+                            _e['_item'] = m
+                    self.notes.append(f"{a.get('code')} {a.get('name')}（工賃 {int(a['wage']):,}）と {b.get('name')}（部品代 {int(b['price']):,}）は"
+                                      '同じ部品の作業の行と部品の行なので 1 行にまとめた（コグニでは 1 行）')
+                    break
+        out = []
+        for i, x in enumerate(items):
+            if i in merged:
+                out.append(merged[i])
+            elif i not in used:
+                out.append(x)
         return out
 
     # 生成器が印字の名前のまま書く作業区分（コグニの作業区分の画面にある名前。estimate_to_neo の disp_name と同じ並び）
@@ -1439,6 +1621,10 @@ class Drafter:
         if not mp or not cur or mp == cur:
             return
         if mp in DISPOSAL:
+            if (mp not in self.KEEP_METHODS and it.get('manual') and not str(it.get('code') or '').strip()
+                    and not str(it.get('parts_no') or '').strip() and not it.get('index')):
+                it['method'] = mp   # 手入力の作業行の区分の別名（'組立'）は印字どおり（生成器が区分コード -1 で書く。nc14）
+                return
             if mp == '分解' and str(self.rd.get('format') or '').strip().upper()[:1] != 'A':
                 return   # 「分解」を区分名のまま刷るのはコグニ印刷（書式 A）の工場だけ。ほかの書式の「分解」はコグニの既定名 分解調整（アクセラ 書式 B）
             if mp in self.KEEP_METHODS and DISPOSAL.get(mp) == DISPOSAL.get(cur):
@@ -1559,6 +1745,33 @@ class Drafter:
                 self._rev('要確認', 'レバーレート', '技術料からのレートの候補が複数あり、ADDATA の標準指数でも決まらない（候補 ' + ' / '.join(f'{r_:,}' for r_ in hits[:6])
                           + ' 円）。速報の工賃単価か工場に確かめて reading の labor_rate に書く')
                 return
+        # 0.25 刻みの指数（トヨタ系ディーラーの技術料）: 0.1 刻みで説明できたレートの 2 倍のレートは、指数を 0.05 刻みにすると同じ技術料を説明できる。
+        # 0.1 刻みだけで選ぶと半分のレートになり、全行の指数が標準の 2 倍になる（2026-09-29 nc06: 5,500 → 正しくは 11,000）。
+        # 2 倍のレートの方が ADDATA の標準指数と一致する行が多い（2 行以上）ときだけ替える
+        try:
+            _w_used = sorted({int(it['wage']) for it in rows if int(it['wage']) > 0})   # * 行を除いて探したときはその行で
+            dbl = [r for r, _ in guess(_w_used, unit=unit, istep=0.05) if any(abs(r - 2 * h) < 1 for h in hits)]
+        except Exception:  # noqa: BLE001
+            dbl = []
+        if dbl:
+            eva = set((self.rd.get('hints') or {}).get('eva_codes') or ())
+            present = [(int(it['code']), _dcode(it.get('method') or '', it.get('price') or 0, it.get('wage'))) for it in items if it.get('code') and not it.get('manual')]
+
+            def _sc(rate):
+                n = 0
+                for it in rows:
+                    try:
+                        st = self.parts.cogni_standard(int(it['code']), _dcode(it.get('method') or '', it.get('price') or 0, it.get('wage')), self.grade, self.fva, eva, self.year, present, self.body)
+                    except Exception:  # noqa: BLE001
+                        st = None
+                    if st and st.get('time') and abs(float(st['time']) - int(it['wage']) / rate) < 0.005:
+                        n += 1
+                return n
+            s_pick = _sc(pick)
+            best2 = max(dbl, key=_sc)
+            if _sc(best2) >= 2 and _sc(best2) > s_pick:
+                why = f'（0.25 刻みの指数: {pick:,} 円の 2 倍 {best2:,} 円の方が標準指数と一致する行が多い {_sc(best2)} 行 > {s_pick} 行）'
+                pick = best2
         self.labor = pick
         self.labor_from = 'inferred'
         self.notes.append(f'レバーレート {pick:,} 円: 技術料を 0.1 刻みの指数で説明できるレート{why}')
@@ -1610,6 +1823,9 @@ class Drafter:
             s = difflib.SequenceMatcher(None, c, n0).ratio()
             if c[:1] in ('L', 'R') and n0[:1] in ('L', 'R') and c[:1] != n0[:1]:
                 s -= 0.5
+            _fr_t, _fr_p = _fr_of(text), (_fr20(pnl['name']) or _fr_of(pnl['name']))
+            if _fr_t and _fr_p and _fr_t != _fr_p:
+                s -= 0.5   # 見積の名前に前後が書いてあり、パネルの前後と違う（2026-09-29 '右 ﾘﾔﾌｪﾝﾀﾞｰ' → 1000 RFﾌｪﾝﾀﾞ）
             scored.append((s, pnl))
         if not scored:
             return None
@@ -1697,6 +1913,7 @@ class Drafter:
         n_other0 = len(other)   # ここから後ろが塗装行から追加項目にした行（前は転記の paint.other）
         auto_manual: list = []  # 下書きが作った手入力の塗装行（rec, 見積の名前）
         _tcs_used: set = set()  # 2 コートソリッド加算の「ルーフ以外 N 枚」に使った行
+        _tcs_pending = None     # 枚数の印字が無い 2 コートソリッド加算の行（t, w, 名前）
         frame_from_lines_w = 0  # 塗装行から内板骨格塗装に振り分けた工賃（塗装工賃計に二重に足さないため）
         # 低隠蔽性塗色（付加塗装）: 「低隠蔽性塗色 ルーフ なし/取替/修理」の行（工賃つき）と、金額の無い「ルーフ以外 取替 N枚」「ルーフ以外 修理 N枚」の行で 1 つ。
         # 拾わないと 3 行とも追加項目・手入力の塗装行に落ちる（2026-09-28 t09 をコグニで刷って判明）
@@ -1715,7 +1932,7 @@ class Drafter:
                     rec['change' if m2.group(1) == '取替' else 'repair'] = int(m2.group(2))
                     _tcs_used.add(id(l2))
             if rec['roof'] == 'なし' and not rec.get('change') and not rec.get('repair'):
-                continue   # 枚数が読めない: 今までどおり（追加項目）にして人が見る
+                rec['_count_from_panels'] = True   # 枚数の行が無い（'低隠蔽性塗色 0.70' の 1 行だけ。nc15）: 塗装パネルの取替・修理の枚数で数える（下）
             w_ = int(float(_num(ln['wage']))) if _num(ln.get('wage')) != '' else None
             t_ = float(_num(ln['index'])) if _num(ln.get('index')) != '' else None
             if t_ is None and w_:
@@ -1758,6 +1975,11 @@ class Drafter:
             # 2 コートソリッド加算（付加塗装）。コグニは PaintingEtcetera の専用欄に入れる。
             # ここで拾わないと「外板パネルの行追加」に落ちて、原本に無いパネル行が 1 行増える（2026-09-18 実機で確認）。
             # 印字は「2コートソリッドルーフ 0枚 / ルーフ以外 3枚」の 2 行に分かれることがあるので、枚数の行も一緒に見る
+            if _TCS_RE.search(n) and not _ROOF_RE.search(n) and (t is not None or w is not None) \
+                    and ('ソリッド' in _nfkc(str((self.rd.get('paint') or {}).get('coat') or out.get('coat') or '')) or not (self.rd.get('paint') or {}).get('coat')):
+                # 枚数の印字が無い「2コートソリッド 0.20」（nc05）: 塗装パネル（ルーフ以外）の枚数で数える（下）
+                _tcs_pending = (t, w, name)
+                continue
             if _TCS_RE.search(n) and _ROOF_RE.search(n):
                 _roof = re.search(_ROOF + r'(?!以外)[0-9]*\s*([0-9]+)\s*枚', n)
                 _oth = re.search(_ROOF + r'以外\s*([0-9]+)\s*枚', n)
@@ -1820,7 +2042,7 @@ class Drafter:
                 if _flag(ln.get('draft'), 'paint.lines[].draft'):  # 文字列 "false" を真に潰さない（Codex 指摘）
                     out[key]['draft'] = True
                 continue
-            m = re.match(r'^(.*?)(取替|新品|交換|修正|修理)\s*(1/[123])?$', _clean_panel_line(n))
+            m = re.match(r'^(.*?)(取替|新品|交換|修正|修理)\s*(1/[123])?$', _clean_panel_line(n, bare_ratio=(t is not None or w is not None)))   # 指数も工賃も無い一覧の行（'Rﾊﾟﾈﾙ(1/3)'）は修理と読まない（C22 フリード）
             if m:
                 pname, mth, ratio = m.group(1), m.group(2), m.group(3) or ''
                 pnl = self._panel_by_code(ln.get('code')) or self._panel_code(pname)
@@ -1851,6 +2073,22 @@ class Drafter:
                 other.append({k: v for k, v in (('name', name), ('index', t), ('wage', w)) if v is not None})
                 self.notes.append(f'塗装 {name}: 工程の名前なので 追加項目（paint.other。材料代の対象外）にした')
                 continue
+            if not m and (t is not None or w is not None):
+                # 区分（取替/修理）の印字が無い塗装行（'ﾌﾛﾝﾄﾊﾞﾝﾊﾟ 1.20' のように部位名と指数だけ刷る工場。2026-09-29 コグニ以外の書式 nc11・nc19）:
+                # 同じ部品コードの明細（取替 / 板金・修理）があるパネルだけ、その区分で 20.DB のパネルにする（明細が根拠。無ければ従来どおり）
+                pnl = self._panel_by_code(ln.get('code')) or self._panel_code(_clean_panel_line(n))
+                _it = next((x for x in (getattr(self, '_items_last', None) or []) if pnl and str(x.get('code') or '') == str(pnl['code'])), None)
+                if pnl and _it is not None and _it.get('method') in ('取替', '板金', '修理', '脱着板金', '脱着修理'):
+                    method = '取替' if _it.get('method') == '取替' else '修理'
+                    rec = {'code': pnl['code'], 'name': pnl['name'].strip(), 'method': method, 'area': pnl['area'], 'ratio': '1/1' if method == '修理' else ''}
+                    if t is not None:
+                        rec['index'] = t
+                    if w is not None:
+                        rec['wage'] = w
+                    panels.append(rec)
+                    self.notes.append(f"塗装 {name}: 区分の印字が無いので、同じ部品コード {pnl['code']} の明細（{_it.get('method')}）から {method}"
+                                      + (' 1/1（面積の比率が読めないので 1/1）' if method == '修理' else '') + ' の塗装パネルにした')
+                    continue
             # 部位の名前なのに 20.DB のパネルに無い（ルーフサイド・リヤボデーフロア・テールゲート …）: 人はコグニの外板パネル画面で
             # 「行追加」して手入力する（PaintingPanel の手入力の塗装行。材料代の対象）。実案件 NEO 354 本・631 行（2026-09-13）
             # 名称は半角カナ（_hw_kana 済みの name）で渡す。コグニで行追加する人の入力は半角カナが大半（実案件 NEO 209 行中 約 95%、長音は 'ｰ' が多い）。
@@ -1866,6 +2104,31 @@ class Drafter:
                 rec_m['wage'] = w
             panels.append(rec_m)
             auto_manual.append((rec_m, name, bool(m)))
+        _pn = [p for p in panels if not is_manual_panel(p)]
+        _roof_n = sum(1 for p in _pn if re.search(_ROOF, _nfkc(_hw_kana(str(p.get('name') or '')))))
+        if _tcs_pending is not None and _pn:
+            _t, _w, _nm = _tcs_pending
+            rec = {'roof': 1 if _roof_n else 0, 'count': len(_pn) - _roof_n}
+            if _t is None and _w:
+                _t = index_from_wage(_w, getattr(self, 'labor', 0) or 0, getattr(self, 'wage_round', 10) or 10)
+            if _t is not None:
+                rec['index'] = _t
+            if _w is not None:
+                rec['wage'] = _w
+            self._put_special(out, 'two_coat_solid', rec, _nm)
+            self.notes.append(f'塗装 {_nm}: 枚数の印字が無いので、塗装パネル（ルーフ {_roof_n} 枚・ルーフ以外 {rec["count"]} 枚）の 2 コートソリッド加算にした')
+        elif _tcs_pending is not None:
+            other.append({k: v for k, v in (('name', _tcs_pending[2]), ('index', _tcs_pending[0]), ('wage', _tcs_pending[1])) if v is not None})
+        _lc = out.get('low_cover')
+        if isinstance(_lc, dict) and _lc.pop('_count_from_panels', False):
+            _ch = sum(1 for p in _pn if p.get('method') == '取替' and not re.search(_ROOF, _nfkc(_hw_kana(str(p.get('name') or '')))))
+            _rp = sum(1 for p in _pn if p.get('method') == '修理' and not re.search(_ROOF, _nfkc(_hw_kana(str(p.get('name') or '')))))
+            if _ch or _rp:
+                _lc.update({k: v for k, v in (('change', _ch), ('repair', _rp)) if v})
+                self.notes.append(f'低隠蔽性塗色: 枚数の印字が無いので、塗装パネルの取替 {_ch} 枚・修理 {_rp} 枚で数えた')
+            else:
+                out.pop('low_cover', None)
+                other.append({'name': '低隠蔽性塗色', **{k: _lc[k] for k in ('index', 'wage') if k in _lc}})
         if auto_manual and all(is_manual_panel(x) for x in panels):
             # 20.DB のパネルに 1 行も対応付けできなかった: 名前の書き方がコグニと違う書式の可能性が高いので、全部を手入力の塗装行にはせず
             # 従来どおり一括計上（paint.total）に戻す（下の else 節。行は追加項目の扱いで落とす）
@@ -1915,6 +2178,13 @@ class Drafter:
         s_frame = sum(int(float(_num((_pf.get(k) or {}).get('wage')) or 0)) for k in ('engine_room', 'front_pillar', 'center_pillar', 'rear_floor')
                       if isinstance(_pf.get(k), dict))  # 内板骨格塗装も印字の塗装工賃計に入る（2026-09-14 C-HR ラジエータサポート 13,130）
         s_frame_all = s_frame   # 内板骨格塗装の工賃の合計（印字の塗装工賃計に含まれる）
+        _lab = getattr(self, 'labor', 0) or 0
+        for _k in ('engine_room', 'front_pillar', 'center_pillar', 'rear_floor'):
+            _fk = _pf.get(_k) if isinstance(_pf.get(_k), dict) else None
+            if _fk and _num(_fk.get('wage')) == '' and _num(_fk.get('index')) != '' and _lab:
+                # 工賃の印字が無く指数だけの骨格塗装（生成器が 指数 × レート で工賃を出す）。一括計上で引き忘れると二重に乗る（2026-09-29 nc16 +7,470）
+                _x = float(_num(_fk['index'])) * _lab; _u = getattr(self, 'wage_round', 10) or 10
+                s_frame_all += int(_x // _u + (1 if (_x % _u) >= _u / 2 else 0)) * _u
         s_frame = max(0, s_frame - frame_from_lines_w)  # 塗装行から振り分けた分は s_lines に入っているので二重に足さない
         if 'total' not in out:
             out['total'] = s_lines
@@ -1924,7 +2194,12 @@ class Drafter:
                 t_in = int(float(_num(out['total']) or 0))
             except ValueError:
                 t_in = None
-            if t_in is not None and t_in != s_lines - line_other_w + s_frame:
+            if t_in is not None and line_other_w and t_in == s_lines + s_frame:
+                # 工場の塗装工賃計が、追加項目にした行（ﾋﾝｼﾞ・ﾁｯﾋﾟﾝｸﾞ …）の工賃も含んでいる（コグニ以外の書式）: paint.total は追加項目を含まない約束なので引く。
+                # 引かないと材料代の割合をその額で決め、生成器（追加項目は材料代の対象外）と材料代がずれる（2026-09-29 nc11 −2,000・nc19 −7,410）
+                out['total'] = t_in - line_other_w
+                self.notes.append(f'塗装計: 印字 {t_in:,} は追加項目にした行の工賃 {line_other_w:,} を含むので、塗装工賃計を {out["total"]:,} にした（追加項目は材料代の対象外）')
+            elif t_in is not None and t_in != s_lines - line_other_w + s_frame:
                 self.notes.append(f'塗装計: 印字 {t_in:,} と塗装行の工賃合計 {s_lines:,} が違う（差 {t_in - s_lines:+,}）。行の写し漏れか、内板骨格・付加塗装が含まれていないか確かめる')
         if 'panels' not in out and s_frame_all and int(float(_num(out.get('total')) or 0)) > 0:
             # 外板パネルの無い一括計上（塗装一式）で内板骨格塗装があるとき: 生成器は paint.total（一式の額）に内板骨格塗装を足す。
@@ -2658,6 +2933,7 @@ class Drafter:
             'insurance': self._insurance(),
             'labor_rate': self.labor,
             '_labor_rate_from': getattr(self, 'labor_from', ''),   # printed / inferred / ''（報告文用。生成器は読まない）
+            '_format': str(self.rd.get('format') or '').strip(),   # 見積書の書式（A = コグニ印刷。run_case の注意の出し分けに使う。生成器は読まない）
         }
         if getattr(self, 'wage_round', 10) != 10:
             est['wage_round'] = self.wage_round

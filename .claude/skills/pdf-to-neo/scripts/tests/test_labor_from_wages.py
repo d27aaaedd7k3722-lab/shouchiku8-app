@@ -100,6 +100,32 @@ def test_low_cover_lines_become_paint_low_cover():
     assert not (e.get('paint') or {}).get('other'), f"枚数の行を追加項目にしない {(e.get('paint') or {}).get('other')}"
 
 
+def test_method_word_at_end_of_name():
+    """区分の列の無い書式で名前の末尾に作業の語（'…交換' '…脱着'）: 切り出して区分にする。部品に当たらない行（手入力の作業行）は印字どおりに戻す（2026-09-29 nc17）"""
+    if not _s89_available():
+        print('   skip test_method_word_at_end_of_name（この ADDATA に S89 が無い）')
+        return
+    rows = ['|ﾌﾛﾝﾄﾊﾞﾝﾊﾟ交換||||1|40700|13720||', '|配線修理||||||4000||']
+    e = de.Drafter(dict(READING, labor_rate=7620, blocks=[{'title': 'x', 'rows': rows}])).build()
+    it = e['items']
+    assert it[0].get('method') == '取替' and it[0].get('code') and not it[0].get('manual'), f"'…交換' は取替で部品に当てる {it[0]}"
+    assert it[1].get('manual') and '配線修理' in str(it[1].get('name')), f"部品に当たらない作業行は印字どおり {it[1]}"
+
+
+def test_work_row_and_part_row_are_merged():
+    """作業の行（工賃だけ）と部品の行（部品代だけ）が同じ部品コードの取替なら 1 行にまとめる（コグニ以外の書式。nc03・nc10・nc11）"""
+    if not _s89_available():
+        print('   skip test_work_row_and_part_row_are_merged（この ADDATA に S89 が無い）')
+        return
+    code = _draft([ROWS_10YEN[0]])['items'][0].get('code')   # この車のフロントバンパの部品コード
+    rows = [f'{code}|ﾌﾛﾝﾄﾊﾞﾝﾊﾟ|取替|||||13720||', f'{code}|ﾌﾛﾝﾄﾊﾞﾝﾊﾟｶﾊﾞｰ|取替|||1|40700|||']
+    e = de.Drafter(dict(READING, labor_rate=7620, blocks=[{'title': 'x', 'rows': rows}])).build()
+    its = [x for x in e['items'] if x.get('code') == code]
+    assert len(its) == 1 and its[0].get('price') == 40700 and its[0].get('wage') == 13720, f'1 行にまとまっていない {its}'
+    e2 = de.Drafter(dict(READING, format='A', labor_rate=7620, blocks=[{'title': 'x', 'rows': rows}])).build()
+    assert len([x for x in e2['items'] if x.get('code') == code]) == 2, 'コグニ印刷（書式 A）はまとめない'
+
+
 def test_tax_round_without_printed_taxable():
     """課税小計の印字が無い見積でも、総合計 − 消費税 から切り捨ての工場を判定する（2026-09-15 アプリのバグハント O11。
     判定しないと 1 円差で不合格になり、逃げ道のベタ打ちでも切り捨ては作れない）"""

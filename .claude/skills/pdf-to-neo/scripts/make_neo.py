@@ -381,7 +381,10 @@ def main() -> int:
         try:
             import print_check
             _rd = json.load(open(os.path.join(case, 'reading.json'), encoding='utf-8'))
-            _pd = print_check.compare(_rd, print_check.print_from_neo(stage))
+            if str(_rd.get('format') or '').strip().upper()[:1] in ('', 'A'):
+                _pd = print_check.compare(_rd, print_check.print_from_neo(stage))
+            else:   # コグニ以外の書式: 写しに部品コードが無いので、下書きが決めた明細（estimate.json）と比べる。名称は ADDATA の名称で刷られるのが正しいので比べない
+                _pd = print_check.compare(print_check.rows_from_estimate(est), print_check.print_from_neo(stage), names=False)
             print(f"== 印刷の予測との突き合わせ == 差 {len(_pd)} 件")
             for _d in _pd[:20]:
                 print('  ★', _d)

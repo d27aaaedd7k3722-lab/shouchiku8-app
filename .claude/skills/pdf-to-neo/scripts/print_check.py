@@ -267,18 +267,47 @@ def read_rows(rd: dict) -> list:
     for b in rd.get('blocks') or []:
         for x in b.get('rows') or []:
             d = dict(zip(ROW_KEYS, (str(x).split('|') + [''] * 10)[:10])) if isinstance(x, str) else dict(x)
-            if not str(d.get('name') or '').strip():
-                continue
+            if not str(d.get('name') or '').strip() or 'N' in str(d.get('flags') or '').upper():
+                continue   # 注記の行（N）は明細として刷られない（2026-09-29 コグニ以外の書式で「行落ち」と誤って出ていた）
+            if d.get('neo_name'):
+                d['name'] = d['neo_name']   # NEO の名称欄に入れた短い名前で刷られる（2026-09-29 nc12・nc13）
+            _c = str(d.get('code') or '').strip()
+            if re.fullmatch(r'\d{1,4}', _c):
+                d['code'] = _c.zfill(4)     # '532' と写しても印刷は '0532'（nc15）
             if 'R' in str(d.get('flags') or '').upper() or d.get('reserve'):
                 d['code'] = '保留'   # 保留の行は印刷でも部品コードの代わりに「保留」と出る
             out.append(d)
     return out
 
 
-def compare(rd: dict, pr: dict) -> list:
-    """差の一覧（人が読む文字列）。表記のゆれは差にしない"""
+def rows_from_estimate(est: dict) -> dict:
+    """estimate.json の明細（下書きが部品コードを決めたもの）を、compare() に渡せる reading の形にする。
+    部品コードの無い見積書（コグニ以外の書式）は写しにコードが無いので、写しと印刷の行を組めない（差 50〜160 件がすべて誤報だった。2026-09-29）"""
+    rows = []
+    for it in est.get('items') or []:
+        rows.append({'code': '' if it.get('manual') else str(it.get('code') or ''), 'name': it.get('neo_name') or it.get('name') or '',
+                     'method': it.get('method') or '', 'parts_no': it.get('parts_no') or '', 'qty': it.get('qty') or '',
+                     'price': it.get('price'), 'wage': it.get('wage'), 'flags': 'R' if it.get('reserve') else ''})
+    out = {k: v for k, v in est.items() if k not in ('items',)}
+    out['blocks'] = [{'title': '', 'rows': rows}]
+    return out
+
+
+def _in(v: int, money: list, tax_rate: int = 0) -> bool:
+    """印刷の金額の中に v があるか。内税で刷る見積（tax_rate）は税込の額（端数処理の違いで ±1 円）も同じとみる"""
+    if v in money:
+        return True
+    if tax_rate:
+        t = v * (100 + tax_rate) / 100
+        return any(abs(m - t) <= 1 for m in money)
+    return False
+
+
+def compare(rd: dict, pr: dict, names: bool = True) -> list:
+    """差の一覧（人が読む文字列）。表記のゆれは差にしない。names=False は名称を比べない（コグニ以外の書式: 部品コードのある行は ADDATA の名称で刷られるのが正しい）"""
     diffs = []
     rrows = read_rows(rd)
+    _tr = int(rd.get('tax_included') or 0) if str(rd.get('tax_included') or '').isdigit() else (10 if rd.get('tax_included') else 0)   # 内税で刷る（2026-09-29 nc06・nc07・nc13）
     p_by = {}
     for r in pr['rows']:
         p_by.setdefault(r['code'], []).append(r)
@@ -302,7 +331,7 @@ def compare(rd: dict, pr: dict) -> list:
         for r, p in pairs:
             nm_r = re.sub(r'\s*[（(]\s*各?\s*\d+\s*個?\s*[)）]\s*$', '', hw(str(r.get('name') or '')))
             nm_p = str(p['name'])
-            if _name_key(nm_r) != _name_key(nm_p):
+            if names and _name_key(nm_r) != _name_key(nm_p):
                 diffs.append(f'名称: {c} 見積書「{nm_r.strip()}」/ 印刷「{nm_p.strip()}」')
             m_r = hw(str(r.get('method') or '')).strip()
             if m_r and p['method'] and _name_key(m_r) != _name_key(p['method']):
@@ -320,7 +349,7 @@ def compare(rd: dict, pr: dict) -> list:
                 diffs.append(f"数量: {c} 見積書 {q_r} / 印刷 {p['qty']}")
             for k, lbl in (('price', '部品価格'), ('wage', '工賃')):
                 v = _money(r.get(k))
-                if v > 0 and v not in p['money']:
+                if v > 0 and not _in(v, p['money'], _tr):
                     diffs.append(f"{lbl}: {c} 見積書 {v:,} / 印刷 {p['money']}")
     # 部品コードの無い手入力の行: 並びが揃わず、自由な区分（'施工'）の行は印刷で名称とくっつき費用の形にも見える。
     # 金額がすべて印刷の金額に含まれ、名称が前方一致する印刷の行（無ければ費用の形の行）と組む。組めなければ行落ち、印刷にだけある行は余分な行（Codex 指摘）
@@ -333,7 +362,7 @@ def compare(rd: dict, pr: dict) -> list:
 
         def _ok(p):
             pk = _name_key(str(p['name']))
-            return bool(_k and pk) and (pk.startswith(_k) or _k.startswith(pk)) and all(v in p['money'] for v in _amts)
+            return bool(_k and pk) and (pk.startswith(_k) or _k.startswith(pk)) and all(_in(v, p['money'], _tr) for v in _amts)
         p = next((p for p in _p_manual if _ok(p)), None)
         if p is not None:
             _p_manual.remove(p)
@@ -360,7 +389,9 @@ def compare(rd: dict, pr: dict) -> list:
         amt = _money(ex.get('amount'))
         if not amt:
             continue
-        hit = [e for e in _p_exp if amt in e['money']]   # 手入力の行と組んだ費用の形の行は使わない（二重に数えない。Codex 指摘）
+        hit = [e for e in _p_exp if _in(amt, e['money'], _tr)]   # 手入力の行と組んだ費用の形の行は使わない（二重に数えない。Codex 指摘）
+        _named = [e for e in hit if _name_key(hw(str(ex.get('name') or ''))) == _name_key(e['name'])]
+        hit = _named + [e for e in hit if e not in _named]   # 同じ額の費用が複数あるときは名前の合う方と組む（'写真代' と 'ｼｮｰﾄﾊﾟｰﾂ' が同額。nc02）
         if not hit:
             diffs.append(f"費用: 見積書「{ex.get('name')}」{amt:,} 円が印刷に無い")
         elif not any(_name_key(hw(str(ex.get('name') or ''))) == _name_key(e['name']) for e in hit):
