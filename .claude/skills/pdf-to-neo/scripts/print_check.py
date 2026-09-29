@@ -67,6 +67,7 @@ def _money(s):
 def parse_print(pages: list) -> dict:
     """印刷 PDF から 明細行 / 費用 / 内板骨格 / 合計 / 部品価格適応日 を取り出す"""
     rows, expenses, frame, tot, pdate = [], [], [], {}, ''
+    name_only: list = []
     sect = ''
     for txt in pages:
         sect = ''   # 区画はページごとに読み直す（帳票の下端に合計欄・作成日が入る）
@@ -122,7 +123,9 @@ def parse_print(pages: list) -> dict:
                 nm = re.split(r'\s{1,}[\d,]+', t)[0].strip()
                 if nums and nm and 'ページ小計' not in nm and '小計' not in nm:
                     expenses.append({'name': nm, 'money': nums})
-    return {'rows': rows, 'expenses': expenses, 'frame': frame, 'totals': tot, 'price_date': pdate}
+            elif not sect and not re.search(r'\d{1,3}(?:,\d{3})+|\d{3,}', t) and len(t.strip()) >= 2:   # 金額の無い行（'NO.2' のような短い数字は名前の一部。Codex 指摘）
+                name_only.append(t.strip())   # 金額の無い明細の行（金額の無い写しの行と名前で組むときだけ使う。parse_print_pdf と同じ。Codex 指摘）
+    return {'rows': rows, 'expenses': expenses, 'frame': frame, 'totals': tot, 'price_date': pdate, 'name_only': name_only}
 
 
 _MONEY_W = re.compile(r'^([\d,]+)円?([#*$@n]*)$')
@@ -137,6 +140,7 @@ def parse_print_pdf(pdf: str):
     except ImportError:
         return None
     rows, expenses, frame, tot, pdate = [], [], [], {}, ''
+    name_only: list = []
     seen = False
     for page in fitz.open(pdf):
         ws = page.get_text('words')
@@ -194,7 +198,7 @@ def parse_print_pdf(pdf: str):
                 continue
             if re.search(r'ページ小計|前頁|次頁', nm):
                 continue
-            h = re.search(r'【(.+?)】', nm)
+            h = re.fullmatch(r'【(.+?)】', nm)   # 区画の見出しは【…】だけの行。名前の中の【本国在庫無】は見出しではない（2026-09-29 nc27）
             if h:
                 sect = 'frame' if '内板骨格' in h.group(1) else 'paint' if '塗装' in h.group(1) else 'expense' if '費用' in h.group(1) else sect
                 continue
@@ -218,9 +222,12 @@ def parse_print_pdf(pdf: str):
                              'qty': qty, 'mark': mark, 'money': [v for v in money if v >= 10], 'raw': ' '.join([nm, meth, pn_text])})
             elif not code and not meth and money and sect != 'paint':
                 expenses.append({'name': nm, 'money': [v for v in money if v >= 10]})
+            elif not code and not meth and not money and nm and not sect:
+                # 金額も区分も無い手入力の明細行（中括弧でまとめた技術料の 2 行目以降 等）。金額の無い行と組むときだけ使う（余分な行とは言わない。nc37）
+                name_only.append(nm)
     if not seen:
         return None
-    return {'rows': rows, 'expenses': expenses, 'frame': frame, 'totals': tot, 'price_date': pdate}
+    return {'rows': rows, 'expenses': expenses, 'frame': frame, 'totals': tot, 'price_date': pdate, 'name_only': name_only}
 
 
 def print_from_neo(neo_path: str) -> dict:
@@ -276,6 +283,12 @@ def read_rows(rd: dict) -> list:
                 d['code'] = _c.zfill(4)     # '532' と写しても印刷は '0532'（nc15）
             if 'R' in str(d.get('flags') or '').upper() or d.get('reserve'):
                 d['code'] = '保留'   # 保留の行は印刷でも部品コードの代わりに「保留」と出る
+            _mt = re.search(r'\[税込 部品=(\d*) 工賃=(\d*)\]', str(d.get('comment') or ''))   # 税抜に直した見積の印字額（reading_check.tax_in_mark。Codex 指摘）
+            if _mt:
+                if _mt.group(1) and not d.get('price_in'):
+                    d['price_in'] = int(_mt.group(1))
+                if _mt.group(2) and not d.get('wage_in'):
+                    d['wage_in'] = int(_mt.group(2))
             out.append(d)
     return out
 
@@ -287,7 +300,8 @@ def rows_from_estimate(est: dict) -> dict:
     for it in est.get('items') or []:
         rows.append({'code': '' if it.get('manual') else str(it.get('code') or ''), 'name': it.get('neo_name') or it.get('name') or '',
                      'method': it.get('method') or '', 'parts_no': it.get('parts_no') or '', 'qty': it.get('qty') or '',
-                     'price': it.get('price'), 'wage': it.get('wage'), 'flags': 'R' if it.get('reserve') else ''})
+                     'price': it.get('price'), 'wage': it.get('wage'), 'flags': 'R' if it.get('reserve') else '',
+                     'price_in': it.get('price_in'), 'wage_in': it.get('wage_in')})
     out = {k: v for k, v in est.items() if k not in ('items',)}
     out['blocks'] = [{'title': '', 'rows': rows}]
     return out
@@ -349,20 +363,25 @@ def compare(rd: dict, pr: dict, names: bool = True) -> list:
                 diffs.append(f"数量: {c} 見積書 {q_r} / 印刷 {p['qty']}")
             for k, lbl in (('price', '部品価格'), ('wage', '工賃')):
                 v = _money(r.get(k))
-                if v > 0 and not _in(v, p['money'], _tr):
+                _vin = _money(r.get(k + '_in'))   # 税込で印字された見積書の印字額（内税の NEO はこの額で刷られる。数量行は 税抜×1.1 と 1〜2 円違う。2026-09-29 nc30・nc38）
+                if v > 0 and not _in(v, p['money'], _tr) and not (_vin > 0 and _vin in p['money']):
                     diffs.append(f"{lbl}: {c} 見積書 {v:,} / 印刷 {p['money']}")
     # 部品コードの無い手入力の行: 並びが揃わず、自由な区分（'施工'）の行は印刷で名称とくっつき費用の形にも見える。
     # 金額がすべて印刷の金額に含まれ、名称が前方一致する印刷の行（無ければ費用の形の行）と組む。組めなければ行落ち、印刷にだけある行は余分な行（Codex 指摘）
     _p_manual = list(p_by.get('', []))
     _p_exp = list(pr['expenses'])
+    _p_name_only = list(pr.get('name_only') or [])   # 呼び出し元の pr を書き換えない（Codex 指摘）
     for r in r_by.get('', []):
         _nm = re.sub(r'\s*[（(]\s*各?\s*\d+\s*個?\s*[)）]\s*$', '', hw(str(r.get('name') or ''))).strip()
         _k = _name_key(_nm)
-        _amts = [v for v in (_money(r.get('price')), _money(r.get('wage'))) if v > 0]
+        _amts = [(_money(r.get(k_)), _money(r.get(k_ + '_in'))) for k_ in ('price', 'wage') if _money(r.get(k_)) > 0]   # (税抜, 税込の印字額)
 
         def _ok(p):
             pk = _name_key(str(p['name']))
-            return bool(_k and pk) and (pk.startswith(_k) or _k.startswith(pk)) and all(_in(v, p['money'], _tr) for v in _amts)
+            if not _amts and p.get('money'):   # 金額の無い行は金額のある印刷の行と組まない（組むと金額付きの余分な行を隠す。Codex 指摘）
+                return False
+            return bool(_k and pk) and (pk.startswith(_k) or _k.startswith(pk)) and all(
+                _in(v, p['money'], _tr) or (vin > 0 and vin in p['money']) for v, vin in _amts)
         p = next((p for p in _p_manual if _ok(p)), None)
         if p is not None:
             _p_manual.remove(p)
@@ -380,6 +399,11 @@ def compare(rd: dict, pr: dict, names: bool = True) -> list:
         if p is not None:
             _p_exp.remove(p)
             diffs.append(f"修理方法: 手入力の行 {_nm} 見積書「{hw(str(r.get('method') or '')).strip()}」が印刷に無い（印刷「{p['name']}」）")
+            continue
+        _no = _p_name_only
+        _hit = next((x for x in _no if not _amts and _k and (_name_key(x).startswith(_k) or _k.startswith(_name_key(x)))), None)
+        if _hit is not None:   # 金額の無い行は、金額の無い印刷の行と名前で組む
+            _no.remove(_hit)
             continue
         diffs.append(f'行落ち: 見積書 手入力の行 {_nm} が印刷に無い')
     for p in _p_manual:

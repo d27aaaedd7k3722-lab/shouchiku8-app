@@ -924,6 +924,10 @@ class Drafter:
                     sim, r2 = alts[0]
                     return r2, f'単価の近い候補({self._std_unit(r2):,} 円・名称 {sim:.2f}) ← {why}', (
                         f'部品コード {ref:04d} は標準単価 {u0:,} 円で印字の単価 {u_in:,} 円と桁違い。名前が近く単価の近い {r2:04d} にした')
+                _pp = self._price_name_pick(name, side, price, qty, used)   # 左右の付いた部品も含めて、単価ぴったり・名前の近い部品が 1 種類なら（'ﾊﾞｯｸﾄﾞｱｶﾞｰﾆｯｼｭﾘﾃｰﾅ' 270 円。nc03）
+                if _pp is not None:
+                    return _pp[0], f'単価一致({u_in:,} 円)・名前 {_pp[1]:.2f} ← {why}', (
+                        f'部品コード {ref:04d} は標準単価 {u0:,} 円で印字の単価 {u_in:,} 円と桁違い。単価がぴったり同じで名前の近い {_pp[0]:04d} にした')
                 return None, why, (f'名前の近い部品 {ref:04d}（標準単価 {u0:,} 円）は印字の単価 {u_in:,} 円と桁違いで、単価の近い候補も無いので手入力の行にした。'
                                    'ADDATA にある部品なら reading の code に書く')
         return ref, why, ''
@@ -963,6 +967,10 @@ class Drafter:
                 if r == ref:
                     continue
                 s = self._name_sim(name, r, side)
+                if s < 0 and not side:   # 左右の無い名前（'ｳｨﾝﾄﾞｼｰﾙﾄﾞﾀﾞﾑﾗﾊﾞｰ'）と左右の付いた部品: その部品の側で測る（左右の組の部品を単価で選べなかった。2026-09-29 nc19）
+                    _s_r = {_side20(x) for x in self.parts.name20_by_ref.get(r, ()) if _side20(x)}
+                    if len(_s_r) == 1:
+                        s = self._name_sim(name, r, next(iter(_s_r)))
                 if s >= 0.6 and self._std_unit(r) == unit_in:
                     exact.append((round(s, 3), 1 if self.parts.block_of(r) in (blk0, ctx_block) else 0, -r, r))
         exact.sort(reverse=True)
@@ -980,6 +988,10 @@ class Drafter:
                 if r == ref or r in (self.raw83 or {}):
                     continue
                 s = self._name_sim(name, r, side)
+                if s < 0 and not side:   # 左右の無い名前と片側の部品: その部品の側で測る（上の単価一致の候補と同じ。Codex 指摘）
+                    _s_r = {_side20(x) for x in n20s if _side20(x)}
+                    if len(_s_r) == 1:
+                        s = self._name_sim(name, r, next(iter(_s_r)))
                 if s < 0.85:
                     continue
                 u = self._std_unit(r)
@@ -1043,6 +1055,61 @@ class Drafter:
             members = [r for r in members if _sd(r) in (side, '')] or []
         members.sort(key=lambda r: (r in used, {'L': 0, '': 1, 'R': 2}.get(_sd(r), 1), r))
         return members[0] if members else None
+
+    def _price_name_pick(self, name: str, side: str, price: int, qty: int, used: set):
+        """名前で決まらなかった部品の行（未照合）を、この車の標準単価が印字の単価とぴったり同じ部品のうち、名前が十分近い（左右を外して 0.6 以上）
+        ものが 1 種類（左右の組は 1 種類）だけのときにそれにする。未照合の注記に「候補:」として出していたものを採る
+        （2026-09-29 コグニ以外の書式 29 件: 外れ 70 行のうち、正解の単価が印字と同じなのに手入力・別部品だった行が 19 行。
+        'ﾊﾞｯｸﾄﾞｱｶﾞｰﾆｯｼｭﾘﾃｰﾅ' 270 円 → ﾊﾞｯｸｶﾞｰﾆｯｼｭﾘﾃｰﾅ、'ﾌｰﾄﾞﾄｩｰﾌﾛﾝﾄｴﾝﾄﾞﾊﾟﾈﾙｼｰﾙ' 850 円 → ﾌｰﾄﾞｼｰﾙ）。戻り値 (ref, 近さ) か None"""
+        if not price or price <= 0 or qty <= 0 or price % qty:
+            return None
+        unit = price // qty
+        if unit < 100:
+            return None
+        n0 = re.sub(r'^[LR](?=[^A-Z])', '', self.parts.norm_name(re.sub(r'^(右|左)', '', name)))
+
+        def _sim(r):
+            best = -1.0
+            for n20 in self.parts.name20_by_ref.get(r, ()):
+                c = self.parts.norm_name(n20)
+                c1 = re.sub(r'^[LR](?=[^A-Z])', '', c) if _side20(n20) else c
+                v = difflib.SequenceMatcher(None, c1, n0).ratio() - 0.3 * sum(1 for w in SMALL_WORDS_N if w in c1 and w not in n0)
+                # ADDATA の名前が行の名前の中に順に全部入っている（'ﾌｰﾄﾞﾄｩｰﾌﾛﾝﾄｴﾝﾄﾞﾊﾟﾈﾙｼｰﾙNO.1' ⊃ ﾌｰﾄﾞｼｰﾙNO.1。nc28）: 単価ぴったりが前提なので近いとみる
+                if len(c1) >= 5 and v < 0.65:
+                    _it = iter(n0)
+                    if all(ch in _it for ch in c1):
+                        v = 0.65
+                best = max(best, v)
+            return best
+
+        def _sd(r):
+            return next((_side20(x) for x in self.parts.name20_by_ref.get(r, ()) if _side20(x)), '')
+        refs = [r for r in self._refs_by_price().get(unit, ()) if self._std_unit(r) == unit]
+        scored = [(_sim(r), r) for r in refs]
+        scored = [(v, r) for v, r in scored if v >= 0.6]
+        if not scored:
+            return None
+        groups: dict = {}
+        for v, r in scored:
+            base = min(re.sub(r'^[LR ]?', '', self.parts.norm_name(x)).lstrip() for x in self.parts.name20_by_ref.get(r, ()))
+            g = groups.setdefault(base, [0.0, []])
+            g[0] = max(g[0], v); g[1].append(r)
+        ranked = sorted(groups.values(), key=lambda g: -g[0])
+        if len(ranked) > 1 and ranked[1][0] >= ranked[0][0] - 0.1:
+            # 番号だけ違う部品（ﾘﾃｰﾅ1 / ﾘﾃｰﾅ2）は、行の名前の番号（'… NO.2'）と同じ番号で終わるものに決める
+            _mn = re.search(r'(?:NO\.?|No\.?|№)?\s*(\d{1,2})\s*$', _nfkc(name))
+            _close = [(k, g) for k, g in groups.items() if g[0] >= ranked[0][0] - 0.1]
+            _num = [g for k, g in _close if _mn and re.search(r'(?:NO\.?)?' + _mn.group(1) + r'$', k)]
+            if len(_num) != 1:
+                return None   # 名前の近さで決め手が無い
+            ranked = _num
+        top, members = ranked[0]
+        if len(members) > 1 and not (len(members) == 2 and {_sd(r) for r in members} == {'L', 'R'}):
+            return None   # 1 つの部品か左右の組だけ
+        if side:
+            members = [r for r in members if _sd(r) in (side, '')]
+        members.sort(key=lambda r: (r in used, {'L': 0, '': 1, 'R': 2}.get(_sd(r), 1), r))
+        return (members[0], top) if members else None
 
     # ------------------------------------------------------------------ 明細
     def _refs_in_block(self, block: str) -> list[int]:
@@ -1553,6 +1620,13 @@ class Drafter:
                         self.notes.append(f'{name_raw}: 直前の作業の部位 {ctx_block} に標準単価 {_u:,} 円の部品が 1 種類だけ → {ref:04d}（{_was} から）')
                         self._rev('判断', '部品コード', f'部位と単価で {ref:04d} {"/".join(sorted(x.strip() for x in self.parts.name20_by_ref.get(ref, ())))} にした（{_was} から）',
                                   row=row, item=item, code=f'{ref:04d}')
+            if ref is None and not pn and not code_in and price > 0 and dcode == 0 and not self.generic:
+                _pp = self._price_name_pick(name, side, price, qty, used)
+                if _pp is not None:
+                    ref, why = _pp[0], f'単価一致({price // qty:,} 円)・名前 {_pp[1]:.2f} ← 未照合'
+                    self.notes.append(f'{name_raw}: 名前では決まらず、この車で標準単価 {price // qty:,} 円・名前の近い部品が 1 種類だけ → {ref:04d}')
+                    self._rev('判断', '部品コード', f'単価と名前で {ref:04d} {"/".join(sorted(x.strip() for x in self.parts.name20_by_ref.get(ref, ())))} にした（名前だけでは未照合）',
+                              row=row, item=item, code=f'{ref:04d}')
             if ref is None and _en_back is not None:
                 name_raw = _en_back
                 item['name'] = _clean_name(name_raw); item['_name_raw'] = name_raw
