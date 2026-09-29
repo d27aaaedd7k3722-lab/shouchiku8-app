@@ -117,6 +117,17 @@ def test_front_rear_and_area_words():
     assert de._clean_name('RH ﾌﾛﾝﾄﾌｪﾝﾀﾞ (5dm²)') == '右ﾌﾛﾝﾄﾌｪﾝﾀﾞ', de._clean_name('RH ﾌﾛﾝﾄﾌｪﾝﾀﾞ (5dm²)')
 
 
+def test_honda_style_part_names():
+    """ホンダ系ディーラーの英語の部品名・「品目,部位」の並びを ADDATA の並びに読み替える（照合用。2026-09-29 nc23・nc38）"""
+    cases = {
+        'HOOD COMP': 'ﾎﾞﾝﾈｯﾄ', 'PANEL COMP,L FR DOOR': '左Fﾄﾞｱﾊﾟﾈﾙ', 'FACE ASSY,FR BUMPE*R565M*': 'Fﾊﾞﾝﾊﾟﾌｪｲｽ',
+        'HINGE COMP L,HOOD': '左ﾎﾞﾝﾈｯﾄﾋﾝｼﾞ', 'ﾍﾞｰｽ,ﾌﾛﾝﾄｸﾞﾘﾙ': 'フロントグリルベース',
+        'ﾌﾛﾝﾄﾊﾞﾝﾊﾟ': None, 'LED ﾗﾝﾌﾟ': None, 'ﾊﾞﾙﾌﾞ,H4': None,   # 読み替えない（表に無い英語の語は半端に訳さない）
+    }
+    bad = [(n, de._honda_name(n), w) for n, w in cases.items() if de._honda_name(n) != w]
+    assert not bad, bad
+
+
 def main() -> int:
     fails = 0
     for name, fn in sorted(globals().items()):

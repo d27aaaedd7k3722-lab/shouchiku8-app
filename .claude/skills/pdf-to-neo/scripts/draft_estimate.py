@@ -178,6 +178,13 @@ def _fr20(name20: str) -> str:
     return s[1:2] if s[1:2] in ('F', 'R') else ''
 
 
+def _int_or0(v) -> int:
+    try:
+        return int(float(_num(v) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _fr_of(name: str) -> str:
     """見積名称の前後: 'Fﾊﾞﾝﾊﾟ' 'ﾌﾛﾝﾄﾄﾞｱ' 'LFﾄﾞｱ' → 'F'、'Rrﾊﾞﾝﾊﾟ' 'ﾘﾔﾄﾞｱ' 'RRﾄﾞｱ' → 'R'。
     先頭の左右記号（RH / LH / 右 / 左）は前後ではないので先に外す。単独の 'R'（Rﾄﾞｱ）は右かリヤか決められないので '' """
@@ -208,6 +215,73 @@ def _side_of(name: str) -> str:
 _ROOF = r'ル[ー\-]?フ'
 _TCS_RE = re.compile(r'2\s*コ[ー\-]?ト\s*ソリ[ッツ]ド')
 _ROOF_RE = re.compile(_ROOF)
+
+
+# 英語の部品名（ホンダ系ディーラーの概算見積: 'HOOD COMP' 'PANEL COMP,L FR DOOR' 'FACE ASSY,FR BUMPE*R565M*'）を
+# ADDATA の名前の語に置き換える表。品目の語だけ（COMP・ASSY は捨てる）。語の途中で切れた印字（'BUMPE'）は 4 字以上の前方一致で引く
+EN_PART_WORDS = {
+    'BUMPER': 'ﾊﾞﾝﾊﾟ', 'FACE': 'ﾌｪｲｽ', 'HOOD': 'ﾎﾞﾝﾈｯﾄ', 'BONNET': 'ﾎﾞﾝﾈｯﾄ', 'HINGE': 'ﾋﾝｼﾞ', 'PANEL': 'ﾊﾟﾈﾙ', 'FENDER': 'ﾌｪﾝﾀﾞ',
+    'DOOR': 'ﾄﾞｱ', 'GRILLE': 'ｸﾞﾘﾙ', 'GRILL': 'ｸﾞﾘﾙ', 'LIGHT': 'ﾗｲﾄ', 'HEADLIGHT': 'ﾍｯﾄﾞﾗｲﾄ', 'LAMP': 'ﾗﾝﾌﾟ', 'FOG': 'ﾌｫｸﾞ',
+    'MIRROR': 'ﾐﾗｰ', 'BEAM': 'ﾋﾞｰﾑ', 'COVER': 'ｶﾊﾞｰ', 'MOLDING': 'ﾓｰﾙ', 'MOULDING': 'ﾓｰﾙ', 'GARNISH': 'ｶﾞｰﾆｯｼｭ', 'SENSOR': 'ｾﾝｻ',
+    'BRACKET': 'ﾌﾞﾗｹｯﾄ', 'CLIP': 'ｸﾘｯﾌﾟ', 'SCREW': 'ｽｸﾘｭ', 'BOLT': 'ﾎﾞﾙﾄ', 'NUT': 'ﾅｯﾄ', 'SEAL': 'ｼｰﾙ', 'RUBBER': 'ﾗﾊﾞｰ',
+    'WEATHERSTRIP': 'ｳｪｻﾞｽﾄﾘｯﾌﾟ', 'RADIATOR': 'ﾗｼﾞｴｰﾀ', 'CONDENSER': 'ｺﾝﾃﾞﾝｻ', 'SUPPORT': 'ｻﾎﾟｰﾄ', 'LOWER': 'ﾛｱ', 'UPPER': 'ｱｯﾊﾟ',
+    'INNER': 'ｲﾝﾅ', 'OUTER': 'ｱｳﾀ', 'SIDE': 'ｻｲﾄﾞ', 'SILL': 'ｼﾙ', 'PILLAR': 'ﾋﾟﾗｰ', 'ROOF': 'ﾙｰﾌ', 'TAILGATE': 'ﾃｰﾙｹﾞｰﾄ',
+    'EMBLEM': 'ｴﾝﾌﾞﾚﾑ', 'SPOILER': 'ｽﾎﾟｲﾗ', 'SKIRT': 'ｽｶｰﾄ', 'LINER': 'ﾗｲﾅ', 'SHROUD': 'ｼｭﾗｳﾄﾞ', 'ABSORBER': 'ｱﾌﾞｿｰﾊﾞ',
+    'REINFORCEMENT': 'ﾘｲﾝﾌｫｰｽﾒﾝﾄ', 'STAY': 'ｽﾃｰ', 'LOCK': 'ﾛｯｸ', 'LATCH': 'ﾗｯﾁ', 'STRIKER': 'ｽﾄﾗｲｶ', 'HANDLE': 'ﾊﾝﾄﾞﾙ',
+    'GLASS': 'ｶﾞﾗｽ', 'WINDSHIELD': 'ｳｲﾝﾄﾞｼｰﾙﾄﾞ', 'WIPER': 'ﾜｲﾊﾟ', 'ARM': 'ｱｰﾑ', 'BLADE': 'ﾌﾞﾚｰﾄﾞ', 'WHEEL': 'ﾎｲｰﾙ',
+    'CAP': 'ｷｬｯﾌﾟ', 'TIRE': 'ﾀｲﾔ', 'FRAME': 'ﾌﾚｰﾑ', 'MEMBER': 'ﾒﾝﾊﾞ', 'APRON': 'ｴﾌﾟﾛﾝ', 'DUCT': 'ﾀﾞｸﾄ', 'HOSE': 'ﾎｰｽ',
+    'TANK': 'ﾀﾝｸ', 'FAN': 'ﾌｧﾝ', 'MOTOR': 'ﾓｰﾀ', 'HORN': 'ﾎｰﾝ', 'PLATE': 'ﾌﾟﾚｰﾄ', 'LICENSE': 'ﾗｲｾﾝｽ', 'BASE': 'ﾍﾞｰｽ',
+    'CORNER': 'ｺｰﾅ', 'EXTENSION': 'ｴｸｽﾃﾝｼｮﾝ', 'TRIM': 'ﾄﾘﾑ', 'LINING': 'ﾗｲﾆﾝｸﾞ', 'MUDGUARD': 'ﾏｯﾄﾞｶﾞｰﾄﾞ', 'FASTENER': 'ﾌｧｽﾅ',
+    'RETAINER': 'ﾘﾃｰﾅ', 'CAMERA': 'ｶﾒﾗ', 'RADAR': 'ﾚｰﾀﾞ', 'UNIT': 'ﾕﾆｯﾄ', 'VALANCE': 'ﾊﾞﾗﾝｽ', 'QUARTER': 'ｸｫｰﾀ',
+}
+EN_DROP_WORDS = {'COMP', 'ASSY', 'SUB', 'SUB-ASSY', 'SET', 'NO', 'WITH'}
+
+
+def _en_word(u: str) -> Optional[str]:
+    if u in EN_PART_WORDS:
+        return EN_PART_WORDS[u]
+    if len(u) >= 4:
+        hit = {v for k, v in EN_PART_WORDS.items() if k.startswith(u)}
+        if len(hit) == 1:
+            return hit.pop()
+    return None
+
+
+def _honda_name(name: str) -> Optional[str]:
+    """ホンダ系ディーラーの概算見積の部品名を、ADDATA の名前の並び（部位 → 品目）に直す（照合用。印字の名前は変えない）。
+    'X,Y' は「Y の X」（'ﾍﾞｰｽ,ﾌﾛﾝﾄｸﾞﾘﾙ' → ﾌﾛﾝﾄｸﾞﾘﾙﾍﾞｰｽ、'ﾌｪﾝﾀﾞｰ,L.ﾌﾛﾝﾄｲﾝﾅｰ' → 左ﾌﾛﾝﾄｲﾝﾅｰﾌｪﾝﾀﾞｰ）、英語の語はカナに
+    （'PANEL COMP,L FR DOOR' → 左Fﾄﾞｱﾊﾟﾈﾙ、'HINGE COMP L,HOOD' → 左ﾎﾞﾝﾈｯﾄﾋﾝｼﾞ）。どちらでもない名前・表に無い英語の語がある名前は None
+    （2026-09-29 nc23・nc38: 英語の名前が 1 行も当たらず照合 7/15、左右の 'L.' ',L' を読まず左右に分割した）"""
+    t = unicodedata.normalize('NFKC', str(name or '')).strip()
+    t = re.sub(r'\*[^*]{0,12}\*?\s*$', '', t).strip()          # 末尾の色コード '*R565M*'（途中で切れた '*G550M' も）
+    words_en = [w for w in re.split(r'[\s,.]+', t.upper()) if re.fullmatch(r'[A-Z][A-Z\-]{2,}', w)]
+    has_en = any(_en_word(w) for w in words_en)
+    if t.count(',') != 1 and not has_en:
+        return None
+    head, _, mod = t.partition(',')
+    side = ''
+    words: list = []
+    for tok in re.findall(r'[A-Za-z][A-Za-z\-]*|[^\sA-Za-z.,]+', mod + ' ' + head):
+        u = tok.upper()
+        if u in ('L', 'LH', 'LEFT'):
+            side = '左'; continue
+        if u in ('R', 'RH', 'RIGHT'):
+            side = '右'; continue
+        if u in ('FR', 'FRONT', 'F'):
+            words.append('F'); continue
+        if u in ('RR', 'REAR'):
+            words.append('Rr'); continue
+        if u in EN_DROP_WORDS:
+            continue
+        if re.fullmatch(r'[A-Z\-]+', u):
+            k = _en_word(u)
+            if not k:
+                return None     # 表に無い英語の語（LED・型式など）: 読み替えない（半端に訳すと別部品に当たる）
+            words.append(k)
+        else:
+            words.append(tok)
+    out = side + ''.join(words)
+    return out if len(out) >= 2 and out != t else None
 
 
 def _clean_name(name: str) -> str:
@@ -779,6 +853,15 @@ class Drafter:
         out.sort(key=lambda x: (-x[0], x[1]))
         return out
 
+    def _name_core(self, name_raw: str) -> str:
+        """名前の芯: 左右・前後の語と空白を外したもの（'右 ﾘﾔﾊﾞﾝﾊﾟ' → ﾊﾞﾝﾊﾟ、'ﾘﾔ　ﾄﾞｱ　ﾍﾞﾙﾄ　ﾓｰﾙ　RH' → ﾄﾞｱﾍﾞﾙﾄﾓｰﾙ）。
+        末尾の左右（'… RH'）と語の間の空白が残ると、ADDATA の名前に芯が含まれず前後の合う候補が 1 つも出なかった（2026-09-29 nc28）"""
+        t = _nfkc(_hw_kana(name_raw)).strip()
+        t = re.sub(r'^(右|左|RH|LH|[LR](?=[\sｦ-ﾟ]))\s*', '', t)
+        t = re.sub(r'[\s,.]*(RH|LH|R/H|L/H|右|左)$', '', t)
+        core = self.parts.norm_name(t.replace(' ', '')).replace(' ', '')
+        return re.sub(r'^(ﾌﾛﾝﾄ|ﾘﾔ|ﾘｱ|Fr|Rr|FR|RR|F|R)', '', core)
+
     def _guard_ref(self, ref, why, name_raw, name, side, price, qty, dcode, ctx_block, title, used):
         """名前だけで決めた部品コードの検査（品番・部品コードの印字が無い行）。戻り値 (ref, why, 何をしたか)。ref None = 手入力にする。
         2026-09-29 コグニ以外の書式 17 件: 名前が近いだけの部品（前後違い・単価が桁違い・同名の行の重複）が 71/607 行あった"""
@@ -791,8 +874,7 @@ class Drafter:
         if _f and _rf and _f not in _rf:
             # 前後の語を外した名前の芯（'ﾘﾔﾊﾞﾝﾊﾟ' → 'ﾊﾞﾝﾊﾟ'）を名前に含む、前後の合う部品。同点は標準単価の高い方（部位の主部品。
             # 名前が近いだけの 'Rｼﾖﾂｸｱﾌﾞｿｰﾊﾞ' に化けないように）
-            core = self.parts.norm_name(re.sub(r'^(右|左|RH|LH|[LR](?=[\sｦ-ﾟ]))\s*', '', _nfkc(_hw_kana(name_raw))).strip())
-            core = re.sub(r'^(ﾌﾛﾝﾄ|ﾘﾔ|ﾘｱ|Fr|Rr|FR|RR|F|R)', '', core)
+            core = self._name_core(name_raw)
             def _ok(r):
                 if _f not in self._ref_fr(r) or not core:   # 使用済みも候補（同じ部品の取替と脱着・板金の行がある）
                     return False
@@ -808,8 +890,7 @@ class Drafter:
         # 本体の作業の行（脱着・板金・修理。部品代なし）が、名前の近い小物（ｸﾘｯﾌﾟ・ﾎﾞﾙﾄ）に当たった（'右ﾘﾔｺﾝﾋﾞﾈｰｼｮﾝﾗﾝﾌﾟ 脱着' → ﾗﾝﾌﾟｸﾘｯﾌﾟ 0.77。nc04）:
         # 行名が小物でなければ、名前を含む小物でない部品（同点は標準単価の高い本体）に替える
         if price <= 0 and dcode in (1, 2, 3, 6) and _s0 < 1.0 and not is_small_name(name_raw)                 and any(is_small_name(x) for x in self.parts.name20_by_ref.get(ref, ())):
-            _core = self.parts.norm_name(re.sub(r'^(右|左|RH|LH|[LR](?=[\sｦ-ﾟ]))\s*', '', _nfkc(_hw_kana(name_raw))).strip())
-            _core = re.sub(r'^(ﾌﾛﾝﾄ|ﾘﾔ|ﾘｱ|Fr|Rr|FR|RR|F|R)', '', _core)
+            _core = self._name_core(name_raw)
 
             _cores = [_core] + [self.parts.norm_name(y) for x, y in self.CORE_SYNONYMS if self.parts.norm_name(x) in _core]
 
@@ -1192,10 +1273,10 @@ class Drafter:
                 self.notes.append(f'{name_raw}: 部品コード {_code_p} が印字された行に M（手入力）が付いていた。コグニの手入力行は部品コードが空なので、'
                                   'M を外して部品コードで作った（印字の印 * の写し違いとみる）')
                 row['manual'] = False
-            _W2M = {'交換': '取替', '鈑金': '板金', '修正': '修理'}
+            _W2M = {'交換': '取替', '鈑金': '板金', '修正': '修理', '板金修正': '板金', '鈑金修正': '板金'}   # '外板板金修正' は 外板 + 板金（2026-09-29 nc33）
             _split_back = None
             if not str(row.get('code') or '').strip() and not self.generic and not row.get('manual'):
-                _mw = re.match(r'^(.*?[^\s(（・･/])\s*(脱着修理|脱着板金|点検調整|分解調整|交換|取替|脱着|鈑金|板金|修理|修正|調整|点検)$', _nfkc(_hw_kana(name_raw)).strip())
+                _mw = re.match(r'^(.*?[^\s(（・･/])\s*(脱着修理|脱着板金|板金修正|鈑金修正|点検調整|分解調整|交換|取替|脱着|鈑金|板金|修理|修正|調整|点検)$', _nfkc(_hw_kana(name_raw)).strip())
                 _m_col = _nfkc(str(row.get('method') or '')).strip().replace('鈑', '板')
                 _orig_method = row.get('method')
                 if _mw and len(_mw.group(1)) >= 2 and not re.search(r'一部\s*$', _mw.group(1))                         and (not _m_col or _m_col == _W2M.get(_mw.group(2), _mw.group(2)).replace('鈑', '板')):   # '…一部脱着' は工場が書き換えた名前（JPN タクシー）
@@ -1205,6 +1286,13 @@ class Drafter:
                     self.notes.append(f'{name_raw}: 名前の末尾の「{_mw.group(2)}」を区分として読んだ（区分の列の無い書式）')
                     _split_back = (name_raw, _orig_method)
                     name_raw = _mw.group(1).strip()
+            _en_back = None
+            if not str(row.get('code') or '').strip() and not self.generic and not row.get('manual'):
+                _hn = _honda_name(name_raw)
+                if _hn:   # 照合は読み替えた名前で。部品に当たらなければ印字の名前に戻す（下の _en_back）
+                    self.notes.append(f'{name_raw}: 部品名を「{_hn}」と読み替えて照合した（英語の語・「品目,部位」の並びの書式）')
+                    _en_back = name_raw
+                    name_raw = _hn
             name = _clean_name(name_raw)
             method = str(row.get('method') or ('' if row.get('manual') else '取替'))  # 手入力行で修理方法が空欄なら空のまま（コグニは DisposalCode -1 で保存。実機 2026-09-08）
             qty = int(float(_num(row.get('qty')) or 1))
@@ -1291,6 +1379,9 @@ class Drafter:
                 # 部品を当てると区分が既定名に、名前が部品名に変わる（リヤナンバー 再封印 12,000 が ｶﾊﾞｰ 脱着 に化けた。2026-09-20 本番 フリード協定見積。
                 # 読み手が M を付けた回は印字どおりだった = 読み取りの揺れで NEO が変わっていた）
                 item['manual'] = True
+                if _en_back is not None:   # 読み替えた名前で来た手入力の作業行は印字の名前に戻す（Codex 指摘）
+                    name_raw = _en_back
+                    item['name'] = _clean_name(name_raw); item['_name_raw'] = name_raw
                 if not _mp:   # 区分の印字が無い行は、手入力行の区分も空のまま（コグニは DisposalCode -1。「取替」にしない）
                     item['method'] = ''
                 self.notes.append(f'{name_raw}: ' + (f'修理方法「{row.get("method")}」' if _noncogni else '名前の手続きの語（再封印 など）')
@@ -1383,7 +1474,14 @@ class Drafter:
                 m_sim = re.search(r'名称近似\(([\d.]+)\)|ブロック内名称照合\(([\d.]+)\)', why or '')
                 sim = float(m_sim.group(1) or m_sim.group(2)) if m_sim else 1.0  # 類似度の無い理由（名称一致・品番一致）は確定扱い = 辞書で置き換えない
                 same_block = (not ctx_block) or self.parts.block_of(aref) == ctx_block if aref is not None else False
-                if aref is not None and (ref is None or (ref != aref and sim < 0.9 and same_block)):  # 既に候補がある行は、辞書のコードが同じ部位ブロックのときだけ置き換える
+                # 別の部位ブロックの辞書のコードでも、今の候補が弱い（名前の近さ 0.7 未満）か、辞書の裏付けが厚い（全車種 20 件以上）なら置き換える
+                # （2026-09-29 nc36: 'R ﾄﾞｱﾐﾗｰ脱着' がブロック内照合 0.62 で ﾄﾞｱﾗｯﾁ に、辞書は 3250 ﾄﾞｱﾐﾗｰ（43 件）。
+                #   nc31: '左 ｽﾗｲﾄﾞﾄﾞｱ' 板金が名称近似 0.89 で ｽﾗｲﾄﾞﾄﾞｱｾｽ（標準 0 円）に、辞書は 2700 ｽﾗｲﾄﾞﾄﾞｱﾊﾟﾈﾙ（58 件））
+                _m_cnt = re.search(r'全車種 (\d+) 件', awhy or '')
+                strong = bool(_m_cnt) and int(_m_cnt.group(1)) >= 20
+                # 別ブロックへ移すのは、行に左右があるなら辞書のコードも同じ側の部品のときだけ（'右 ﾘﾔﾊﾞﾝﾊﾟ' を左右の無い Rﾊﾞﾝﾊﾟ 3810 にしない。nc14 は 3818 RRﾊﾞﾝﾊﾟﾌｪｲｽ）
+                _side_ok = (not side) or (aref is not None and side in {_side20(x) for x in self.parts.name20_by_ref.get(aref, ())})
+                if aref is not None and (ref is None or (ref != aref and sim < 0.9 and (same_block or ((sim < 0.7 or strong) and _side_ok)))):  # 既に候補がある行は、辞書のコードが同じ部位ブロックのときだけ置き換える
                     self.notes.append(f'{awhy}: {name}' + (f'（名称近似 {ref} {"/".join(sorted(self.parts.name20_by_ref.get(ref, ())))} より辞書を優先）' if ref is not None else ''))
                     ref, why = aref, awhy
             if ref is None and not code_in and price > 0 and qty == 1 and dcode == 0:
@@ -1408,6 +1506,9 @@ class Drafter:
                 if _tr is not None and _tr[0] != ref:
                     self.notes.append(f'{name}: {_tr[1]}' + (f'（名称近似の {ref:04d} より優先）' if ref is not None else ''))
                     ref, why = _tr[0], _tr[1]
+            if ref is None and _en_back is not None:
+                name_raw = _en_back
+                item['name'] = _clean_name(name_raw); item['_name_raw'] = name_raw
             if ref is None and _split_back is not None:
                 # 名前の末尾の作業語を切り出しても部品に当たらなかった: 手入力の作業行なので印字の名前・区分に戻す（'配線修理'・'燃料誤給油点検'）
                 name_raw, _om = _split_back
@@ -1460,6 +1561,8 @@ class Drafter:
                     if ref is None:   # 単価が桁違いで替わりの候補も無い: 手入力の行にする（名前の印字どおり）
                         self._rev('要確認', '部品コード', _gd, row=row, item=item)
                         item['manual'] = True
+                        if _en_back is not None:   # 読み替えた名前（英語・「品目,部位」）で当てた行は印字の名前に戻す（Codex 指摘）
+                            item['name'] = _clean_name(_en_back); item['_name_raw'] = _en_back
                         out.append(item)
                         continue
                     self._rev('判断', '部品コード', _gd, row=row, item=item, code=f'{ref:04d}')
@@ -1949,7 +2052,7 @@ class Drafter:
             t = float(_num(ln['index'])) if _num(ln.get('index')) != '' else None
             w = int(float(_num(ln['wage']))) if _num(ln.get('wage')) != '' else None
             n = _nfkc(name).replace(' ', '')
-            if re.search(r'加算基礎', n):
+            if re.search(r'加算基礎|基礎加算', n):   # 「基礎加算数値」と刷る工場もある（2026-09-29 nc38: 追加項目に落ち、標準の加算基礎と二重になった）
                 self._put_special(out, 'base', {k: v for k, v in (('index', t), ('wage', w)) if v is not None}, name)
                 continue
             if re.search(r'ブ[ー\-]ス', n):   # 長音が '-' で刷られる書式がある
@@ -2920,6 +3023,45 @@ class Drafter:
         self.notes.append('★ ' + why)
         self._rev('要確認', '単価の端数', f'工場の印字 {printed_total:,} 円 / コグニ計算 {neo_total:,} 円（差 {diff:+,} 円）。' + why)
 
+    def _tax_included_expense_tolerance(self, est: dict) -> None:
+        """税込で印字された見積書（10-4）の費用: 工場は費用を 1 行ずつ税込で足すが、コグニ（内税）は費用の合計に税をかけて税込にする
+        （生成器の内税の経路。実 NEO 81 本で確かめた式）。費用の行ごとの丸めの分だけ合計が印字と 1〜2 円ずれることがあり、
+        読み取りでは直せない。試算の差が費用の行数で説明できる幅のときだけ 3 点セットを書いて通し、要確認に出す
+        （2026-09-29 nc30: 産廃の税込 1 行で +1 円）"""
+        t = est.get('totals') or {}
+        if not int(est.get('tax_included') or 0):
+            return
+        if any(t.get(k) is not None for k in ('neo_total', 'tolerance', 'target_total')) or _num(self.rd.get('target_total')) != '':
+            return
+        n_exp = sum(1 for e in (est.get('expenses') or []) if not e.get('taxfree') and int(e.get('amount') or 0))
+        if not n_exp:
+            return
+        try:
+            printed_total = int(float(_num(t.get('total')) or 0))
+        except ValueError:
+            return
+        import copy
+        probe = copy.deepcopy(est)
+        probe.pop('totals', None)
+        try:
+            _, rep = self.nb.build(probe, probe['vehicle'], hints=probe.get('hints'), labor_rate=probe.get('labor_rate'),
+                                   est_date=probe.get('est_date'), insurance=probe.get('insurance'))
+            neo_total = int((rep.get('totals') or {}).get('total') or 0)
+        except Exception:  # noqa: BLE001  試算できない案件は今までどおり検算で止める
+            return
+        diff = neo_total - printed_total
+        if not printed_total or not neo_total or diff == 0 or abs(diff) > (n_exp + 1) // 2:
+            return
+        why = (f'税込で印字された見積書（10-4）の費用 {n_exp} 行: 工場は費用を 1 行ずつ税込で足し、コグニ（内税）は費用の合計に税をかけるので、'
+               f'合計が {diff:+,} 円ずれる。明細・費用の金額は印字どおり')
+        t['neo_total'] = neo_total
+        t['tolerance'] = abs(diff)
+        t['tolerance_reason'] = why
+        t['tolerance_keys'] = ['taxable', 'tax']
+        est['totals'] = t
+        self.notes.append('★ ' + why)
+        self._rev('要確認', '内税の費用の丸め', f'工場の印字 {printed_total:,} 円 / コグニ計算 {neo_total:,} 円（差 {diff:+,} 円）。' + why)
+
     def build(self) -> dict:
         items = self.items()
         paint = self.paint()
@@ -2949,6 +3091,21 @@ class Drafter:
                     sub_ = tot_ - tax_ - nt_ if tot_ > tax_ + nt_ else 0
             except ValueError:
                 sub_ = tax_ = 0
+            if _int_or0(self.rd.get('tax_included')) == 10 and tax_:
+                # 内税（税込で印字された見積書 10-4）: コグニは税を「税込の総額 × 10/110」で丸める（estimate_to_neo の内税の経路）。
+                # 外税の式（税抜 × 10%）で判定すると四捨五入の工場を切り捨てと取り違える（2026-09-29 nc30）
+                try:
+                    tot_ = int(float(_num((self.rd.get('totals') or {}).get('total')) or 0))
+                except ValueError:
+                    tot_ = 0
+                in_ = tot_ - sum(int(float(_num(e.get('amount')) or 0)) for e in (self.rd.get('expenses') or [])   # 非課税の費用（taxfree か in に「非課税」。expenses() と同じ判定。Codex 指摘）
+                                 if isinstance(e, dict) and (_flag(e.get('taxfree'), 'expenses[].taxfree') or '非課税' in _nfkc(e.get('in') or '')))
+                sub_ = 0   # 下の外税の判定は使わない
+                if in_ > 0 and tax_ != (in_ * 100 + 561) // 1100:
+                    if tax_ == in_ // 11:
+                        tr = '切り捨て'
+                    elif tax_ == -((-in_) // 11):
+                        tr = '切り上げ'
             if sub_ and tax_ and tax_ != (sub_ * 10 + 50) // 100:
                 if tax_ == (sub_ * 10) // 100:
                     tr = '切り捨て'
@@ -3009,6 +3166,7 @@ class Drafter:
         tt = self.apply_target_total(est)  # 生成器の実計算で材料代を決める（discount/frame を含めた後）
         est['totals'] = tt if tt else self.totals(items, paint, expenses)
         self._unit_fraction_tolerance(est)   # 単価に円未満の端数がある見積の、コグニでは再現できない数円差
+        self._tax_included_expense_tolerance(est)   # 内税の費用の合計にかかる税の丸め（数円）
         est['_draft_notes'] = self.notes
         pos = {id(it): i + 1 for i, it in enumerate(items)}
         est['_review'] = [dict({k: v for k, v in r.items() if k != '_item'}, row=pos.get(id(r.get('_item')), '')) for r in self.review]

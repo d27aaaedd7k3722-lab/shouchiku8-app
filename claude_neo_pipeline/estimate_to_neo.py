@@ -2756,7 +2756,8 @@ class NeoBuilder:
             if dcode in (2, 6):
                 work_code = ''  # 板金(6)/修理(2) 行の WorkCode は空欄（工場 NEO の板金 7 行・修理 13 行、コグニ再検索 C-HR 3500 板金 '#'。取替(K) 行の区分を流用しない）
             name_disp = display_name(std_name) if std_name else hw(re.sub(r'(?<=[ｦ-ﾟ])S$', 'ｽ', it.get('name', '')))  # 半角カナの末尾の 'S' だけ 'ｽ' に（OCR の読み違い）。英字の品名 'SPL. S' は直さない（2026-09-13 ベンツ）
-            if it.get('name') and ('左' in it['name'] or '右' in it['name']) and name_disp and name_disp[0] not in '左右':
+            # 左右の付け足しは ADDATA の名称で刷る行だけ。手入力行は印字どおり（名前の途中の「左」を頭にも足して '左ｼﾞｬｯｷ支持部 左前後' になった。2026-09-29 nc20・nc25）
+            if std_name and it.get('name') and ('左' in it['name'] or '右' in it['name']) and name_disp and name_disp[0] not in '左右':
                 name_disp = ('左' if '左' in it['name'] else '右') + name_disp
             _pn_in = re.sub(r'\s*\(\d+\)\s*$', '', str(it.get('parts_no') or '')).strip()   # 見積書の品番欄（数量の '(2)' は落とす）。品番でない文字もそのまま持つ
             is_sub = pprice > 0 and wage == 0 and dcode == 0 and ref is not None  # 手入力行（部品コード無し）には付属部品の 2 スペース接頭辞を付けない（コグニ実機 2026-09-08）
@@ -3063,6 +3064,12 @@ class NeoBuilder:
                         # 印字の税込額を割った値が今の税抜額と一致するときだけ使う（下書きが金額を直した行では古い印字額を使わない）。
                         # 割り方は読み取り側（reading_check.tax_excluded_amount。常に四捨五入）と同じにする。消費税が切り捨て設定の工場でも
                         # 税抜は読み取りが決めた値なので、ここで設定の丸め方を使うと一致しなくなり印字額が捨てられる（Codex 指摘）
+                        tx = int(_pin) - int(out); it_ = int(_pin)
+                    elif (getattr(self, '_tax_included', False) and base == 'PartsPrice' and _pin is not None and int(rec.get('PartsCount') or 1) > 1
+                          and int(_pin) % int(rec['PartsCount']) == 0
+                          and (_tax_excluded_printed(int(_pin) // int(rec['PartsCount'])) or 0) * int(rec['PartsCount']) == int(out)):
+                        # 内税の数量行: 工場は 1 個の税込単価ごとに税を割っている（reading_check.to_tax_excluded の d_qty）。
+                        # 税抜から作り直すと税込が印字の数量分の額から 1 円ずれる（2026-09-29 nc23 −2 円・nc30 −1 円）
                         tx = int(_pin) - int(out); it_ = int(_pin)
                     elif base == 'PartsPrice' and int(rec.get('PartsCount') or 0) > 1 and int(rec.get('PartsUnitPriceOutTax') or 0) > 0 and int(rec['PartsUnitPriceOutTax']) * int(rec['PartsCount']) == int(out):
                         tx = _tax_amount(int(rec['PartsUnitPriceOutTax'])) * int(rec['PartsCount']); it_ = int(out) + tx  # 数量行の税 = 単価の税（消費税設定の丸め。既定 四捨五入）×数量（コグニ実機: 155×10 → 税 160、185×9 → 171。単価欄 PartsUnitPriceTax は切捨 15 のまま）

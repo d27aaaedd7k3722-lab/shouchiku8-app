@@ -283,6 +283,16 @@ def to_tax_excluded(rd: dict, rate: int = 10, warn=None) -> int:
         for it in seq or []:
             d_keys(it, keys)
 
+    def d_qty(v, qty):
+        """数量 2 以上の行の部品金額: 工場は 1 個の税込単価ごとに税を割っている（単価 682 → 620、2 個 1,364 → 1,240）。
+        数量分の金額をまとめて割ると 1,240 でなく 1,240±1 になり、標準価格とも印字の税込額とも合わなくなる（2026-09-29 nc30: 622 / 796）。
+        数量で割り切れる金額だけ単価で割って数量を掛ける"""
+        n_, q_ = _int(v), _int(qty)
+        if n_ is None or not q_ or q_ < 2 or n_ % q_:
+            return d(v)
+        n[0] += 1
+        return tax_excluded_amount(n_ // q_, rate) * q_
+
     def d_unit_comment(s: str) -> str:
         """comment の `unit=単価` も税抜に直す（reading_check が単価×数量の検算に使う）"""
         return _UNIT_RE.sub(lambda m: m.group(1) + str(tax_excluded_amount(m.group(2), rate)), s)
@@ -294,7 +304,9 @@ def to_tax_excluded(rd: dict, rate: int = 10, warn=None) -> int:
                 mk = tax_in_mark(r.get('price'), r.get('wage'))
                 if mk and not TAX_IN_RE.search(str(r.get('comment') or '')):
                     r['comment'] = (str(r.get('comment') or '') + mk).strip()
-                d_keys(r, ('price', 'wage', 'unit'))
+                if r.get('price') not in (None, ''):
+                    r['price'] = d_qty(r['price'], r.get('qty'))
+                d_keys(r, ('wage', 'unit'))
                 d_keys(r.get('recycle'), ('price', 'stock_price'))  # リサイクル部品の売価・仕入値（生成器が部品計に入れる）
                 if r.get('comment'):
                     r['comment'] = d_unit_comment(str(r['comment']))
@@ -306,9 +318,10 @@ def to_tax_excluded(rd: dict, rate: int = 10, warn=None) -> int:
                 if mk and len(p) <= 10 and not TAX_IN_RE.search(p[9] if len(p) > 9 else ''):
                     p += [''] * (10 - len(p))   # 末尾のメモ欄を省いた行（draft は足りない列を空で補う）にも印を残す
                     p[9] = (p[9] + mk).strip()
-                for idx in (6, 7):
-                    if len(p) > idx and _int(p[idx]) is not None:
-                        p[idx] = str(d(p[idx]))
+                if len(p) > 6 and _int(p[6]) is not None:
+                    p[6] = str(d_qty(p[6], p[5] if len(p) > 5 else None))
+                if len(p) > 7 and _int(p[7]) is not None:
+                    p[7] = str(d(p[7]))
                 if len(p) > 9:
                     p[9] = d_unit_comment(p[9])
                 rows[i] = '|'.join(p)
@@ -726,7 +739,8 @@ class Checker:
         def _slack(n: int) -> int:
             """割り戻しの丸めで許される幅。印字を割った値と、割った明細の積み上げのそれぞれに 0.5 円まで乗る"""
             return (n + 3) // 2 if _tax_on else 0
-        _n_price = sum(1 for r in rows if _int(r.get('price')))
+        # 数量 2 以上の行は 1 個の単価ごとに割り戻すので、丸めは個数ぶん乗る（to_tax_excluded の d_qty。2026-09-29 nc23 クリップ ×10）
+        _n_price = sum(max(1, _int(r.get('qty')) or 1) for r in rows if _int(r.get('price')))
         _n_wage = sum(1 for r in rows if _int(r.get('wage')))
         _n_lines = len(p.get('lines') or []) + len(p.get('other') or []) + len(p.get('panels') or [])
         _n_exp = len(self.rd.get('expenses') or [])
@@ -945,11 +959,15 @@ class Checker:
             return 'E'
         if not has_index and not any(_int(r.get('wage')) for r in rows):
             return 'D'
+        if not has_index:   # 指数の列が無く技術料だけ（書式 F。ブロック見出しのあるディーラーの概算は D とも読める）
+            return 'F/D'
         return 'B' if titles or has_index else 'D'
 
     def check_format(self) -> None:
         det = self.detect_format()
         given = str(self.rd.get('format') or '').strip().upper()[:1]
+        if given == 'G' and _int(self.rd.get('tax_included')):
+            det = det + '/G'   # 税込で印字された見積書（書式 G。束ねるときに税抜に直した）は特徴ではなく金額で決まる
         self.settings['format'] = given if given in det.split('/') else det  # 記録には reading の書式（判定と矛盾しなければ）
         if not given:
             self.note(f'format 未記入。特徴からは書式 {det}（format_catalog.md）')

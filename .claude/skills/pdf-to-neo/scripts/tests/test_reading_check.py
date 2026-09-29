@@ -762,6 +762,34 @@ def test_expense_or_row_side_drift():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_tax_included_quantity_rows_divide_the_unit_price():
+    """税込の数量行は 1 個の税込単価で割ってから数量を掛ける（工場は単価ごとに税を割っている。2026-09-29 nc30: 数量分をまとめて割ると 622 / 796）。
+    数量で割り切れない金額はこれまでどおりまとめて割る"""
+    rd = {'blocks': [{'title': '', 'rows': ['|ｸﾘｯﾌﾟ|取替|||10|6840|||', {'name': 'ﾎﾞﾙﾄ', 'method': '取替', 'qty': 10, 'price': 6840},
+                                             '|ﾅｯﾄ|取替|||3|1000|||', '|ﾊﾞﾝﾊﾟ|取替|||1|6840|||']}], 'totals': {}}
+    rc.to_tax_excluded(rd, 10)
+    r = rd['blocks'][0]['rows']
+    assert r[0].split('|')[6] == '6220', r[0]            # 684 → 622、× 10（まとめて割ると 6,218）
+    assert r[1]['price'] == 6220, r[1]
+    assert r[2].split('|')[6] == '909', r[2]             # 1,000 は 3 で割り切れない: まとめて割る
+    assert r[3].split('|')[6] == '6218', r[3]            # 数量 1 は今までどおり
+
+
+def test_format_f_is_detected_for_wage_only_estimates():
+    """指数の列が無く技術料だけの見積は書式 F（D とも読める）。税込で割り戻した見積の G も受ける（2026-09-29: F と書くと毎回 B/D と WARN が出た）"""
+    rd = {'format': 'F', 'blocks': [{'title': '', 'rows': ['|ﾌﾛﾝﾄﾊﾞﾝﾊﾟ|取替|||1|40000|8000||']}], 'totals': {}}
+    ck = rc.Checker(rd)
+    ck.load_rows()
+    assert 'F' in ck.detect_format().split('/'), ck.detect_format()
+    ck.check_format()
+    assert not any('reading.format' in t for lv, t in ck.msgs if lv == 'WARN'), ck.msgs
+    rd2 = dict(rd, format='G', tax_included=10)
+    ck2 = rc.Checker(rd2)
+    ck2.load_rows()
+    ck2.check_format()
+    assert not any('reading.format' in t for lv, t in ck2.msgs if lv == 'WARN'), ck2.msgs
+
+
 if __name__ == '__main__':
     fails = 0
     for name, fn in sorted(globals().items()):

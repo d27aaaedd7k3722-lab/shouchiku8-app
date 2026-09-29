@@ -148,9 +148,16 @@ def build(fields: dict, case_name: str) -> dict:
         v['engine'] = m.group(0)  # 'S07A型(2WD)' → 'S07A'、'DLA-4450' → 'DLA'（既存案件の書き方）
     if nfkc(fields.get('グレード')).strip():
         h['grade_name'] = nfkc(fields['グレード']).split('/')[0].strip()  # 'G Cuero/FUNBASE G Cuero' → 'G Cuero'
+    def _placeholder(x) -> bool:   # 報告書の「車検証確認できず」「書類確認出来ず」は名前ではない（2026-09-29 nc22・nc27・nc29 で顧客名に入った）
+        return bool(re.search(r'確認(でき|出来)ず|確認不可|不明|記載なし', nfkc(x or '')))
+    for _k in ('使用者', '所有者'):
+        if _placeholder(fields.get(_k)):
+            fields = dict(fields, **{_k: ''})
     user = (fields.get('使用者') or '').strip()
     if nfkc(user).replace(' ', '') in ('同上', '***', '＊＊＊') and fields.get('所有者'):
         user = fields['所有者'].strip()  # 使用者欄が「同上」: 所有者が使用者（シエンタ 2026-09-28。正解の顧客名は所有者だった）
+    if nfkc(user).replace(' ', '') in ('同上', '***', '＊＊＊'):
+        user = ''   # 「同上」なのに所有者が空（「車検証確認できず」を外した）: 印を名前にしない（Codex 指摘）
     if user:
         c['name'] = user
     if fields.get('所有者'):

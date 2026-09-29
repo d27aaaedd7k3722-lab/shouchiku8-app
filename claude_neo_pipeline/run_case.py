@@ -342,6 +342,22 @@ def main(path: str, out: str = ''):
     # そのときだけ totals.tolerance_keys で対象を名指しする（下書きが証拠付きで書く。手書きでも 3 点セットは必要）。
     # 広げてよいのは **部品計だけ**（材料代・費用は工場が円単位で出すので 0 円一致のまま。レビュー指摘 2026-09-17）
     TOL_KEYS |= {str(k) for k in (pt.get('tolerance_keys') or []) if str(k) == 'parts'}
+    # 税込で印字された見積書（10-4）: 印字の小計を割った値と、割った明細の積み上げは行ごとの四捨五入の分だけずれる
+    # （1 個あたり 0.5 円まで。reading_check の _TAX_SLACK と同じ考え）。どちらも正しいので項目別の差はその幅まで止めない。
+    # 合計は内税の NEO が印字の税込額を行ごとに持つので 1 円まで一致させる（下の「見積書合計との一致」）。2026-09-29 nc23・nc30・nc38
+    _tax_slack: dict = {}
+    if int(est.get('tax_included') or 0):
+        _its = [i for i in (est.get('items') or []) if isinstance(i, dict)]
+        _np = sum(max(1, int(i.get('qty') or 1)) for i in _its if int(i.get('price') or 0) > 0)
+        _nw = sum(1 for i in _its if int(i.get('wage') or 0) > 0)
+        _pl = est.get('paint') or {}
+        _nl = sum(len(_pl.get(k) or []) for k in ('panels', 'other', 'lines')) + 1
+        _ne = sum(1 for e in (est.get('expenses') or []) if isinstance(e, dict) and not _flag(e.get('taxfree'), 'expenses[].taxfree'))   # 非課税の費用は割らないので丸めも乗らない（Codex 指摘）
+        def _sl(n):
+            return (n + 3) // 2
+        _tax_slack = {'parts': _sl(_np), 'wage': _sl(_nw + _nl + _ne), 'paint': _sl(_nl), 'paint_total': _sl(_nl + 1),
+                      'expense_parts': _sl(_ne), 'expense_wage': _sl(_ne), 'expense': _sl(_ne),
+                      'taxable': _sl(_np + _nw + _nl + _ne), 'tax': _sl(_np + _nw + _nl + _ne) // 10 + 1}
     for label, key, gen in checks:
         if pt.get(key) is None or gen is None:
             continue
@@ -351,6 +367,9 @@ def main(path: str, out: str = ''):
             continue
         print(f"  検算 {label:<10} 見積 {int(pt[key]):>10,} / 生成 {int(gen):>10,}  {'OK' if d == 0 else f'差 {d:+,}'}")
         _lim = eff_tol if key in TOL_KEYS else 0  # 丸めの出ない項目に合計用の幅を流用しない
+        if d and _tax_slack.get(key) and abs(d) <= _tax_slack[key] and abs(d) > _lim:
+            print(f'  （税込で印字された見積書を割り戻した丸めの差。この項目は最大 {_tax_slack[key]} 円まで。合計は下で 1 円まで比べる）')
+            continue
         if abs(d) > _lim:  # 説明できない項目差分は不合格。tolerance が効くのは 3 点セットが揃っているときだけ
             cat_ok = False
             if key not in TOL_KEYS and eff_tol and abs(d) <= eff_tol:

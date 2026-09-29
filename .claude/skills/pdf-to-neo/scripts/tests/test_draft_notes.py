@@ -457,7 +457,8 @@ def test_price_fixes_the_part_code():
     a, b = e['items']
     assert a['code'] == '0085' and a['qty'] == 1, a            # ﾗｼﾞｴ-ﾀｸﾞﾘﾙ(ﾛﾜ) 7,000 円（名称近似だと 0077 ｻｲﾄﾞｸﾞﾘﾙ 3,490 円）
     assert b['code'] == '2565' and b['qty'] == 8, b            # LFﾄﾞｱﾄﾘﾑﾎﾞ-ﾄﾞｸﾘﾂﾌﾟ 90 円 × 8（辞書だとｱｳﾀﾐﾗ-ｽｸﾘﾕ）
-    assert sum(1 for r in e['_review'] if r['kind'] == '部品コード') == 2, e['_review']
+    # 2026-09-29 から b は別名辞書（全車種 14 件）が 2565 を直接当てる（名前の近い候補が 0.7 未満と弱いので別ブロックでも辞書を採る）。価格で直すのは a だけ
+    assert sum(1 for r in e['_review'] if r['kind'] == '部品コード') == 1, e['_review']
 
 
 def test_labor_rate_from_standard_index():

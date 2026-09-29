@@ -80,5 +80,9 @@ check(ha.wareki_ym('平成27年5月') == 'H27.5' and ha.wareki_ymd('令和元年
 hdr = {'vehicle': {'desig': '99999'}}
 wrote = ha.apply(hdr, h, overwrite=False)
 check(hdr['vehicle']['desig'] == '99999' and 'vehicle.desig' not in wrote and 'vehicle.category' in wrote, '既にある値は上書きしない')
+h3 = ha.build({'使用者': '車検証確認できず', '所有者': '書類確認出来ず', '型式': 'JF3'}, '')
+check('name' not in (h3.get('customer') or {}) and 'owner' not in (h3.get('customer') or {}), f'「車検証確認できず」は名前ではない {h3}')
+h4 = ha.build({'使用者': '同上', '所有者': '車検証確認できず'}, '')
+check('name' not in (h4.get('customer') or {}), f'「同上」で所有者が無ければ顧客名は空 {h4}')
 print('OK' if not FAILS else f'NG {len(FAILS)} 件')
 sys.exit(1 if FAILS else 0)
