@@ -149,7 +149,9 @@ def build(fields: dict, case_name: str) -> dict:
     if nfkc(fields.get('グレード')).strip():
         h['grade_name'] = nfkc(fields['グレード']).split('/')[0].strip()  # 'G Cuero/FUNBASE G Cuero' → 'G Cuero'
     def _placeholder(x) -> bool:   # 報告書の「車検証確認できず」「書類確認出来ず」は名前ではない（2026-09-29 nc22・nc27・nc29 で顧客名に入った）
-        return bool(re.search(r'確認(でき|出来)ず|確認不可|不明|記載なし', nfkc(x or '')))
+        # 欄の全体が印のときだけ（名前の一部に「不明」を含む会社名は消さない。2026-09-29 バグハント）
+        return bool(re.fullmatch(r'[(（]?(車検証|書類|車検証等)?の?(確認(でき|出来)(ず|ない)|確認不可|不明|記載なし)[)）]?',
+                                 re.sub(r'\s', '', nfkc(x or ''))))
     for _k in ('使用者', '所有者'):
         if _placeholder(fields.get(_k)):
             fields = dict(fields, **{_k: ''})

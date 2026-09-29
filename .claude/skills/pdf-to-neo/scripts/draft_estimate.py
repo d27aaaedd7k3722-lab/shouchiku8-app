@@ -1810,6 +1810,8 @@ class Drafter:
                 if _part(b) and b.get('code') == a.get('code'):
                     m = dict(b)
                     m['wage'] = a['wage']
+                    if a.get('wage_in') is not None:   # 税込で印字された見積書の工賃の印字額（内税の NEO で 1 円ずらさない。バグハント 2026-09-29）
+                        m['wage_in'] = a['wage_in']
                     if a.get('index'):
                         m['index'] = a['index']
                     for key in ('_mark', '_memo'):
@@ -2301,7 +2303,10 @@ class Drafter:
                 # 区分（取替/修理）の印字が無い塗装行（'ﾌﾛﾝﾄﾊﾞﾝﾊﾟ 1.20' のように部位名と指数だけ刷る工場。2026-09-29 コグニ以外の書式 nc11・nc19）:
                 # 同じ部品コードの明細（取替 / 板金・修理）があるパネルだけ、その区分で 20.DB のパネルにする（明細が根拠。無ければ従来どおり）
                 pnl = self._panel_by_code(ln.get('code')) or self._panel_code(_clean_panel_line(n))
-                _it = next((x for x in (getattr(self, '_items_last', None) or []) if pnl and str(x.get('code') or '') == str(pnl['code'])), None)
+                _same = [x for x in (getattr(self, '_items_last', None) or []) if pnl and str(x.get('code') or '') == str(pnl['code'])
+                         and not x.get('reserve') and not x.get('manual')]   # 保留・手入力の行は塗装の連動の根拠にしない（Codex 指摘）
+                _it = next((x for x in _same if x.get('method') == '取替'), None) or next(   # 取替があれば取替、無ければ板金・修理の行（先頭が 脱着 でも。バグハント）
+                    (x for x in _same if x.get('method') in ('板金', '修理', '脱着板金', '脱着修理')), None)
                 if pnl and _it is not None and _it.get('method') in ('取替', '板金', '修理', '脱着板金', '脱着修理'):
                     method = '取替' if _it.get('method') == '取替' else '修理'
                     rec = {'code': pnl['code'], 'name': pnl['name'].strip(), 'method': method, 'area': pnl['area'], 'ratio': '1/1' if method == '修理' else ''}

@@ -238,5 +238,7 @@ if Image is not None:
         check(oa.col_of(L, 2500, 2000) == 'price' and oa.col_of(L, 3000, 2000) == 'wage' and oa.col_of(L, 260, 2000) == 'code', '列の振り分け')
         check(clean.getpixel((205, 2500)) == 255, '縦線を白で消す')
 
+check(not oa.END_RE.search('ﾊﾞﾝﾊﾟ 【再使用】') and not oa.END_RE.search('【流用】') and oa.END_RE.search('【豊用】'),
+      '【再使用】【流用】は明細の行（区画の終わりにしない）。OCR で崩れた【費用】は区画の終わり（バグハント 2026-09-29）')
 print('OK' if not FAILS else f'NG {len(FAILS)} 件')
 sys.exit(1 if FAILS else 0)

@@ -740,7 +740,12 @@ class Checker:
             """割り戻しの丸めで許される幅。印字を割った値と、割った明細の積み上げのそれぞれに 0.5 円まで乗る"""
             return (n + 3) // 2 if _tax_on else 0
         # 数量 2 以上の行は 1 個の単価ごとに割り戻すので、丸めは個数ぶん乗る（to_tax_excluded の d_qty。2026-09-29 nc23 クリップ ×10）
-        _n_price = sum(max(1, _int(r.get('qty')) or 1) for r in rows if _int(r.get('price')))
+        def _printed_price(r):
+            """割り戻す前の印字の金額（to_tax_excluded がメモに残す [税込 部品=…]。無ければ今の金額）"""
+            m_ = TAX_IN_RE.search(str(r.get('comment') or ''))
+            return _int(m_.group(1)) if (m_ and m_.group(1)) else _int(r.get('price'))
+        _n_price = sum((_int(r.get('qty')) if ((_int(r.get('qty')) or 1) > 1 and (_printed_price(r) or 0) % _int(r.get('qty')) == 0) else 1)
+                       for r in rows if _int(r.get('price')))   # to_tax_excluded の d_qty と同じ条件を印字の金額で（割り切れない行は 1 回だけ丸める。バグハント・Codex 指摘）
         _n_wage = sum(1 for r in rows if _int(r.get('wage')))
         _n_lines = len(p.get('lines') or []) + len(p.get('other') or []) + len(p.get('panels') or [])
         _n_exp = len(self.rd.get('expenses') or [])

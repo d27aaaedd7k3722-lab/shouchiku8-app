@@ -136,13 +136,18 @@ def tax_of(out: int) -> tuple[int, int]:
 _TAX_ROUND: contextvars.ContextVar = contextvars.ContextVar('neo_tax_round', default='四捨五入')
 
 
-def _tax_excluded_printed(p) -> Optional[int]:
-    """税込の印字額を税抜に直した値（reading_check.tax_excluded_amount と同じ四捨五入）。数値でなければ None"""
+def _int_or_none(v) -> Optional[int]:
+    """'1,364' や ' 1364 ' も整数に。数値にできなければ None（手で書いた estimate.json の税込の印字額。バグハント 2026-09-29）"""
     try:
-        p = int(p)
+        return int(float(unicodedata.normalize('NFKC', str(v)).replace(',', '').strip()))
     except (TypeError, ValueError):
         return None
-    if p <= 0:
+
+
+def _tax_excluded_printed(p) -> Optional[int]:
+    """税込の印字額を税抜に直した値（reading_check.tax_excluded_amount と同じ四捨五入）。数値でなければ None"""
+    p = _int_or_none(p)
+    if p is None or p <= 0:
         return None
     r = int(round(TAX * 100))
     return (p * 100 + (100 + r) // 2) // (100 + r)
@@ -3080,13 +3085,13 @@ class NeoBuilder:
                         # 印字の税込額を割った値が今の税抜額と一致するときだけ使う（下書きが金額を直した行では古い印字額を使わない）。
                         # 割り方は読み取り側（reading_check.tax_excluded_amount。常に四捨五入）と同じにする。消費税が切り捨て設定の工場でも
                         # 税抜は読み取りが決めた値なので、ここで設定の丸め方を使うと一致しなくなり印字額が捨てられる（Codex 指摘）
-                        tx = int(_pin) - int(out); it_ = int(_pin)
-                    elif (getattr(self, '_tax_included', False) and base == 'PartsPrice' and _pin is not None and int(rec.get('PartsCount') or 1) > 1
-                          and int(_pin) % int(rec['PartsCount']) == 0
-                          and (_tax_excluded_printed(int(_pin) // int(rec['PartsCount'])) or 0) * int(rec['PartsCount']) == int(out)):
+                        tx = _int_or_none(_pin) - int(out); it_ = _int_or_none(_pin)   # '1,364' と書かれた印字額でも落ちない（Codex 指摘）
+                    elif (getattr(self, '_tax_included', False) and base == 'PartsPrice' and _int_or_none(_pin) is not None and int(rec.get('PartsCount') or 1) > 1
+                          and _int_or_none(_pin) % int(rec['PartsCount']) == 0
+                          and (_tax_excluded_printed(_int_or_none(_pin) // int(rec['PartsCount'])) or 0) * int(rec['PartsCount']) == int(out)):
                         # 内税の数量行: 工場は 1 個の税込単価ごとに税を割っている（reading_check.to_tax_excluded の d_qty）。
                         # 税抜から作り直すと税込が印字の数量分の額から 1 円ずれる（2026-09-29 nc23 −2 円・nc30 −1 円）
-                        tx = int(_pin) - int(out); it_ = int(_pin)
+                        tx = _int_or_none(_pin) - int(out); it_ = _int_or_none(_pin)
                     elif base == 'PartsPrice' and int(rec.get('PartsCount') or 0) > 1 and int(rec.get('PartsUnitPriceOutTax') or 0) > 0 and int(rec['PartsUnitPriceOutTax']) * int(rec['PartsCount']) == int(out):
                         tx = _tax_amount(int(rec['PartsUnitPriceOutTax'])) * int(rec['PartsCount']); it_ = int(out) + tx  # 数量行の税 = 単価の税（消費税設定の丸め。既定 四捨五入）×数量（コグニ実機: 155×10 → 税 160、185×9 → 171。単価欄 PartsUnitPriceTax は切捨 15 のまま）
                     rec[base + 'InTax'] = it_; rec[base + 'Tax'] = tx

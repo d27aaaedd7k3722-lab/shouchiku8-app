@@ -84,5 +84,7 @@ h3 = ha.build({'使用者': '車検証確認できず', '所有者': '書類確�
 check('name' not in (h3.get('customer') or {}) and 'owner' not in (h3.get('customer') or {}), f'「車検証確認できず」は名前ではない {h3}')
 h4 = ha.build({'使用者': '同上', '所有者': '車検証確認できず'}, '')
 check('name' not in (h4.get('customer') or {}), f'「同上」で所有者が無ければ顧客名は空 {h4}')
+h5 = ha.build({'使用者': '不明商事'}, '')
+check((h5.get('customer') or {}).get('name') == '不明商事', f'名前の一部に「不明」を含む会社名は消さない {h5}')
 print('OK' if not FAILS else f'NG {len(FAILS)} 件')
 sys.exit(1 if FAILS else 0)

@@ -124,6 +124,11 @@ def test_work_row_and_part_row_are_merged():
     assert len(its) == 1 and its[0].get('price') == 40700 and its[0].get('wage') == 13720, f'1 行にまとまっていない {its}'
     e2 = de.Drafter(dict(READING, format='A', labor_rate=7620, blocks=[{'title': 'x', 'rows': rows}])).build()
     assert len([x for x in e2['items'] if x.get('code') == code]) == 2, 'コグニ印刷（書式 A）はまとめない'
+    # 税込で印字された見積書: 作業行の工賃の印字額（wage_in）もまとめた行に残す（バグハント 2026-09-29）
+    rows3 = [f'{code}|ﾌﾛﾝﾄﾊﾞﾝﾊﾟ|取替|||||13720||[税込 部品= 工賃=15092]', f'{code}|ﾌﾛﾝﾄﾊﾞﾝﾊﾟｶﾊﾞｰ|取替|||1|40700|||[税込 部品=44770 工賃=]']
+    e3 = de.Drafter(dict(READING, labor_rate=7620, blocks=[{'title': 'x', 'rows': rows3}])).build()
+    its3 = [x for x in e3['items'] if x.get('code') == code]
+    assert len(its3) == 1 and its3[0].get('wage_in') == 15092 and its3[0].get('price_in') == 44770, f'税込の印字額が落ちた {its3}'
 
 
 def test_tax_round_without_printed_taxable():

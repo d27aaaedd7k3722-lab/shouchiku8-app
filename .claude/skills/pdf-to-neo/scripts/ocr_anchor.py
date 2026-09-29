@@ -55,7 +55,7 @@ import reading_pages  # noqa: E402
 UNVERIFIED = 'OCR未確認'
 METHODS = ('脱着修理', '脱着板金', '脱着鈑金', '鈑金修正', '点検調整', '分解調整', '取替', '交換', '取換', '脱着', '取外', '取付', '板金', '鈑金',
            '修理', '補修', '修正', '点検', '調整', '診断', '分解')  # 生成器の DISPOSAL の語（長い語から）。印字どおりに写す
-END_RE = re.compile(r'塗装費用|塗装明細|【塗装|【費用|明細】|【.{0,2}用】|ページ小計|頁小計|ジ小計|次頁|前頁繰越|課税額計|消費税|御見積額')  # 見出しは OCR で崩れる（'【奘明細】' '【豊用】'）
+END_RE = re.compile(r'塗装費用|塗装明細|【塗装|【費用|明細】|【[^使流転共兼汎専再]用】|ページ小計|頁小計|ジ小計|次頁|前頁繰越|課税額計|消費税|御見積額')  # 見出しは OCR で崩れる（'【奘明細】' '【豊用】'）
 FRAME_RE = re.compile(r'ランク|ﾗﾝｸ|基本内|基本修正')
 END2_RE = re.compile(r'ページ小計|頁小計|ジ小計|次頁|前頁繰越|課税額計|消費税|御見積額')  # 区画（塗装明細・費用）の下端
 # 塗装明細の行（見出しの「塗装費用計」が OCR で崩れても、ここから下は部品の明細ではない）
@@ -1409,7 +1409,7 @@ def parse_sections(slots: list[dict], labor: Optional[int], vocab: dict, an=None
             continue
         seen_any = True
         if state == 'head':
-            if re.fullmatch(r'塗装費用', nm) and wg is not None and not heads:
+            if re.fullmatch(r'塗装費用計?', nm) and wg is not None and not heads:   # 「塗装費用計」と刷る様式も（バグハント）
                 # 塗装が一式（'塗装費用 202,230' の 1 行だけ）。コグニはこの下に【費用】の見出しを付けずに費用を並べることがある（ハイエース C14）
                 heads['paint_total'] = wg
                 s['_paint_head'] = 'paint_total'

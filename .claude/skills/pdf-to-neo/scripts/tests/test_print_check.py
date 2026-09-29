@@ -64,6 +64,17 @@ def chk(cond, msg):
         print('  NG', msg)
 
 
+def test_parts_price_and_amountless_rows():
+    """rows_from_estimate は parts_price を price より先に（生成器と同じ）。金額の無い印刷の行が余れば余分な行（欄外・塗装条件は除く）（バグハント 2026-09-29）"""
+    r = pc.rows_from_estimate({'items': [{'code': '0010', 'name': 'x', 'parts_price': 1234, 'price': 999}]})
+    assert r['blocks'][0]['rows'][0]['price'] == 1234, r
+    pr = {'rows': [], 'expenses': [], 'frame': [], 'totals': {}, 'name_only': ['ｽﾃｯﾌﾟｶﾊﾞｰ', 'ﾄﾞｱ付替']}
+    rd = {'blocks': [{'title': '', 'rows': [{'code': '', 'name': 'ｽﾃｯﾌﾟｶﾊﾞｰ', 'method': ''}]}]}
+    d = pc.compare(rd, pr, names=False)
+    assert d == ['余分な行: 印刷 金額の無い行 ﾄﾞｱ付替 が見積書の写しに無い'], d
+    assert pr['name_only'] == ['ｽﾃｯﾌﾟｶﾊﾞｰ', 'ﾄﾞｱ付替'], '呼び出し元の pr を書き換えない'
+
+
 def test_parse_and_compare():
     pr = pc.parse_print([PAGE])
     codes = [r['code'] for r in pr['rows']]
