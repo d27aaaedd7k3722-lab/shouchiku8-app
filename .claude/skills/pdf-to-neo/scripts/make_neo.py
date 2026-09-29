@@ -94,8 +94,12 @@ def write_report(case: str, est: dict, rep: dict, rows: list[dict], inspect_json
     _from = est.get('_labor_rate_from')   # 下書きが残すレートの出どころ（printed / inferred）。古い estimate.json には無い
     if (rep.get('stats') or {}).get('labor_rate_assumed'):
         _rate_note = '（★ 見積書に印字が無く、工賃÷指数からも決められないので仮定）'
+    elif (rep.get('stats') or {}).get('labor_rate_weak'):
+        _rate_note = f"（★ 見積書に印字が無く、{rep['stats']['labor_rate_weak']} で決め手が無い。仮の値）"
     elif _from == 'printed' or (not _from and str(_rate_neo) == str(est.get('labor_rate'))):
         _rate_note = ''
+    elif _from == 'inferred':   # 下書きが印字の技術料（と指数）から推定したレート。決め手が弱いときは下書きが確認箇所シートの「レバーレート」を要確認にする（Codex 指摘）
+        _rate_note = '（見積書に印字なし。下書きが印字の技術料から推定。根拠は下書きの注記・確認箇所シート）'
     else:
         _rate_note = '（見積書に印字なし。工賃÷指数から決めた）'
     L.append(f"- レバーレート {_rate_neo} 円{_rate_note}" + (f"、工賃丸め {est.get('wage_round')} 円" if est.get('wage_round') else '') + (f"、index_policy {est.get('index_policy')}" if est.get('index_policy') else ''))

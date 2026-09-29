@@ -2593,6 +2593,8 @@ class NeoBuilder:
         parts._row_disp = None
         # 2) レバーレート推定（工賃 ÷ 指数 の最頻値）
         rate_votes = Counter()
+        idx_tie = False; idx_best = None
+        rate_rows: dict = {}   # レート → 票を入れた明細の行（1 行の複数の指数が同じレートに票を入れても 1 行と数える）
         idx_pairs = []  # (指数, 印字工賃): 見積書に指数が印字された行。候補レートごとに「指数×レートを丸め単位で丸めると印字工賃になる行数」で選ぶ（100 円丸めの工場でも 11,200 に誤らない）
         for w in work:
             wage = int(w['item'].get('wage') or 0)
@@ -2607,6 +2609,7 @@ class NeoBuilder:
                     r = round(wage / (wi / 100.0) / 100) * 100
                     if 4000 <= r <= 20000:
                         rate_votes[r] += 1
+                        rate_rows.setdefault(r, set()).add(id(w))
         if idx_pairs:
             cands = {int(round(w_ / t_ / 10)) * 10 for t_, w_ in idx_pairs if t_ > 0 and 4000 <= w_ / t_ <= 20000}
             for t_, w_ in idx_pairs:  # 丸め後の印字工賃から逆算できるレート範囲（10 円 / 100 円丸め）も候補に（100 円丸めの行だけだと実単価が w/t に現れない）
@@ -2623,8 +2626,13 @@ class NeoBuilder:
             if cands:
                 best = max(cands, key=lambda c: (sum(1 for t_, w_ in idx_pairs if r10_even(t_ * c) == w_), -abs(c - 10000)))
                 rate_votes[best] += 2 * len(idx_pairs)
+                # 指数の印字がある行は、選んだレートで印字の工賃が再現できる行だけを票として数える（Codex 指摘）。
+                # 丸めの幅の中の候補（8,490〜8,510 など）は同じレートとみて、2% を超えて違う候補が同じ行数を再現するときだけ同点とする
+                _sc = {c: sum(1 for t_, w_ in idx_pairs if r10_even(t_ * c) == w_) for c in cands}
+                idx_tie = any(v == _sc[best] and abs(c - best) > best * 0.02 for c, v in _sc.items())
+                idx_best = best
 
-        rate = labor_rate; rate_assumed = False
+        rate = labor_rate; rate_assumed = False; rate_weak = ''
         if not rate:
             top = rate_votes.most_common(4)
             rate = top[0][0] if top else 7280
@@ -2633,6 +2641,14 @@ class NeoBuilder:
             for r_, n_ in top[1:]:
                 if abs(r_ * 2 - rate) <= 200 and n_ >= max(2, top[0][1] * 0.4):
                     rate = r_; break
+            # 票を入れた行が 1 行だけ・同じだけ説明できる別のレートがあるときは決め手にならない（2026-09-29 nc35: 明細 6 行で 15,000 円を採り、
+            # 報告文は「工賃÷指数から決めた」と言い切っていた）。値はそのまま使うが、仮の値として run_case・報告文に ★ で出す。
+            # 判定は最終的に採ったレート（半分のレートに直した後）で行う（Codex 指摘）
+            _nrow = len(rate_rows.get(rate, ())) + sum(1 for t_, w_ in idx_pairs if r10_even(t_ * rate) == w_)   # 最終のレートで印字の工賃を再現できる行（Codex 指摘）
+            _tie = (idx_tie and rate == idx_best) or any(n_ == rate_votes.get(rate, 0) and abs(r_ - rate) > rate * 0.02 for r_, n_ in rate_votes.items())
+            if top and (_nrow < 2 or _tie):
+                _vs = ', '.join(f'{r_:,} 円 {n_} 票' for r_, n_ in top[:3])
+                rate_weak = (f"工賃÷指数の票が {_nrow} 行分だけ（{_vs}）" if _nrow < 2 else f"工賃÷指数で同じだけ説明できるレートが複数（{_vs}）")
         # 3) 行組み立て
         rows, evidence, opt_pos, opt_neg = [], [], Counter(), Counter()
         for i, w in enumerate(work):
@@ -2927,7 +2943,7 @@ class NeoBuilder:
             evidence.append(f"{row['PartsCode'] or '----'} {name_disp}: {w['why']} / 指数{wi_used if wi_used > 0 else '-'} {sec_used or ''}")
         if getattr(parts, '_r11_error', ''):
             self._note_silent('11.DB（品番・価格）の解析', RuntimeError(parts._r11_error), '標準品番・標準価格が全行で空になる')
-        stats = {'labor_rate': rate, 'rate_votes': dict(rate_votes.most_common(3)), 'labor_rate_assumed': rate_assumed,
+        stats = {'labor_rate': rate, 'rate_votes': dict(rate_votes.most_common(3)), 'labor_rate_assumed': rate_assumed, 'labor_rate_weak': rate_weak,
                  'matched': sum(1 for r in rows if r['PartsCode']), 'total': len(rows),
                  'option_pos': dict(opt_pos), 'option_neg': dict(opt_neg), 'evidence': evidence,
                  # build_rows を直に呼ぶ検査・スクリプトからも握り潰しに気づけるようにする（build は report['silent_errors'] にも載せる）

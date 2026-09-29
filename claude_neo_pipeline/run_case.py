@@ -251,6 +251,9 @@ def main(path: str, out: str = ''):
     _warn_too_many_manual(est, rep, st)
     for _ku in _warn_known_unresolved(est):
         print(f'  ★ {_ku}')
+    if st.get('labor_rate_weak'):
+        print(f"  ★ レバーレートが見積に無く、{st['labor_rate_weak']} で決め手が無い。{st.get('labor_rate'):,} 円は仮の値"
+              '（指数・標準工賃がこの単価で計算される。金額は印字どおり）。速報・確報の工賃単価か工場の過去の NEO を見て reading の labor_rate に書く')
     if st.get('labor_rate_assumed'):
         print('  ★ レバーレートが見積に無く、工賃÷指数からも決められないので 7,280 円を仮定した。estimate.json に labor_rate を書く（標準工賃・塗装工賃がこの単価で計算されている）')
     if getattr(nb, '_std_route_note', None):

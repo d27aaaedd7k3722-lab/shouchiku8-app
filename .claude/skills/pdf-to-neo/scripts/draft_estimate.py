@@ -1016,6 +1016,34 @@ class Drafter:
         return ' / '.join(f"{r:04d} {'/'.join(sorted(x.strip() for x in self.parts.name20_by_ref.get(r, ())))}（標準 {unit:,} 円・名前 {sim:.2f}）"
                           for sim, _b, _n, r in scored[:limit])
 
+    def _ctx_price_pick(self, name: str, side: str, price: int, qty: int, ctx_block: str, used: set) -> Optional[int]:
+        """直前の主作業の部位（ctx_block）にある部品のうち、標準単価が印字の単価とぴったり同じものが 1 種類（左右の組は 1 種類と数える）だけなら、それ。
+        名前が工場のソフトと ADDATA で違う付属品（'Fｶﾞﾗｽｳｴｻﾞｽﾄﾘｯﾌﾟ' = Fｳｲﾝﾄﾞｼｰﾙﾄﾞﾀﾞﾑﾗﾊﾞｰ、'Fｶﾞﾗｽﾓｰﾙ' = ｳｲﾝﾄﾞｼｰﾙﾄﾞｻｲﾄﾞﾓｰﾙ、
+        ガラス脱着の後の 'ｸﾘｯﾌﾟ' = ｳｲﾝﾄﾞｼｰﾙﾄﾞｸﾘｯﾌﾟ）を、部位と単価の 2 つの手掛かりで決める（2026-09-29 nc30: 名前だけでは未照合・ﾌｪﾝﾀﾞのｸﾘｯﾌﾟ）。
+        左右の組は、行の左右 → 未使用の左 → 右 の順"""
+        if not ctx_block or not price or price <= 0 or qty <= 0 or price % qty:
+            return None
+        unit = price // qty
+        if unit < 100:
+            return None   # 数十円の小物は同じ単価の部品が多く、偶然の一致と見分けられない
+        cands = [r for r in self._refs_in_block(ctx_block) if self._std_unit(r) == unit]   # 色別の部品（83.DB）も候補（ダムラバー・サイドモールがそう）
+        groups: dict = {}
+        for r in cands:
+            base = {re.sub(r'^[LR ]?', '', self.parts.norm_name(x)).lstrip() for x in self.parts.name20_by_ref.get(r, ())}
+            groups.setdefault(min(base) if base else str(r), []).append(r)
+        if len(groups) != 1:
+            return None
+        members = next(iter(groups.values()))
+
+        def _sd(r):
+            return next((_side20(x) for x in self.parts.name20_by_ref.get(r, ()) if _side20(x)), '')
+        if len(members) > 1 and not (len(members) == 2 and {_sd(r) for r in members} == {'L', 'R'}):
+            return None   # 1 つの部品か左右の組だけ。同じ名前の部品が他にもある（同じ側・左右の無いもの）: どれか決められない（Codex 指摘）
+        if side:
+            members = [r for r in members if _sd(r) in (side, '')] or []
+        members.sort(key=lambda r: (r in used, {'L': 0, '': 1, 'R': 2}.get(_sd(r), 1), r))
+        return members[0] if members else None
+
     # ------------------------------------------------------------------ 明細
     def _refs_in_block(self, block: str) -> list[int]:
         return [r for r, b in self.parts.block_by_ref.items() if b == block]
@@ -1310,6 +1338,8 @@ class Drafter:
                                   '取替の行と取り違えていないか、部品代が別行のものでないか確かめる（合計が合っていても区分が変わる）')
             item: dict = {'code': '', 'name': name, 'method': ('' if (row.get('manual') and not method.strip()) else METHOD_NAME.get(dcode, '取替')), 'parts_no': pn, 'qty': qty,
                           '_method_print': method, '_name_raw': name_raw}
+            # 名前の末尾の工法の語（'右ﾌﾛﾝﾄﾄﾞｱｰﾊﾟﾈﾙ ﾃﾞﾝﾄ'）は照合だけ外す（NEO の名前は印字どおり。付いたままだとブロック内の別部品 0.62 に替わった。2026-09-29 nc19）
+            name = re.sub(r'\s*[(（]?(ﾃﾞﾝﾄ|デント)(修理|ﾘﾍﾟｱ|リペア)?[)）]?$', '', name).strip() or name
             if price_raw != '':
                 item['price'] = price  # 印字された金額（0 も含む）。欄が無い行は省略 → 生成器が標準価格で補完（取替）/ 0（脱着等）
             if wage is not None:
@@ -1506,6 +1536,23 @@ class Drafter:
                 if _tr is not None and _tr[0] != ref:
                     self.notes.append(f'{name}: {_tr[1]}' + (f'（名称近似の {ref:04d} より優先）' if ref is not None else ''))
                     ref, why = _tr[0], _tr[1]
+            if not pn and not code_in and ctx_block and price > 0 and dcode == 0:
+                # 直前の主作業の部位に、印字の単価とぴったり同じ標準単価の部品が 1 種類だけある: 名前で決まらなかった行か、
+                # 名前で決めた部品が部位の外で単価も合わない行はそれにする（_ctx_price_pick）
+                _u = price // qty if qty > 0 and price % qty == 0 else 0
+                _su = self._std_unit(ref) if ref is not None else 0
+                _cur_bad = ref is None or (self.parts.block_of(ref) != ctx_block and _u and not (_su and abs(_su - _u) <= _u * 0.2)
+                                           and (AddataParts._why_score(re.sub(r'^語順入替「.*?」\s*', '', (why or '').split(' ← ')[0])) < 1.0 or is_small_name(name_raw, _u)))
+                # 名前が完全に一致した部品（小物の 'ｸﾘｯﾌﾟ' のような部位ごとにある名前は除く）と、標準単価が 2 割以内の部品は替えない
+                # （C17: ｱｸｽﾙﾊﾌﾞﾅｯﾄ 250 円 → 同じ部位の 240 円の別部品にしない。nc30: ｸﾘｯﾌﾟ 440 円は ﾌｪﾝﾀﾞの 210 円でなく ｳｲﾝﾄﾞｼｰﾙﾄﾞｸﾘｯﾌﾟ）
+                if _cur_bad:
+                    _cp = self._ctx_price_pick(name, side, price, qty, ctx_block, used)
+                    if _cp is not None and _cp != ref:
+                        _was = f'{ref:04d}' if ref is not None else '未照合'
+                        ref, why = _cp, f'部位 {ctx_block} で単価一致({_u:,} 円) ← {why or "未照合"}'
+                        self.notes.append(f'{name_raw}: 直前の作業の部位 {ctx_block} に標準単価 {_u:,} 円の部品が 1 種類だけ → {ref:04d}（{_was} から）')
+                        self._rev('判断', '部品コード', f'部位と単価で {ref:04d} {"/".join(sorted(x.strip() for x in self.parts.name20_by_ref.get(ref, ())))} にした（{_was} から）',
+                                  row=row, item=item, code=f'{ref:04d}')
             if ref is None and _en_back is not None:
                 name_raw = _en_back
                 item['name'] = _clean_name(name_raw); item['_name_raw'] = name_raw
