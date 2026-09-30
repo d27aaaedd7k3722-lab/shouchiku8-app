@@ -4299,9 +4299,55 @@ class NeoBuilder:
         return self._close(con, p)
 
     # ------------------------------------------------------------ AnSMB.txt (142B 固定長)
+    # 1 行 = 21 欄（名前, 位置, 幅）。位置・幅・中身は人が作った実機 NEO 374 本 16,533 行の AnSMB を
+    # ERParts と行番号で突き合わせて確かめた（2026-09-30。NEO_FILE_SPEC_COMPLETE.md §5）
+    ANSMB_FIELDS = (('LineNo', 0, 8), ('PartsCode', 8, 4), ('PartsCodeSub', 12, 1), ('DisposalCode', 13, 1),
+                    ('PartsName', 14, 24), ('PartsNameStandard', 38, 24), ('PartsNo', 62, 18), ('PartsNoStandard', 80, 18),
+                    ('PartsCount', 98, 2), ('OrderFlag', 100, 1), ('RecycleFlag', 101, 1), ('ReserveFlag', 102, 1),
+                    ('RWLinkFlag', 103, 1), ('CutWorkFlag', 104, 1), ('CutWorkL', 105, 1), ('CutWorkLDisposal', 106, 6),
+                    ('CutWorkR', 112, 1), ('CutWorkRDisposal', 113, 6), ('PartsFigNo', 119, 8), ('PartsNameCode', 127, 6),
+                    ('PartsNameCodeStandard', 133, 9))
+
+    @staticmethod
+    def ansmb_fields(r: dict) -> dict:
+        """明細 1 行（ERParts の行）→ AnSMB の 21 欄の文字列。build_ansmb が位置に並べる"""
+        def digit(v, blank_below=0):  # 1 桁の数字欄: 負（未設定）は空白、10 以上は 9
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                return ' '
+            return ' ' if n < blank_below else str(min(n, 9))
+        cw = _smb_cutwork(str(r.get('_smb_tail') or ''))  # '' か 'フラグ 1 桁 ＋ 12.DB の CutWork 欄 11 バイト'
+        cw_tail = cw[1:] if cw else ''
+        _of = r.get('OrderFlag')
+        f = {
+            'LineNo': f"{r['LineNo']:08d}",
+            'PartsCode': r['PartsCode'] or '    ',  # 部品コードの無い行はコード欄も空白（コグニ実機 2026-09-08 cogni_K1 / C06 再検索: '0000' ではない）
+            'PartsCodeSub': digit(r.get('PartsCodeSub', -1)),  # -1 は空白、0〜9 はその数字（ERParts.PartsCodeSub。実機 16,533 行すべて一致。リサイクル部品は 1。10 以上は実例なし・9 に丸める）
+            'DisposalCode': digit(r['DisposalCode']),  # 修理方法空欄の手入力行: コード欄・区分欄とも空白（コグニ実機 2026-09-08 exp_manual.neo）
+            'PartsName': r['PartsName'],
+            'PartsNameStandard': r['PartsNameStandard'],  # 11.DB の名称欄そのまま（先頭スペースを落とさない。実 NEO 299 行で開始桁 38/39/40 の分布が名称の先頭スペース数と一致）
+            'PartsNo': r['PartsNo'],
+            'PartsNoStandard': r['PartsNoStandard'],  # 標準品番は修理方法によらず入る（実機 cogni_M1。再検索を通した保存版では消えるが、それは再検索の副作用）
+            'PartsCount': f"{max(1, r['PartsCount'] if r['PartsCount'] > 0 else 1):02d}",
+            'OrderFlag': ' ' if _of in (None, '') else str(_of),  # ERParts.OrderFlag と同じ値（数値の 0 も '0'）。触っていない見積は全行 空白（実機 cogni_M1、実 NEO 199 本 6,477 行で恒等）
+            'RecycleFlag': '1' if r.get('_smb_recycle') else '0',
+            'ReserveFlag': digit(r.get('ReserveFlag') or 0),  # ERParts.ReserveFlag の値そのまま（保留 '1'・もう 1 種類の保留 '2'。実機 16,533 行で 0/1/2 とも一致。実機 2026-09-09 cogni_CX4 6800）
+            'RWLinkFlag': digit(r.get('RWLinkFlag') or 0),  # ERParts.RWLinkFlag（実機 16,533 行すべて一致・1 は 39 行）。生成器は常に 0
+            # 104〜118 桁: 部分切断作業。12.DB の CutWork 欄（[65:76] 11 バイト = 左 1＋左の処分 6＋右 1＋右の処分の先頭 4）を
+            # **欄が空でなければそのまま写し**、先頭のフラグは英字の有無（2026-09-21 に実案件 46,437 行で 99.380% → 99.989%。
+            # 実機 16,533 行で 116〜118 桁は常に空白、フラグは「英字あり」と「左右どちらかが 1/3/5/7/9」が 76/76 行で同じ）
+            'CutWorkFlag': cw[:1] or '0',
+            'CutWorkL': cw_tail[0:1], 'CutWorkLDisposal': cw_tail[1:7], 'CutWorkR': cw_tail[7:8], 'CutWorkRDisposal': cw_tail[8:14],
+            'PartsFigNo': r.get('_smb_fig_no') or '',  # 部品図番（実機で入るのは 16,533 行中 30 行だけ。生成器は持たない＝空白）
+            'PartsNameCode': r.get('_smb_name_code') or 'F99999',
+            'PartsNameCodeStandard': r.get('_smb_name_code_std') or '',
+        }
+        return f
+
     @staticmethod
     def build_ansmb(rows: list[dict]) -> bytes:
-        """AnSMB.txt: 142B 固定長 × 明細行（ERParts の全行）。60 行で打ち切る実装だったが、実 NEO は 1 行も欠けない
+        """AnSMB.txt: 142B 固定長 × 明細行（ERParts の全行）＋ CRLF。60 行で打ち切る実装だったが、実 NEO は 1 行も欠けない
         （コグニ標準サンプル 04011141 は 267 行 / 267 行、工場 NEO 12051345 は 97/97、再検索保存版 C06 は 66/66。2026-09-08 の総当たり検証で修正）"""
         out = []
         for r in rows:
@@ -4309,18 +4355,11 @@ class NeoBuilder:
             def put(pos, s, width):
                 b = str(s).encode('cp932w', 'replace')[:width]
                 line[pos:pos + len(b)] = b
-            put(0, f"{r['LineNo']:08d}", 8)
-            put(8, (r['PartsCode'] or '    '), 4)  # 部品コードの無い行はコード欄も空白（コグニ実機 2026-09-08 cogni_K1 / C06 再検索: '0000' ではない）
-            put(12, ('  ' if int(r['DisposalCode']) < 0 else f" {r['DisposalCode']}"), 2)  # 修理方法空欄の手入力行: コード欄・区分欄とも空白（コグニ実機 2026-09-08 exp_manual.neo の AnSMB）
-            put(14, r['PartsName'], 25); put(38, r['PartsNameStandard'], 24)  # 標準名称は 38 桁目から、11.DB の名称欄そのまま（先頭スペースを落とさない。実 NEO 299 行で開始桁 38/39/40 の分布が名称の先頭スペース数と一致）
-            put(62, r['PartsNo'], 18)
-            put(80, r['PartsNoStandard'], 18)  # 標準品番は修理方法によらず入る（実機 cogni_M1。再検索を通した保存版では消えるが、それは再検索の副作用）
+            f = NeoBuilder.ansmb_fields(r)
+            for name, pos, width in NeoBuilder.ANSMB_FIELDS:
+                put(pos, f[name], width)
             if r.get('_smb_recycle'):  # リサイクル部品: 12 桁目 PartsCodeSub=1、名称と品番欄を差替、101 桁目 RecycleFlag
                 put(12, '1', 1); put(14, ' ' * 25, 25); put(14, r['_smb_recycle'][0], 25); put(39, ' ' * 23, 23); put(62, ' ' * 18, 18); put(62, 'リサイクル部品', 18); put(80, ' ' * 18, 18)
-            put(98, f"{max(1, r['PartsCount'] if r['PartsCount'] > 0 else 1):02d}", 2)
-            _of = r.get('OrderFlag')
-            put(100, (' ' if _of in (None, '') else str(_of)), 1)  # 数値の 0 も '0' として書く（ERParts と同じ値にする）  # 100 桁 = ERParts.OrderFlag（部品発注の状態）。触っていない見積は全行 空白（実機 cogni_M1、実 NEO 199 本 6,477 行で恒等）
-            put(101, ('1' if r.get('_smb_recycle') else '0') + ('1' if r.get('ReserveFlag') else '0') + '00', 4); put(104, _smb_cutwork(str(r.get('_smb_tail') or '')), 12); put(127, 'F99999', 6)  # 101 桁 = リサイクル置換、102 桁 = 保留（実機 2026-09-09 cogni_CX4 6800）。 104〜115 桁: 12.DB の CutWork 欄（[65:76] = 部分切断作業）を **欄が空でなければそのまま写し**、先頭 1 桁を英字の有無で '1'/'0' にする（2026-09-21 に訂正。実案件 46,437 行で 99.380% → 99.989%。それまで『数字だけの欄は捨てる』としていたが、当時の根拠 801 行にたまたま数字だけの欄を持つ部品が入っていなかっただけで、実際は 179/815 本が 1 行以上ずれていた）
             out.append(bytes(line) + b'\r\n')
         return b''.join(out)
 

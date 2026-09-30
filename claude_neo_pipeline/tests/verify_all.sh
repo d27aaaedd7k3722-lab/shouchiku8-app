@@ -18,6 +18,7 @@ run 'unit era (元号は改元日で分ける)' bash -c 'set -o pipefail; PYTHON
 run 'unit era (元号は改元日で分ける)' bash -c 'set -o pipefail; PYTHONIOENCODING=utf-8 python "$0/unit_cab.py" | tail -2' "$SP"
 run 'unit link/absorb (cogni 2026-09-08 H1-H7/G1)' bash -c 'set -o pipefail; PYTHONIOENCODING=utf-8 python "$0/unit_link_absorb.py" | tail -2' "$SP"
 run 'AnSMB 142 桁一致 (そのまま保存 25 本・実案件を含む)' bash -c 'set -o pipefail; PYTHONIOENCODING=utf-8 python "$0/audit_cogni_files.py" --ansmb | tail -1' "$SP"
+run 'unit ansmb (AnSMB 21 欄の位置・幅・境界)' bash -c 'set -o pipefail; PYTHONIOENCODING=utf-8 python "$0/unit_ansmb.py" | tail -1' "$SP"
 run 'unit frame basic (内板骨格の基本内・控えの初期化)' bash -c 'set -o pipefail; PYTHONIOENCODING=utf-8 python "$0/unit_frame_basic.py" | tail -1' "$SP"
 run 'unit parts infer (品番からの車両・装備の逆引き)' bash -c 'set -o pipefail; PYTHONIOENCODING=utf-8 python "$0/unit_parts_infer.py" | tail -1' "$SP"
 run 'unit guards (入力の境界)' bash -c 'set -o pipefail; PYTHONIOENCODING=utf-8 python "$0/unit_guards.py" | tail -1' "$SP"
