@@ -15,7 +15,7 @@ pdf-to-neo の**精度を測って上げる**ための手順。NEO を 1 件作�
 | スキル・生成器のテスト | `scripts/tests/test_*.py`・`claude_neo_pipeline/tests/unit_*.py`・`env_check.py --self-test` | 全部合格 |
 | 回帰（人が確かめた正解との一致） | `scripts/regress_cases.py` | 22 / 22 |
 | コグニ印刷 FAX の自動読み取り | `scripts/ocr_eval.py` | 369 行・**確定なのに違う 0**・確定 342 |
-| コグニ以外の書式: 部品コードの当たり | `verify/code_accuracy.py` | **966 / 1,028（94.0%）**（29 件） |
+| コグニ以外の書式: 部品コードの当たり | `verify/code_accuracy.py` | **971 / 1,028（94.5%）**（29 件） |
 | コグニ以外の書式: 作り直しの合否 | `verify/remake_cases.py --base _nc` | 38 / 38（見積でない nc01・nc09 を除く。紙上検算も通す） |
 | コグニ印刷の自動読み取り → NEO | `verify/remake_cases.py --base _batch` | 28 件中 18 合格（`--skip-check` なら 20。sienta・f03 は自動読み取りの写しに紙上検算の FAIL が 1 つずつ残る。ほかの不合格は車両が決まらない t02・t13・f05、FAX の OCR で ADDATA に照合できない f01・f02・f04、t03・t08。既知） |
 | コグニで刷った印刷と見積書 | `verify/print_compare.py` | 合計は刷った 36 件すべて一致。行の差は 1 件 0〜3 で全部説明がつく（下の §5） |
@@ -133,6 +133,9 @@ PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/verify/remake_ca
 - **コグニ印刷（書式 A）に効かせない規則は書式で分ける**（部品コードが刷られる書式に、名前から部品を推す規則を当てない）。作り直し `_batch` で確かめる
 - 回帰の正解が昔の下書きの誤りを固めていることがある。**意味で正しいと言えるときだけ** `regress_cases.py --only <案件> --update`
 - 名前の完全一致は強い。ただし「ｸﾘｯﾌﾟ」のような部位ごとにある小物の名前は例外
+- **同じ行が並んでいても、勝手に別々の部品に配らない**。ADDATA が枝番（(NO.n)）で位置を分けている族だけ配る。
+  名前が同じだけの族（ﾌﾞﾗｹﾂﾄ ×3・ｴﾙﾎﾞｼﾞﾖｲﾝﾄ ×3）は、**同じ部品を 2 行に書いた見積と見分けられない**
+  （人が確かめた回帰の正解では同じ部品コードが 2 行に入るのが正しかった。2026-09-30 実測）
 - 「合計を合わせるために明細を動かす」直し方はしない。数円の差は理由を 3 点セット（neo_total / tolerance / 理由）で残し、`--allow-neo-total` は人が付ける
 - コード変更は codex-loop（Codex に 1 周ずつ見せ、指摘を直して、合格まで）
 - コミット前に差分を grep して取引先名・顧客名・電話・車台番号・登録番号が無いことを確かめる（GitHub は公開）

@@ -166,6 +166,45 @@ def _money_or(v, default=0, name='金額'):
         raise ValueError(f'{name}が数値でない: {v!r}（写し間違いか、単位や記号が混ざっている）')
 
 
+# ADDATA の枝番（同じ名前で位置だけ違う部品: 'LRﾘﾃ-ﾅ(NO.1)'・'Rﾊﾞﾝﾊﾟｱﾂﾊﾟﾘﾃ-ﾅNO.2'）
+_BRANCH_NO_RE = re.compile(r'\(?\s*NO\.?\s*\d+\s*\)?\s*$', re.I)
+
+
+def _dup_runs(rows_flat: list) -> dict:
+    """同じ名前・同じ金額・同じ数量の行が**続けて**並ぶ組を見つけ、{行の番号: (何本目, 何本)} を返す。
+
+    部品コード・品番の印字がある行と手入力の行は数えない（印字が正）。**続きが切れたら別の組**にする
+    （見出しが変わった・間に別の行が入った）。見積全体で同じ名前を数えると、別の部位に 1 本ずつある
+    同じ名前の行を「同じ組の 2 本目」と見て、関係のない部品に替えてしまう（2026-09-30 Codex 指摘）。
+    使い道は Drafter._dup_ref_pick"""
+    out: dict = {}
+    run: list = []
+    run_key = None
+
+    def flush():
+        if len(run) >= 2:
+            for p_, j_ in enumerate(run):
+                out[j_] = (p_, len(run))
+        run.clear()
+
+    for i, r in enumerate(rows_flat):
+        k = None
+        if not (str(r.get('code') or '').strip() or str(r.get('parts_no') or '').strip()
+                or _flag(r.get('manual'), 'rows[].manual')):
+            k = (r.get('_block_title'), str(r.get('name') or '').strip(), _num(r.get('price')), _num(r.get('qty')))
+            if not k[1] or k[2] in ('', '0'):
+                k = None
+        if k is not None and k == run_key:
+            run.append(i)
+            continue
+        flush()
+        run_key = k
+        if k is not None:
+            run.append(i)
+    flush()
+    return out
+
+
 def _side20(name20: str) -> str:
     """12.DB / 11.DB の 20 文字名の左右: 1 文字目が L/R のときだけ（2 文字目の F/R は前後。' Rﾊﾞﾝﾊﾟｸﾘﾂﾌﾟ' はリヤの無印部品）"""
     s = str(name20 or '')
@@ -1111,6 +1150,81 @@ class Drafter:
         members.sort(key=lambda r: (r in used, {'L': 0, '': 1, 'R': 2}.get(_sd(r), 1), r))
         return (members[0], top) if members else None
 
+    def _family_names(self, ref: int) -> set:
+        """部品の族（左右・前後・枝番を外した名前）。'LRﾘﾃ-ﾅ(NO.6)' も 'RRﾘﾃ-ﾅ(NO.5)' も 'ﾘﾃﾅ'。
+        norm_name は 'RR'→'R'・'FR'→'F' と潰してしまうので、**生の 20 文字名から**左右と前後を外してから正規化する
+        （潰れた名前で比べると、左のリヤ部品と右のリヤ部品が別の族になる）。
+        枝番は括弧付き '(NO.1)' も括弧無し 'NO.2' も外す（norm_name が落とすのは括弧の中だけ。2026-09-30 Codex 指摘）。
+
+        20 文字名の頭は「左右の枠」「前後の枠」の 2 つで、どちらも空欄のときは空白（'  ﾘｻﾞ-ﾌﾞﾀﾝｸｷﾔﾂﾌﾟ'・
+        ' Rﾊﾞﾝﾊﾟﾘﾃ-ﾅ'）。枠の無い名前（'ﾍﾂﾄﾞﾗﾝﾌﾟ'）もあるので、**枠に字が入っているときだけ**外す
+        （長さで切ると、左右が空欄の部品で前後の字が残る。2026-09-30 Codex 指摘）"""
+        return set(self._families(ref))
+
+    def _families(self, ref: int) -> dict:
+        """族 → **その族の名前が枝番を持つか**。1 つの部品が複数の名前を持つ（'R ﾍﾂﾄﾞﾗﾝﾌﾟ' と 'ﾍﾂﾄﾞﾗﾝﾌﾟ'、
+        'LRﾘﾃ-ﾅ(NO.3)' と 'LRﾘﾃ-ﾅ(NO.4)'）ので、枝番の有無は**族ごとに**持つ。
+        「別の族の名前に枝番があるから」で配ってしまわないため（2026-09-30 Codex 指摘）"""
+        out: dict = {}
+        for x in self.parts.name20_by_ref.get(ref, ()):
+            raw = str(x)
+            core = raw[1:] if (_side20(raw) or raw[:1] == ' ') else raw   # 左右の枠（L/R か空白）
+            if _fr20(raw):                                               # 前後の枠（F/R）は生の名前の 2 文字目
+                core = core[1:]
+            elif core[:1] == ' ':
+                core = core[1:]
+            has_no = bool(_BRANCH_NO_RE.search(core))
+            core = _BRANCH_NO_RE.sub('', core)   # 括弧の無い枝番（'Rﾊﾞﾝﾊﾟｱﾂﾊﾟﾘﾃ-ﾅNO.2'）も外す。norm_name は括弧の中しか落とさない
+            n = self.parts.norm_name(core)
+            if n:
+                out[n] = out.get(n, False) or has_no
+        return out
+
+    def _dup_ref_pick(self, name: str, side: str, price: int, qty: int, ref: int, pos: int, k: int):
+        """同じ名前・同じ単価の行が k 本並ぶとき、その pos 本目（0 から）に当たる部品コードを返す。
+
+        実機の部品表は枝番違いの別部品（LRﾘﾃ-ﾅ(NO.1)〜(NO.6)・LRﾌﾞﾗｹﾂﾄ ×3）で、工場の見積は同じ名前・同じ単価の行を
+        その数だけ並べる。1 つの部品コードを全部の行に書くと、紙の部品名と品番が実物と違う（金額は変わらない）。
+
+        歯止めは 2 つ:
+        - 同じ部位・同じ標準単価・同じ族（左右と前後を外した名前）の候補が**ちょうど k 個**であること
+        - その候補が**全部 ADDATA の枝番付き**（'LRﾘﾃ-ﾅ(NO.1)' のような (NO.n)）であること。
+          ＝ **実機の部品表が「別の位置の部品」と言っている**ときだけ配る
+
+        名前がまったく同じだけの族（'LRﾌﾞﾗｹﾂﾄ' ×3・'ﾗﾝﾌﾟｸﾘ-ﾅｴﾙﾎﾞｼﾞﾖｲﾝﾄ' ×3・'L ｳｲﾝﾄﾞｼ-ﾙﾄﾞﾌｱｽﾅB' ×2）は触らない。
+        **同じ部品を 2 行に分けて書いた見積と見分けられない**（人が確かめた回帰の正解では、同じ部品コードを 2 行に
+        書くのが正しかった: ランクル 300 のエルボジョイント・リザーブタンクキャップ、カローラのスクリューグロメット、
+        フリードのウインドシールドファスナ。2026-09-30 実測）。数十円の小物は同じ単価の部品が多く、偶然と見分けられない。
+        2026-09-30 nc18 で実測: 枝番付きの ﾘﾃｰﾅ 6 行が正解と一致"""
+        if not ref or k < 2 or not (0 <= pos < k) or not price or price <= 0 or qty <= 0 or price % qty:
+            return None
+        unit = price // qty
+        if unit < 100:
+            return None
+        block = self.parts.block_of(ref)
+        fams = self._families(ref)
+        if not block or not fams:
+            return None
+        # 1 つの部品が複数の名前を持つので、**この行の名前に当たった族**を選び、その族で見る
+        _n0 = self.parts.norm_name(re.sub(r'^[LR](?=[^A-Z])', '', self.parts.norm_name(name)))
+        _best = max(fams, key=lambda f: (difflib.SequenceMatcher(None, f, _n0).ratio(), f))
+        fam = {_best}
+
+        def _sd(r):
+            return next((_side20(x) for x in self.parts.name20_by_ref.get(r, ()) if _side20(x)), '')
+        cands = sorted(r for r in self._refs_in_block(block)
+                       if self._std_unit(r) == unit and (self._family_names(r) & fam))
+        if side:   # 行に左右があるなら同じ側（左右の無い部品は両方の候補）
+            cands = [r for r in cands if _sd(r) in (side, '')]
+        if len(cands) != k:
+            return None
+        # 枝番の歯止め: 候補が全部**当たった族で**枝番を持つこと（別の族の名前に枝番があっても数えない）。
+        # 枝番の無い族（名前が同じだけ）は、同じ部品を 2 行に書いた見積と見分けられない。
+        # この行の部品（ref）も候補に入っているので、ここだけで両側を見ている
+        if not all(self._families(r).get(_best) for r in cands):
+            return None
+        return cands[pos]
+
     # ------------------------------------------------------------------ 明細
     def _refs_in_block(self, block: str) -> list[int]:
         return [r for r, b in self.parts.block_by_ref.items() if b == block]
@@ -1345,7 +1459,8 @@ class Drafter:
         # 同じ部位の主作業の左右が 1 種類のときだけそれを引き継ぐ（左右両方の作業のあとは引き継がない）。見出しが変わったら捨てる（2026-09-14 スペーシア）
         grp_sides: dict[str, set] = {}
         grp_unknown: set = set()   # 部位の分からない主作業（手入力・未照合）の左右。どの部位の引き継ぎにも加える（Codex 指摘）
-        for row in rows_flat:
+        dup_pos = _dup_runs(rows_flat)   # 同じ行が続けて並ぶ組（行 → 何本中の何本目か）。使い道は _dup_ref_pick
+        for _ri, row in enumerate(rows_flat):
             if row.get('_block_title') != cur_title:  # 新しいブロック: 見出しから部位文脈を作り直す（前ブロックの ref を引きずらない）
                 grp_sides, grp_unknown = {}, set()
                 cur_title = row.get('_block_title')
@@ -1687,6 +1802,14 @@ class Drafter:
                         out.append(item)
                         continue
                     self._rev('判断', '部品コード', _gd, row=row, item=item, code=f'{ref:04d}')
+            _dp = dup_pos.get(_ri)
+            if _dp and not code_in and not pn and ref is not None:
+                # 同じ名前・同じ単価の行が並ぶ見積（ﾘﾃｰﾅ ×6・左右のﾌﾞﾗｹｯﾄ ×3）で、同じ部品コードを全部の行に書かない。
+                # 実機の部品表は枝番違いの別部品で、見積は印字の順に並べている。印字の順に 1 つずつ配る
+                _dup = self._dup_ref_pick(name, side, price, qty, ref, _dp[0], _dp[1])
+                if _dup is not None and _dup != ref:
+                    why = f'同名・同単価 {_dp[1]} 行の {_dp[0] + 1} 本目（{ref} ← {why}）'
+                    ref = _dup
             if not code_in and not pn and '辞書' not in (why or ''):  # 品番も部品コードも無い行（汎用小物など）は名称だけが根拠なので必ず見せる
                 self.notes.append(f'名称だけで決めた: {name} → {ref} '
                                   + '/'.join(sorted(self.parts.name20_by_ref.get(ref, ()))) + f'（{why}）。品番が無いので別の部品を選んでいないか確かめる')
