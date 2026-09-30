@@ -26,17 +26,18 @@ def test_same_amount_rows_pair_by_name():
     assert res['matched'] == 1 and not res['only_other'], res
 
 
-def test_align_pairs_match_compare():
-    """align は compare と同じ揃え方の組を返す（人の NEO を正解にする答え合わせ human_neo_accuracy が使う）。
-    保留の行は外れ、組の番号は保留を外したあとの並びを指す"""
-    mine = [R(1, 'ﾌｰﾄﾞ', '53301-60B00', price=79100, code='0600'), R(2, '保留', 'X1', price=500, reserve=1),
-            R(3, 'ｸﾘｯﾌﾟ', '90467-07215', price=180, code='0100')]
-    other = [R(1, 'ｸﾘｯﾌﾟ', '9046707215', price=180, code='0170'), R(2, 'ﾌｰﾄﾞ', '5330160B00', price=79100, code='0600')]
-    a, b, left, right, pairs = nc.align(mine, other)
-    assert len(a) == 2 and len(b) == 2 and not left and not right, (len(a), len(b), left, right)
-    got = sorted((a[i]['PartsCode'], b[j]['PartsCode']) for _k, i, j in pairs)
-    assert got == [('0100', '0170'), ('0600', '0600')], got
-    assert nc.compare(mine, other)['matched'] == len(pairs), 'compare と組の数が合わない'
+def test_same_parts_no_rows_pair_by_amount():
+    """同じ品番・同じ名前の行が 1 つの見積に何本もあり（クリップ 4 個 600 円 と 1 個 150 円）、
+    2 本の NEO で並び順が違うとき、**金額の合う相手と組にする**（並び順で組にすると入れ替わって見える）"""
+    mine = [R(1, 'L ｸﾘﾂﾌﾟ', '909140007', qty=4, price=600, code='0974'),
+            R(2, 'L ｸﾘﾂﾌﾟ', '909140007', qty=1, price=150, code='0976'),
+            R(3, 'R ｸﾘﾂﾌﾟ', '909140007', qty=4, price=600, code='1174')]
+    other = [R(1, 'L ｸﾘﾂﾌﾟ', '909140007', qty=4, price=600, code='0974'),
+             R(2, 'R ｸﾘﾂﾌﾟ', '909140007', qty=4, price=600, code='1174'),
+             R(3, 'L ｸﾘﾂﾌﾟ', '909140007', qty=1, price=150, code='0976')]
+    res = nc.compare(mine, other)
+    assert res['matched'] == 3 and not res['diffs'], res      # 3 行とも中身は同じ = 違いなし
+    assert not res['only_mine'] and not res['only_other'], res
 
 
 def test_parts_no_difference_and_quantity():

@@ -16,7 +16,7 @@ pdf-to-neo の**精度を測って上げる**ための手順。NEO を 1 件作�
 | 回帰（人が確かめた正解との一致） | `scripts/regress_cases.py` | 22 / 22 |
 | コグニ印刷 FAX の自動読み取り | `scripts/ocr_eval.py` | 369 行・**確定なのに違う 0**・確定 342 |
 | コグニ以外の書式: 部品コードの当たり | `verify/code_accuracy.py` | **971 / 1,028（94.5%）**（29 件。正解は担当が直した写し＝**上限**） |
-| 人の NEO を正解にした当たり（独立） | `verify/human_neo_accuracy.py` | まだ 2 件だけ（nc36 18/20・コグニ書式の t04 39/39）。**案件を増やす** |
+| 人の NEO を正解にした当たり（独立） | `verify/human_neo_accuracy.py` | **115 / 115**（5 件。コグニ以外 1 件 9/9・コグニ印刷 4 件 106/106）。母数が少ない |
 | コグニ以外の書式: 作り直しの合否 | `verify/remake_cases.py --base _nc` | 38 / 38（見積でない nc01・nc09 を除く。紙上検算も通す） |
 | コグニ印刷の自動読み取り → NEO | `verify/remake_cases.py --base _batch` | 28 件中 18 合格（`--skip-check` なら 20。sienta・f03 は自動読み取りの写しに紙上検算の FAIL が 1 つずつ残る。ほかの不合格は車両が決まらない t02・t13・f05、FAX の OCR で ADDATA に照合できない f01・f02・f04、t03・t08。既知） |
 | コグニで刷った印刷と見積書 | `verify/print_compare.py` | 合計は刷った 36 件すべて一致。行の差は 1 件 0〜3 で全部説明がつく（下の §5） |
@@ -48,6 +48,8 @@ PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/verify/noncogni_
 ```
 
 - 速報・確報のある案件だけを選ぶ（車両・保険を header_auto で埋めるため）。新しい案件から順
+- **人の NEO がある案件はほとんどコグニ印刷**（2026-09-30 に 50 件調べて 50 件）。工場がコグニ印刷を送ってきた案件は
+  コグニで開いて NEO を保存するから。**コグニ以外の書式で人の NEO がある案件は 2026 年分で 2 件しかない**
 - **`--need-human-neo` を付けると、部品コードの入った人の NEO がある案件だけ**を候補にする。
   その案件は `verify/human_neo_accuracy.py` で**下書きと独立した**答え合わせができる
   （ふつうの `code_accuracy.py` の正解は担当が直した写しなので、担当が気づかなかった取り違えは正解に数えられる）

@@ -9,7 +9,9 @@
     PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/verify/noncogni_candidates.py --add 19 --max-pages 6  # 候補のうち未使用の 19 件を cases.json に足す
     PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/verify/noncogni_candidates.py --want 30 --need-human-neo  # 人の NEO で答え合わせできる案件だけ
 
-`--need-human-neo` は「部品コードの入った人の NEO（Claude 製でない）がある案件」だけを候補にする。
+`--need-human-neo` は「部品コードの入った人の NEO（Claude 製でない）がある案件」だけを候補にする
+（既定は 5 行以上。`--need-human-neo 1` なら 1 行でも。行数は**写しを作る手間に見合うか**の線引きで、
+答え合わせ自体は 1 行でもできる）。
 その案件は `verify/human_neo_accuracy.py` で**下書きと独立した**部品コードの答え合わせができる
 （ふつうの `code_accuracy.py` の正解は担当が直した写しなので、担当が気づかなかった取り違えは正解に数えられる）。
 """
@@ -31,9 +33,20 @@ CAND = os.path.join(NEO_CHECK, '_verify', 'noncogni_candidates.json')
 CASES = os.path.join(NEO_CHECK, '_nc', 'cases.json')
 
 
+def human_neo_rows_dir(case_dir: str) -> int:
+    """案件フォルダを直接見て、人の NEO（Claude 製でない .neo）の部品コード行の最大本数を返す"""
+    d = str(case_dir or '').replace('/', os.sep)
+    if not os.path.isdir(d):
+        return 0
+    return human_neo_rows({'dir': d, 'neo': [f for f in os.listdir(d)
+                                            if f.lower().endswith('.neo') and 'claude' not in f.lower()]})
+
+
 def human_neo_rows(case: dict) -> int:
     """その案件にある**人の NEO**（Claude 製でない）のうち、部品コードの入った行がいちばん多い本数。
-    ベタ打ちの NEO（部品コードが空）は 0。答え合わせに使えるかの目印"""
+    ベタ打ちの NEO（部品コードが空）は 0。答え合わせに使えるかの目印。
+    `--need-human-neo` はこれが指定の行数（既定 5）以上の案件を選ぶ。**写しを作る手間に見合うか**の
+    線引きであって、4 行以下の NEO が答えにならないという意味ではない（human_neo_accuracy は 1 行でも数える）"""
     sys.path.insert(0, SCRIPTS)
     import neo_compare  # noqa: PLC0415
     best = 0
@@ -71,24 +84,34 @@ def first_text(pdf: str):
         return None
 
 
-def find(want: int, need_human: bool = False) -> list[dict]:
+def find(want: int, need_human: int = 0) -> list[dict]:
     logging.disable(logging.WARNING)
     sv = load_json(os.path.join(NEO_CHECK, '_verify', 'survey.json')) or load_json(os.path.join(NEO_CHECK, '_ocr_eval', '_survey.json')) or []
     if not sv:
         raise SystemExit('survey.json が無い。先に survey_cases.py を回す')
     out = load_json(CAND, []) or []
     seen = {x['pdf'] for x in out}
+
+    def enough(x):   # 行数の線引きは**前に貯めた候補にも**効かせる（古い候補で数が埋まると、線引きが素通りする。Codex 指摘）
+        return (not need_human) or int(x.get('human_neo_rows') or 0) >= need_human
     cands = sorted((x for x in sv if x.get('est') and x.get('rep') and '99999' not in x['dir']), key=lambda x: x['dir'], reverse=True)
+    by_pdf = {y['pdf']: y for y in out}
     for x in cands:
-        if len(out) >= want:
+        if sum(1 for y in out if enough(y)) >= want:
             break
         # 同じ案件に複数あれば「最終」→ 新しい順
         ests = sorted(x['est'], key=lambda f: (('最終' in f), os.path.getmtime(os.path.join(x['dir'], f)) if os.path.exists(os.path.join(x['dir'], f)) else 0), reverse=True)
         pdf = os.path.join(x['dir'], ests[0]).replace('\\', '/')
         if pdf in seen:
+            # 前に貯めた候補は、人の NEO の行数を数え直して覚え直す（あとから人の NEO が置かれた案件・
+            # 行数を覚えていなかった頃の候補が、線引きに掛からないまま埋もれる。Codex 指摘）
+            y = by_pdf.get(pdf)
+            if need_human and y is not None and not enough(y):
+                y['human_neo_rows'] = human_neo_rows(x)
+                save_json(CAND, out)
             continue
         hn = human_neo_rows(x) if x.get('neo') else 0   # PDF を読むより先に見る（速い）
-        if need_human and hn < 5:
+        if need_human and hn < need_human:
             continue
         r = first_text(pdf)
         if r is None:
@@ -99,12 +122,12 @@ def find(want: int, need_human: bool = False) -> list[dict]:
         out.append({'pdf': pdf, 'src': x['dir'], 'kind': kind, 'pages': pages,
                     'has_human_neo': bool(x.get('neo')), 'human_neo_rows': hn})
         seen.add(pdf)
-        save_json(CAND, out)   # 途中で止まっても続きから
-        print(len(out), kind, pages, f'人の NEO の部品コード {hn} 行' if hn else '-', flush=True)
-    return out
+        save_json(CAND, out)   # 途中で止まっても続きから（貯めるのは全部。返すのは線引きに合うものだけ）
+        print(sum(1 for y in out if enough(y)), kind, pages, f'人の NEO の部品コード {hn} 行' if hn else '-', flush=True)
+    return [x for x in out if enough(x)]
 
 
-def add_cases(n: int, max_pages: int, need_human: bool = False) -> None:
+def add_cases(n: int, max_pages: int, need_human: int = 0) -> None:
     cand = load_json(CAND, []) or []
     cases = load_json(CASES, []) or []
     used = {c['pdf'] for c in cases}
@@ -116,8 +139,12 @@ def add_cases(n: int, max_pages: int, need_human: bool = False) -> None:
             break
         if x['pdf'] in used or x.get('pages', 1) > max_pages:
             continue
-        if need_human and int(x.get('human_neo_rows') or 0) < 5:
-            continue
+        if need_human:
+            # 候補に覚えた行数は当てにせず、**足すときに毎回数え直す**（人の NEO が消えた・差し替わった・
+            # 行数を覚えていなかった頃の候補。多い側にも少ない側にもずれる。Codex 指摘）
+            x['human_neo_rows'] = human_neo_rows_dir(x.get('src') or '')
+            if int(x.get('human_neo_rows') or 0) < need_human:
+                continue
         cases.append({'name': f'nc{k:02d}', **x})
         print(f'nc{k:02d}', x['kind'], x.get('pages'))
         k += 1; added += 1
@@ -130,8 +157,10 @@ def main() -> int:
     ap.add_argument('--want', type=int, default=0, help='候補をこの件数まで探す')
     ap.add_argument('--add', type=int, default=0, help='未使用の候補をこの件数だけ cases.json に足す')
     ap.add_argument('--max-pages', type=int, default=6, help='これより長い PDF は足さない（控えを重ねた束・見積以外の書類が多い）')
-    ap.add_argument('--need-human-neo', action='store_true',
-                    help='部品コードの入った人の NEO がある案件だけ（human_neo_accuracy.py で独立した答え合わせができる）')
+    ap.add_argument('--need-human-neo', nargs='?', type=int, const=5, default=0, metavar='行数',
+                    help='人の NEO に部品コードがこの行数以上ある案件だけ（数を書かなければ 5）。'
+                         'human_neo_accuracy.py は 1 行でも数えるので、これは「写しを作る手間に見合うか」の線引き。'
+                         '小さい修理も入れたいなら --need-human-neo 1')
     a = ap.parse_args()
     if a.want:
         print('候補', len(find(a.want, a.need_human_neo)), '件:', CAND)

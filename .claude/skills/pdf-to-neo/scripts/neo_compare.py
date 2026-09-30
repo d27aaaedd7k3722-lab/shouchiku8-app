@@ -60,6 +60,24 @@ def _nm(r: dict) -> str:
     return re.sub(r'[\s\-ｰー･・,、.。()（）]', '', unicodedata.normalize('NFKC', str(r.get('PartsName') or ''))).upper()
 
 
+def _same_amt(x: dict, y: dict) -> int:
+    """**名前が同じで**数量・部品代・工賃もそろって同じなら 1。同じ品番・同じ名前の行が 1 つの見積に何本もあるとき
+    （クリップ 4 個 600 円 と 1 個 150 円）、**金額の合う相手と組にする**ため。
+    これが無いと並び順だけで組にして、入れ替わった組に見えてしまう（2026-09-30 実測）。
+
+    名前が違う行には効かせない。効かせると、名前の合う相手より金額の合う相手を先に取って、
+    「この行の金額が変わった」という本当の違いを隠す（2026-09-30 Codex 指摘）"""
+    if _nm(x) != _nm(y):
+        return 0
+    def n_(r):
+        try:
+            return int(r.get('PartsCount') or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 1 if (n_(x) == n_(y) and _amt(x, 'PartsPriceOutTax') == _amt(y, 'PartsPriceOutTax')
+                 and _amt(x, 'WageOutTax') == _amt(y, 'WageOutTax')) else 0
+
+
 def _sim(x: dict, y: dict) -> float:
     return difflib.SequenceMatcher(None, _nm(x), _nm(y)).ratio()
 
@@ -79,16 +97,13 @@ def _row(r: dict) -> dict:
             'qty': r.get('PartsCount'), 'price': _amt(r, 'PartsPriceOutTax'), 'wage': _amt(r, 'WageOutTax')}
 
 
-def align(mine: list[dict], other: list[dict]) -> tuple:
-    """2 本の明細の行を揃える。返り値 (納品の行, 相手の行, 揃わなかった納品の番号, 揃わなかった相手の番号, 組)。
-    組は (揃え方, 納品の番号, 相手の番号)。揃え方は 品番 → 金額 → 品番の違い → 部品金額が同じ → 工賃が同じ の順（上から順に取る）。
-    compare() と、部品コードの答え合わせ（verify/human_neo_accuracy.py）で同じ揃え方を使う"""
+def compare(mine: list[dict], other: list[dict]) -> dict:
     a = [r for r in mine if not int(r.get('ReserveFlag') or 0)]   # 保留の行は合計に入らないので外す
     b = [r for r in other if not int(r.get('ReserveFlag') or 0)]
     left, right = list(range(len(a))), list(range(len(b)))
     pairs: list[tuple[str, int, int]] = []
 
-    def take(kind, key_a, ok=None):
+    def take(kind, key_a, ok=None, by_amt=False):
         # 条件に合う組を全部挙げ、名称の近い組 → 並び順の近い組から揃える（前から順に取ると、同じ金額の別の行に先を越される。
         # 2026-09-13 ベンツ: 25,200 円の作業行が 2 つあり、削られた「誤給油点検」が残った「テスト走行」と揃っていた）
         cand = []
@@ -98,23 +113,21 @@ def align(mine: list[dict], other: list[dict]) -> tuple:
                 continue
             for j in right:
                 if ok(a[i], b[j]) if ok else key_a(b[j]) == ka:
-                    cand.append((_sim(a[i], b[j]), -abs(j - i), i, j))
+                    cand.append(((_same_amt(a[i], b[j]) if by_amt else 0), _sim(a[i], b[j]), -abs(j - i), i, j))
         used_i, used_j = set(), set()
-        for _s, _d, i, j in sorted(cand, reverse=True):
+        for _amtok, _s, _d, i, j in sorted(cand, reverse=True):
             if i not in used_i and j not in used_j:
                 pairs.append((kind, i, j)); used_i.add(i); used_j.add(j)
         left[:] = [i for i in left if i not in used_i]
         right[:] = [j for j in right if j not in used_j]
-    take('品番', lambda r: _pn(r) or None)
+    # 品番で組にするときだけ数量・金額の一致を最優先にする（同じ品番・同じ名前の行が 4 個 600 円 と 1 個 150 円 で
+    # 並ぶ見積を、並び順で組にすると入れ替わって見える）。金額で組にする段でこれを効かせると、
+    # 名前の合う行より数量の合う行を先に取って「数量の違い」を隠すので、ここだけ（2026-09-30 Codex 指摘）
+    take('品番', lambda r: _pn(r) or None, by_amt=True)
     take('金額', lambda r: (_amt(r, 'PartsPriceOutTax'), _amt(r, 'WageOutTax')))
     take('品番の違い', lambda r: _pn(r) or None, ok=lambda x, y: _amt(x, 'PartsPriceOutTax') == _amt(y, 'PartsPriceOutTax') and _near(_pn(x), _pn(y)))
     take('部品金額が同じ', lambda r: _amt(r, 'PartsPriceOutTax') or None, ok=lambda x, y: _amt(x, 'PartsPriceOutTax') and _amt(x, 'PartsPriceOutTax') == _amt(y, 'PartsPriceOutTax'))
     take('工賃が同じ', lambda r: _amt(r, 'WageOutTax') or None, ok=lambda x, y: _amt(x, 'WageOutTax') and _amt(x, 'WageOutTax') == _amt(y, 'WageOutTax'))
-    return a, b, left, right, pairs
-
-
-def compare(mine: list[dict], other: list[dict]) -> dict:
-    a, b, left, right, pairs = align(mine, other)
     diffs, style = [], Counter()
     for kind, i, j in pairs:
         x, y = a[i], b[j]
