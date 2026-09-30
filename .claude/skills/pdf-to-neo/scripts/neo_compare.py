@@ -79,7 +79,10 @@ def _row(r: dict) -> dict:
             'qty': r.get('PartsCount'), 'price': _amt(r, 'PartsPriceOutTax'), 'wage': _amt(r, 'WageOutTax')}
 
 
-def compare(mine: list[dict], other: list[dict]) -> dict:
+def align(mine: list[dict], other: list[dict]) -> tuple:
+    """2 本の明細の行を揃える。返り値 (納品の行, 相手の行, 揃わなかった納品の番号, 揃わなかった相手の番号, 組)。
+    組は (揃え方, 納品の番号, 相手の番号)。揃え方は 品番 → 金額 → 品番の違い → 部品金額が同じ → 工賃が同じ の順（上から順に取る）。
+    compare() と、部品コードの答え合わせ（verify/human_neo_accuracy.py）で同じ揃え方を使う"""
     a = [r for r in mine if not int(r.get('ReserveFlag') or 0)]   # 保留の行は合計に入らないので外す
     b = [r for r in other if not int(r.get('ReserveFlag') or 0)]
     left, right = list(range(len(a))), list(range(len(b)))
@@ -107,6 +110,11 @@ def compare(mine: list[dict], other: list[dict]) -> dict:
     take('品番の違い', lambda r: _pn(r) or None, ok=lambda x, y: _amt(x, 'PartsPriceOutTax') == _amt(y, 'PartsPriceOutTax') and _near(_pn(x), _pn(y)))
     take('部品金額が同じ', lambda r: _amt(r, 'PartsPriceOutTax') or None, ok=lambda x, y: _amt(x, 'PartsPriceOutTax') and _amt(x, 'PartsPriceOutTax') == _amt(y, 'PartsPriceOutTax'))
     take('工賃が同じ', lambda r: _amt(r, 'WageOutTax') or None, ok=lambda x, y: _amt(x, 'WageOutTax') and _amt(x, 'WageOutTax') == _amt(y, 'WageOutTax'))
+    return a, b, left, right, pairs
+
+
+def compare(mine: list[dict], other: list[dict]) -> dict:
+    a, b, left, right, pairs = align(mine, other)
     diffs, style = [], Counter()
     for kind, i, j in pairs:
         x, y = a[i], b[j]

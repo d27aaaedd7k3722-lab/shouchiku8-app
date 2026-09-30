@@ -15,7 +15,8 @@ pdf-to-neo の**精度を測って上げる**ための手順。NEO を 1 件作�
 | スキル・生成器のテスト | `scripts/tests/test_*.py`・`claude_neo_pipeline/tests/unit_*.py`・`env_check.py --self-test` | 全部合格 |
 | 回帰（人が確かめた正解との一致） | `scripts/regress_cases.py` | 22 / 22 |
 | コグニ印刷 FAX の自動読み取り | `scripts/ocr_eval.py` | 369 行・**確定なのに違う 0**・確定 342 |
-| コグニ以外の書式: 部品コードの当たり | `verify/code_accuracy.py` | **971 / 1,028（94.5%）**（29 件） |
+| コグニ以外の書式: 部品コードの当たり | `verify/code_accuracy.py` | **971 / 1,028（94.5%）**（29 件。正解は担当が直した写し＝**上限**） |
+| 人の NEO を正解にした当たり（独立） | `verify/human_neo_accuracy.py` | まだ 2 件だけ（nc36 18/20・コグニ書式の t04 39/39）。**案件を増やす** |
 | コグニ以外の書式: 作り直しの合否 | `verify/remake_cases.py --base _nc` | 38 / 38（見積でない nc01・nc09 を除く。紙上検算も通す） |
 | コグニ印刷の自動読み取り → NEO | `verify/remake_cases.py --base _batch` | 28 件中 18 合格（`--skip-check` なら 20。sienta・f03 は自動読み取りの写しに紙上検算の FAIL が 1 つずつ残る。ほかの不合格は車両が決まらない t02・t13・f05、FAX の OCR で ADDATA に照合できない f01・f02・f04、t03・t08。既知） |
 | コグニで刷った印刷と見積書 | `verify/print_compare.py` | 合計は刷った 36 件すべて一致。行の差は 1 件 0〜3 で全部説明がつく（下の §5） |
@@ -32,6 +33,7 @@ pdf-to-neo の**精度を測って上げる**ための手順。NEO を 1 件作�
 | ④ 刷る | コグニで開いて「見積り1（塗装明細）」を PDF(通常) に | `verify/cogni_open.ps1` ＋ computer-use（§4） | `_prints/ncNN.pdf` |
 | ⑤ 突き合わせる | 刷った PDF と下書きの明細・写しの合計を行ごとに | `verify/print_compare.py` | `_nc/print_compare.json` |
 | ⑥ 測る | 部品コードの当たり・外れの原因 | `verify/code_accuracy.py -v --why` | |
+| ⑥' 独立に測る | 人が作った NEO を正解にした当たり（下書きと独立） | `verify/human_neo_accuracy.py -v` | |
 | ⑦ 直す | 外れの行を追って（`debug_row.py`・`debug_find.py`）スクリプトを直す → 全部の物差しを回す → Codex で見てもらう | codex-loop | |
 | ⑧ 記録 | ロードマップ・日誌・（必要なら）format_catalog / judgment_rules | | `docs/pdf-to-neo_ロードマップ.md` |
 
@@ -46,6 +48,9 @@ PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/verify/noncogni_
 ```
 
 - 速報・確報のある案件だけを選ぶ（車両・保険を header_auto で埋めるため）。新しい案件から順
+- **`--need-human-neo` を付けると、部品コードの入った人の NEO がある案件だけ**を候補にする。
+  その案件は `verify/human_neo_accuracy.py` で**下書きと独立した**答え合わせができる
+  （ふつうの `code_accuracy.py` の正解は担当が直した写しなので、担当が気づかなかった取り違えは正解に数えられる）
 - FAX 受信名の PDF（`0938633113_20260916_172058.pdf`）は見積でないことがある（部品商の納品書・レンタカーの請求書）。担当が見て除く
 - 7 ページ以上は控えを重ねた束や別の書類が多いので `--max-pages 6`
 - **人が作った NEO がある案件**（`has_human_neo`）は答え合わせに使える（`neo_compare.py`）

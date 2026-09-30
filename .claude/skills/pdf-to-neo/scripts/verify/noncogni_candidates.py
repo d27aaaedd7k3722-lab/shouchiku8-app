@@ -7,6 +7,11 @@
 
     PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/verify/noncogni_candidates.py --want 40            # 候補を 40 件探す（数十分）
     PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/verify/noncogni_candidates.py --add 19 --max-pages 6  # 候補のうち未使用の 19 件を cases.json に足す
+    PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/verify/noncogni_candidates.py --want 30 --need-human-neo  # 人の NEO で答え合わせできる案件だけ
+
+`--need-human-neo` は「部品コードの入った人の NEO（Claude 製でない）がある案件」だけを候補にする。
+その案件は `verify/human_neo_accuracy.py` で**下書きと独立した**部品コードの答え合わせができる
+（ふつうの `code_accuracy.py` の正解は担当が直した写しなので、担当が気づかなかった取り違えは正解に数えられる）。
 """
 from __future__ import annotations
 
@@ -24,6 +29,24 @@ COGNI = re.compile(r'部品価格適応日|修理項目.{0,6}部品名称|ｺｰ
 EST = re.compile(r'(部品|品番|品名|部品名).*(工賃|技術料|作業|金額)|(工賃|技術料).*(部品)', re.S)
 CAND = os.path.join(NEO_CHECK, '_verify', 'noncogni_candidates.json')
 CASES = os.path.join(NEO_CHECK, '_nc', 'cases.json')
+
+
+def human_neo_rows(case: dict) -> int:
+    """その案件にある**人の NEO**（Claude 製でない）のうち、部品コードの入った行がいちばん多い本数。
+    ベタ打ちの NEO（部品コードが空）は 0。答え合わせに使えるかの目印"""
+    sys.path.insert(0, SCRIPTS)
+    import neo_compare  # noqa: PLC0415
+    best = 0
+    for n in (case.get('neo') or []):
+        p = os.path.join(str(case.get('dir') or '').replace('/', os.sep), n)
+        if not os.path.exists(p):
+            continue
+        try:
+            rows = neo_compare.load(p)
+        except Exception:  # noqa: BLE001
+            continue
+        best = max(best, sum(1 for r in rows if str(r.get('PartsCode') or '').strip() not in ('', '0', '-1')))
+    return best
 
 
 def first_text(pdf: str):
@@ -48,7 +71,7 @@ def first_text(pdf: str):
         return None
 
 
-def find(want: int) -> list[dict]:
+def find(want: int, need_human: bool = False) -> list[dict]:
     logging.disable(logging.WARNING)
     sv = load_json(os.path.join(NEO_CHECK, '_verify', 'survey.json')) or load_json(os.path.join(NEO_CHECK, '_ocr_eval', '_survey.json')) or []
     if not sv:
@@ -64,20 +87,24 @@ def find(want: int) -> list[dict]:
         pdf = os.path.join(x['dir'], ests[0]).replace('\\', '/')
         if pdf in seen:
             continue
+        hn = human_neo_rows(x) if x.get('neo') else 0   # PDF を読むより先に見る（速い）
+        if need_human and hn < 5:
+            continue
         r = first_text(pdf)
         if r is None:
             continue
         t, kind, pages = r
         if COGNI.search(t) or ('修理項目' in t and '部品価格' in t) or not EST.search(t):
             continue
-        out.append({'pdf': pdf, 'src': x['dir'], 'kind': kind, 'pages': pages, 'has_human_neo': bool(x.get('neo'))})
+        out.append({'pdf': pdf, 'src': x['dir'], 'kind': kind, 'pages': pages,
+                    'has_human_neo': bool(x.get('neo')), 'human_neo_rows': hn})
         seen.add(pdf)
         save_json(CAND, out)   # 途中で止まっても続きから
-        print(len(out), kind, pages, '人の NEO あり' if x.get('neo') else '-', flush=True)
+        print(len(out), kind, pages, f'人の NEO の部品コード {hn} 行' if hn else '-', flush=True)
     return out
 
 
-def add_cases(n: int, max_pages: int) -> None:
+def add_cases(n: int, max_pages: int, need_human: bool = False) -> None:
     cand = load_json(CAND, []) or []
     cases = load_json(CASES, []) or []
     used = {c['pdf'] for c in cases}
@@ -88,6 +115,8 @@ def add_cases(n: int, max_pages: int) -> None:
         if added >= n:
             break
         if x['pdf'] in used or x.get('pages', 1) > max_pages:
+            continue
+        if need_human and int(x.get('human_neo_rows') or 0) < 5:
             continue
         cases.append({'name': f'nc{k:02d}', **x})
         print(f'nc{k:02d}', x['kind'], x.get('pages'))
@@ -101,11 +130,13 @@ def main() -> int:
     ap.add_argument('--want', type=int, default=0, help='候補をこの件数まで探す')
     ap.add_argument('--add', type=int, default=0, help='未使用の候補をこの件数だけ cases.json に足す')
     ap.add_argument('--max-pages', type=int, default=6, help='これより長い PDF は足さない（控えを重ねた束・見積以外の書類が多い）')
+    ap.add_argument('--need-human-neo', action='store_true',
+                    help='部品コードの入った人の NEO がある案件だけ（human_neo_accuracy.py で独立した答え合わせができる）')
     a = ap.parse_args()
     if a.want:
-        print('候補', len(find(a.want)), '件:', CAND)
+        print('候補', len(find(a.want, a.need_human_neo)), '件:', CAND)
     if a.add:
-        add_cases(a.add, a.max_pages)
+        add_cases(a.add, a.max_pages, a.need_human_neo)
     if not (a.want or a.add):
         ap.print_help()
     return 0

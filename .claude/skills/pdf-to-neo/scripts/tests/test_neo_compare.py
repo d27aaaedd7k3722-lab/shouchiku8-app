@@ -26,6 +26,19 @@ def test_same_amount_rows_pair_by_name():
     assert res['matched'] == 1 and not res['only_other'], res
 
 
+def test_align_pairs_match_compare():
+    """align は compare と同じ揃え方の組を返す（人の NEO を正解にする答え合わせ human_neo_accuracy が使う）。
+    保留の行は外れ、組の番号は保留を外したあとの並びを指す"""
+    mine = [R(1, 'ﾌｰﾄﾞ', '53301-60B00', price=79100, code='0600'), R(2, '保留', 'X1', price=500, reserve=1),
+            R(3, 'ｸﾘｯﾌﾟ', '90467-07215', price=180, code='0100')]
+    other = [R(1, 'ｸﾘｯﾌﾟ', '9046707215', price=180, code='0170'), R(2, 'ﾌｰﾄﾞ', '5330160B00', price=79100, code='0600')]
+    a, b, left, right, pairs = nc.align(mine, other)
+    assert len(a) == 2 and len(b) == 2 and not left and not right, (len(a), len(b), left, right)
+    got = sorted((a[i]['PartsCode'], b[j]['PartsCode']) for _k, i, j in pairs)
+    assert got == [('0100', '0170'), ('0600', '0600')], got
+    assert nc.compare(mine, other)['matched'] == len(pairs), 'compare と組の数が合わない'
+
+
 def test_parts_no_difference_and_quantity():
     """金額で揃った行でも品番が違えば「品番の違い」。数量だけ違う行（金額は同じ）も挙げる。保留の行は数えない"""
     mine = [R(1, 'O-ﾘﾝｸﾞ', '028997144565', price=1980), R(2, 'ｸﾘｯﾌﾟ', '90467-07215', qty=2, price=180, code='0100'),
