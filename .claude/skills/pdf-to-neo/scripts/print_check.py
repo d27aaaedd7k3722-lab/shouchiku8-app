@@ -76,9 +76,11 @@ def parse_print(pages: list) -> dict:
             t = line.rstrip()
             if not t.strip():
                 continue
-            if 'ｺｰﾄﾞ' in t and '修理項目' in t:
+            if re.match(r'^\s*(ｺｰﾄﾞ|修理項目)', t):   # 見出しが 1 行でも、文字層で「ｺｰﾄﾞ」「修理項目…」の 2 行に割れても（Codex 指摘）
                 in_table = True
                 continue
+            if re.match(r'^(\d{4}|保留)\s+', t):
+                in_table = True   # 見出しを読めなくても、部品コードの行が出たら表の中
             m = re.search(r'部品価格適応日\s*(\d+)\s*年\s*(\d+)\s*月\s*(\d+)\s*日', t)
             if m:
                 _y = int(m.group(1)) % 100   # 西暦 4 桁で刷る様式もある（令和 8 年 = 08）
@@ -133,7 +135,8 @@ def parse_print(pages: list) -> dict:
 
 
 # 金額の無い行のうち明細でないもの（欄外の受付番号・部品価格適応日、塗装条件の行）。余分な行として数えない（バグハント 2026-09-29）
-_NOT_ROW_RE = re.compile(r'部品価格適応日|作成日|\d{5,}|ｺｰﾄﾞ|修理項目|^\d+\s*/\s*\d+$|^(塗料|塗膜|高機能塗装|材料代|加算基礎|ブース|塗装方法|見積書|ページ)')
+_NOT_ROW_RE = re.compile(r'部品価格適応日|作成日|\d{5,}|ｺｰﾄﾞ|修理項目|修理方法|部品名称|部品番号|塗装項目|塗装面積|部品価格|工賃\s*[(（]|^\d+\s*/\s*\d+$'
+                         r'|^(塗料|塗膜|高機能塗装|材料代|加算基礎|ブース|塗装方法|見積書|ページ)')   # 表の見出し（2 行に割れた断片も。Codex 指摘）
 _MONEY_W = re.compile(r'^([\d,]+)円?([#*$@n]*)$')
 _TOTAL_LBL = (('小計', 'sub'), ('課税額計', 'taxable'), ('消費税', 'tax'), ('合計', 'total'))
 

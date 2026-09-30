@@ -18,6 +18,9 @@
 | 標準の品番・名称・価格（部品コードと車両を与えたとき） | 3 つとも **94.5%**（品番 94.8% / 名称 99.2% / 価格 96.6%） | 2026-09-22 の作業用の測定（リポジトリ未収録。収録は改善提案 6） |
 | 生成器が書く装備（CarEVA） | 完全一致 **340 / 541**・誤って付けた装備 2 文字 | 2026-09-22 の作業用の測定（リポジトリ未収録） |
 | 回帰（NEO_check の reading.json 全案件） | **22 / 22** | `scripts/regress_cases.py` |
+| コグニ以外の書式（29 件）: 部品コードの当たり | **966 / 1,028（94.0%）**（2026-09-30） | `scripts/verify/code_accuracy.py` |
+| コグニ以外の書式: 生成 NEO をコグニで刷った合計 | **36 / 36 一致**（2026-09-29） | `scripts/verify/print_compare.py`（手順は `reference/verification_workflow.md`） |
+| コグニ印刷 FAX の自動読み取り | 369 行・**確定なのに違う 0** | `scripts/ocr_eval.py` |
 | 自己診断（配布先で回る単体テスト） | すべて合格 | `scripts/env_check.py --self-test` |
 
 ### 0-1b. 読み取りの自動化（2026-09-28。`scripts/ocr_anchor.py`）
@@ -104,6 +107,8 @@
 | 8 | `../../../NEO_FILE_SPEC_COMPLETE.md` | NEO コンテナと各テーブルの仕様（解析結果） |
 | 9 | `../../../ADDATA_REVERSE_LOOKUP_SPEC.md` | ADDATA（コグニのマスタ）の解析結果 |
 | 10 | `../../../claude_neo_pipeline/README.md` | 生成器の設計方針・既知の制限・検証の回し方 |
+| 11 | `reference/verification_workflow.md` | **精度を測って上げる手順**（実案件を探す → サブエージェントで NEO に → コグニで刷る → 突き合わせ → 部品コードの当たりを測る → 直す → バグハント）。道具は `scripts/verify/`。いまの数字もここ |
+| 12 | `../../../docs/pdf-to-neo_ロードマップ.md` §9〜§13 | 2026-09-28〜30 の検証の結果・直したもの・残した課題 |
 
 **同じ話題が複数の文書にあるときは `judgment_rules.md` が正本**。
 ここに無い新しい判断をしたら、作業のあとで必ず judgment_rules に書き足す（この一式は使うたびに育てる）。

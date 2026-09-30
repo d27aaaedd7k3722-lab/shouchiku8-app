@@ -46,6 +46,8 @@ ADDATA のデータ版が違うと標準品番・標準指数が変わる ＝ �
 | `README.md` | プロジェクトの現況と使い方。**最初に読む** |
 | `.claude/skills/pdf-to-neo/HANDOFF.md` | A の引き継ぎ文書（全体の地図・絶対ルール・実機で確かめた事実・未解決）。**README の次に読む** |
 | `.claude/skills/pdf-to-neo/SKILL.md` | A の手順書（9段）。HANDOFF の次に読む |
+| `.claude/skills/pdf-to-neo/reference/verification_workflow.md` | A の**精度の検証・改善の手順書**（実案件で NEO を作ってコグニで刷り、見積書と突き合わせて直す。道具は `scripts/verify/`）。精度を上げる作業ならこれ |
+| `docs/pdf-to-neo_ロードマップ.md` | A の改善の記録と残課題（§9〜§13 が 2026-09-28〜30 の検証） |
 | `NEO_FILE_SPEC_COMPLETE.md` | NEO ファイル仕様（実機で確定した項目） |
 | `ADDATA_REVERSE_LOOKUP_SPEC.md` | 車検証 → ADDATA 逆引きの仕様 |
 | `dev\neo-estimate\docs\引き継ぎ書.md` | B の引き継ぎ書 |

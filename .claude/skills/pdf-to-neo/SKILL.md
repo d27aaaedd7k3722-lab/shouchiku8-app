@@ -45,6 +45,9 @@ description: 工場見積 PDF（どの書式でも）＋車検証から、コグ
 | `scripts/winocr.ps1` | Windows.Media.Ocr を呼ぶ PowerShell（`ocr_prefill.py` が使う） |
 | `scripts/tests/` | スキル自体の単体テスト（紙上検算 / ページ単位 / OCR / 別名辞書 / 下書きの写し取り規則 / 下書きの注記 / グレード絞り込み / 単価からの部品コード / レバーレート逆算 / 環境検出）。script を直したら **`scripts/tests/test_*.py` を全部**回す（`env_check.py --self-test` は生成器側の 9 本。本数は env_check の出力が正） |
 | `scripts/regress_cases.py` | スキル自体の回帰テスト。NEO_check の reading.json 全案件を再下書きして正解（expected_estimate.json）と比較し、run_case 合格を確認。script を直したら必ず実行 |
+| `reference/verification_workflow.md` | **精度を測って上げる手順書**（実案件を探す → サブエージェントで NEO に → コグニで刷る → 突き合わせ → 部品コードの当たりを測る → 直す → バグハント）。いまの数字（直したら下回らない基準）もここ |
+| `reference/verify_agent_task.md` | 検証でサブエージェントに渡す指示書（写し方・守ること・agent_report.md の書き方） |
+| `scripts/verify/` | 検証の道具: `survey_cases.py`（案件の走査）・`noncogni_candidates.py`（コグニ以外の書式の候補）・`remake_cases.py`（作り直し）・`code_accuracy.py`（部品コードの当たり）・`print_compare.py`（コグニで刷った PDF との突き合わせ）・`cogni_open.ps1`（NEO をコグニで開く）・`debug_row.py` / `debug_find.py`（外れの行を追う） |
 
 ## 前提（無ければ止まって報告）
 
