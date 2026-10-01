@@ -43,7 +43,7 @@ description: 工場見積 PDF（どの書式でも）＋車検証から、コグ
 | `scripts/build_part_names.py` | 全車種 12.DB から 部品名 → 部品コード の別名辞書 `reference/part_code_names.json` を作る（ADDATA 更新後に 1 回） |
 | `<NEO_CHECK_ROOT>/_profiles/factory_profiles.json`（PC ごと・git に入れない） | 工場ごとの設定の学習データ（レート・工賃丸め・消費税丸め・費用の集計先・書式・手入力行モード）。make_neo が合格時に書き、reading_check が前回との差を WARN に出す（`--no-profile` で書かない） |
 | `scripts/winocr.ps1` | Windows.Media.Ocr を呼ぶ PowerShell（`ocr_prefill.py` が使う） |
-| `scripts/tests/` | スキル自体の単体テスト（紙上検算 / ページ単位 / OCR / 別名辞書 / 下書きの写し取り規則 / 下書きの注記 / グレード絞り込み / 単価からの部品コード / レバーレート逆算 / 環境検出）。script を直したら **`scripts/tests/test_*.py` を全部**回す（`env_check.py --self-test` は生成器側の 9 本。本数は env_check の出力が正） |
+| `scripts/tests/` | スキル自体の単体テスト（紙上検算 / ページ単位 / OCR / 別名辞書 / 下書きの写し取り規則 / 下書きの注記 / グレード絞り込み / 単価からの部品コード / レバーレート逆算 / 環境検出）。script を直したら **`scripts/tests/test_*.py` を全部**回す（`env_check.py --self-test` は生成器側の 9 本。本数は env_check の出力が正。2026-10-01 訂正: いまは 18 本） |
 | `scripts/regress_cases.py` | スキル自体の回帰テスト。NEO_check の reading.json 全案件を再下書きして正解（expected_estimate.json）と比較し、run_case 合格を確認。script を直したら必ず実行 |
 | `reference/verification_workflow.md` | **精度を測って上げる手順書**（実案件を探す → サブエージェントで NEO に → コグニで刷る → 突き合わせ → 部品コードの当たりを測る → 直す → バグハント）。いまの数字（直したら下回らない基準）もここ |
 | `reference/verify_agent_task.md` | 検証でサブエージェントに渡す指示書（写し方・守ること・agent_report.md の書き方） |
@@ -69,7 +69,7 @@ python .claude/skills/pdf-to-neo/scripts/env_check.py --save --install-skill
 自動検出できない PC ではパスを指定する: `env_check.py --addata "D:\Addata" --cogni "D:\Audatex\Auda7\Bin\AudaMenu.exe" --neo-check "D:\NEO_check" --save --install-skill`
 
 4. `[OK]` が並び「使える」と出れば完了（自己テストで N BOX JF1 の車両特定と雛形 NEO の読込まで確認する）。`hh.exe` が無い・使えない PC は塗装指数表（CHM）を展開できない。その PC では生成時に `★ 塗装指数表（CHM）を展開できない` と出る。ただし **`<car>77/97/87/99.DB`（パネル別塗り数値の表）がある車種は CHM が無くても標準指数が出せる**（ADDATA 2026/08 で溶剤 434 車種・水性 357 車種。2026-09-21 に対応）。★ が出て、その車種にこの表も無いときだけ **修正塗装の行は `paint.panels[].index` に見積書の指数を必ず書く**（書かないと塗装計が静かにずれる）
-5. 受け入れ確認（推奨）: `python .claude/skills/pdf-to-neo/scripts/env_check.py --self-test` で、その PC の ADDATA を使って生成器の単体テスト 9 本（引き継ぎ文書との整合を含む）を通す（10 秒ほど）。`自己診断: すべて合格` なら開発機と同じ NEO が作れる。`ADDATA データ版`（例 2026/08）も控えて社内で揃える
+5. 受け入れ確認（推奨）: `python .claude/skills/pdf-to-neo/scripts/env_check.py --self-test` で、その PC の ADDATA を使って生成器の単体テスト 9 本（引き継ぎ文書との整合を含む）を通す（10 秒ほど）（2026-10-01 訂正: いまは 18 本。制限時間は全体で 180 秒。本数は env_check の出力が正）。`自己診断: すべて合格` なら開発機と同じ NEO が作れる。`ADDATA データ版`（例 2026/08）も控えて社内で揃える
 
 補足: ADDATA が複数ある PC（古い `C:\Addata` と別ドライブの本番データ）では、**既定で走査した候補の中から** `COM\AnVer.DB` が最新のものを選ぶ。既定の走査は「よくある置き方」で 1 つ見つかった時点で止まるので、**古い `C:\Addata` を残したまま本番データを深い場所に置いている PC では古い方を選ぶ**。`env_check.py` が毎回 深い場所まで調べて「ADDATA 他の候補」で知らせるので、導入時に必ず 1 回実行する。使いたいものを固定するなら `--addata` で明示（`ADDATA_SCAN_DEEP=1` でも毎回深く探せるが数十秒かかる）。`--install-skill` は古いコピーや別の場所を指すジャンクションを退避・付け替える。配布 zip は `python .claude/skills/pdf-to-neo/scripts/make_bundle.py` で作る（NEO_check・実 NEO は入らない。雛形 NEO 1 本だけ同梱）。
 

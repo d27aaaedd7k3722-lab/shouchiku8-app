@@ -41,7 +41,7 @@ $env:PYTHONIOENCODING = 'utf-8'
 python .claude\skills\pdf-to-neo\scripts\env_check.py --save --install-skill
 # 別名辞書を作る（ADDATA を更新したときも）
 python .claude\skills\pdf-to-neo\scripts\build_part_names.py
-# その PC で正しく作れるかの確認（ADDATA だけで完結する単体テスト 9 本。「自己診断: すべて合格」なら開発機と同じ結果になる）
+# その PC で正しく作れるかの確認（ADDATA だけで完結する単体テスト 9 本（2026-10-01 訂正: いまは 18 本）。「自己診断: すべて合格」なら開発機と同じ結果になる）
 python .claude\skills\pdf-to-neo\scripts\env_check.py --self-test
 ```
 
@@ -57,10 +57,12 @@ bash claude_neo_pipeline/tests/verify_all.sh
 
 ## 4. 検証の状態（2026-09-12 更新）
 
+> 2026-10-01 訂正: この表は 2026-09-12 時点。**いまの数字の正本は `.claude/skills/pdf-to-neo/HANDOFF.md` §0-1**（実案件 600 本で 車両 88.3% / 部品 98.5% / 標準指数 99.8% / 塗装パネル 99.6% / 加算基礎 99.8%、実機実験との全列一致 差 0 / 86 など）と `reference/verification_workflow.md` §0。
+
 | 検証 | 結果 |
 |---|---|
-| **実案件 NEO 638 本**（亮平さんがコグニで作成、この PC と同じ ADDATA 2026/08 版。`tests/corpus_scan.py roundtrip`） | 車両 87.8% / 部品照合 98.2%（品番あり）・94.7%（名称のみ）/ 標準指数 95.9% / 塗装パネル 94.7% / 加算基礎 94.1% |
-| 生成器の単体（セル比較 285 / 標準指数 77 / 塗装 44 / 骨格 / バンパ / 色別部品） | 全合格（開発機の `verify_all.sh`。新しい PC では `env_check.py --self-test` で 9 本） |
+| **実案件 NEO 638 本**（亮平さんがコグニで作成、この PC と同じ ADDATA 2026/08 版。`tests/corpus_scan.py roundtrip`） | 車両 87.8% / 部品照合 98.2%（品番あり）・94.7%（名称のみ）/ 標準指数 95.9% / 塗装パネル 94.7% / 加算基礎 94.1%（2026-10-01 訂正: 塗装パネル・加算基礎は測定ツールの数え方を直して 99.2% / 100%（2026-09-21、HANDOFF §8-2）。この PC の ADDATA は 2026/09 に更新済み） |
+| 生成器の単体（セル比較 285 / 標準指数 77 / 塗装 44 / 骨格 / バンパ / 色別部品） | 全合格（開発機の `verify_all.sh`。新しい PC では `env_check.py --self-test` で 9 本。2026-10-01 訂正: いまは 18 本 = `make_bundle.SELFTEST_TESTS`。本数は env_check の出力が正） |
 | 実案件 4 件（C01 C-HR、C02 シエンタ、C03 ボルボ、N-ONE）の再生成 | 合計一致（N-ONE は工場書式の円未満計上により −8 円が正） |
 | 実案件 3 件（C04 アルファード、C05 オデッセイ、C06 N-BOX）の reading.json 回帰 | 下書きが正解と一致・合計一致 |
 | コグニ実機: 装備 9 条件（N-BOX J87） | 部品番号・価格 全件一致、指数は「枠の取り合い」実装後に一致（`tests/unit_eva_slot.py` 20 件） |
