@@ -87,18 +87,31 @@ KNOWN_DIFF = {  # 実機側の操作で入力と構造が変わった実験（�
              '残る差は 明細画面から入れた行の OrderFlag 0 と SortNo（記録 reference/experiments/2026-09-12_W90_実機手入力.md の W66 節）',
              'KNOWN_W66x'),
     'W66y': ('W66x に 0600/2300/5800/4600 の修理(2) を足した版（5 枚とも 1/2 で連動、指数は連動減算）。'
-             '残る差は OrderFlag 0・SortNo・float の足し算の癖・ルーフ 287 の下処理面積（近似式 50 / 実機 48。W66 のルーフだけ合わない、未解決）',
+             '残る差は OrderFlag 0・SortNo・float の足し算の癖（ルーフ 287 の下処理面積 48 は 2026-09-21 の式 min(切上(S÷3), 上限) で合うようになった）',
              'KNOWN_W66y'),
     'W66z': ('W66y に 2602 L ロッカパネルアウタ 修理(2) を足した版: CHM に 1/2・1/3 列の無いパネルは 1/1 固定（指数 1.3、下処理面積 9）。'
-             '実機は後から足した 2602 を塗装パネルの末尾に置く（LineNo/SortNo は操作順）ので並びの差が出る。ほかは OrderFlag 0・float の癖・ルーフの下処理面積',
+             '実機は後から足した 2602 を塗装パネルの末尾に置く（LineNo/SortNo は操作順）ので並びの差が出る。ほかは OrderFlag 0・float の癖',
              'KNOWN_W66z'),
     'H11': ('板金行の加算基礎に 0 を明示入力した実験（品番欄に「付加 0.00」が残る。加算が無ければ書かないのが実機の既定で、他 19 件はそちら）', 'KNOWN_H11'),
+    # ↓ 生成 NEO を開いてそのまま保存した実験で、生成器の意図した変更の後に入力そのものが変わったもの。コグニはこの欄を開いても作り直さず、
+    #   保存版は当時の生成物を写しているだけ（gen_<tag>.neo と cogni_<tag>.neo はこの欄で同じ）。2026-10-01 に当時の生成器を今の ADDATA で
+    #   動かすと一致することを確かめ、ADDATA の版の違いではないと切り分けた
+    'CXC': ('汎用車種の手入力行「Fﾌｴﾝﾀﾞ 左」。2026-09-09 の生成器は名前の中の「左」を頭にも足して「左Fﾌｴﾝﾀﾞ 左」を書き、コグニはそれを保存した。'
+            '2026-09-29（ee8896c）から手入力行は印字どおりに書く（実案件で「左ｼﾞｬｯｷ支持部 左前後」になっていた）',
+            'KNOWN_CXC'),
+    'N1': ('修正パネルの下処理面積。2026-09-08 の生成器は近似 四捨五入(S×0.345) で 16/33 を書き、コグニは開いても作り直さずに保存した。'
+           '2026-09-21（4b8095a）から min(切上(S÷3), 上限) で 15/32（実機で人が入れた W66 のルーフ 48 と実案件 188 行で確定）',
+           'KNOWN_N1'),
 }
 
+# 全ファイル一致（--full-files）・AnSMB 142 桁（--ansmb）の既知差。KNOWN_DIFF と同じ理由のものだけ。
+# 期待する差分そのもの（tests/known_full_<tag>.txt）と 1 行ずつ照合し、1 件でも増減したら失敗にする
+KNOWN_FULL = ('CXC',)
 
-def known_diff_lines(tag: str) -> list:
-    """既知差の期待メッセージ（tests/known_diff_<tag>.txt）。無ければ空 = 必ず失敗させる"""
-    p = os.path.join(os.path.dirname(os.path.realpath(__file__)), f'known_diff_{tag}.txt')
+
+def known_diff_lines(tag: str, kind: str = 'diff') -> list:
+    """既知差の期待メッセージ（tests/known_<kind>_<tag>.txt。kind = diff: ERParts の総当たり / full: 全ファイル一致）。無ければ空 = 必ず失敗させる"""
+    p = os.path.join(os.path.dirname(os.path.realpath(__file__)), f'known_{kind}_{tag}.txt')
     if not os.path.exists(p):
         return []
     return sorted(l.rstrip(chr(10)) for l in io.open(p, encoding='utf-8') if l.strip())
@@ -270,6 +283,22 @@ if __name__ == '__main__' and '--ansmb' not in sys.argv and '--full-files' not i
     sys.exit(main())
 
 
+def _extra_file_diff(fn: str, fa: bytes, fb: bytes) -> list:
+    """付随ファイル（AnSMB.txt など）1 本の差分メッセージ。同じなら空"""
+    if fa == fb:
+        return []
+    # 行単位の差を出す前に、まず「バイトが違う」ことを必ず記録する。
+    # splitlines() は CRLF/LF の違いや末尾の改行有無を消すので、これが無いと完全一致ゲートが空回りする
+    out = ['%s: バイト一致しない (%d B vs %d B)' % (fn, len(fa), len(fb))]
+    la = fa.decode('cp932', 'replace').splitlines(); lb = fb.decode('cp932', 'replace').splitlines()
+    if len(la) != len(lb):
+        out.append('%s: 行数 %d vs %d' % (fn, len(la), len(lb)))
+    for i, (x, y) in enumerate(zip(la, lb)):
+        if x != y:
+            out.append('%s[%d]: %r vs %r' % (fn, i, x, y))
+    return out
+
+
 def check_ansmb(tag: str = 'M1') -> int:
     """AnSMB.txt が実機保存版と 142 桁一致するか。基準は M1（生成 NEO をコグニで開いてそのまま保存したもの）。
     K1 は明細を編集した後の保存版なので OrderFlag（100 桁）が変わっている
@@ -284,11 +313,26 @@ def check_ansmb(tag: str = 'M1') -> int:
     def _smb(p):
         raw = open(p, 'rb').read(); ck = _nc.find_real_cks(raw); dec = _nc.decompress_neo(raw, ck)
         mgmt, entries = _nc.parse_entries(raw, ck[0]); files = _nc.extract_files(dec, entries)
-        return [l for l in files.get('AnSMB.txt', b'').split(b'\r\n') if l]
+        return files.get('AnSMB.txt', b'')
     neo, _ = NeoBuilder().build(est, est['vehicle'], hints=est.get('hints'), labor_rate=est.get('labor_rate') or 8000, est_date=est.get('est_date') or '20260908', insurance={})
     tmp = os.path.join(os.environ.get('TEMP', '.'), f'ansmb_{tag}.neo'); open(tmp, 'wb').write(neo)
-    g, c = _smb(tmp), _smb(cog_p)
+    graw, craw = _smb(tmp), _smb(cog_p)
+    g = [l for l in graw.split(b'\r\n') if l]; c = [l for l in craw.split(b'\r\n') if l]
     same = (g == c)
+    if tag in KNOWN_FULL:
+        # 既知差の実験は、全ファイル比較と同じ書式の差分が known_full_<tag>.txt の AnSMB 分と完全に同じときだけ通す。
+        # 差が消えた（一致するようになった）ときも既知差ファイルを直すまで失敗にする（Codex 指摘）
+        exp = [m for m in known_diff_lines(tag, 'full') if m.startswith('AnSMB.txt')]
+        got = sorted(_extra_file_diff('AnSMB.txt', graw, craw))
+        if got == exp:
+            print(f'AnSMB {tag}: 行 {len(g)}/{len(c)} ' + (f'差 {len(got)}（既知の差と完全に一致: {KNOWN_DIFF[tag][0][:60]}）' if got else '142 桁すべて一致'))
+            return 0
+        print(f'AnSMB {tag}: 行 {len(g)}/{len(c)} 既知の差（{len(exp)} 件）と違う（{len(got)} 件）')
+        for m in sorted(set(got) - set(exp))[:8]:
+            print('    新しい差', m[:170])
+        for m in sorted(set(exp) - set(got))[:8]:
+            print('    消えた差', m[:170])
+        return 1
     print(f'AnSMB {tag}: 行 {len(g)}/{len(c)} ' + ('142 桁すべて一致' if same else '差あり'))
     return 0 if same else 1
 
@@ -385,18 +429,7 @@ def _full_diff(gen_path: str, cog_path: str) -> list:
                             _price_date_newer.add(os.path.basename(cog_path)); continue
                         out.append('%s[%d].%s: %r vs %r' % (t, i, kk, x[kk], y[kk]))
     for fn in EXTRA_FILES:
-        fa = A['files'].get(fn, b''); fb = B['files'].get(fn, b'')
-        if fa == fb:
-            continue
-        # 行単位の差を出す前に、まず「バイトが違う」ことを必ず記録する。
-        # splitlines() は CRLF/LF の違いや末尾の改行有無を消すので、これが無いと完全一致ゲートが空回りする
-        out.append('%s: バイト一致しない (%d B vs %d B)' % (fn, len(fa), len(fb)))
-        la = fa.decode('cp932', 'replace').splitlines(); lb = fb.decode('cp932', 'replace').splitlines()
-        if len(la) != len(lb):
-            out.append('%s: 行数 %d vs %d' % (fn, len(la), len(lb)))
-        for i, (x, y) in enumerate(zip(la, lb)):
-            if x != y:
-                out.append('%s[%d]: %r vs %r' % (fn, i, x, y))
+        out += _extra_file_diff(fn, A['files'].get(fn, b''), B['files'].get(fn, b''))
     return out
 
 
@@ -407,7 +440,7 @@ def check_full() -> int:
         print('** 全ファイル比較: 実機ファイル（NEO_check/_eva_exp）が無いので行っていない **')
         return 1 if os.environ.get('PDF_TO_NEO_REQUIRE_FIXTURES', '') == '1' else 0
     require = os.environ.get('PDF_TO_NEO_REQUIRE_FIXTURES', '') == '1'
-    nb = NeoBuilder(); ng = 0; done = 0; missing = []
+    nb = NeoBuilder(); ng = 0; done = 0; known = 0; missing = []
     for tag in STRAIGHT_SAVE:
         cog_p = os.path.join(E, 'cogni_%s.neo' % tag)
         est, _label = est_of(tag)
@@ -421,6 +454,19 @@ def check_full() -> int:
         open(tmp, 'wb').write(neo)
         msgs = _full_diff(tmp, cog_p)
         done += 1
+        if tag in KNOWN_FULL:   # 差が消えたときも既知差ファイルを直すまで失敗にする（Codex 指摘）
+            exp = known_diff_lines(tag, 'full')
+            if exp and sorted(msgs) == exp:
+                known += 1
+                print('--  %s: 差 %d（既知の差と完全に一致: %s）' % (tag, len(msgs), KNOWN_DIFF[tag][0][:60]))
+                continue
+            ng += 1
+            print('** %s: 差 %d —— 既知の差（%d 件）と違うので退行の疑い:' % (tag, len(msgs), len(exp)))
+            for m in sorted(set(msgs) - set(exp))[:8]:
+                print('    新しい差', m[:170])
+            for m in sorted(set(exp) - set(msgs))[:8]:
+                print('    消えた差', m[:170])
+            continue
         if msgs:
             ng += 1
             print('** %s: 差 %d' % (tag, len(msgs)))
@@ -433,7 +479,8 @@ def check_full() -> int:
         return 1 if require else 0
     if _price_date_newer:
         print('   （部品価格適応日だけ新しい ADDATA の日付: %d 本。実機 NEO を保存したときより ADDATA が新しいため。差にしない）' % len(_price_date_newer))
-    print('--- 全ファイル一致（そのまま保存） %d / %d 本' % (done - ng, done)
+    print('--- 全ファイル一致（そのまま保存） %d / %d 本' % (done - ng - known, done)
+          + ('（既知の差と完全に一致 %d 本）' % known if known else '')
           + ('（実機ファイルの無い %d 本は未実施）' % len(missing) if missing else ''))
     return 1 if (ng or (missing and require)) else 0
 

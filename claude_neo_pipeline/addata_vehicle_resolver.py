@@ -526,13 +526,12 @@ class AddataVehicleResolver:
         recs = [b[i * 13:(i + 1) * 13] for i in range(len(b) // 13)]
         bnum = int(str(body).strip()) if str(body).strip().isdigit() else None
         best = None
+        low = None   # この車のボディより大きいボディの行しか無いときの控え（いちばん小さいボディの行）
         for r in recs:
             key = r[2:9].decode('latin1'); codes = r[9:13].decode('latin1')
             if not re.match(r'^\d{3}[\d ]$', codes):
                 continue   # FinishCode（4 桁目）は空白の車種がある（実案件 9 件。2026-09-21）
             rec_body = r[1]   # [1] = ボディ（0 = 共通）。車のボディ以下で**いちばん大きい**行が正（実案件で確認）
-            if bnum is not None and rec_body > bnum:
-                continue
             # [2:9] の 7 文字は**該当するグレードコードの列挙**（'B      ' / 'JKL    ' / 'ABCDP  '。条件行を持つのは 5 車種）。
             # 年式・ボディ・駆動の欄ではない（2026-09-21 に実データで確認。Codex 指摘）
             cond = key.strip().upper()
@@ -543,10 +542,20 @@ class AddataVehicleResolver:
                     score += 1
                 else:
                     ok = False
+            if not ok:
+                continue
+            if bnum is not None and rec_body > bnum:
+                # 25.DB にボディ以下の行が 1 つも無い車（共通行 0 を持たない 46 車種の小さいボディ。C88 ボディ 10 は行が 30/40 だけ）は
+                # 空にすると車形が経験則の値（FormCode2 = ドア数・FinishCode '2'）になるので、いちばん小さいボディの行を採る（2026-10-01）。
+                # 並べ方は本流と同じく条件（グレード）が合う行が先、同点ならボディが小さい行（今の ADDATA ではどちらを先にしても同じ行になる）
+                if low is None or (score, -rec_body) > (low[0], low[1]):
+                    low = (score, -rec_body, codes)
+                continue
             # ボディが分かるときは「ボディ以下でいちばん大きい行」、分からないときは共通行（0）を優先（Codex 指摘）
             rank = rec_body if bnum is not None else -rec_body
-            if ok and (best is None or (score, rank) > (best[0], best[1])):
+            if best is None or (score, rank) > (best[0], best[1]):
                 best = (score, rank, codes)
+        best = best or low
         if best:
             c = best[2]
             out = {'CarFormCode': c[0], 'FormCode1': c[1], 'FormCode2': c[2], 'FinishCode': c[3]}

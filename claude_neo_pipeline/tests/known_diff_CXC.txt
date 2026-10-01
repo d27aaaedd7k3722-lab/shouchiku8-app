@@ -1,0 +1,2 @@
+ d2 PartsName: 'Fﾌｴﾝﾀﾞ 左' vs '左Fﾌｴﾝﾀﾞ 左'
+ d2 PartsNameStandard: 'Fﾌｴﾝﾀﾞ 左' vs '左Fﾌｴﾝﾀﾞ 左'

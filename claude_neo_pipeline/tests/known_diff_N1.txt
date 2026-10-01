@@ -1,0 +1,2 @@
+PP 0600.PrepareArea: 15 vs 16
+PP 5800.PrepareArea: 32 vs 33

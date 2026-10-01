@@ -1231,6 +1231,25 @@ def test_scratch_high_function_paint():
         raise AssertionError('知らない高機能塗装を通してしまった')
 
 
+def test_form_codes_when_no_row_fits_the_body():
+    """25.DB（車形コード）は「この車のボディ以下でいちばん大きいボディの行」。ボディ以下の行が 1 つも無い車
+    （共通行 0 を持たない 46 車種の小さいボディ。C88 は行がボディ 30/40 の 2 つだけで、どちらも 6251）は
+    空にせず、いちばん小さいボディの行を採る。空にすると Car.FormCode2 がドア数・FinishCode が '2' の経験則になり、
+    塗装の表も車形 '' で引いていた（実機 cogni_CXE は C88 ボディ 10 で 6251。2026-09-21 の 25.DB の読み直しで外れていた）"""
+    import paint_index as pi_
+    root = NeoBuilder().engine.root
+    if not os.path.exists(os.path.join(root, 'C', 'C88', 'C8825.DB')):
+        print('  (C88 の 25.DB が無いので省略)'); return
+    rs = NeoBuilder().resolver
+    for body in ('10', '20', '30', '40'):
+        assert pi_.PaintIndex(root, 'C88', body=body).form_codes() == ('6', '2', '5', '1'), body
+        assert rs.form_codes('C88', '01', body, 'B') == {'CarFormCode': '6', 'FormCode1': '2', 'FormCode2': '5', 'FinishCode': '1'}, body
+    # ボディ以下の行があるときは今までどおりその中でいちばん大きいボディ（W44 ボディ 40 = 2252、ボディ 10 = 2142。実案件で確認済み）
+    if os.path.exists(os.path.join(root, 'W', 'W44', 'W4425.DB')):
+        assert pi_.PaintIndex(root, 'W44', body='40').form_codes()[:3] == ('2', '2', '5')
+        assert pi_.PaintIndex(root, 'W44', body='10').form_codes()[:3] == ('2', '1', '4')
+
+
 def _paint_db(neo):
     ck = _nc.find_real_cks(neo); dec = _nc.decompress_neo(neo, ck); _m, entries = _nc.parse_entries(neo, ck[0]); files = _nc.extract_files(dec, entries)
     t = tempfile.NamedTemporaryFile(delete=False, suffix='.sld'); t.write(files['AnSvEm0001.sld']); t.close()

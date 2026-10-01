@@ -1,0 +1,4 @@
+AnSMB.txt: バイト一致しない (432 B vs 432 B)
+AnSMB.txt[1]: '00000020     2Fﾌｴﾝﾀﾞ 左               Fﾌｴﾝﾀﾞ 左                                                   01 0000                      F99999         ' vs '00000020     2左Fﾌｴﾝﾀﾞ 左             左Fﾌｴﾝﾀﾞ 左                                                 01 0000                      F99999         '
+ERParts[1].PartsName: 'Fﾌｴﾝﾀﾞ 左' vs '左Fﾌｴﾝﾀﾞ 左'
+ERParts[1].PartsNameStandard: 'Fﾌｴﾝﾀﾞ 左' vs '左Fﾌｴﾝﾀﾞ 左'

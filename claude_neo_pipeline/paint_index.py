@@ -580,13 +580,12 @@ class PaintIndex:
             return ('', '', '', '')
         b = open(p, 'rb').read()
         best = None
+        low = None   # この車のボディより大きいボディの行しか無いときの控え（いちばん小さいボディの行）
         for i in range(len(b) // 13):
             r = b[i * 13:(i + 1) * 13]
             c = r[9:13].decode('latin1')
             if not (len(c) == 4 and c[:3].isdigit() and (c[3].isdigit() or c[3] == ' ')):
                 continue   # FinishCode（4 桁目）は空白の車種がある
-            if self.body_code and r[1] > self.body_code:
-                continue      # この車のボディより大きいボディ専用の行は使わない
             # [2:9] の条件（年式群・ボディ・グレード・駆動）が空でない行は、この車に合うときだけ使う
             # （条件行を持つのは 1,209 ファイル中 5 ファイル。set_vehicle 前は grade も年式群も空なので無条件行が選ばれる）
             # [2:9] は**該当するグレードコードの列挙**（'B      ' / 'ABCDP  '）。条件行を持つのは 1,209 ファイル中 5
@@ -597,10 +596,18 @@ class PaintIndex:
                 if not _g or _g not in cond:
                     continue
                 score = 1
+            if self.body_code and r[1] > self.body_code:
+                # この車のボディより大きいボディ専用の行は使わない。ただし 25.DB にボディ以下の行が 1 つも無い車
+                # （共通行 0 を持たない 46 車種の小さいボディ。C88 ボディ 10 は行が 30/40 だけ）は空にせず、いちばん小さいボディの行を採る。
+                # 並べ方は本流と同じく条件（グレード）が合う行が先、同点ならボディが小さい行（今の ADDATA ではどちらを先にしても同じ行になる）
+                if low is None or (score, -r[1]) > low[0]:
+                    low = ((score, -r[1]), c)
+                continue
             # 条件が合った行を優先し、同点ならボディ（分かる車は最大・分からない車は共通行 0）で決める（Codex 指摘）
             rank = (score, r[1] if self.body_code else -r[1])
             if best is None or rank > best[0]:
                 best = (rank, c)
+        best = best or low
         if not best:
             return ('', '', '', '')
         c = best[1]

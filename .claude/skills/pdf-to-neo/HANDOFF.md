@@ -463,7 +463,7 @@ bash claude_neo_pipeline/tests/verify_all.sh
   `auto_panels` は一括計上に戻し、`target_total` は `target_total_replaces_material: true` が無いと止まる
 - ~~修理(2) の塗装パネルが自動連動する条件~~ → **2026-09-12 に実機で確認**: 修理(2) を明細に入れただけで
   20.DB にあるパネルは **1/2** で自動連動する（W66 5 枚すべて。`cogni_W66x` / `cogni_W66y`、判断規則 10-18）。
-  下処理面積 `PrepareArea` は近似式が 4 枚で合い、W66 のルーフだけ合わない（表示のみ・既知差 W66y）
+  下処理面積 `PrepareArea` は 2026-09-21 の式 `min(切上(S ÷ 3), 上限)` で W66 のルーフも合う（2026-10-01 に既知差 W66y/W66z から外した）
 
 ---
 

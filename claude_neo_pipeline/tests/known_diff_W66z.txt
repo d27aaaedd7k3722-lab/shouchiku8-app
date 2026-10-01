@@ -13,6 +13,5 @@ PP 4600.SortNo: 1 vs 2
 PP 4802.LineNo: 4 vs 3
 PP 4802.SortNo: 1 vs 2
 PP 5800.LineNo: 5 vs 4
-PP 5800.PrepareArea: 50 vs 48
 PP 5800.SortNo: 1 vs 2
 PaintingTotal.TimeTotal: 15.9 vs 15.899999999999999
